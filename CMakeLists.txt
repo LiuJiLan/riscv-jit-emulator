@@ -46,7 +46,24 @@ add_compile_options(
 include_directories(src)
 
 add_executable(riscv_jit_emulator
-        src/main.c)
+        src/main.c
+        src/loader.c
+        src/loader.h
+        src/core/cpu.c
+        src/core/cpu.h
+        src/core/dispatcher.c
+        src/core/dispatcher.h
+        src/core/interpreter.c
+        src/core/interpreter.h
+        src/core/decode.c
+        src/core/decode.h
+        src/core/mmu.c
+        src/core/mmu.h
+        src/core/tlb.c
+        src/core/tlb.h
+        src/platform/ram.c
+        src/platform/ram.h
+        src/config.h)
 
 # Test
 enable_testing()
