@@ -148,3 +148,7 @@ Temporary Items
 
 CLAUDE.md
 notes/*
+refs/*
+
+# 测试 fixture 的生成产物(out.bin / out.elf / 任何 out.*),源 .S / .ld / Makefile 仍跟踪
+tests/**/out.*
