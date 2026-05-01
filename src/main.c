@@ -20,6 +20,11 @@ static int has_suffix(const char *s, const char *suffix) {
     return strcmp(s + ns - nsuf, suffix) == 0;
 }
 
+// Debug 构建带 -fsanitize=address (含 LSan 的 exit-time 内存泄漏扫描)。
+// 在 CLion Debug / gdb / strace 等 ptrace 环境下跑本程序, 必须设
+//   ASAN_OPTIONS=abort_on_error=1:detect_leaks=0
+// 否则 LSan 撞 ptrace 冲突会报 "LeakSanitizer has encountered a fatal error" 并 exit 1,
+// 看起来像本程序的 bug 但其实是工具链限制。Run 模式(无 gdb)正常, 想查泄漏走 Run 即可。
 int main(int argc, char **argv) {
     // a_01: 命令行参数 ./jit-emu <bin-or-elf-path>
     if (argc < 2) {
