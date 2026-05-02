@@ -66,7 +66,8 @@ add_executable(riscv_jit_emulator
         src/core/tlb.h
         src/platform/ram.c
         src/platform/ram.h
-        src/config.h)
+        src/config.h
+        src/riscv.h)
 
 # Test
 enable_testing()

@@ -19,10 +19,25 @@
 // 留足空间,后期不用回头改。
 #define GUEST_RAM_SIZE    (128UL * 1024 * 1024)
 
-// a01_1 范围内 config.h 只这两个宏。
-// 后续可能加入(均不在 a01_1):
-//   ASID_MAX / TLB_ASID_BITS    a01_4 (cpu + tlb)
-//   TLB 大小 / 关联度等         a01_4
+// ----------------------------------------------------------------------------
+// TLB / ASID 配置(a01_2 加入)
+// ----------------------------------------------------------------------------
+//
+// TLB_ASID_BITS = 4 → ASIDLEN = 4。Sv32 规范: ASIDMAX ≤ 9, 我们选 4 < 9, 合法。
+// guest 看到的 ASIDLEN 就是 4 位; csr.c 的 satp 写 helper 必须做 WARL 截断, 详见
+// dummy.txt §3 (satp 合法性契约)。
+#define TLB_ASID_BITS     4U
+#define ASID_MAX          (1U << TLB_ASID_BITS)         /* = 16 */
+#define ASID_MASK         (ASID_MAX - 1U)               /* = 0xF, fast path 用 */
+
+// 单套叶 TLB 的 entry 数 (direct-mapped index)。
+// 64 entry × 16 B/entry = 1 KB / 套, cache line 友好。
+// set-associative 是改进项, 现阶段 direct-mapped 足够。
+#define TLB_INDEX_BITS    6U
+#define TLB_NUM_ENTRIES   (1U << TLB_INDEX_BITS)        /* = 64 */
+
+// ----------------------------------------------------------------------------
+// 后续可能加入(均不在 a01_2):
 //   软边界 max block length     a01_3 / a01_5
 // 加入时各自带 doc comment 说明取值理由。
 

@@ -1,14 +1,15 @@
 //
 // Created by liujilan on 2026/4/28.
 // a_01 main。
-// a_01 范围内只到 loader 调用为止;cpu / dispatcher / cpu_destroy
-// 三段保留为 #if 0 占位,等 a01_4(cpu + tlb + mmu)+ a01_5
-// (interpreter + dispatcher + main 翻译)入场再激活。
+// 当前形态: ram_init → loader → cpu_create + 字段设置 → cpu_destroy。
+// dispatcher 段仍 #if 0 占位, 等 a01_5 (interpreter + dispatcher 真实现) 激活。
 //
 
 #include "config.h"
+#include "core/cpu.h"
 #include "loader.h"
 #include "platform/ram.h"
+#include "riscv.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -33,7 +34,7 @@ int main(int argc, char **argv) {
     }
 
     // 调用 ram_init();成功后 ram.h 暴露的全局 host_ram_base /
-    // host_ram_base_adjusted 可用。报错风格见 src/dummy.txt §5。
+    // gpa_to_hva_offset 可用。报错风格见 src/dummy.txt §5。
     if (ram_init() != 0) {
         fprintf(stderr, "ram_init failed\n");
         return 1;
@@ -61,43 +62,35 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-#if 0
-    // ========================================================================
-    // 以下段落 a01_4(cpu / tlb / mmu)+ a01_5(interpreter / dispatcher /
-    // main 翻译)入场后激活。保留 LiuJiLan 风格的设计意图注释。
-    // ========================================================================
-    //
-    // cpu 提供 alloc_cpu_t(misa) -> cpu_t*(失败返回 NULL)
-    // 参数会被忽略, 完全无用; 返回时, 整个结构体全 0
-    // 作用解释:
-    // 由于 cpu_t 中部分 isa 相关的部分, 使用的是指针引用避免整体结构过大,
-    // 只有当这个 misa 有使用它的意图时, 才会去对应 isa 的函数去分配
-    // 但由于现在都没有 misa 这个位置, 只是留下这个参数, 表达这种未来的接口
-    // PS:
-    // void * tlb_table[4] 此时直接是 cpu_t 字段
-    // PS: 暂时不真的设置 sigjmp_buf *jmp_buf_ptr
-    cpu_t *hart = alloc_cpu_t(0);
-    if (hart == NULL) {                            // alloc_cpu_t 内部已 fprintf "why"
-        fprintf(stderr, "alloc_cpu_t failed\n");
+    // hart 构造: misa 参数 a_01 不读, 仅作未来 misa 驱动初始化预留 (cpu.h 已 doc)。
+    // tlb_t **tlb_table[4] 是 cpu_t 字段; sigjmp_buf *jmp_buf_ptr 暂留 NULL (memset 0 已置)。
+    // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc;
+    // [PRIV_S][asid] 的 entries 由 dispatcher 懒分配 (a_01 仍 #if 0)。
+    cpu_t *hart = cpu_create(0);
+    if (hart == NULL) {                            // cpu_create 内部已 fprintf "why"
+        fprintf(stderr, "cpu_create failed\n");
         return 1;
     }
 
-    // 早期代码会直接设置这个 cpu_t hart, 之后会是有个函数来,
-    // 但是这个函数先不存在, 因为放在哪没想好
-    hart->pc    = GUEST_RAM_START;  // 考虑到远远的未来会有热插拔核, 程序起点在外部设置
+    // hart 字段初始化 (以后会设计函数 / 启动协议接管)。
+    // (但是一定是在 dispatcher 外部, 因为 hart 的热插拔 = hart寄存器初始化 + 开始运行)
+    // 注: regs[0] 是 pc (cpu_t 内 regs[0] 物理占 x0 位置, 实际存 pc; 见 cpu.h)。
+    hart->regs[0] = GUEST_RAM_START;       // pc; 程序起点; 未来热插拔核时由外部参数设置
+    hart->satp    = 0;                      // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
+    hart->priv    = PRIV_M;                 // M 模式
     // 下面的来自参考 https://docs.kernel.org/arch/riscv/boot.html
-    hart->a0    = 0;  // hartid #0    // cpu_t 中除了 x0, 使用 abi 命名
-    hart->a1    = 0;  // 暂时没有设备树
-    hart->satp  = 0;
-    hart->priv  = 3;  // M 态
+    // hart->regs[10] = 0;  // a0 = hartid #0    (Linux RV boot protocol; x10 = a0)
+    // hart->regs[11] = 0;  // a1 = device tree pointer (暂无 dtb; x11 = a1)
+    // 注: regs 已被 memset 0; 以上两行显式赋值是 boot protocol 文档化, 等价于 memset 后的现状。
+    //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
-    // 注意, tlb 的实际分配不在外部
-
-    dispatcher(hart);  // 在远远的未来, 就是 pthread 启动了
-
-    // a_01 后: 真正退出 = helper 走 exit(), 走不到这
-    cpu_destroy(hart);
+#if 0
+    // dispatcher 真实现等 a01_5 (interpreter + dispatcher 翻译) 激活。
+    // 在远远的未来, 这里就是 pthread 启动了。
+    dispatcher(hart);
+    // a_01 后: 真正退出 = helper 走 exit(), 走不到 cpu_destroy
 #endif
 
+    cpu_destroy(hart);
     return 0;
 }
