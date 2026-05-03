@@ -50,4 +50,18 @@
                         //           "priv 编码值" 语义。
 #define PRIV_M  3U
 
+// ----------------------------------------------------------------------------
+// Sv32 PTE 位段 (Privileged Spec Vol II, table 4.18 / fig 4.16-4.18)
+//
+// PTE bit:  9 8 7 6 5 4 3 2 1 0
+//          [RSW][D][A][G][U][X][W][R][V]
+//
+// 增量加: 当前用到 V (TLB entry 有效位) + R/W/X (取指/读/写权限位; M/bare TLB fill 合成全权限);
+// U/G/A/D 后续真用到时 (Sv32 walker 接入) 再加宏化。
+// ----------------------------------------------------------------------------
+#define PTE_V  (1U << 0)
+#define PTE_R  (1U << 1)
+#define PTE_W  (1U << 2)
+#define PTE_X  (1U << 3)
+
 #endif //RISCV_H

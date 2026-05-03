@@ -62,6 +62,6 @@ cpu_t *cpu_create(uint32_t misa);
 
 // 释放 cpu_create 分配的 cpu_t 及其下所有子结构 (tlb 容器 + 共享 leaf + 已懒分配的 entries)。
 // NULL 入参 do nothing。
-void cpu_destroy(cpu_t *cpu);
+void cpu_destroy(cpu_t *hart);
 
 #endif //CORE_CPU_H

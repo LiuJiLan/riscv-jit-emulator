@@ -1,12 +1,15 @@
 //
 // Created by liujilan on 2026/4/28.
 // a_01 main。
-// 当前形态: ram_init → loader → cpu_create + 字段设置 → cpu_destroy。
-// dispatcher 段仍 #if 0 占位, 等 a01_5 (interpreter + dispatcher 真实现) 激活。
+// 当前形态: ram_init → loader → cpu_create + 字段设置 →
+//             多次 dispatcher self-check (a01_2 mmu_translate_pc 端到端验证) → cpu_destroy。
+// dispatcher 当前 a01_2 简化形态 (block 1+2 + 临时输出, 无循环), 完整 dispatcher
+// (sigsetjmp + while loop + block 3 派发) 等 a01_5 真接入。
 //
 
 #include "config.h"
 #include "core/cpu.h"
+#include "core/dispatcher.h"
 #include "loader.h"
 #include "platform/ram.h"
 #include "riscv.h"
@@ -84,12 +87,45 @@ int main(int argc, char **argv) {
     // 注: regs 已被 memset 0; 以上两行显式赋值是 boot protocol 文档化, 等价于 memset 后的现状。
     //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
-#if 0
-    // dispatcher 真实现等 a01_5 (interpreter + dispatcher 翻译) 激活。
-    // 在远远的未来, 这里就是 pthread 启动了。
+    // ------------------------------------------------------------------------
+    // a01_2 self-check: 多次设 hart->regs[0] (= pc) 调 dispatcher, 看 mmu_translate_pc
+    // 路径输出。dispatcher 内部 (a01_2 简化形态) 走 block 1 (选 TLB) + block 2
+    // (mmu_translate_pc) + 临时 fprintf, 不循环不真派发。
+    //
+    // 期望:
+    //   - RAM 内 (含起点 / 中间 / 末尾对齐) → cause = 0, byte0 反映 loader 写入内容
+    //   - RAM 外 (低地址 / 高地址 / RAM 紧后) → cause = 1 (Instruction Access Fault)
+    //
+    // 真激活完整 dispatcher 时这整段 self-check 删除, 只留一个 dispatcher(hart) 调用 + 内部 loop。
+    // ------------------------------------------------------------------------
+
+    /* test 1: RAM 起点, loader 已写入 (a01_1 fixture: 0xDEADBEEF 之类) */
+    hart->regs[0] = GUEST_RAM_START;
     dispatcher(hart);
-    // a_01 后: 真正退出 = helper 走 exit(), 走不到 cpu_destroy
-#endif
+
+    /* test 2: RAM 内偏移, 仍在 loader 写入范围 (依 fixture) 或 mmap 零页 */
+    hart->regs[0] = GUEST_RAM_START + 0x100;
+    dispatcher(hart);
+
+    /* test 3: RAM 末尾对齐, 还在范围 */
+    hart->regs[0] = GUEST_RAM_START + GUEST_RAM_SIZE - 4;
+    dispatcher(hart);
+
+    /* test 4: 0 地址, RAM 外, 应 access fault */
+    hart->regs[0] = 0;
+    dispatcher(hart);
+
+    /* test 5: 低地址但非 0, RAM 外, 应 access fault */
+    hart->regs[0] = 0x1000;
+    dispatcher(hart);
+
+    /* test 6: 紧贴 RAM 后第一字节, RAM 外, 应 access fault */
+    hart->regs[0] = GUEST_RAM_START + GUEST_RAM_SIZE;
+    dispatcher(hart);
+
+    /* test 7: 远高地址, RAM 外, 应 access fault */
+    hart->regs[0] = 0xC0000000;
+    dispatcher(hart);
 
     cpu_destroy(hart);
     return 0;
