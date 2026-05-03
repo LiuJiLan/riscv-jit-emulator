@@ -1,8 +1,91 @@
 //
 // Created by liujilan on 2026/4/28.
+// a01_3 decode 模块对外接口。
+//
+// 职责: 把 RV32 32-bit 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst) 的纯数据结构,
+//       给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
+//
+// op_kind_t a01_3 范围: 算术 / 逻辑 / 立即数子集 (RV32I 中不碰内存 / 不碰控制流的部分),
+//   共 21 个真 op + 1 个 OP_UNSUPPORTED 兜底。
+//   不在此范围的 opcode (load / store / branch / jal / jalr / fence / csr / ecall / ebreak
+//   / mret / sret / wfi / amo / 等) decode 全部归 OP_UNSUPPORTED。
+//
+// op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
+//   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
+//   时编译器逼着补 case, 不会漏。
+//
+// decoded_inst_t 字段:
+//   kind     - op_kind_t, 由 decode 分类
+//   rd       - 0..31, 写目标寄存器号 (R/I/U-type 都有; OP_UNSUPPORTED 时按通用编码位置填,
+//              但调用方不应使用)
+//   rs1, rs2 - 0..31, 源寄存器号 (R/I-type 用 rs1; R-type 还用 rs2; U-type 都没用)
+//   imm      - int32_t, 已符号扩展; 含义按 kind 不同:
+//                I-type (ADDI/SLTI/...): 12 位 imm 符号扩到 32 位
+//                I-type shift (SLLI/SRLI/SRAI): shamt 5 位放低位 (无符号扩展)
+//                U-type (LUI/AUIPC):     20 位 imm 左移 12 位 (低 12 位 0)
+//                R-type (ADD/SUB/...):   不用, decode 设 0
+//   raw_inst - 原始 32 位指令; 留给 debug / illegal-instruction trap 的 mtval 填充
+//                (RV 规范规定 illegal trap 的 mtval = 触发指令本身; 未来 a_03 trap.c
+//                接 OP_UNSUPPORTED → trap_raise(2) 时, raw_inst 现成可用, 不用反查 hva)
+//
+// 注: x0 寄存器号约定见 dummy.txt §2 (decode 不特判, rd/rs1/rs2 字段都可能是 0,
+//     interpreter 路径自己用 READ_REG / WRITE_REG 宏分流)。
 //
 
 #ifndef CORE_DECODE_H
 #define CORE_DECODE_H
+
+#include <stdint.h>
+
+typedef enum {
+    // ---- U-type (2) ----
+    OP_LUI = 0,         // U-type, opcode 0x37
+    OP_AUIPC,           // U-type, opcode 0x17
+
+    // ---- I-type OP-IMM (9), opcode 0x13 ----
+    OP_ADDI,
+    OP_SLTI,
+    OP_SLTIU,
+    OP_XORI,
+    OP_ORI,
+    OP_ANDI,
+    OP_SLLI,            // shamt 在 imm 低 5 位
+    OP_SRLI,
+    OP_SRAI,
+
+    // ---- R-type OP (10), opcode 0x33 ----
+    OP_ADD,
+    OP_SUB,
+    OP_SLL,
+    OP_SLT,
+    OP_SLTU,
+    OP_XOR,
+    OP_SRL,
+    OP_SRA,
+    OP_OR,
+    OP_AND,
+
+    // ---- 兜底 ----
+    // 不在 a01_3 范围的 opcode (load 0x03 / store 0x23 / branch 0x63 / jalr 0x67 /
+    // jal 0x6F / fence 0x0F / system 0x73 / amo 0x2F / 等) 全部归这里。
+    // interpreter 收到这个 case break 出 fetch loop, dispatcher 看 count_out 知道
+    // 本次 block 跑了多少条; 未来 a_03 trap.c 接入后改为 trap_raise(2) Illegal Instruction
+    // (RV cause code 2), mtval = decoded.raw_inst (RV 规范要求)。
+    OP_UNSUPPORTED,
+} op_kind_t;
+
+typedef struct {
+    op_kind_t kind;
+    uint32_t  rd;
+    uint32_t  rs1;
+    uint32_t  rs2;
+    int32_t   imm;
+    uint32_t  raw_inst;     // 原始 32 位指令; debug / illegal trap mtval 用
+} decoded_inst_t;
+
+// 纯函数: 不读 / 不写 cpu_t, 不依赖 mmu / tlb / ram。
+// 对于不识别的 opcode, kind = OP_UNSUPPORTED; 其它字段 (rd/rs1/rs2/imm) 仍按通用编码位置
+// 填入, 但调用方不应使用 (除 raw_inst 用作 trap mtval)。
+decoded_inst_t decode(uint32_t inst);
 
 #endif //CORE_DECODE_H

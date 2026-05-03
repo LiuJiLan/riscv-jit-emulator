@@ -1,6 +1,7 @@
 //
 // Created by liujilan on 2026/4/28.
-// a01_2 dispatcher 实现 (简化形态)。
+// a01_3 dispatcher 实现 (block 1+2+3 真调度起步; 临时 if(1) 限制单次, 等 a_03 trap.c
+// + a01_5 完整 dispatcher 时改 while(1) + sigsetjmp)。
 // 跨文件协议见 src/dummy.txt §1 (sigsetjmp) / §4 (TLB 分发机制)。
 //
 
@@ -8,6 +9,7 @@
 
 #include "config.h"
 #include "cpu.h"
+#include "interpreter.h"
 #include "mmu.h"
 #include "tlb.h"
 #include "riscv.h"
@@ -26,7 +28,7 @@
 //    - PA 给 JIT hash (jit_cache 用 PA 为 key 找 host_code_ptr)
 //    - HVA 给解释器直接读字节取指 (依赖块边界保证不跨 4K page)
 //
-// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing) - 等 a_03 真接入
+// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing) - 等 a_03 trap.c 真接入
 //
 // III. 迭代头 perf 同步 / mtime 推进 / 中断检查 - 等 a_03 真接入
 //
@@ -38,18 +40,23 @@
 //       /* block 1 + 2 + 3 */
 //   }
 //
-// a01_2 简化: 一次性走完 block 1 + block 2 + 临时 self-check 输出, 无循环, 无 sigsetjmp,
-//            无 block 3 派发。main 通过多次设 hart->regs[0] 调 dispatcher 驱动测试。
+// a01_3 当前形态: if(1) 包 block 1+2+3, 跑一次。
+//   - while(1) → if(1): 一次性执行, 不引入临时 "已跑过" 标记变量
+//   - sigsetjmp 仍不调 (a01_3 没有 helper 会 longjmp, 等 a_03 trap.c 接入)
+//   - block 3: 完整 jit_cache_hit/else 派发结构作为注释保留 (设计意图);
+//              其下方临时调 interpret_one_block 一次, 完整派发 a01_5+ 激活时换上
 // ============================================================================
 
 
 int dispatcher(cpu_t *hart) {
     // sigsetjmp / siglongjmp 协议见 src/dummy.txt §1。
-    // a01_2: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
+    // a01_3: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
     //         (没 helper 会 longjmp; 真激活等 a_03 trap.c + a01_5 完整 dispatcher)。
     //         实体在 dispatcher 栈帧上 (cpu_t 只持指针, 紧凑布局, 见 dummy.txt §1)。
     sigjmp_buf dispatch_env;
     hart->jmp_buf_ptr = &dispatch_env;
+
+    if (1) {  // a01_3 临时形态 (while(1) → if(1), 跑一次, 不需要 hack 变量)
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb) [D23 + D25 + D25.1 路线]
@@ -66,9 +73,9 @@ int dispatcher(cpu_t *hart) {
     //   (NULL ↔ BARE, 非 NULL ↔ SV32), 故下游 mmu_translate_pc / interpret_one_block
     //   只吃 current_tlb 即可 (NULL 编码 regime); 详见 mmu.h regime_t doc 段。
     // D25.1 (落地修订): dispatcher 内部仍把 regime 显式算出, 表达 "这是两个独立的派发概念,
-    //   现阶段恰好一致" + 服务 self-check label + 未来若 H 扩展真打破 1:1 时这里不需要
-    //   重新引入变量。两个本地变量在同一 if/else 内一同赋值, 没有 inconsistent state 风险
-    //   (D25 担心的是接口层调用方传不一致, 不是同一函数内本地变量)。
+    //   现阶段恰好一致" + 服务 dispatcher 末尾报告 label + 未来若 H 扩展真打破 1:1 时
+    //   这里不需要重新引入变量。两个本地变量在同一 if/else 内一同赋值, 没有 inconsistent
+    //   state 风险 (D25 担心的是接口层调用方传不一致, 不是同一函数内本地变量)。
     //
     // xatp 抽象层 (有意保留): 初版 = satp; 未来 H 扩展 V=1 时 = vsatp。
     //
@@ -83,7 +90,6 @@ int dispatcher(cpu_t *hart) {
     uint32_t xatp = hart->satp;
     regime_t regime;
     tlb_t *current_tlb;
-    uint32_t asid_for_log = 0;          // 仅供 self-check 输出
 
     if (hart->priv == PRIV_M || (xatp >> 31) == 0 /* satp.mode == bare */) {
         // Trust regime: bypass TLB
@@ -95,7 +101,6 @@ int dispatcher(cpu_t *hart) {
         // ASID_MASK 位 (dummy.txt §3 satp 合法性契约), 所以这里直接索引安全。
         regime      = REGIME_SV32;
         uint32_t asid = (xatp >> 22) & ASID_MASK;
-        asid_for_log = asid;
         current_tlb = hart->tlb_table[hart->priv][asid];
         // future 懒分配 (a_01 不会到这, SV32 在 a_01 不触发):
         //   if (current_tlb == NULL) {
@@ -116,30 +121,27 @@ int dispatcher(cpu_t *hart) {
     int cause = mmu_translate_pc(hart, current_tlb, &pa, &hva);
 
     // ========================================================================
-    // a01_2 临时 self-check 输出 (真激活 dispatcher 时整段删掉)
-    // 用 regime 本地变量打 label (D25.1 后保留), 比 current_tlb == NULL 推导直白
+    // a01_3 取指 trap 临时处理 (a_03 trap.c 接入后改为 trap_raise(hart, cause)):
+    //
+    // 真接入后 dispatcher 不在这里 fprintf + return; 而是 trap_raise + 走 sigsetjmp
+    // landing 重入下一轮迭代 (mmu.h 顶部 trap_raise 段 + dispatcher 预期使用伪码)。
+    // 当前 a01_3 fixture 全部走 RAM 内 BARE 路径, cause = 0; 这条仅为防 fixture 写错时
+    // 给个有用错误信息。pa 仅在未来给 JIT 查 jit_cache 用, a01_3 不消费 (cast to void)。
     // ========================================================================
-    fprintf(stderr,
-            "[dispatcher] pc=0x%08" PRIx32 " priv=%u satp=0x%08" PRIx32 " regime=%s",
-            hart->regs[0], hart->priv, hart->satp,
-            regime == REGIME_BARE ? "BARE" : "SV32");
-    if (regime == REGIME_SV32) {
-        fprintf(stderr, " asid=%u tlb=%p", asid_for_log, (void *)current_tlb);
-    }
-    fprintf(stderr, " cause=%d", cause);
-    if (cause == 0) {
-        fprintf(stderr, " pa=0x%08" PRIx32 " hva=%p byte0=0x%02x\n",
-                pa, (void *)hva, hva[0]);
-    } else {
-        fprintf(stderr, " (fail, no pa/hva)\n");
+    (void)pa;
+
+    if (cause != 0) {
+        fprintf(stderr, "[dispatcher] fetch trap: cause=%d pc=0x%08" PRIx32 "\n",
+                cause, hart->regs[0]);
+        return 1;
     }
 
     // ========================================================================
-    // block 3: 派发到 jit / interpreter (a01_2 不做; 等 a01_3+ 真接入)
+    // block 3: 派发到 jit / interpreter
     //
-    // 真激活后这里调:
+    // 完整形态注释 (a01_5+ 激活时把下方临时调用删掉, 解开这段):
     //   if (jit_cache_hit) {
-    //       jit_block(hart, current_tlb, &local_counter);  // 通过 jit_cache 注册的 host_code_ptr
+    //       jit_block(hart, current_tlb, &local_counter);  // jit_cache 注册的 host_code_ptr
     //   } else {
     //       counter[pc]++;                                  // 热度计数 hash
     //       if (达阈值) trigger_translate(...);              // 触发翻译 (a_01 后改 thread 非阻塞)
@@ -149,7 +151,19 @@ int dispatcher(cpu_t *hart) {
     //   }
     // 出块后所有扫尾搬到迭代头 (helper longjmp 跳回 sigsetjmp 落点会跳过迭代尾;
     // 只有迭代头才能保证一定执行)。
+    //
+    // a01_3 临时调用 (jit_cache 没接 / 热度计数没接 / 块边界没真做): 直接 interp 一次。
     // ========================================================================
+    uint32_t local_count = 0;
+    interpret_one_block(hart, current_tlb, hva, &local_count);
+    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_03 接入)
+
+    fprintf(stderr,
+            "[dispatcher] block done: regime=%s count=%u pc=0x%08" PRIx32 "\n",
+            regime == REGIME_BARE ? "BARE" : "SV32",
+            local_count, hart->regs[0]);
+
+    }  /* if (1) */
 
     return 0;
 }

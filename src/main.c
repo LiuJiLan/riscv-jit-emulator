@@ -88,44 +88,26 @@ int main(int argc, char **argv) {
     //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
     // ------------------------------------------------------------------------
-    // a01_2 self-check: 多次设 hart->regs[0] (= pc) 调 dispatcher, 看 mmu_translate_pc
-    // 路径输出。dispatcher 内部 (a01_2 简化形态) 走 block 1 (选 TLB) + block 2
-    // (mmu_translate_pc) + 临时 fprintf, 不循环不真派发。
+    // a01_3: 跑 fixture 一次, dispatcher 内部 if(1) 包 block 1+2+3, 调
+    // interpret_one_block 解释执行, fixture 末尾 ecall 触发 OP_UNSUPPORTED 让解释器
+    // break 出 fetch loop, 回 dispatcher, dispatcher 报告 count + pc, 然后回到 main
+    // 这里 fprintf 关心的寄存器值。
     //
-    // 期望:
-    //   - RAM 内 (含起点 / 中间 / 末尾对齐) → cause = 0, byte0 反映 loader 写入内容
-    //   - RAM 外 (低地址 / 高地址 / RAM 紧后) → cause = 1 (Instruction Access Fault)
-    //
-    // 真激活完整 dispatcher 时这整段 self-check 删除, 只留一个 dispatcher(hart) 调用 + 内部 loop。
+    // 期望 (跑 tests/a_01/a01_3/01_arith_basic/out.bin):
+    //   x1  = 42                             (addi x1, x0, 42)
+    //   x2  = 8                              (addi x2, x0, 8)
+    //   x3  = 50  ← 主测试目标               (add  x3, x1, x2)
+    //   pc  = 0x8000000c                     (ecall 地址, OP_UNSUPPORTED 时 pc 不前进)
+    //   count = 3 (dispatcher 那一行打)      (3 条算术, 不含 ecall)
     // ------------------------------------------------------------------------
+    int rc = dispatcher(hart);
+    if (rc != 0) {
+        fprintf(stderr, "dispatcher returned %d (fetch trap or other failure)\n", rc);
+    }
 
-    /* test 1: RAM 起点, loader 已写入 (a01_1 fixture: 0xDEADBEEF 之类) */
-    hart->regs[0] = GUEST_RAM_START;
-    dispatcher(hart);
-
-    /* test 2: RAM 内偏移, 仍在 loader 写入范围 (依 fixture) 或 mmap 零页 */
-    hart->regs[0] = GUEST_RAM_START + 0x100;
-    dispatcher(hart);
-
-    /* test 3: RAM 末尾对齐, 还在范围 */
-    hart->regs[0] = GUEST_RAM_START + GUEST_RAM_SIZE - 4;
-    dispatcher(hart);
-
-    /* test 4: 0 地址, RAM 外, 应 access fault */
-    hart->regs[0] = 0;
-    dispatcher(hart);
-
-    /* test 5: 低地址但非 0, RAM 外, 应 access fault */
-    hart->regs[0] = 0x1000;
-    dispatcher(hart);
-
-    /* test 6: 紧贴 RAM 后第一字节, RAM 外, 应 access fault */
-    hart->regs[0] = GUEST_RAM_START + GUEST_RAM_SIZE;
-    dispatcher(hart);
-
-    /* test 7: 远高地址, RAM 外, 应 access fault */
-    hart->regs[0] = 0xC0000000;
-    dispatcher(hart);
+    fprintf(stderr,
+            "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n",
+            hart->regs[0], hart->regs[1], hart->regs[2], hart->regs[3]);
 
     cpu_destroy(hart);
     return 0;
