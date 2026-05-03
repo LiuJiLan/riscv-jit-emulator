@@ -74,18 +74,101 @@ typedef enum {
     OP_UNSUPPORTED,
 } op_kind_t;
 
+// PC 步进量, 由 decode 一次决定, fetch loop 末尾统一 hart->regs[0] += d.pc_step。
+//   PC_STEP_RV    : 普通 RV 指令 (RV32 / RV64 都是 4 字节固定长度), fetch loop +4
+//   PC_STEP_RVC   : 16-bit C 扩展 (compressed), fetch loop +2
+//   PC_STEP_NONE  : control flow op (branch / jal / jalr / mret / sret / ...), case
+//                   自描述 pc, fetch loop += 0 是 NOP (case 内必须 hart->regs[0] = ...,
+//                   漏 = 死循环 → 64 hard limit 立刻 break, 容易发现)
+//
+// 设计动机: pc 推进数据驱动 (decode 决定), fetch loop 不 if (is_boundary), 与 ISA 长度
+// 处理统一 (RVC 与 control flow 在 fetch loop 看法一致, 都是"d.pc_step 多少就推多少")。
+//
+// 注: 块边界 (is_block_boundary_inst) 与 pc_step 是两个独立维度:
+//   - branch 跳/不跳: pc_step=PC_STEP_NONE (case 自设 pc), is_boundary=true (块尾)
+//   - sfence.vma:    pc_step=PC_STEP_RV (普通 +4), is_boundary=true (改 TLB)
+//   - addi:          pc_step=PC_STEP_RV, is_boundary=false
+#define PC_STEP_RV    4u
+#define PC_STEP_RVC   2u
+#define PC_STEP_NONE  0u
+
 typedef struct {
     op_kind_t kind;
     uint32_t  rd;
     uint32_t  rs1;
     uint32_t  rs2;
     int32_t   imm;
-    uint32_t  raw_inst;     // 原始 32 位指令; debug / illegal trap mtval 用
+    uint32_t  raw_inst;     // 原始指令; debug / illegal trap mtval 用
+                            // (32-bit 指令 = 完整 32 位; 16-bit RVC 时 = 低 16 位 + 高
+                            // 16 位 0, 因为 decode_rvc 用 (uint16_t)inst cast 截断;
+                            // RV illegal trap mtval 规范也是按指令长度填, 取低 16 位即可)
+    uint32_t  pc_step;      // PC_STEP_RV / PC_STEP_RVC / PC_STEP_NONE
 } decoded_inst_t;
 
 // 纯函数: 不读 / 不写 cpu_t, 不依赖 mmu / tlb / ram。
 // 对于不识别的 opcode, kind = OP_UNSUPPORTED; 其它字段 (rd/rs1/rs2/imm) 仍按通用编码位置
 // 填入, 但调用方不应使用 (除 raw_inst 用作 trap mtval)。
 decoded_inst_t decode(uint32_t inst);
+
+// ----------------------------------------------------------------------------
+// is_block_boundary_inst —— 块边界判定 (硬边界), 共享给 interpreter + 未来 translator
+//
+// 硬边界 = 必须结束当前 block 的指令 (改变控制流 / 改变全局状态导致后续译码假设失效)。
+// 共享 inline 函数保证 interpreter 与 translator 对"什么算硬边界"判断 100% 一致 —
+// -Wswitch-enum + -Werror 强制下方 switch 覆盖所有 op_kind_t, 加新 op_kind 时编译器
+// 逼着补 case (boundary or 不是), 不会漏。
+//
+// a_01_3 起步: 没有 boundary op (算术 / 逻辑 / 立即数都不是); OP_UNSUPPORTED 不归 boundary
+// (它是 trap 触发, 走 trap_raise + longjmp, 不走"块边界"路径; a_01_3 临时形态用 break +
+// 不动 pc 与 RV trap 语义对齐, 不是 boundary)。
+//
+// a_01_4 加 boundary op: branch (BEQ/BNE/BLT/BGE/BLTU/BGEU) + jal + jalr (8 个)
+// a_01_5 加 boundary op: CSR 写 (CSRRW/RS/RC + I 变体共 6 个) + ECALL/EBREAK/MRET (3) +
+//                        WFI / SFENCE.VMA / FENCE.I (Zifencei + Zicsr)
+//   注: file_plan §7.decode G3 说 "所有 CSR 写都视为软边界 (过度刷新允许)" 简化策略, 即
+//       CSR 读 (CSRRS rd, csr, x0 = 读) 不一定要 boundary; 但保险起见统一视为 boundary
+//       (a_01_5 真做时再细化)
+//
+// 软边界 (块长度上限) 不在这里, 由 interpreter / translator 各自循环维护计数器,
+// 见 file_plan §7.decode G4 / §8.interpreter R3 + plan.md §1.23.2 (默认 64)。
+//
+// 返回 int 0/1 (与 codebase 一致, 不引入 bool / stdbool.h; mmu_translate_pc / dispatcher
+// 都是 int 风格)。
+//
+// 待评估 (用户拍 xii): "在指令实现的差不多后, 要考虑是否放入 decoded_inst_t 结构体" —
+// 即未来某个 milestone 重新评估是否把 boundary 信息从 helper 移到 decoded_inst_t 字段
+// (与 pc_step 同风格, 数据驱动)。当前阶段保持 helper, 因为 boundary 是项目级判断 (策略)
+// 而 pc_step 是 ISA 属性 (数据), 两者粒度不同。
+// ----------------------------------------------------------------------------
+static inline int is_block_boundary_inst(const decoded_inst_t *d) {
+    switch (d->kind) {
+        // ---- a_01_3 op (全部不是 boundary) ----
+        case OP_LUI:   case OP_AUIPC:
+        case OP_ADDI:  case OP_SLTI:  case OP_SLTIU: case OP_XORI:
+        case OP_ORI:   case OP_ANDI:
+        case OP_SLLI:  case OP_SRLI:  case OP_SRAI:
+        case OP_ADD:   case OP_SUB:   case OP_SLL:   case OP_SLT:  case OP_SLTU:
+        case OP_XOR:   case OP_SRL:   case OP_SRA:   case OP_OR:   case OP_AND:
+            return 0;
+
+        // ---- OP_UNSUPPORTED (a_01_3 临时不归 boundary, 走 fetch loop goto out;
+        //      a_01_5 真接 trap 后改 trap_raise(2) + longjmp, 也不归 boundary) ----
+        case OP_UNSUPPORTED:
+            return 0;
+
+        // ---- a_01_4 待加 (解开注释 + op_kind_t 加对应 enum 值): ----
+        // case OP_BEQ:  case OP_BNE:
+        // case OP_BLT:  case OP_BGE:  case OP_BLTU: case OP_BGEU:
+        // case OP_JAL:  case OP_JALR:
+        //     return 1;
+
+        // ---- a_01_5 待加: ----
+        // case OP_CSRRW: case OP_CSRRS: case OP_CSRRC:
+        // case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
+        // case OP_ECALL: case OP_EBREAK: case OP_MRET:
+        //     return 1;
+    }
+    return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
+}
 
 #endif //CORE_DECODE_H

@@ -16,7 +16,72 @@
 
 #include <stdint.h>
 
+// ----------------------------------------------------------------------------
+// decode_rvc —— 16-bit C 扩展 (compressed) 指令的 decode 路径
+//
+// a_01_3 起步 (用户拍 viii): 只翻译 C.LI + C.ADDI 两个最常用 RVC 算术指令到 RV32I
+// op_kind (decoded_inst_t 复用 RV32I 的 OP_ADDI 等, 不为 RVC 单立 op_kind enum —
+// RVC 是"指令长度变化", 不是"语义变化", 与 RV32I 同源)。
+// 其他 RVC 指令暂时归 OP_UNSUPPORTED + pc_step=PC_STEP_RVC (fetch loop 仍 +2 推进
+// 位置正确, 但解释器到这条立即 break)。
+//
+// RVC 编码 (RISC-V Spec Vol I §16):
+//   inst[1:0] != 11 → 16-bit RVC; inst[1:0] = 11 → 32-bit (或更长)
+//   inst[15:13] + inst[1:0] 是 RVC 的 opcode 分类 (C0/C1/C2 三个 quadrant × 8 个 funct3)
+//
+// 本 helper 拿 16-bit inst (低 16 位有效, 高 16 位是 fetch over-read 残值)。
+// ----------------------------------------------------------------------------
+static decoded_inst_t decode_rvc(uint16_t inst) {
+    decoded_inst_t d;
+    d.raw_inst = (uint32_t)inst;        // 低 16 位有效
+    d.kind     = OP_UNSUPPORTED;
+    d.rd       = 0;
+    d.rs1      = 0;
+    d.rs2      = 0;
+    d.imm      = 0;
+    d.pc_step  = PC_STEP_RVC;            // 16-bit 指令统一 pc 步进 2
+
+    const uint32_t op    = inst & 0x3u;          // C 扩展 quadrant (0/1/2)
+    const uint32_t funct3 = (inst >> 13) & 0x7u; // 类别
+
+    // ---- C1 quadrant (op = 01) ----
+    if (op == 0x1) {
+        // C.ADDI (funct3=000): rd != 0; addi rd, rd, sign-ext(imm6)
+        // C.LI   (funct3=010): rd != 0; addi rd, x0, sign-ext(imm6)
+        // imm6 编码: bit[12]=imm[5] (sign), bit[6:2]=imm[4:0]
+        if (funct3 == 0x0 || funct3 == 0x2) {
+            const uint32_t rd = (inst >> 7) & 0x1Fu;
+            if (rd == 0) return d;          // C.ADDI rd=0 是 C.NOP (这里也归 unsupported,
+                                            // 真要支持 C.NOP 需 funct3=0 + rd=0 + imm=0
+                                            // 翻译为 OP_ADDI x0, x0, 0; 留未来)
+            // imm6 sign-ext to 32-bit
+            uint32_t imm5 = (inst >> 12) & 0x1u;        // bit 5
+            uint32_t imm4_0 = (inst >> 2) & 0x1Fu;      // bit 4..0
+            int32_t imm = (int32_t)(imm5 << 5 | imm4_0);
+            if (imm5) imm |= (int32_t)0xFFFFFFC0u;      // sign-ext bit 6+
+
+            d.kind = OP_ADDI;
+            d.rd   = rd;
+            d.rs1  = (funct3 == 0x0) ? rd : 0u;         // C.ADDI: rs1=rd; C.LI: rs1=0
+            d.imm  = imm;
+            return d;
+        }
+        // 其他 C1 子类 (C.JAL / C.J / C.BEQZ / C.BNEZ / C.LUI / C.SRLI / C.SRAI / ...)
+        // 留 OP_UNSUPPORTED, 真做时按 funct3 + 子位段加 case
+        return d;
+    }
+
+    // C0 / C2 quadrant 全部留 OP_UNSUPPORTED (load/store/jr/jalr/mv/add 等真做时加)
+    return d;
+}
+
 decoded_inst_t decode(uint32_t inst) {
+    // RVC (16-bit) 分流: inst[1:0] != 11 → 走 decode_rvc 路径
+    if ((inst & 0x3u) != 0x3u) {
+        return decode_rvc((uint16_t)inst);
+    }
+
+    // 32-bit 普通 RV 路径 (a_01_3 现有)
     decoded_inst_t d;
     d.raw_inst = inst;
     d.kind     = OP_UNSUPPORTED;     // 默认; 各 case 命中再覆盖
@@ -24,6 +89,7 @@ decoded_inst_t decode(uint32_t inst) {
     d.rs1      = (inst >> 15) & 0x1Fu;
     d.rs2      = (inst >> 20) & 0x1Fu;
     d.imm      = 0;                  // 默认; 各 type 命中再覆盖
+    d.pc_step  = PC_STEP_RV;          // 32-bit 普通指令默认 +4; control flow 在 case override
 
     const uint32_t opcode = inst & 0x7Fu;
     const uint32_t funct3 = (inst >> 12) & 0x7u;

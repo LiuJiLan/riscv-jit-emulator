@@ -17,12 +17,14 @@
 
 // ----------------------------------------------------------------------------
 // a01_3 失控保护 hard limit:
-// fetch loop 强制最多跑 256 条, 防止 fixture 写错时无限循环 (例如忘写 ecall 末尾)。
-// 这条与未来软边界 max block length 概念同类但 a01_3 不打通 —— 真做软边界时再移到
-// config.h, 并加跨 4K page 检查 + 真边界 op (branch/jal/jalr/sfence/wfi/...) 截断。
-// 256 是临时 magic number, 没有性能 / 正确性意义, a01_3 fixture 4 条远低于此。
+// fetch loop 强制最多跑 64 条, 防止 fixture 写错时无限循环 (例如忘写 ecall 末尾)。
+// 数字 64 与 plan.md §1.23.2 软边界初版默认对齐 ("64 不是绝对值, 在 [32, 128] 之间都
+// 合理。初版定 64 起步, 性能数据出来后再调"); 真做软边界 (a_01_4) 时移到 config.h, 并
+// 加跨 4K page 检查 + 真边界 op (branch/jal/jalr/sfence/wfi/...) 截断 + 与 translator
+// 共享同一个常量 (file_plan §8.interpreter G4 / R3)。
+// a01_3 fixture 4 条远低于 64, 不会触发限制。
 // ----------------------------------------------------------------------------
-#define INTERP_A01_3_HARD_LIMIT  256u
+#define INTERP_A01_3_HARD_LIMIT  64u
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint32_t *count_out) {
@@ -141,11 +143,15 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 goto out;
         }
 
-        // 算术 / 逻辑 / 立即数 op 不动 pc — 这里统一 +4。
-        // 控制流 op (branch / jal / jalr) 真接入 (a01_4+) 时, 它们各自的 case 自己改
-        // hart->regs[0] (= pc), 然后跳过这条 +4 (用 continue 或重构成早期 update)。
-        hart->regs[0] = pc + 4;
-        hva_pc += 4;
+        // PC 推进 (数据驱动, decode 一次决定):
+        //   PC_STEP_RV   (4): 普通 32-bit 算术 / 逻辑 / 立即数 op, fetch loop +4
+        //   PC_STEP_RVC  (2): 16-bit C 扩展, fetch loop +2
+        //   PC_STEP_NONE (0): control flow op (branch/jal/jalr/...) case 自描述 pc,
+        //                     fetch loop += 0 是 NOP (case 内必须 hart->regs[0] = ...,
+        //                     漏 = 死循环 → hard limit 立刻 break, 易发现)
+        // 设计意图见 decode.h PC_STEP_* 注释。
+        hart->regs[0] += d.pc_step;
+        hva_pc        += d.pc_step;
         count++;
     }
 
