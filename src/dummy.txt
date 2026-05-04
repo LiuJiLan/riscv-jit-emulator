@@ -270,6 +270,37 @@ store/restore。否决理由:
   - **store**:**全部走 store_helper**(初版无 inline fast path)。
     JIT 和解释器都这样做。
 
+store_helper 内部翻译形态(2026-05-05 拍方案 1, a_01_6 起步前对齐):
+
+  接口: store_helper(cpu_t *hart, tlb_t *current_tlb, uint32_t gva,
+                     uint32_t value, uint32_t size);
+
+  helper 内部:
+    (a) misalign 检查(size > 1 时低位非 0)→ trap_raise_exception
+        (cause 6 store/AMO address misaligned, tval = gva)
+    (b) GVA → host_ptr 翻译, 跟 load inline 路径概念对称, 但在 helper 内做:
+        - BARE(current_tlb=NULL): identity + IS_GPA_RAM 检查;
+          失败 → trap_raise_exception(cause 7 store/AMO access fault, tval = gva)
+        - SV32(a_01_7+): TLB lookup; 命中 host_ptr; miss → walker_helper_store
+          → fill TLB → host_ptr; 权限错 → trap_raise_exception(cause 15
+          store/AMO page fault, tval = gva)
+    (c) host store:*(uint?_t *)host_ptr = value
+    (d) reservation 清除(a_01 注释占位; future LR/SC 真接时清当前 hart 的
+        reservation;SMP 时需跨 hart 同步 reservation table)
+    (e) future SMC 检测:配合 page_dirty 位图(替代 SIGSEGV 机制)
+
+  对称性:
+    - load inline 路径:caller 在 case 内 inline TLB lookup, 命中 bypass helper
+    - store helper 路径:caller 调 store_helper, helper 内做 TLB lookup
+      (而不是 caller 自己查后传 host_ptr)
+    两条路径 TLB lookup 用同一份逻辑, 区别在于 caller 是否 bypass helper。
+    load bypass 是性能优化(fast path 完全 inline);
+    store 必须经 helper 因为 reservation / SMC / 未来扩展副作用。
+
+  current_tlb 由 caller 透传:dispatcher 在 block 1 算好 current_tlb 一路传到
+    interpret_one_block / JIT block, 再传到 store_helper(跟 mmu_translate_pc
+    接口同模式, 不需要 helper 内重新算)。
+
 为什么 store 不能简单 inline:
   - LR/SC 语义:任何 store 都可能让某个 reservation 失效。reservation
     检查的逻辑放在 store_helper 内部。
