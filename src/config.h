@@ -37,8 +37,33 @@
 #define TLB_NUM_ENTRIES   (1U << TLB_INDEX_BITS)        /* = 64 */
 
 // ----------------------------------------------------------------------------
-// 后续可能加入(均不在 a01_2):
-//   软边界 max block length     a01_3 / a01_5
-// 加入时各自带 doc comment 说明取值理由。
+// IALIGN(指令地址对齐, a01_4 加入)
+// ----------------------------------------------------------------------------
+//
+// RV spec: IALIGN 是 hart 级常量(单位:位), 由是否实现 C / Zca 扩展决定:
+//   - 实现 C/Zca → IALIGN = 16(所有 PC 必须 2 字节对齐)
+//   - 不实现 C   → IALIGN = 32(所有 PC 必须 4 字节对齐)
+// misa.C 决定 IALIGN; 多数实现把 misa.C 写死, IALIGN 是编译期常量。
+// 本项目: misa.C 强制为 1(decode 已含 RVC 路径), IALIGN 固定 16。
+// 动态切 misa 是远期议题, 真要做时再回来动这里 + 加运行时切换路径。
+//
+// 实际效果: jal / branch (imm[0]=0 编码强制) + jalr (& ~1u 强制 mask LSB) 路径下,
+// (target & IALIGN_MASK) 永远 = 0, instruction-address-misaligned 异常 (cause 0)
+// 在本项目中是 dead code; 但代码里仍写检查 + 调 trap_raise_exception 占位, 保结构
+// 完整, 与 spec 语义对齐, 也方便日后切 IALIGN=32 时只改宏不改逻辑。
+#define IALIGN            16U
+#define IALIGN_BYTES      (IALIGN / 8U)        /* = 2 */
+#define IALIGN_MASK       (IALIGN_BYTES - 1U)  /* = 1; (target & IALIGN_MASK) != 0 → 不对齐 */
+
+// ----------------------------------------------------------------------------
+// 软边界:单 block 最大指令数(a01_4 加入,interpreter / 未来 translator 共用)
+// ----------------------------------------------------------------------------
+//
+// plan §1.23.2 软边界初版默认 64;[32, 128] 区间都合理, 性能数据出来后再调。
+// interpreter / translator 各自循环维护自己的计数器, 共享同一个上限常量。
+// 当前用途:fixture 写错时 (例如忘 ecall 收尾, 或 branch 死循环) 失控保护;
+// a_05+ OS 场景下还要叠加跨 4K page 检查 + 真边界 op (硬边界由
+// is_block_boundary_inst 处理), 这两条是另两个独立的 block 截断条件。
+#define BLOCK_INST_LIMIT  64U
 
 #endif //CONFIG_H

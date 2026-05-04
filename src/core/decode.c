@@ -157,10 +157,82 @@ decoded_inst_t decode(uint32_t inst) {
             }
             break;
 
+        // ---- B-type BRANCH ---- a_01_4
+        case 0x63: {
+            // B-type 13 位有符号立即数 (multiple of 2, imm[0]=0 编码强制), 4 段位拼接 (RV
+            // spec Vol I, Conditional Branches 段; J-type 同型, 后面也 4 段):
+            //   imm[12]   = inst[31]                 (sign bit)
+            //   imm[10:5] = inst[30:25]
+            //   imm[4:1]  = inst[11:8]
+            //   imm[11]   = inst[7]                  (这一位"塞回去"是为了让 rs1/rs2 字段位置
+            //                                         与所有其他指令类型保持一致 - RV 设计哲学)
+            //   imm[0]    = 0
+            //
+            // sign-ext 用 ((int32_t)(inst & 0x80000000u)) >> 19 一次性把 bit 12 + 高位全部
+            // 同时填好 (0x80000000 算术右移 19 位 = 0xFFFFF000 = 高 20 位全 1, 含 bit 12);
+            // 其他段位置在 [11:0] 不与 sign-ext 部分重叠, 直接 OR。
+            const int32_t imm =
+                  (((int32_t)(inst & 0x80000000u)) >> 19)              /* sign-ext bit 12+ */
+                | (int32_t)(((inst >> 25) & 0x3Fu) << 5)               /* bits 10:5 */
+                | (int32_t)(((inst >> 8)  & 0xFu)  << 1)               /* bits 4:1 */
+                | (int32_t)(((inst >> 7)  & 0x1u)  << 11);             /* bit 11 */
+            d.imm     = imm;
+            d.pc_step = PC_STEP_NONE;     /* control flow: case 自描述 pc, fetch loop +=0 NOP */
+            switch (funct3) {
+                case 0: d.kind = OP_BEQ;  break;
+                case 1: d.kind = OP_BNE;  break;
+                case 4: d.kind = OP_BLT;  break;
+                case 5: d.kind = OP_BGE;  break;
+                case 6: d.kind = OP_BLTU; break;
+                case 7: d.kind = OP_BGEU; break;
+                default:
+                    // funct3 = 010 / 011 reserved by RV spec; 归 OP_UNSUPPORTED。
+                    // 此时 pc_step 已被设为 PC_STEP_NONE, 但 OP_UNSUPPORTED 走 interpreter
+                    // goto out 路径不依赖 pc_step (a_01_5 trap.c 接入后 pc_step 字段对 unsupp
+                    // 也无意义), 不需要 reset。
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
+        // ---- J-type JAL ---- a_01_4
+        case 0x6F: {
+            // J-type 21 位有符号立即数 (multiple of 2, imm[0]=0 编码强制), 4 段位拼接:
+            //   imm[20]    = inst[31]                (sign bit)
+            //   imm[10:1]  = inst[30:21]
+            //   imm[11]    = inst[20]
+            //   imm[19:12] = inst[19:12]              (天然在原位, 不 shift)
+            //   imm[0]     = 0
+            //
+            // sign-ext: 0x80000000 算术右移 11 位 = 0xFFF00000 = 高 12 位全 1 (含 bit 20)。
+            // imm[19:12] 段直接拿 inst & 0xFF000u (该段在 inst 中的位置就是 imm 中的位置)。
+            const int32_t imm =
+                  (((int32_t)(inst & 0x80000000u)) >> 11)              /* sign-ext bit 20+ */
+                | (int32_t)(((inst >> 21) & 0x3FFu) << 1)              /* bits 10:1 */
+                | (int32_t)(((inst >> 20) & 0x1u)   << 11)             /* bit 11 */
+                | (int32_t)(inst & 0xFF000u);                          /* bits 19:12, 在原位 */
+            d.kind    = OP_JAL;
+            d.imm     = imm;
+            d.pc_step = PC_STEP_NONE;
+            break;
+        }
+
+        // ---- I-type JALR ---- a_01_4
+        case 0x67:
+            // funct3 != 0 reserved by RV spec; 归 OP_UNSUPPORTED。
+            if (funct3 != 0) break;       // d.kind 默认 OP_UNSUPPORTED
+            // 立即数 12 位有符号 (与 OP-IMM 同型), 同样用 ((int32_t)inst) >> 20 算术右移做
+            // sign-ext。目标地址的 & ~1u mask 不在 decode 做 (decode 是纯函数, 不知 rs1 值);
+            // 由 interpreter / translator 在 case 内做 (Step 3 WRITE_PC_OR_TRAP 的事)。
+            d.kind    = OP_JALR;
+            d.imm     = ((int32_t)inst) >> 20;
+            d.pc_step = PC_STEP_NONE;
+            break;
+
         // ---- 其他 opcode ----
-        // 0x03 LOAD / 0x23 STORE / 0x63 BRANCH / 0x67 JALR / 0x6F JAL / 0x0F FENCE /
-        // 0x73 SYSTEM (CSR / ECALL / EBREAK / MRET / SRET / WFI) / 0x2F AMO / 真非法 opcode
-        // 全部走默认的 OP_UNSUPPORTED, 不覆盖 d.kind。
+        // 0x03 LOAD / 0x23 STORE / 0x0F FENCE / 0x73 SYSTEM (CSR / ECALL / EBREAK / MRET /
+        // SRET / WFI) / 0x2F AMO / 真非法 opcode 全部走默认的 OP_UNSUPPORTED。
         default:
             // 已经初始化为 OP_UNSUPPORTED, 保持。
             break;

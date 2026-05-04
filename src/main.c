@@ -1,10 +1,10 @@
 //
 // Created by liujilan on 2026/4/28.
 // a_01 main。
-// 当前形态: ram_init → loader → cpu_create + 字段设置 →
-//             多次 dispatcher self-check (a01_2 mmu_translate_pc 端到端验证) → cpu_destroy。
-// dispatcher 当前 a01_2 简化形态 (block 1+2 + 临时输出, 无循环), 完整 dispatcher
-// (sigsetjmp + while loop + block 3 派发) 等 a01_5 真接入。
+// 当前形态: decode_test 单测 → ram_init → loader → cpu_create + 字段设置 →
+//             dispatcher 一次 → 末尾 fprintf 关键寄存器 → cpu_destroy。
+// dispatcher 当前 a_01_4 形态 (while(1) 多块循环, count==0 break + 单行 halted 总结);
+// sigsetjmp / 完整 jit_cache 派发 / perf_advance 等 a_01_5 真接入。
 //
 
 #include "config.h"
@@ -120,7 +120,53 @@ static int decode_test(void) {
     //   decode_rvc C2 路径全部归 OP_UNSUPPORTED, 验证 fetch loop +=2 路径
     CASE(0x8186, OP_UNSUPPORTED, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x8186, PC_STEP_RVC);
 
-    // ---- a_01_4 待加 (B-type / J-type 立即数解码 + boundary case) ----
+    // ---- a_01_4 boundary 立即数解码 (8 case, max+ / max- / 0 / off-by-one 边界值)----
+    //
+    // 选取规则 (与之前 chat 拍的一致): B-type 4 case (近距正负 + 0 + max+) + J-type 3 case
+    // (近距正负 + max+) + JALR 1 case (I-type 立即数, 复用 ADDI 路径)。max- (B=-4096 / J=
+    // -1MiB) 不单独测, 因为 -8 / -0x100 已经覆盖 sign-ext 走通; 真担心 sign 漏 ext 那 -8
+    // 这条就先 fail 了。
+    //
+    // 编码细节看 decode.c B-type / J-type 的 4 段位拼接注释; rd / rs1 / rs2 字段在 B/J 类型
+    // 实际复用为 imm 段 (rd 字段 = imm[11]<<4|imm[4:1] 等), 所以 CASE 期望值含这些 garbage
+    // (decode.c 用通用 (inst>>X)&0x1F 提取, 不特判)。
+
+    // BEQ x1, x0, +8 = 0x00008463
+    //   imm=8 (13-bit signed): imm[12]=0, imm[11]=0, imm[10:5]=0, imm[4:1]=4, imm[0]=0
+    //   rd garbage (bits 11:7) = imm[4:1]<<1 | imm[11] = 4<<1 | 0 = 8
+    CASE(0x00008463, OP_BEQ,  /*rd*/8,  /*rs1*/1, /*rs2*/0, 8,    0x00008463, PC_STEP_NONE);
+    // BEQ x1, x0, -8 = 0xFE008CE3 (sign-ext 验证)
+    //   imm=-8: imm[12]=1, imm[11]=1, imm[10:5]=63, imm[4:1]=12, imm[0]=0
+    //   rd garbage = 12<<1 | 1 = 25
+    CASE(0xFE008CE3, OP_BEQ,  /*rd*/25, /*rs1*/1, /*rs2*/0, -8,   0xFE008CE3, PC_STEP_NONE);
+    // BNE x0, x0, 0 = 0x00001063 (零偏移 / 自跳, imm 全 0 验证不会"凭空"算出非 0)
+    CASE(0x00001063, OP_BNE,  /*rd*/0,  /*rs1*/0, /*rs2*/0, 0,    0x00001063, PC_STEP_NONE);
+    // BLTU x1, x2, +4094 = 0x7E20EFE3 (B-type max+, imm[12]=0 + 其他位全 1)
+    //   imm=4094: imm[12]=0, imm[11]=1, imm[10:5]=63, imm[4:1]=15, imm[0]=0
+    //   rd garbage = 15<<1 | 1 = 31
+    CASE(0x7E20EFE3, OP_BLTU, /*rd*/31, /*rs1*/1, /*rs2*/2, 4094, 0x7E20EFE3, PC_STEP_NONE);
+
+    // JAL x0, +0x100 = 0x1000006F
+    //   imm=0x100=256: imm[20]=0, imm[19:12]=0, imm[11]=0, imm[10:1]=0x080 (bit 8 only), imm[0]=0
+    //   rs1 garbage (bits 19:15) = imm[19:15] = 0; rs2 garbage (bits 24:20) = 0
+    CASE(0x1000006F, OP_JAL,  /*rd*/0,  /*rs1*/0,  /*rs2*/0,  0x100,    0x1000006F, PC_STEP_NONE);
+    // JAL x0, -0x100 = 0xF01FF06F (sign-ext 验证)
+    //   imm=-256: imm[20]=1, imm[19:12]=0xFF, imm[11]=1, imm[10:1]=0x380, imm[0]=0
+    //   rs1 garbage (bits 19:15) = imm[19:15] = 0x1F = 31
+    //   rs2 garbage (bits 24:20) = imm[10:6] from inst[24:21]+inst[20] = ...inst[20]=imm[11]=1
+    //                              + inst[24:21]=imm[10:7]=0b1110 → 0b00001 + 0b1110<<1
+    //                              简单做: (inst >> 20) & 0x1F = 0xF01 & 0x1F = 1
+    CASE(0xF01FF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/1,  -0x100,   0xF01FF06F, PC_STEP_NONE);
+    // JAL x0, +max(0xFFFFE) = 0x7FFFF06F (J-type max+, imm[20]=0 + 其他位全 1)
+    //   imm=0xFFFFE=1048574: imm[20]=0, imm[19:12]=0xFF, imm[11]=1, imm[10:1]=0x3FF, imm[0]=0
+    //   rs1 garbage = 0x1F = 31; rs2 garbage = (inst>>20)&0x1F = 0x7FF & 0x1F = 0x1F = 31
+    CASE(0x7FFFF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/31, 0xFFFFE,  0x7FFFF06F, PC_STEP_NONE);
+
+    // JALR x0, x1, +4 = 0x00408067 (I-type 立即数, 与 ADDI sign-ext 路径同源, 此处仅验证
+    //   opcode=0x67 + funct3=0 路由对 + pc_step=PC_STEP_NONE)
+    //   rs2 garbage (bits 24:20) = imm[4:0] = 4
+    CASE(0x00408067, OP_JALR, /*rd*/0,  /*rs1*/1,  /*rs2*/4,  4,        0x00408067, PC_STEP_NONE);
+
     // ---- a_01_5 待加 (CSR* / ECALL / EBREAK / MRET) ----
     // ---- a_01_6 待加 (LB/LH/LW/LBU/LHU + SB/SH/SW; S-type 立即数 bit[31:25, 11:7]) ----
     // ---- 未来 RVC 扩展 (C.MV / C.ADD / C.LUI / C.SUB / ... 真翻译) ----
@@ -206,17 +252,24 @@ int main(int argc, char **argv) {
     //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
     // ------------------------------------------------------------------------
-    // a01_3: 跑 fixture 一次, dispatcher 内部 if(1) 包 block 1+2+3, 调
-    // interpret_one_block 解释执行, fixture 末尾 ecall 触发 OP_UNSUPPORTED 让解释器
-    // break 出 fetch loop, 回 dispatcher, dispatcher 报告 count + pc, 然后回到 main
-    // 这里 fprintf 关心的寄存器值。
+    // a_01_4: 跑 fixture, dispatcher 进 while(1) 多块循环, 每块调 interpret_one_block;
+    // branch/jal/jalr 命中 is_block_boundary_inst 后退出 fetch loop, dispatcher 累加
+    // count + 重做 block 1+2+3; 末尾 ecall 触发 OP_UNSUPPORTED 让解释器立刻 goto out
+    // (count=0), dispatcher 看到 count==0 break, 末行 fprintf "halted: total_count=N pc="。
+    // 然后回到 main 这里 fprintf 关心的寄存器值。
     //
-    // 期望 (跑 tests/a_01/a01_3/01_arith_basic/out.bin):
-    //   x1  = 42                             (addi x1, x0, 42)
-    //   x2  = 8                              (addi x2, x0, 8)
-    //   x3  = 50  ← 主测试目标               (add  x3, x1, x2)
-    //   pc  = 0x8000000c                     (ecall 地址, OP_UNSUPPORTED 时 pc 不前进)
-    //   count = 3 (dispatcher 那一行打)      (3 条算术, 不含 ecall)
+    // 期望 (跑 tests/a_01/a01_3/01_arith_basic/out.bin, 算术 only):
+    //   x1=42, x2=8, x3=50
+    //   pc=0x8000000c (ecall 地址)
+    //   total_count=3 (dispatcher halted 行打: 3 条算术 + 第二轮 ecall 这块 count=0 → break)
+    //
+    // 期望 (跑 tests/a_01/a01_3/02_arith_compressed/out.bin):
+    //   x1=11, x2=5, x3=0; pc=0x80000006; total_count=3
+    //
+    // 期望 (跑 tests/a_01/a01_4/01_branch_loop/out.bin):
+    //   x1=0 (倒计数到 0), x2=5 (循环累加 5 次)
+    //   pc=0x80000014 (ecall 地址)
+    //   total_count=17 (= 5 (init+iter1) + 3*4 (iter2-5 = 4 块每块 3 条) + 0 (ecall 块))
     // ------------------------------------------------------------------------
     int rc = dispatcher(hart);
     if (rc != 0) {

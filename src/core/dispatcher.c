@@ -28,11 +28,11 @@
 //    - PA 给 JIT hash (jit_cache 用 PA 为 key 找 host_code_ptr)
 //    - HVA 给解释器直接读字节取指 (依赖块边界保证不跨 4K page)
 //
-// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing) - 等 a_03 trap.c 真接入
+// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing) - 等 a_01_5 trap.c 真接入
 //
-// III. 迭代头 perf 同步 / mtime 推进 / 中断检查 - 等 a_03 真接入
+// III. 迭代头 perf 同步 / mtime 推进 / 中断检查 - 等 a_01_5 / a_03 真接入
 //
-// 完整形态 (a01_5 后):
+// 完整形态 (a_01_5 后):
 //   while (1) {
 //       sigsetjmp(*hart->jmp_buf_ptr, 1);
 //       /* 迭代头扫尾: hart->cycle += local_counter; local_counter = 0;
@@ -40,23 +40,30 @@
 //       /* block 1 + 2 + 3 */
 //   }
 //
-// a01_3 当前形态: if(1) 包 block 1+2+3, 跑一次。
-//   - while(1) → if(1): 一次性执行, 不引入临时 "已跑过" 标记变量
-//   - sigsetjmp 仍不调 (a01_3 没有 helper 会 longjmp, 等 a_03 trap.c 接入)
+// a_01_4 当前形态: while(1) 多块循环, count==0 break 退出。
+//   - sigsetjmp 仍不调 (a_01_4 没有 helper 会 longjmp; trap_raise_exception 是 fprintf
+//     占位 + return; 真激活等 a_01_5 trap.c)
+//   - 停止条件 = local_count == 0: 表示当前块没成功跑任何指令, 即:
+//       (a) OP_UNSUPPORTED 立即 goto out (fixture 末尾 ecall 触发, count=0)
+//       (b) trap_raise_exception fprintf 后 caller goto out (本项目 IALIGN=16 + jal/branch
+//           imm[0]=0 + jalr & ~1u 路径下不可达, 仅占位)
+//     a_01_5 真接 trap.c 后, 这条改成 sigsetjmp 返回值分流 (cause-driven retry vs halt)。
 //   - block 3: 完整 jit_cache_hit/else 派发结构作为注释保留 (设计意图);
-//              其下方临时调 interpret_one_block 一次, 完整派发 a01_5+ 激活时换上
+//              其下方临时调 interpret_one_block 一次, 完整派发 a_01_5+ 激活时换上
 // ============================================================================
 
 
 int dispatcher(cpu_t *hart) {
     // sigsetjmp / siglongjmp 协议见 src/dummy.txt §1。
-    // a01_3: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
-    //         (没 helper 会 longjmp; 真激活等 a_03 trap.c + a01_5 完整 dispatcher)。
+    // a_01_4: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
+    //         (没 helper 会 longjmp; 真激活等 a_01_5 trap.c)。
     //         实体在 dispatcher 栈帧上 (cpu_t 只持指针, 紧凑布局, 见 dummy.txt §1)。
     sigjmp_buf dispatch_env;
     hart->jmp_buf_ptr = &dispatch_env;
 
-    if (1) {  // a01_3 临时形态 (while(1) → if(1), 跑一次, 不需要 hack 变量)
+    uint32_t total_count = 0;     // 累加 local_count, halted 时一并报告
+
+    while (1) {  // a_01_4 真激活: 多块循环, local_count==0 break 退出
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb) [D23 + D25 + D25.1 路线]
@@ -108,6 +115,10 @@ int dispatcher(cpu_t *hart) {
         //       hart->tlb_table[hart->priv][asid] = current_tlb;
         //   }
     }
+    // regime 显式算出表达 D25.1 设计意图 ("两个独立的派发概念, 现阶段恰好一致, 未来 H 扩展
+    // 真打破 1:1 时这里不重新引入变量"); 当前下游只吃 current_tlb (NULL 编码 regime), regime
+    // 在本函数没有运行时消费者, 抑制 unused 警告。
+    (void)regime;
 
     // ========================================================================
     // block 2: 取指路径 (mmu_translate_pc)
@@ -121,12 +132,12 @@ int dispatcher(cpu_t *hart) {
     int cause = mmu_translate_pc(hart, current_tlb, &pa, &hva);
 
     // ========================================================================
-    // a01_3 取指 trap 临时处理 (a_03 trap.c 接入后改为 trap_raise(hart, cause)):
+    // a_01_4 取指 trap 临时处理 (a_01_5 trap.c 接入后改为 trap_raise_exception):
     //
-    // 真接入后 dispatcher 不在这里 fprintf + return; 而是 trap_raise + 走 sigsetjmp
-    // landing 重入下一轮迭代 (mmu.h 顶部 trap_raise 段 + dispatcher 预期使用伪码)。
-    // 当前 a01_3 fixture 全部走 RAM 内 BARE 路径, cause = 0; 这条仅为防 fixture 写错时
-    // 给个有用错误信息。pa 仅在未来给 JIT 查 jit_cache 用, a01_3 不消费 (cast to void)。
+    // 真接入后 dispatcher 不在这里 fprintf + return; 而是 trap_raise_exception + 走
+    // sigsetjmp landing 重入下一轮迭代 (mmu.h 顶部 trap_raise 段 + dispatcher 预期使用
+    // 伪码)。当前 fixture 全部走 RAM 内 BARE 路径, cause = 0; 这条仅为防 fixture 写错时
+    // 给个有用错误信息。pa 仅在未来给 JIT 查 jit_cache 用, a_01_4 不消费 (cast to void)。
     // ========================================================================
     (void)pa;
 
@@ -139,7 +150,7 @@ int dispatcher(cpu_t *hart) {
     // ========================================================================
     // block 3: 派发到 jit / interpreter
     //
-    // 完整形态注释 (a01_5+ 激活时把下方临时调用删掉, 解开这段):
+    // 完整形态注释 (a_01_5+ 激活时把下方临时调用删掉, 解开这段):
     //   if (jit_cache_hit) {
     //       jit_block(hart, current_tlb, &local_counter);  // jit_cache 注册的 host_code_ptr
     //   } else {
@@ -152,18 +163,25 @@ int dispatcher(cpu_t *hart) {
     // 出块后所有扫尾搬到迭代头 (helper longjmp 跳回 sigsetjmp 落点会跳过迭代尾;
     // 只有迭代头才能保证一定执行)。
     //
-    // a01_3 临时调用 (jit_cache 没接 / 热度计数没接 / 块边界没真做): 直接 interp 一次。
+    // a_01_4 临时调用 (jit_cache 没接 / 热度计数没接): 直接 interp 一次, 块边界由解释器
+    // 末尾 is_block_boundary_inst 自然产生 (branch/jal/jalr 命中后退出 fetch loop)。
     // ========================================================================
     uint32_t local_count = 0;
     interpret_one_block(hart, current_tlb, hva, &local_count);
-    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_03 接入)
+    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_01_5 / a_03 接入)
+
+    total_count += local_count;
+
+    // 停止条件: local_count == 0 表示当前块没成功跑任何指令 (OP_UNSUPPORTED 立即 goto out,
+    // 或 trap_raise_exception 占位 fprintf 后 caller goto out)。a_01_4 临时方案;
+    // a_01_5 trap.c 接入后改 sigsetjmp landing 区分 (cause-driven retry vs halt)。
+    if (local_count == 0) break;
+
+    }  /* while (1) */
 
     fprintf(stderr,
-            "[dispatcher] block done: regime=%s count=%u pc=0x%08" PRIx32 "\n",
-            regime == REGIME_BARE ? "BARE" : "SV32",
-            local_count, hart->regs[0]);
-
-    }  /* if (1) */
+            "[dispatcher] halted: total_count=%u pc=0x%08" PRIx32 "\n",
+            total_count, hart->regs[0]);
 
     return 0;
 }

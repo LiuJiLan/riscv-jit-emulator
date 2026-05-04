@@ -5,10 +5,12 @@
 // 职责: 把 RV32 32-bit 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst) 的纯数据结构,
 //       给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
 //
-// op_kind_t a01_3 范围: 算术 / 逻辑 / 立即数子集 (RV32I 中不碰内存 / 不碰控制流的部分),
-//   共 21 个真 op + 1 个 OP_UNSUPPORTED 兜底。
-//   不在此范围的 opcode (load / store / branch / jal / jalr / fence / csr / ecall / ebreak
-//   / mret / sret / wfi / amo / 等) decode 全部归 OP_UNSUPPORTED。
+// op_kind_t 当前范围 (a01_3 + a01_4):
+//   - a01_3: 算术 / 逻辑 / 立即数子集 (21 个真 op)
+//   - a01_4: 控制流 (branch 6 + jal + jalr = 8 个真 op)
+//   共 29 个真 op + 1 个 OP_UNSUPPORTED 兜底。
+//   不在此范围的 opcode (load / store / fence / csr / ecall / ebreak / mret / sret / wfi /
+//   amo / 等) decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -65,11 +67,33 @@ typedef enum {
     OP_OR,
     OP_AND,
 
+    // ---- B-type BRANCH (6), opcode 0x63 ---- a_01_4
+    // 6 个变体 funct3 编码 (RV spec): BEQ=000, BNE=001, BLT=100, BGE=101, BLTU=110, BGEU=111
+    // (funct3=010 / 011 reserved, decode 归 OP_UNSUPPORTED)。
+    // 立即数 13 位有符号 (multiple of 2, imm[0]=0 编码强制); 4 段位拼接见 decode.c。
+    OP_BEQ,
+    OP_BNE,
+    OP_BLT,
+    OP_BGE,
+    OP_BLTU,
+    OP_BGEU,
+
+    // ---- J-type JAL (1), opcode 0x6F ---- a_01_4
+    // 立即数 21 位有符号 (multiple of 2, imm[0]=0 编码强制); 4 段位拼接见 decode.c。
+    // ±1 MiB 跳转范围。
+    OP_JAL,
+
+    // ---- I-type JALR (1), opcode 0x67, funct3=000 ---- a_01_4
+    // 立即数复用 I-type 12 位有符号 (与 ADDI / SLTI 等同型)。
+    // 目标 = (rs1 + imm) & ~1u (RV spec 强制 mask LSB)。
+    // funct3 != 0 reserved by spec, decode 归 OP_UNSUPPORTED。
+    OP_JALR,
+
     // ---- 兜底 ----
-    // 不在 a01_3 范围的 opcode (load 0x03 / store 0x23 / branch 0x63 / jalr 0x67 /
-    // jal 0x6F / fence 0x0F / system 0x73 / amo 0x2F / 等) 全部归这里。
+    // 不在当前范围的 opcode (load 0x03 / store 0x23 / fence 0x0F / system 0x73 / amo 0x2F /
+    // 真非法 opcode / 真非法 funct3 子段) 全部归这里。
     // interpreter 收到这个 case break 出 fetch loop, dispatcher 看 count_out 知道
-    // 本次 block 跑了多少条; 未来 a_03 trap.c 接入后改为 trap_raise(2) Illegal Instruction
+    // 本次 block 跑了多少条; 未来 a_01_5 trap.c 接入后改为 trap_raise(2) Illegal Instruction
     // (RV cause code 2), mtval = decoded.raw_inst (RV 规范要求)。
     OP_UNSUPPORTED,
 } op_kind_t;
@@ -156,11 +180,16 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_UNSUPPORTED:
             return 0;
 
-        // ---- a_01_4 待加 (解开注释 + op_kind_t 加对应 enum 值): ----
-        // case OP_BEQ:  case OP_BNE:
-        // case OP_BLT:  case OP_BGE:  case OP_BLTU: case OP_BGEU:
-        // case OP_JAL:  case OP_JALR:
-        //     return 1;
+        // ---- a_01_4 控制流 (硬边界) ----
+        // 8 个 op 都改 pc, 块必须在此结束。interpreter / translator (未来) 在 fetch loop 末
+        // 检查本 helper 返回值, 是 1 则 break 出 loop, dispatcher 重新走 block 1+2+3 (重新
+        // mmu_translate_pc 拿新 pc 的 hva, 进新一块 block)。
+        // 注: 当前 helper 还没真被 caller 用 (Step 3 在 interpreter 接), 改成 return 1 仅
+        // 是 "声明事实", 运行时行为要等 Step 3 + Step 4 才生效。
+        case OP_BEQ:  case OP_BNE:
+        case OP_BLT:  case OP_BGE:  case OP_BLTU: case OP_BGEU:
+        case OP_JAL:  case OP_JALR:
+            return 1;
 
         // ---- a_01_5 待加: ----
         // case OP_CSRRW: case OP_CSRRS: case OP_CSRRC:
