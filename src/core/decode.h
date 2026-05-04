@@ -5,12 +5,13 @@
 // 职责: 把 RV32 32-bit 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst) 的纯数据结构,
 //       给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
 //
-// op_kind_t 当前范围 (a01_3 + a01_4):
-//   - a01_3: 算术 / 逻辑 / 立即数子集 (21 个真 op)
-//   - a01_4: 控制流 (branch 6 + jal + jalr = 8 个真 op)
-//   共 29 个真 op + 1 个 OP_UNSUPPORTED 兜底。
-//   不在此范围的 opcode (load / store / fence / csr / ecall / ebreak / mret / sret / wfi /
-//   amo / 等) decode 全部归 OP_UNSUPPORTED。
+// op_kind_t 当前范围 (a01_3 + a01_4 + a01_5_a):
+//   - a01_3:    算术 / 逻辑 / 立即数子集 (21 个真 op)
+//   - a01_4:    控制流 (branch 6 + jal + jalr = 8 个真 op)
+//   - a01_5_a:  csr 6 变体 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
+//   共 35 个真 op + 1 个 OP_UNSUPPORTED 兜底。
+//   不在此范围的 opcode (load / store / fence / ecall / ebreak / mret / sret / wfi /
+//   amo / 等) decode 全部归 OP_UNSUPPORTED (ECALL/EBREAK/MRET 在 a_01_5_c 加进来)。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -89,6 +90,38 @@ typedef enum {
     // funct3 != 0 reserved by spec, decode 归 OP_UNSUPPORTED。
     OP_JALR,
 
+    // ---- I-type SYSTEM CSR (6), opcode 0x73 ---- a_01_5_a
+    // 6 个 csr 指令变体, funct3 编码 (RV spec):
+    //   001 = CSRRW   atomic Read-Write
+    //   010 = CSRRS   atomic Read-Set    (按位 |)
+    //   011 = CSRRC   atomic Read-Clear  (按位 & ~)
+    //   101 = CSRRWI  atomic Read-Write  Immediate (rs1 字段当 5-bit zimm)
+    //   110 = CSRRSI  atomic Read-Set    Immediate
+    //   111 = CSRRCI  atomic Read-Clear  Immediate
+    // funct3 = 000 在 SYSTEM opcode 内是 ECALL / EBREAK / MRET / SRET / WFI 等
+    // (各自由 imm[11:0] 进一步区分), a_01_5_a 仍归 OP_UNSUPPORTED, a_01_5_c 加。
+    //
+    // 字段约定 (与 dummy.txt §2 x0 编码对齐):
+    //   d.imm = csr 12-bit address (inst[31:20]); 无符号, 高 20 位 0
+    //   d.rs1 = inst[19:15]:
+    //             RW/RS/RC 变体:  rs1 寄存器号 (interpreter READ_REG(d.rs1) 取源值)
+    //             RWI/RSI/RCI 变体: 5-bit zimm (interpreter 直接用 d.rs1 数值, 不查 regs)
+    //             两种语义在 op_kind 区分, 字段位置共用 (Spike / QEMU 同做法)
+    //   d.rd  = inst[11:7]: 写目标寄存器号; rd=x0 是合法 (csr 副作用 / 写仍发生, 只是
+    //                       读出来的旧值丢; 各小 r/w helper 不感知 rd)
+    //   d.pc_step = PC_STEP_RV (csr 不是 control flow, fetch loop 正常 +4; 但 csr 是
+    //                            硬边界, fetch loop 末尾 is_block_boundary_inst 检查
+    //                            后退出, dispatcher 重派发)
+    //
+    // is_block_boundary_inst 这 6 个 case 都 return 1 (硬边界, plan §1.6 简化策略:
+    // "所有 csr 写视为硬边界, 过度刷新允许")。
+    OP_CSRRW,
+    OP_CSRRS,
+    OP_CSRRC,
+    OP_CSRRWI,
+    OP_CSRRSI,
+    OP_CSRRCI,
+
     // ---- 兜底 ----
     // 不在当前范围的 opcode (load 0x03 / store 0x23 / fence 0x0F / system 0x73 / amo 0x2F /
     // 真非法 opcode / 真非法 funct3 子段) 全部归这里。
@@ -147,11 +180,11 @@ decoded_inst_t decode(uint32_t inst);
 // 不动 pc 与 RV trap 语义对齐, 不是 boundary)。
 //
 // a_01_4 加 boundary op: branch (BEQ/BNE/BLT/BGE/BLTU/BGEU) + jal + jalr (8 个)
-// a_01_5 加 boundary op: CSR 写 (CSRRW/RS/RC + I 变体共 6 个) + ECALL/EBREAK/MRET (3) +
-//                        WFI / SFENCE.VMA / FENCE.I (Zifencei + Zicsr)
-//   注: file_plan §7.decode G3 说 "所有 CSR 写都视为软边界 (过度刷新允许)" 简化策略, 即
+// a_01_5_a 加 boundary op: csr 6 变体 (CSRRW/RS/RC + RWI/RSI/RCI), 全视为硬边界
+// a_01_5_c 加 boundary op: ECALL/EBREAK/MRET (3) + 未来 WFI / SFENCE.VMA / FENCE.I
+//   注: file_plan §7.decode G3 说 "所有 CSR 写都视为硬边界 (过度刷新允许)" 简化策略, 即
 //       CSR 读 (CSRRS rd, csr, x0 = 读) 不一定要 boundary; 但保险起见统一视为 boundary
-//       (a_01_5 真做时再细化)
+//       (未来真细化时按 csr_addr 分流, 现在统一)
 //
 // 软边界 (块长度上限) 不在这里, 由 interpreter / translator 各自循环维护计数器,
 // 见 file_plan §7.decode G4 / §8.interpreter R3 + plan.md §1.23.2 (默认 64)。
@@ -184,16 +217,23 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         // 8 个 op 都改 pc, 块必须在此结束。interpreter / translator (未来) 在 fetch loop 末
         // 检查本 helper 返回值, 是 1 则 break 出 loop, dispatcher 重新走 block 1+2+3 (重新
         // mmu_translate_pc 拿新 pc 的 hva, 进新一块 block)。
-        // 注: 当前 helper 还没真被 caller 用 (Step 3 在 interpreter 接), 改成 return 1 仅
-        // 是 "声明事实", 运行时行为要等 Step 3 + Step 4 才生效。
         case OP_BEQ:  case OP_BNE:
         case OP_BLT:  case OP_BGE:  case OP_BLTU: case OP_BGEU:
         case OP_JAL:  case OP_JALR:
             return 1;
 
-        // ---- a_01_5 待加: ----
-        // case OP_CSRRW: case OP_CSRRS: case OP_CSRRC:
-        // case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
+        // ---- a_01_5_a csr 6 变体 (硬边界) ----
+        // plan §1.6 + file_plan §7.decode G3 简化策略: 所有 csr 写视为硬边界, 过度刷新允许。
+        // 实际上 6 个变体里 CSRRS/RC + rs1=x0 / CSRRSI/RCI + zimm=0 是"纯读不写"也归边界,
+        // 现在统一不细分; 未来按 csr_addr (例如 mtvec / mideleg / satp 的写) 分流时再优化。
+        // 当前运行时效果要等 Step 4 interpreter 真接 csr_op (case break 而不是 goto out)
+        // 后, fetch loop 末尾 boundary 检查 (count++ 之后) 才生效。Step 2 改 return 1 是
+        // "声明事实", Step 1 末尾的 stub goto out 路径不走 boundary 检查, 行为不依赖此值。
+        case OP_CSRRW:  case OP_CSRRS:  case OP_CSRRC:
+        case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
+            return 1;
+
+        // ---- a_01_5_c 待加: ----
         // case OP_ECALL: case OP_EBREAK: case OP_MRET:
         //     return 1;
     }

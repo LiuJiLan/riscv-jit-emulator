@@ -17,7 +17,7 @@
 //   - SATP_MODE_BARE / SATP_MODE_SV32 + SATP_MODE_SHIFT (csr.c 读写 satp.MODE 时)
 //   - MSTATUS_MPP / SSTATUS_SPP / MIE / SIE / 中断使能位 (csr.c)
 //   - PTE_V / PTE_R / PTE_W / PTE_X / PTE_U / PTE_G / PTE_A / PTE_D (mmu walker)
-//   - CSR 编号 (csr.c 大 switch 时一次填全)
+//   - CSR 编号 (csr.c 大 switch 时增量加 — a_01_5_a 加 trap 5 个; OS / S-mode 时再加 sstatus / sepc / sscratch / scause / stval / stvec / sip / sie 等)
 //
 
 #ifndef RISCV_H
@@ -63,5 +63,37 @@
 #define PTE_R  (1U << 1)
 #define PTE_W  (1U << 2)
 #define PTE_X  (1U << 3)
+
+// ----------------------------------------------------------------------------
+// CSR 编号 (Privileged Spec Vol II, table of Machine-Level CSRs / §2.2)
+//
+// 增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。a_01_5_a 加 trap 路径用的
+// 5 个 csr (mstatus 物理 64 位 = mstatus + mstatush 双 csr 入口)。
+//
+// 12-bit csr 地址位段 (RV Privileged Spec §2.1):
+//   bits [11:10] = 访问性质: 00/01/10 = RW, 11 = RO  (csr.c 入口判 RO 写 → trap)
+//   bits [9:8]   = 最低特权要求: 00=U, 01=S, 10=H/VS, 11=M  (csr.c 入口判 priv < 要求 → trap)
+//   bits [7:0]   = 在该 (RW/RO, priv) 范围内的编号
+// ----------------------------------------------------------------------------
+
+// 编码位段 (csr.c 入口判权限 / RO 用)
+#define CSR_ADDR_PRIV_SHIFT  8U
+#define CSR_ADDR_PRIV_MASK   0x3U          /* (addr >> 8) & 3 == 最低 priv 要求 */
+#define CSR_ADDR_RO_SHIFT    10U
+#define CSR_ADDR_RO_MASK     0x3U          /* (addr >> 10) & 3 == 0b11 时为 RO */
+#define CSR_ADDR_RO_VALUE    0x3U          /* (addr >> 10) & 3 == 0x3 → 只读 */
+
+// Machine-level trap setup / handling CSRs (a_01_5_a 加; trap 路径必备)
+//
+// 注: mstatus 在 RV32 物理 64 位, RV 规范拆 mstatus (低 32) + mstatush (高 32) 两个 csr
+//     入口访问。本项目 cpu_t 内只存一份 _mstatus (uint64_t), csr.c 的 mstatus / mstatush
+//     read/write 都映射到同一个物理字段的不同半边 (dummy.txt §1 第一类). sstatus = 0x100
+//     是 mstatus 的 masked view, a_01_5_a 不实现, 等真做 S-mode 时加。
+#define CSR_MSTATUS    0x300U          /* mstatus 低 32 位 (MIE/MPIE/MPP/SUM/MXR/...) */
+#define CSR_MTVEC      0x305U          /* M-mode trap vector base (+ MODE 低 2 位) */
+#define CSR_MSTATUSH   0x310U          /* mstatus 高 32 位 (RV32 only; SBE/MBE 等大端控制) */
+#define CSR_MEPC       0x341U          /* M-mode 异常 / 中断的"返回 PC" */
+#define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
+#define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
 
 #endif //RISCV_H

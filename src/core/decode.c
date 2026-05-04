@@ -230,9 +230,46 @@ decoded_inst_t decode(uint32_t inst) {
             d.pc_step = PC_STEP_NONE;
             break;
 
+        // ---- I-type SYSTEM ---- a_01_5_a 加 csr 6 变体
+        case 0x73: {
+            // SYSTEM opcode 含两类指令:
+            //   funct3 = 000: ECALL / EBREAK / MRET / SRET / WFI / SFENCE.VMA / ...
+            //                 由 imm[11:0] 进一步区分 (a_01_5_c 加; 现在归 OP_UNSUPPORTED)
+            //   funct3 ∈ {001, 010, 011, 101, 110, 111}: csr 6 变体
+            //
+            // csr 字段约定 (decode.h enum 段已 doc):
+            //   d.imm = csr 12-bit address (inst[31:20]); 无符号扩展到 int32_t (高 20 位 0)
+            //   d.rs1 = inst[19:15] (decode 顶部已统一提取):
+            //             RW/RS/RC:   rs1 寄存器号
+            //             RWI/RSI/RCI: 5-bit zimm (interpreter 不查 regs, 直接用数值)
+            //   d.rd / d.pc_step: 走默认 (rd 顶部已提取; pc_step = PC_STEP_RV)
+            //
+            // csr 是硬边界 (decode.h is_block_boundary_inst Step 2 改 return 1, fetch loop
+            // 末退出 → dispatcher 重派发 pc + 4 进下一块)。
+            d.imm = (int32_t)((inst >> 20) & 0xFFFu);     /* 无符号 12 位放 imm */
+            switch (funct3) {
+                case 1: d.kind = OP_CSRRW;  break;
+                case 2: d.kind = OP_CSRRS;  break;
+                case 3: d.kind = OP_CSRRC;  break;
+                case 5: d.kind = OP_CSRRWI; break;
+                case 6: d.kind = OP_CSRRSI; break;
+                case 7: d.kind = OP_CSRRCI; break;
+                case 0:
+                case 4:
+                default:
+                    // funct3=000: ECALL / EBREAK / MRET / ... a_01_5_c 加; 现在 OP_UNSUPPORTED
+                    // funct3=100: reserved by RV spec; OP_UNSUPPORTED
+                    // d.kind 默认已 OP_UNSUPPORTED, 但此处 d.imm 已被改成 csr 12-bit 形态,
+                    // 不影响 unsupp 路径 (interpreter goto out 不读 d.imm)
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
         // ---- 其他 opcode ----
-        // 0x03 LOAD / 0x23 STORE / 0x0F FENCE / 0x73 SYSTEM (CSR / ECALL / EBREAK / MRET /
-        // SRET / WFI) / 0x2F AMO / 真非法 opcode 全部走默认的 OP_UNSUPPORTED。
+        // 0x03 LOAD / 0x23 STORE / 0x0F FENCE / 0x2F AMO / 真非法 opcode 全部走默认的
+        // OP_UNSUPPORTED (a_01_6 加 LOAD/STORE; AMO 等更后)。
         default:
             // 已经初始化为 OP_UNSUPPORTED, 保持。
             break;

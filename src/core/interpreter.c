@@ -10,6 +10,7 @@
 
 #include "config.h"     // BLOCK_INST_LIMIT, IALIGN_MASK
 #include "cpu.h"
+#include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
 #include "decode.h"
 #include "tlb.h"
 
@@ -217,6 +218,46 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             case OP_JALR:
                 WRITE_REG(d.rd, pc + 4u);
                 WRITE_PC_OR_TRAP((READ_REG(d.rs1) + (uint32_t)d.imm) & ~1u);
+                break;
+
+            // ---- I-type SYSTEM CSR 6 变体 (a_01_5_a) ----
+            // 6 个 op_kind 在 csr 侧映射到 3 个内核操作 (csr_op_t) + new_val 来源:
+            //   RW/RS/RC:    new_val = READ_REG(d.rs1)             /* rs1 是寄存器号 */
+            //   RWI/RSI/RCI: new_val = (uint32_t)d.rs1             /* rs1 字段当 5-bit zimm */
+            // csr_op 返回 read_old, WRITE_REG(d.rd, old) 写 rd (rd=x0 走 dummy.txt §2 dead store
+            // 路径, 自然丢弃)。case 末 break (不 goto out), fetch loop 末 count++ 后
+            // is_block_boundary_inst (Step 2 已 return 1) 让 fetch loop 退出, dispatcher
+            // 重派发 pc + 4 进下一块。
+            //
+            // d.imm 是 12-bit csr addr (decode 已无符号扩展放低 12 位, 高 20 位 0); 这里
+            // (uint32_t)d.imm 强转去除 int32_t 符号扩展风险 (d.imm 实际值范围 [0, 0xFFF],
+            // cast 等价于 d.imm & 0xFFF, 但语义清晰)。
+            //
+            // d.raw_inst 是 32-bit 原始指令编码 (decode 顶部已填), 给 csr_op 内 trap 路径
+            // 填 mtval 用 (a_01_5_b 真接 trap.c 后激活)。
+            case OP_CSRRW:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
+                                       CSR_OP_RW, d.raw_inst));
+                break;
+            case OP_CSRRS:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
+                                       CSR_OP_RS, d.raw_inst));
+                break;
+            case OP_CSRRC:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
+                                       CSR_OP_RC, d.raw_inst));
+                break;
+            case OP_CSRRWI:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
+                                       CSR_OP_RW, d.raw_inst));
+                break;
+            case OP_CSRRSI:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
+                                       CSR_OP_RS, d.raw_inst));
+                break;
+            case OP_CSRRCI:
+                WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
+                                       CSR_OP_RC, d.raw_inst));
                 break;
 
             // ---- 兜底 ----

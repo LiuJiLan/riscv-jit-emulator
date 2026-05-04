@@ -167,7 +167,35 @@ static int decode_test(void) {
     //   rs2 garbage (bits 24:20) = imm[4:0] = 4
     CASE(0x00408067, OP_JALR, /*rd*/0,  /*rs1*/1,  /*rs2*/4,  4,        0x00408067, PC_STEP_NONE);
 
-    // ---- a_01_5 待加 (CSR* / ECALL / EBREAK / MRET) ----
+    // ---- a_01_5_a I-type SYSTEM CSR 6 变体 (7 case: 6 op_kind 各 1 + csr_addr=0 边界)----
+    //
+    // 编码 (RV spec): csr_addr inst[31:20] / rs1_or_zimm inst[19:15] / funct3 inst[14:12]
+    //                  (001=RW 010=RS 011=RC 101=RWI 110=RSI 111=RCI) / rd inst[11:7] /
+    //                  opcode 0x73。decoded_inst_t 字段约定 (decode.h enum 段已 doc):
+    //                  d.imm = csr 12-bit addr (无符号扩展, 高 20 位 0); d.rs1 字段在 RWI/RSI/RCI
+    //                  时是 5-bit zimm (interpreter 不查 regs 直接用数值), 在 RW/RS/RC 时是
+    //                  rs1 寄存器号; 字段共用同一位置 (Spike / QEMU 同做法)。
+    //                  d.rs2 是 garbage = (inst>>20) & 0x1F = csr_addr & 0x1F (csr decode 不
+    //                  动 d.rs2, 走顶部统一提取); CASE 宏期望值按此填。
+    //                  d.pc_step = PC_STEP_RV (csr 不是 control flow, fetch loop +4; 但是硬
+    //                  边界, 由 is_block_boundary_inst 让 fetch loop 退出)。
+
+    // CSRRW x1, mtvec, x2 = 0x305110F3 (csr=0x305 mtvec, rs1=2, rd=1)
+    CASE(0x305110F3, OP_CSRRW,  /*rd*/1, /*rs1*/2,  /*rs2*/5,  0x305, 0x305110F3, PC_STEP_RV);
+    // CSRRS x3, mstatus, x4 = 0x300221F3 (csr=0x300 mstatus, rs1=4, rd=3)
+    CASE(0x300221F3, OP_CSRRS,  /*rd*/3, /*rs1*/4,  /*rs2*/0,  0x300, 0x300221F3, PC_STEP_RV);
+    // CSRRC x0, mcause, x5 = 0x3422B073 (csr=0x342 mcause, rs1=5, rd=0; 验 rd=x0 路径)
+    CASE(0x3422B073, OP_CSRRC,  /*rd*/0, /*rs1*/5,  /*rs2*/2,  0x342, 0x3422B073, PC_STEP_RV);
+    // CSRRWI x6, mepc, 0 = 0x34105373 (csr=0x341 mepc, zimm=0 边界, rd=6; 验 zimm=0 不真写规则)
+    CASE(0x34105373, OP_CSRRWI, /*rd*/6, /*rs1*/0,  /*rs2*/1,  0x341, 0x34105373, PC_STEP_RV);
+    // CSRRSI x7, mtval, 31 = 0x343FE3F3 (csr=0x343 mtval, zimm=31 max, rd=7)
+    CASE(0x343FE3F3, OP_CSRRSI, /*rd*/7, /*rs1*/31, /*rs2*/3,  0x343, 0x343FE3F3, PC_STEP_RV);
+    // CSRRCI x0, 0xFFF, 31 = 0xFFFFF073 (csr_addr=0xFFF 边界, zimm=31 max, rd=0)
+    CASE(0xFFFFF073, OP_CSRRCI, /*rd*/0, /*rs1*/31, /*rs2*/31, 0xFFF, 0xFFFFF073, PC_STEP_RV);
+    // CSRRW x0, 0x000, x0 = 0x00001073 (csr_addr=0x000 边界, rs1=x0, rd=x0; 全零路径)
+    CASE(0x00001073, OP_CSRRW,  /*rd*/0, /*rs1*/0,  /*rs2*/0,  0x000, 0x00001073, PC_STEP_RV);
+
+    // ---- a_01_5_c 待加 (ECALL / EBREAK / MRET; opcode 0x73 funct3=000 + imm[11:0] 区分)----
     // ---- a_01_6 待加 (LB/LH/LW/LBU/LHU + SB/SH/SW; S-type 立即数 bit[31:25, 11:7]) ----
     // ---- 未来 RVC 扩展 (C.MV / C.ADD / C.LUI / C.SUB / ... 真翻译) ----
 
