@@ -174,5 +174,37 @@ int dispatcher(cpu_t *hart) {
             "[dispatcher] halted: in_trap=%u total_count=%u pc=0x%08" PRIx32 "\n",
             hart->trap.in_trap, total_count, hart->regs[0]);
 
+    // ========================================================================
+    // 未来 reset 扩展占位 (a_03+ 真接入时填; 当前 dispatcher 直接 return 给 main 处理)
+    //
+    // reset 是 per-hart 级 (跟 SMP-ready 一致, 跟 RV Smdbltrp 扩展 + SiFive 等 commercial
+    // cores 的实际行为一致): 单 hart reset 不影响其他 hart, 跟 x86 triple fault 整 CPU
+    // reset 不同。
+    //
+    // 伪码:
+    //   if (misa 支持 reset 扩展 && hart->trap.in_trap == 3) {
+    //       cpu_reset(hart);     // cpu.c 加, 跟 cpu_create / cpu_destroy 接口对称;
+    //                             // 重置 regs[1..31] / pc=reset_vector / mstatus /
+    //                             // xtvec/xepc/xcause/xtval / in_trap=0; 保留 hartid
+    //                             // 等"硬件标识"字段 (真 hardware reset 后 hartid 不变)
+    //       siglongjmp(*hart->jmp_buf_ptr, 1);  // 重入 dispatcher 入口的 sigsetjmp 落点 +
+    //                                            // while 顶判 (in_trap=0 < 3 true 进 while)
+    //                                            // 复用现有控制流原语, 不需要新协议
+    //   }
+    //   // else: dispatcher 退出, main 端处理 (in_trap >= 10 走 main 的硬停机分支;
+    //   //        misa 不支持 reset 也走 main exit)
+    //
+    // in_trap 编码语义 (扩展):
+    //   0/1/2     普通 trap 嵌套深度
+    //   3         标准 triple fault = reset 信号 (跟 RV/SiFive 风格一致)
+    //   4..9      留作未来扩展 (远离 3 避免跟标准 reset 信号撞)
+    //   >= 10     项目内部硬停机编码 (退出 hart, 不 reset; 例如 MMIO sifive_test finisher
+    //              触发时, trap_set_state 直接把 in_trap 设到 10+ 而不是 ++ 到 3)
+    //
+    // 规范: cpu 的分配 + 初始化 + 销毁都在 dispatcher 之外 (cpu_create / cpu_destroy 由 main
+    // 调用)。cpu_reset 是状态重置 (不是 alloc/destroy), 是规范的合法例外, 允许由 dispatcher
+    // 调用; 它在 cpu.c 实现, 跟 cpu_create / cpu_destroy 接口对称。
+    // ========================================================================
+
     return 0;
 }
