@@ -49,14 +49,28 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
     sigjmp_buf 实体放在 dispatcher 函数自己的栈帧上(局部变量),cpu_t 里
     只持有 sigjmp_buf 指针(jmp_buf_ptr 字段,8 字节)。
 
-    dispatcher 进入主循环前一次性注册:
+    dispatcher 进入主循环前一次性注册 + 一次性调 sigsetjmp;主循环内不再
+    调 sigsetjmp:
         sigjmp_buf dispatch_env;
         cpu->jmp_buf_ptr = &dispatch_env;
+        sigsetjmp(*cpu->jmp_buf_ptr, 1);   /* 落点同时承接"初次进入"和
+                                              "longjmp 跳来"两种路径 */
 
-    每次主循环迭代开头调用:
-        sigsetjmp(*cpu->jmp_buf_ptr, 1);
+        while (cpu->trap.in_trap < 3) {
+            /* block 1+2+3, 任何 helper longjmp 都跳回上面那行 sigsetjmp */
+        }
 
-    [设计理由]
+    [为什么 sigsetjmp 在 while 外, 不在每轮迭代开头]
+      sigsetjmp 的代价 ~50 ns(glibc, 包含信号 mask 操作)。如果放在每轮
+      迭代开头,fast path 命中 JIT 块时也付这个代价(每跑完一个块就重新
+      建立落点),没意义 —— 落点本身在 longjmp 跳来之前一直有效, 不需要
+      "刷新"。一次性建立 + 永久落点是更对的形态。
+
+      副作用: longjmp 跳来后, 栈帧上 dispatcher 的局部变量(total_count
+      之类)需要按 dummy.txt §1 末段的规则处理(volatile 或不依赖跨 longjmp
+      持久性)。
+
+    [设计理由 —— sigjmp_buf 实体放栈, cpu_t 持指针]
       sigjmp_buf 在 glibc 大约 200 字节,如果直接嵌入 cpu_t 会占用一大块
       cache line。改为指针(8 字节)+ 实体放栈,cpu_t 紧凑,jmp_buf 实体
       生命期天然绑定 dispatcher 线程。
@@ -68,38 +82,76 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
       jmp_buf_ptr 字段本身可以继续留 cpu_t,因为它只是一个普通指针,
       不会让"shm 暴露 cpu_t 整体"成为风险。
 
-(2) longjmp 端 —— slow path helper
-    helper 决定 raise trap 时:
-    a. 调用 trap.c 的架构层 trap 处理(填 mcause/mtval/mepc、设新 pc、
-       切特权 mode 等)
-    b. 调 siglongjmp(*cpu->jmp_buf_ptr, 1) 跳回 dispatcher
+(2) longjmp 端 —— 两种 raise 路径
 
-    helper 不返回 JIT 代码。
+    项目里产生 trap 的位置分两类, 它们用不同形态接 trap:
+
+    (2a) interpreter / JIT block 内部 helper —— 经 trap_raise_exception 长跳
+       这类 helper(OP_UNSUPPORTED, csr 权限失败, store_helper 越界, ...)
+       已经在 block 控制流深处, 退栈到 dispatcher 的清理代价大于直接 longjmp。
+       trap_raise_exception 内部:
+         a. 调 trap_set_state(hart, cause, tval) 设架构状态
+            (in_trap++; 写 _cause/_tval/_epc; 跳 _tvec)
+         b. siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 的落点
+       trap_raise_exception 标 _Noreturn, 不返回 caller。
+
+    (2b) dispatcher fetch 路径 —— 直接调 trap_set_state, 不长跳
+       mmu_translate_pc 内部检测到取指 fault 时, 已经在 dispatcher 主循环帧
+       内, 直接走普通 control flow (return rc) 比 longjmp 简洁。它直接调
+       trap_set_state, 后者只设架构状态(写字段, 不长跳), 然后通过 mmu_
+       translate_pc 的返回值告诉 dispatcher "已 deliver, continue 这一轮"。
+       dispatcher 看 rc != 0 直接 continue, 让 while 条件接管。
+
+    两种路径共用同一个 trap_set_state 内核(写字段 + 计数 + 决定不 deliver
+    when in_trap >= 3); 区别只是"控制流如何回到 dispatcher 主循环顶":
+    longjmp(路径 a)还是 普通 return + continue(路径 b)。
+
+    [trap_set_state 在 in_trap >= 3 时的行为]
+      早 return, 不写 _cause/_tval/_epc, 不跳 _tvec。理由: 第三次进 trap_
+      set_state 已经是"硬件 reset 信号", 字段保留第二次的状态作为 root cause
+      给 main 端 fprintf 看, 比覆盖成第三次的"_tvec 死循环造成的"信息更有用。
 
 (3) 控制流路径
 
+    [前提] dispatcher 入口一次性 sigsetjmp 已建立永久落点, while 条件
+    while (cpu->trap.in_trap < 3) 是唯一退出判断。
+
     路径 A(无 trap):
-      dispatcher
-        → sigsetjmp(cpu->jmp_buf)
-        → JIT block 执行
-            [可能调或不调 helper,helper 也可能正常返回]
+      dispatcher 入口 sigsetjmp 一次性建立落点
+        → 进 while 循环 (in_trap < 3)
+        → block 1 (regime / current_tlb)
+        → block 2 (mmu_translate_pc 返回 0, 进 block 3)
+        → block 3 (interpret_one_block / JIT block 跑完, helper 都正常返回)
         → block 出口
-        → 回 dispatcher 循环顶,重新 sigsetjmp,继续
+        → 回 while 顶判 in_trap < 3, 继续下一轮
 
-    路径 B(有 trap):
-      dispatcher
-        → sigsetjmp(cpu->jmp_buf)
-        → JIT block 执行
-            → helper 决定 raise trap
-            → trap.c 处理架构语义(更新 cpu_t 的 trap 相关字段、设新 pc)
-            → siglongjmp(cpu->jmp_buf)
-        → 回到 sigsetjmp 落点(返回值非 0)
-        → dispatcher 循环顶,重新 sigsetjmp,从新 pc(已被 trap 处理设好)继续
+    路径 B(interpreter / JIT block 内 helper longjmp, 例如 trap_raise_exception):
+      dispatcher 入口 sigsetjmp 一次性建立落点
+        → 进 while 循环
+        → block 1+2+3 内 helper 调 trap_raise_exception
+            → trap_raise_exception 调 trap_set_state(写字段 + in_trap++)
+            → siglongjmp(*cpu->jmp_buf_ptr, 1)
+        → 回到 dispatcher 入口的 sigsetjmp 落点 (栈帧已退到 dispatcher)
+        → 顺序执行到 while 条件, 重新判 in_trap < 3
+        → 满足 → 继续下一轮 (regs[0] 已是 _tvec, 自然从 trap handler 起点 fetch)
+        → 不满足 (in_trap == 3) → 退出 dispatcher
 
-    dispatcher 视角:不关心 JIT 块内部到底有没有调 helper、helper 有没有
-    raise。只关心 sigsetjmp 返回值:
-      返回 0  → 正常进入 JIT 块
-      返回非 0 → 从 longjmp 路径回来,继续循环
+    路径 C(dispatcher fetch trap, 不 longjmp):
+      dispatcher 入口 sigsetjmp 一次性建立落点
+        → 进 while 循环
+        → block 2 mmu_translate_pc 内 fetch fault
+            → 调 trap_set_state(写字段 + in_trap++)
+            → return rc != 0 给 mmu_translate_pc 的 caller(dispatcher)
+        → dispatcher 看 rc != 0 → continue (跳过 block 3)
+        → 回 while 顶判 in_trap < 3, 继续下一轮
+
+    dispatcher 视角(关键):
+      sigsetjmp 返回值不被 dispatcher 用来分流。longjmp 不携带"trap 错误"
+      语义 —— 它只是个无条件的"控制流重置到主循环顶部"原语,未来 wfi
+      早退 / 中断 fast-forward / 其它"省略中间过程回归 dispatcher"的路径
+      也共用这个落点,不需要新机制。
+      退出唯一靠 while 条件 (in_trap < 3); 派发动作唯一靠状态字段
+      (regs[0]/_cause/_tval/_epc/_tvec)。两件事完全解耦。
 
 
 --------------------------------------------------------------------------------
