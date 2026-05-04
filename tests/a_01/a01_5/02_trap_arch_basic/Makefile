@@ -1,35 +1,45 @@
-# a_01_5_b / 02_trap_arch_basic
-# 产出 out.bin: 24 字节, 主程序 4 条 + handler 2 条, loader 加载到 GUEST_RAM_START。
+# a_01_5_c / 02_trap_arch_basic
+# 产出 out.bin: 36 字节, 起步 3 条 (la+csrw 设 mtvec) + 主程序 4 条 + handler 2 条;
+# loader 加载到 GUEST_RAM_START。
 #
-# 验证目标 (a_01_5_b 阶段):
-#   - trap_set_state 写 xcause/xtval/xepc 字段对 (cause=2 illegal, tval=raw_inst, epc=触发 PC)
-#   - regs[0] = xtvec[PRIV_M] 跳 trap handler 真生效 (block 跳到 0x80000010 跑 addi x3)
-#   - mmu_translate_pc 路径不命中 (xtvec=0x80000010 在 RAM 内, fetch 不 fail)
-#   - 候选 A 早 return: 第 3 次 trap 字段保留第 2 次状态 (mtval=0x73 ecall raw, 不是再次覆盖)
-#   - dispatcher while(in_trap < 3) 退出条件: 主程序 .word 0 + handler 2 次 ecall = 3 次 trap
+# 验证目标 (a_01_5_c 阶段):
+#   - csr.c 真接读写: csrw mtvec 设 handler 地址 (a_01_5_b 由 main.c hard-code, a_01_5_c
+#     起 fixture 自包含, main.c 不再设 xtvec)
+#   - trap_set_state 写 xcause/xtval/xepc 字段对
+#   - regs[0] = xtvec[PRIV_M] 跳 trap handler 真生效 (跳到 0x8000001c 跑 addi x3)
+#   - 候选 A 早 return: 第 3 次 trap 字段保留第 2 次状态
+#   - dispatcher while(in_trap < 3) 退出条件 + sigsetjmp 一次性落点 + trap_raise_exception
+#     _Noreturn longjmp 路径
 #
 # 期望:
-#   x1 = 1   (主程序第一条 addi 跑过)
-#   x2 = 0   (主程序第二条 addi 不应跑 — .word 0 触发 trap 截断主程序)
-#   x3 = 7   (handler 内 addi x3, x0, 7 跑过, 第二/第三轮 handler 重复设同值)
-#   pc = 0x80000014   (block 3 内 addi 跑完后 regs[0] += 4 = 0x14; ecall 触发第 3 次 trap;
-#                       候选 A 早 return 不动 regs[0]; 所以 regs[0] 停在第 3 次 trap 的触发 PC)
-#   trap dump: in_trap=3 mcause=2 mtval=0x73 mepc=0x80000014 mtvec=0x80000010
-#                       (字段保留第 2 次 deliver 的状态: 第 3 次早 return 不写字段)
+#   x1 = 1           (主程序第一条 addi 跑过)
+#   x2 = 0           (.word 0 触发 trap 截断主程序, addi x2 不应跑)
+#   x3 = 7           (handler 内 addi x3 跑过)
+#   pc = 0x80000020  (block 4 内 addi x3 跑完 pc += 4 = 0x20, ecall 触发第 3 次 trap 候选 A
+#                      早 return 不动 pc; pc 停在 ecall PC)
+#   trap dump: in_trap=3 mcause=11 mtval=0 mepc=0x80000020 mtvec=0x8000001c
+#              (字段保留第 2 次 trap = handler ecall 的; mtvec 由 fixture csrw 写)
 #
 # dispatcher 行为:
-#   block 1 (0x80000000): addi x1 + .word 0 → trap (in_trap 0→1)
-#                          deliver: regs[0] = xtvec = 0x80000010; count_out=1
-#   block 2 (0x80000010): addi x3 (regs[0] += 4 → 0x14) + ecall → trap (in_trap 1→2)
-#                          deliver: 字段更新 (cause=2 tval=0x73 epc=0x14); regs[0] = xtvec
-#                          = 0x80000010; count_out=1
-#   block 3 (0x80000010): addi x3 (regs[0] += 4 → 0x14) + ecall → trap (in_trap 2→3)
-#                          候选 A 早 return: 不写字段, 不动 regs[0]; regs[0] 停在 0x14
-#                          count_out=1
-#   while (3 < 3) false → 退出, total_count = 3, regs[0] = 0x80000014
+#   block 1 (0x80000000): la(2) + csrw(boundary)
+#                          mtvec = 0x8000001c; count_out=3, total_count += 3 = 3
+#   block 2 (0x8000000c): addi x1 + .word 0 → trap_raise(2,0) longjmp
+#                          (in_trap 0→1, _cause=2/_tval=0/_epc=0x10, regs[0]=mtvec=0x1c)
+#                          longjmp 跳过 dispatcher 的 total_count += 行, total_count 不变
+#   block 3 (0x8000001c handler): addi x3 + ecall → trap_raise(11,0) longjmp
+#                          (in_trap 1→2, _cause=11/_tval=0/_epc=0x20, regs[0]=mtvec=0x1c)
+#                          total_count 不变
+#   block 4 (0x8000001c handler): addi x3 + ecall → trap_raise(11,0) longjmp
+#                          (in_trap 2→3, 候选 A 早 return; 字段保留第 2 次)
+#                          total_count 不变
+#   while (3<3) false → 退出, total_count = 3
+#
+# 注: a_01_5_c 起 trap_raise_exception 是 _Noreturn longjmp, 跳过 dispatcher 的
+# total_count += local_count 行; 所以 trap 触发的 block 内"trap 之前已跑的指令" 不计入
+# total_count。这是与 a_01_5_b 的行为差异 (a_01_5_b 时 trap_raise return + caller
+# goto out + fetch loop 末尾 *count_out=count + dispatcher total_count += 都正常执行)。
 #
 # 工具链 / 模式: 套 a01_4 + 01_csr_basic 同款。
-# build flow: stub.S → out.elf → out.bin (objcopy 提 raw bytes)。
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

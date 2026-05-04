@@ -74,8 +74,10 @@ static int decode_test(void) {
     CASE(0x000012B7, OP_LUI,   /*rd*/5, /*rs1*/0, /*rs2*/0, 0x1000, 0x000012B7, PC_STEP_RV);
     // I-type OP-IMM 负 imm: addi x6, x0, -8 = 0xFF800313 (rs2 garbage = 0xFF8 & 0x1F = 24)
     CASE(0xFF800313, OP_ADDI,  /*rd*/6, /*rs1*/0, /*rs2*/24, -8, 0xFF800313, PC_STEP_RV);
-    // ecall = 0x00000073: opcode 0x73 a_01_3 不识别 → OP_UNSUPPORTED, pc_step 仍 PC_STEP_RV
-    CASE(0x00000073, OP_UNSUPPORTED, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x00000073, PC_STEP_RV);
+    // ecall = 0x00000073: a_01_3 时 OP_UNSUPPORTED, a_01_5_c 起细分到 OP_ECALL (decode 0x73
+    //                      funct3=0 + imm[11:0]=0 → ECALL); pc_step=PC_STEP_NONE (trap 跳 xtvec,
+    //                      不让 fetch loop 末 += pc_step 误推)
+    CASE(0x00000073, OP_ECALL, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x00000073, PC_STEP_NONE);
 
     // ---- a_01_4 起步: 16-bit RVC (compressed), pc_step = PC_STEP_RVC = 2 ----
     //
@@ -195,7 +197,19 @@ static int decode_test(void) {
     // CSRRW x0, 0x000, x0 = 0x00001073 (csr_addr=0x000 边界, rs1=x0, rd=x0; 全零路径)
     CASE(0x00001073, OP_CSRRW,  /*rd*/0, /*rs1*/0,  /*rs2*/0,  0x000, 0x00001073, PC_STEP_RV);
 
-    // ---- a_01_5_c 待加 (ECALL / EBREAK / MRET; opcode 0x73 funct3=000 + imm[11:0] 区分)----
+    // ---- a_01_5_c I-type SYSTEM (ECALL / EBREAK / MRET) ----
+    //
+    // opcode 0x73, funct3=000, 由 imm[11:0] (= inst[31:20]) 进一步区分:
+    //   imm = 0x000 → ECALL  (上方 a_01_3 sanity 那条已覆盖, 顺手验证 a_01_5_c 后路由对)
+    //   imm = 0x001 → EBREAK
+    //   imm = 0x302 → MRET
+    // d.rs2 garbage = (inst>>20) & 0x1F = imm 低 5 位; pc_step = PC_STEP_NONE (case 自描述 pc)。
+
+    // EBREAK = 0x00100073
+    CASE(0x00100073, OP_EBREAK, /*rd*/0, /*rs1*/0, /*rs2*/1, 0x001, 0x00100073, PC_STEP_NONE);
+    // MRET = 0x30200073
+    CASE(0x30200073, OP_MRET,   /*rd*/0, /*rs1*/0, /*rs2*/2, 0x302, 0x30200073, PC_STEP_NONE);
+
     // ---- a_01_6 待加 (LB/LH/LW/LBU/LHU + SB/SH/SW; S-type 立即数 bit[31:25, 11:7]) ----
     // ---- 未来 RVC 扩展 (C.MV / C.ADD / C.LUI / C.SUB / ... 真翻译) ----
 
@@ -279,11 +293,11 @@ int main(int argc, char **argv) {
     // 注: regs 已被 memset 0; 以上两行显式赋值是 boot protocol 文档化, 等价于 memset 后的现状。
     //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
-    // a_01_5_b: 手动设 mtvec 指向 fixture 内 trap handler 的起点。a_01_5_c csr.c 真接 csr
-    //           读写后, fixture 自己用 csrw mtvec, x.. 设, main.c 这条移除。
-    //           跟 a_01_5_b/c fixture 协议: handler 起点 = GUEST_RAM_START + 0x10 (即 main
-    //           程序前 16 字节是主程序, 其后是 handler 起点)。当前 02_trap_arch_basic 遵守此约定。
-    hart->trap.xtvec[PRIV_M] = GUEST_RAM_START + 0x10u;
+    // a_01_5_c 起 csr.c 真接 csr 读写, fixture 自己用 csrw mtvec, x.. 设 trap handler 地址,
+    // main.c 不再 hard-code (a_01_5_b 时为方便测试临时设的, 现在 fixture 自包含)。
+    // 启动协议: hart 创建后默认所有 trap 字段 0 (cpu_create memset 0); fixture 在执行 trap
+    // 触发指令前必须先 csrw mtvec 设好, 否则 trap 跳 0 → fetch fail → triple fault → 退出。
+    // 这跟真实 hart reset 后 mtvec=0 由 firmware 设的行为一致。
 
     // ------------------------------------------------------------------------
     // a_01_4: 跑 fixture, dispatcher 进 while(1) 多块循环, 每块调 interpret_one_block;

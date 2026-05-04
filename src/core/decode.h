@@ -5,13 +5,15 @@
 // 职责: 把 RV32 32-bit 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst) 的纯数据结构,
 //       给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
 //
-// op_kind_t 当前范围 (a01_3 + a01_4 + a01_5_a):
+// op_kind_t 当前范围 (a01_3 + a01_4 + a01_5_a + a01_5_c):
 //   - a01_3:    算术 / 逻辑 / 立即数子集 (21 个真 op)
 //   - a01_4:    控制流 (branch 6 + jal + jalr = 8 个真 op)
 //   - a01_5_a:  csr 6 变体 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
-//   共 35 个真 op + 1 个 OP_UNSUPPORTED 兜底。
-//   不在此范围的 opcode (load / store / fence / ecall / ebreak / mret / sret / wfi /
-//   amo / 等) decode 全部归 OP_UNSUPPORTED (ECALL/EBREAK/MRET 在 a_01_5_c 加进来)。
+//   - a01_5_c:  system 3 op (ECALL / EBREAK / MRET); SRET / WFI / SFENCE.VMA 等仍归
+//               OP_UNSUPPORTED (S-mode / 中断 真做时再加)
+//   共 38 个真 op + 1 个 OP_UNSUPPORTED 兜底。
+//   不在此范围的 opcode (load / store / fence / amo / SRET / WFI / SFENCE.VMA / 等)
+//   decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -122,6 +124,32 @@ typedef enum {
     OP_CSRRSI,
     OP_CSRRCI,
 
+    // ---- I-type SYSTEM (ECALL / EBREAK / MRET, 3 op) ---- a_01_5_c
+    // opcode 0x73, funct3=000, 由 imm[11:0] (= inst[31:20]) 进一步区分:
+    //   imm[11:0] = 0x000 → ECALL    (Environment Call from current priv)
+    //   imm[11:0] = 0x001 → EBREAK   (Breakpoint)
+    //   imm[11:0] = 0x302 → MRET     (Machine-mode Return; 从 trap handler 回归)
+    //   其他 (SRET / WFI / SFENCE.VMA 等) 仍归 OP_UNSUPPORTED, 等真做 S-mode / 中断时加
+    //
+    // 字段约定:
+    //   d.imm = 0 (ECALL/EBREAK 的 imm[11:0] 已用于区分 op_kind, interpreter case 不读此字段;
+    //               MRET 也不读)
+    //   d.rd / d.rs1 = 0 (RV spec 要求, decode 顶部统一提取的值理论上应是 0; 实际 fixture 编
+    //                      ecall=0x73 时这些位都 0; 不强求, interpreter case 不读)
+    //   d.pc_step = PC_STEP_RV (4 字节固定, fetch loop 推进 +4 — 但 ECALL/EBREAK 走 trap 路径
+    //                            不到 fetch loop 末尾; MRET 写 pc=xepc 后 case 不动 +pc_step,
+    //                            走 boundary 退出 fetch loop)
+    //   注: MRET 像 control flow op (改 pc), 但因为它通过 csr 路径 (xepc) 而不是立即数算 pc,
+    //       这里 pc_step 设 PC_STEP_RV 然后 case 内手动覆盖 hart->regs[0] = xepc 也行;
+    //       或设 PC_STEP_NONE 跟 jal/branch 同模式。a_01_5_c 选 PC_STEP_NONE (case 写 pc, 不
+    //       让 fetch loop 末尾 += 4 误推 4 字节)。下面 decode.c 也跟此约定。
+    //
+    // 是块边界 (硬边界): ECALL/EBREAK 触发 trap (cause 11/3) 控制流跳 xtvec; MRET 跳 xepc.
+    // 都改 pc, 必须结束当前 block (is_block_boundary_inst 3 case → return 1)。
+    OP_ECALL,
+    OP_EBREAK,
+    OP_MRET,
+
     // ---- 兜底 ----
     // 不在当前范围的 opcode (load 0x03 / store 0x23 / fence 0x0F / system 0x73 / amo 0x2F /
     // 真非法 opcode / 真非法 funct3 子段) 全部归这里。
@@ -181,7 +209,7 @@ decoded_inst_t decode(uint32_t inst);
 //
 // a_01_4 加 boundary op: branch (BEQ/BNE/BLT/BGE/BLTU/BGEU) + jal + jalr (8 个)
 // a_01_5_a 加 boundary op: csr 6 变体 (CSRRW/RS/RC + RWI/RSI/RCI), 全视为硬边界
-// a_01_5_c 加 boundary op: ECALL/EBREAK/MRET (3) + 未来 WFI / SFENCE.VMA / FENCE.I
+// a_01_5_c 加 boundary op: ECALL/EBREAK/MRET (3 个) + 未来 WFI / SFENCE.VMA / FENCE.I
 //   注: file_plan §7.decode G3 说 "所有 CSR 写都视为硬边界 (过度刷新允许)" 简化策略, 即
 //       CSR 读 (CSRRS rd, csr, x0 = 读) 不一定要 boundary; 但保险起见统一视为 boundary
 //       (未来真细化时按 csr_addr 分流, 现在统一)
@@ -233,9 +261,10 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
             return 1;
 
-        // ---- a_01_5_c 待加: ----
-        // case OP_ECALL: case OP_EBREAK: case OP_MRET:
-        //     return 1;
+        // ---- a_01_5_c system 3 op (硬边界) ----
+        // ECALL/EBREAK 触发 trap → pc 跳 xtvec; MRET → pc 跳 xepc。都改 pc, 必须块尾。
+        case OP_ECALL: case OP_EBREAK: case OP_MRET:
+            return 1;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
 }

@@ -1,18 +1,16 @@
 //
 // Created by liujilan on 2026/5/4.
-// a_01_5_b trap 模块实现 (架构语义层 + 双 raise 入口)。
+// a_01_5_c trap 模块实现 (架构语义层 + 双 raise 入口接通 sigsetjmp 协议)。
 //
 // 顶部接口 doc 见 trap.h; 跨文件协议见 src/dummy.txt §1。
 //
-// a_01_5_b 阶段范围:
-//   - trap_set_state: 候选 A 早 return + deliver_priv hard-code PRIV_M (a_01_5_b v0)
-//   - trap_raise_exception: 调 trap_set_state + 普通 return (不 _Noreturn, 不 longjmp);
-//                            a_01_5_c 才标 _Noreturn + siglongjmp
+// 阶段演进:
+//   a_01_5_b: trap_set_state 候选 A 早 return; trap_raise_exception 普通 return (不 longjmp)
+//   a_01_5_c: trap_raise_exception 标 _Noreturn + siglongjmp 跳回 dispatcher 落点
 //
-// 未实现 (a_01_5_c 加):
+// 未实现 (留 a_03+):
 //   - 切 priv mode (写 _mstatus.MPP / 当前 hart->priv 等)
 //   - mideleg / medeleg-driven deliver_priv (现在 hard-code PRIV_M)
-//   - sigsetjmp / siglongjmp 协议接通
 //
 
 #include "trap.h"
@@ -20,6 +18,7 @@
 #include "cpu.h"        // cpu_t 完整定义 (trap.h 只 forward, 这里要访问字段)
 #include "riscv.h"      // PRIV_M
 
+#include <setjmp.h>     // siglongjmp (a_01_5_c)
 #include <stdint.h>
 
 
@@ -60,12 +59,13 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
 // ----------------------------------------------------------------------------
 // trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口; 详见 trap.h doc
 //
-// a_01_5_b 形态: 调 trap_set_state + 普通 return; caller goto out 退出 fetch loop,
-//                dispatcher 通过 while(in_trap < 3) 接管退出判断。
-// a_01_5_c 形态: 标 _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1)。
+// a_01_5_c 形态: _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回
+//                dispatcher 入口的一次性 sigsetjmp 落点。caller (interpreter) 内 goto out
+//                变 unreachable 但保留无害。
 // ----------------------------------------------------------------------------
-void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval) {
+_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval) {
     (void)trap_set_state(hart, cause, tval);
-    // a_01_5_c 加: siglongjmp(*hart->jmp_buf_ptr, 1);  /* 不返回 caller */
-    // a_01_5_b 当前: return; caller goto out 接控制流
+    siglongjmp(*hart->jmp_buf_ptr, 1);
+    // unreachable; siglongjmp 不返回。GCC 在 _Noreturn 函数末尾不需要 return 语句, 但若
+    // 漏调 siglongjmp 会触发 -Wreturn-local-addr / 调用方 UB; 此处留空依赖 _Noreturn 标识。
 }

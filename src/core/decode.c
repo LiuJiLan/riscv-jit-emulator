@@ -255,12 +255,33 @@ decoded_inst_t decode(uint32_t inst) {
                 case 6: d.kind = OP_CSRRSI; break;
                 case 7: d.kind = OP_CSRRCI; break;
                 case 0:
+                    // funct3=000 system 类: 由 imm[11:0] = inst[31:20] 进一步区分
+                    //   imm = 0x000 → ECALL
+                    //   imm = 0x001 → EBREAK
+                    //   imm = 0x302 → MRET
+                    //   其他 (SRET=0x102 / WFI=0x105 / SFENCE.VMA / ...) → OP_UNSUPPORTED, a_01
+                    //   不做 (S-mode / 中断 / TLB sfence 真做时再加 op_kind + case)
+                    switch ((uint32_t)d.imm) {
+                        case 0x000:
+                            d.kind    = OP_ECALL;
+                            d.pc_step = PC_STEP_NONE;   /* trap 跳 xtvec, 不让 fetch loop 末 += 4 */
+                            break;
+                        case 0x001:
+                            d.kind    = OP_EBREAK;
+                            d.pc_step = PC_STEP_NONE;
+                            break;
+                        case 0x302:
+                            d.kind    = OP_MRET;
+                            d.pc_step = PC_STEP_NONE;   /* MRET 写 pc=xepc, 不让 fetch loop +4 */
+                            break;
+                        default:
+                            d.kind = OP_UNSUPPORTED;
+                            break;
+                    }
+                    break;
                 case 4:
                 default:
-                    // funct3=000: ECALL / EBREAK / MRET / ... a_01_5_c 加; 现在 OP_UNSUPPORTED
                     // funct3=100: reserved by RV spec; OP_UNSUPPORTED
-                    // d.kind 默认已 OP_UNSUPPORTED, 但此处 d.imm 已被改成 csr 12-bit 形态,
-                    // 不影响 unsupp 路径 (interpreter goto out 不读 d.imm)
                     d.kind = OP_UNSUPPORTED;
                     break;
             }

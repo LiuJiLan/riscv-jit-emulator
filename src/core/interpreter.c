@@ -12,6 +12,7 @@
 #include "cpu.h"
 #include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
 #include "decode.h"
+#include "riscv.h"      // PRIV_M (a_01_5_c MRET 读 hart->trap.xepc[PRIV_M])
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception 真 helper (a_01_5_b; 替换 a_01_4 的 file-static 占位)
 
@@ -224,6 +225,41 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             case OP_CSRRCI:
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
                                        CSR_OP_RC, d.raw_inst));
+                break;
+
+            // ---- I-type SYSTEM (ECALL / EBREAK / MRET) ---- a_01_5_c
+            //
+            // ECALL: 触发 environment-call trap, cause 按 priv 分流 (RV spec table 3.6):
+            //          priv U → cause 8, priv S → cause 9, priv M → cause 11
+            //          有意写成 (8 + hart->priv) 公式 — RV 编码巧合: PRIV_U=0, PRIV_S=1,
+            //          PRIV_M=3 与 cause 8/9/11 差 8。a_01 hart->priv 永远 PRIV_M (= 3),
+            //          所以实际值 = 11。Spike/QEMU 同做法。
+            //          tval = 0 (RV spec §3.1.17: ECALL/EBREAK 的 mtval write 0)。
+            //
+            // EBREAK: cause 3 (breakpoint, RV spec); 不分 priv。tval 一般 = 0
+            //          (实现 debug 子集时可填触发 PC, 项目当前 = 0)。
+            //
+            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径的反操作:
+            //          - hart->trap.in_trap = 0  (复位嵌套链, 跟 mret 语义"trap 完成"对齐;
+            //                                      不是 in_trap-- 模拟"退一层"; mret 整体重置)
+            //          - hart->regs[0] = hart->trap.xepc[PRIV_M]  (从 mepc 恢复 PC)
+            //          - TODO a_03+: 切 priv from _mstatus.MPP, 恢复 _mstatus.MIE = MPIE 等
+            //                         (当前 a_01 hart->priv 永远 PRIV_M, _mstatus 字段不重要,
+            //                          注释占位)
+            //          case 末 break (不 goto out): fetch loop 末 += PC_STEP_NONE (=0, NOP),
+            //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
+            //          boundary) → goto out 退出 fetch loop, dispatcher 重派发 from xepc。
+            case OP_ECALL:
+                trap_raise_exception(hart, /*cause*/8u + hart->priv, /*tval*/0u);
+                goto out;
+            case OP_EBREAK:
+                trap_raise_exception(hart, /*cause*/3u, /*tval*/0u);
+                goto out;
+            case OP_MRET:
+                hart->trap.in_trap = 0;
+                hart->regs[0]      = hart->trap.xepc[PRIV_M];
+                // TODO a_03+: 切 priv (hart->priv = (_mstatus >> MPP_SHIFT) & MPP_MASK);
+                //              恢复 mstatus.MIE = mstatus.MPIE; mstatus.MPIE = 1; mstatus.MPP = U
                 break;
 
             // ---- 兜底 ---- (a_01_5_b 接 trap_raise_exception 真路径)

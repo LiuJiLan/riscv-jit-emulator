@@ -1,21 +1,29 @@
 //
 // Created by liujilan on 2026/5/4.
-// a_01_5_a csr 模块实现起步: csr_op 大 helper 框架 + 5 个小 r/w helper (mstatus / mstatush
-//   / mtvec / mepc / mcause / mtval; 后两半边 mstatus/mstatush 共享物理字段 _mstatus)。
+// a_01_5_c csr 模块实现 (csr_op 大 helper + 6 个小 r/w helper 真读写 hart->trap 字段)。
 //
-// 顶部模块文档见 csr.h; 跨文件协议见 src/dummy.txt §1 (sigsetjmp / 大入口 vs 直调辅助函数)。
+// 顶部模块文档见 csr.h; 跨文件协议见 src/dummy.txt §1。
 //
-// a_01_5_a 阶段范围:
-//   - 不依赖 hart->trap.* 字段 (a_01_5_b 才加 trap_csrs_t 内嵌 cpu_t)
-//   - 小 r/w helper 全部是 fprintf 占位 + 返回 0 (read) / fprintf 参数 (write); a_01_5_b
-//     改成真读写 hart->trap 的对应字段 (xcause / xtval / xepc / xtvec[PRIV_M], _mstatus 半边)
-//   - csr_op 入口的 priv / RO 检查路径用注释占位 (trap_raise_exception 还没真接 longjmp,
-//     a_01_5_c 才接); 当前 fixture 不构造非法 csr 访问, 这条路径不会被触发
-//   - 不存在的 csr addr 走 default 路径, 现在用 fprintf + 返回 0; a_01_5_c 改 trap
+// 演进:
+//   a_01_5_a: csr_op 框架 + 6 小 helper fprintf 占位 (read 返 0, write 仅 fprintf)
+//   a_01_5_c: 6 小 helper 改真读写 hart->trap 的对应字段; 删 fprintf; 大 switch 不变
+//
+// csr 编号 → trap_csrs_t 字段映射:
+//   mstatus  (0x300) → _mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
+//   mstatush (0x310) → _mstatus 高 32 位 (RV32-only csr 入口)
+//   mtvec    (0x305) → xtvec[PRIV_M]; write WARL mask 低 2 位 (项目不实现 Vectored, 强制 Direct)
+//   mepc     (0x341) → xepc[PRIV_M];  write WARL mask 低 IALIGN_MASK 位 (RV spec mepc[0]=0
+//                       when IALIGN=16; mepc[1:0]=0 when IALIGN=32)
+//   mcause   (0x342) → xcause[PRIV_M]
+//   mtval    (0x343) → xtval[PRIV_M]
+//
+// csr_op 入口的 priv / RO 检查路径仍是注释占位 (fixture 不构造非法访问, a_01_5_b 起
+//   trap_raise_exception 已可调用, 但当前未真接到入口判路径; 真接见下方 csr_op 注释段)。
 //
 
 #include "csr.h"
 
+#include "config.h"     // IALIGN_MASK
 #include "cpu.h"
 #include "riscv.h"
 
@@ -23,121 +31,134 @@
 #include <stdint.h>
 #include <stdio.h>
 
+
 // ============================================================================
 // 小 r/w helper —— 每个 csr 一对, file-static, csr_op 大 switch 调用
 //
-// a_01_5_a: 全部 fprintf 占位 + read 返 0 / write fprintf 参数。设计保留接口形态稳定,
-// a_01_5_b 改实现 (内部读写 hart->trap 的对应字段) 时不动 csr_op 大 switch 的调用现场。
+// a_01_5_c 真接 hart->trap 字段。
+// 命名规则 (与 trap.h 一致):
+//   - mstatus / mstatush 操作 _mstatus (uint64_t) 的低/高 半边
+//   - mtvec / mepc / mcause / mtval 操作 xxx[PRIV_M] (priv-indexed, x 前缀)
 // ============================================================================
 
 // ---- mstatus 半边 (mstatus 物理 64 位, mstatus = 低 32, mstatush = 高 32) ----
 //
-// a_01_5_b 真接 hart->trap._mstatus (uint64_t) 后, read 取低/高 32 位, write 通过 mask
-// 改半边保留另半边。当前占位:
+// read 取对应半边; write 通过 mask 改半边保留另半边。
+// sstatus 是 _mstatus 的 masked view, a_01_5_c 不实现 (S-mode 真做时加 csr_sstatus_*)。
+
 static uint32_t csr_mstatus_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mstatus -> 0\n");
-    return 0;
+    return (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 }
 
 static void csr_mstatus_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mstatus = 0x%08" PRIx32 "\n", v);
+    // 低 32 位换成 v, 高 32 位保留。
+    // RV spec mstatus 字段 WARL: MIE/MPIE/MPP 等是合法位, 当前 a_01 全部接受不截断
+    // (a_03 真做中断时按 spec 加 WARL 截断: e.g. MPP 写非法 priv 编码时落到合法值)。
+    hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+                        | (uint64_t)v;
 }
 
 static uint32_t csr_mstatush_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mstatush -> 0\n");
-    return 0;
+    return (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu);
 }
 
 static void csr_mstatush_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mstatush = 0x%08" PRIx32 "\n", v);
+    // 高 32 位换成 v, 低 32 位保留。
+    // mstatush 字段 (SBE / MBE 等) a_01 全部 0, 不真触发 endian 切换。
+    hart->trap._mstatus = (hart->trap._mstatus & 0x00000000FFFFFFFFULL)
+                        | ((uint64_t)v << 32);
 }
 
-// ---- mtvec / mepc / mcause / mtval (a_01_5_b 后映射到 hart->trap.xtvec[PRIV_M] 等) ----
+// ---- mtvec / mepc / mcause / mtval (映射到 hart->trap.{xtvec,xepc,xcause,xtval}[PRIV_M]) ----
 
 static uint32_t csr_mtvec_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mtvec -> 0\n");
-    return 0;
+    return hart->trap.xtvec[PRIV_M];
 }
 
 static void csr_mtvec_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mtvec = 0x%08" PRIx32 "\n", v);
+    // WARL 截断 MODE 位 (项目不实现 Vectored, 强制 Direct):
+    //   - mtvec[1:0] = MODE: 00 = Direct (全部 trap 跳 BASE; 项目支持)
+    //                         01 = Vectored (async/interrupt 跳 BASE+4*cause; 项目不支持)
+    //                         10/11 = reserved by RV spec
+    //   - mtvec[31:2] = BASE
+    // RV spec WARL 允许实现"不支持的 MODE 写入 → 落到合法值"; 我们选 mask 低 2 位为 0
+    // (即 MODE 永远存 00 = Direct), 跟 trap_set_state 内 hart->regs[0] = xtvec[deliver_priv]
+    // 直接赋值 (不算 BASE+4*cause) 一致。
+    // 未来 a_03 真做中断时, 解开本 mask 接受 MODE; trap_set_state 按 cause 分流 (sync 跳 BASE,
+    // async 跳 BASE + 4*cause)。
+    hart->trap.xtvec[PRIV_M] = v & ~0x3u;
 }
 
 static uint32_t csr_mepc_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mepc -> 0\n");
-    return 0;
+    return hart->trap.xepc[PRIV_M];
 }
 
 static void csr_mepc_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mepc = 0x%08" PRIx32 "\n", v);
+    // WARL 截断 IALIGN 对齐位:
+    //   - IALIGN=16 (项目当前): mepc[0] = 0 (低 1 位强制 0)
+    //   - IALIGN=32: mepc[1:0] = 0 (低 2 位强制 0)
+    // config.h IALIGN_MASK = IALIGN_BYTES - 1 (= 1 当 IALIGN=16; = 3 当 IALIGN=32),
+    // & ~IALIGN_MASK 即"截断到 IALIGN 对齐"。
+    // RV spec §3.1.15 mepc: "the low bit of mepc (mepc[0]) is always zero. ... If an
+    // implementation supports only IALIGN=32, then the two low bits (mepc[1:0]) are always
+    // zero." 我们按 config.h 编译期 IALIGN 配置自动适配。
+    hart->trap.xepc[PRIV_M] = v & ~IALIGN_MASK;
 }
 
 static uint32_t csr_mcause_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mcause -> 0\n");
-    return 0;
+    return hart->trap.xcause[PRIV_M];
 }
 
 static void csr_mcause_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mcause = 0x%08" PRIx32 "\n", v);
+    // mcause 字段: bit[31] = Interrupt (1) vs Exception (0); bit[30:0] = Exception/Interrupt code。
+    // RV spec §3.1.16 没强制 WARL (除了 MSB; "implementations may further restrict"), 我们当前
+    // 接受全 32 位写入。a_01 fixture 一般也不直接写 mcause (handler 只读, trap_set_state 写)。
+    hart->trap.xcause[PRIV_M] = v;
 }
 
 static uint32_t csr_mtval_read(cpu_t *hart) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] read mtval -> 0\n");
-    return 0;
+    return hart->trap.xtval[PRIV_M];
 }
 
 static void csr_mtval_write(cpu_t *hart, uint32_t v) {
-    (void)hart;
-    fprintf(stderr, "[csr_a stub] write mtval = 0x%08" PRIx32 "\n", v);
+    // mtval RV spec §3.1.17 没强制 WARL, 接受任意值。
+    hart->trap.xtval[PRIV_M] = v;
 }
 
+
 // ============================================================================
-// csr_op —— 大 helper, decode 分发入口
+// csr_op —— 大 helper, decode 分发入口 (与 a_01_5_a 形态相同, 不动)
 // ============================================================================
 
 uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
                 csr_op_t op, uint32_t raw_inst) {
-    (void)raw_inst;     // a_01_5_a 不真调 trap_raise_exception, 参数透传留 a_01_5_b 激活
+    (void)raw_inst;     // a_01_5_c 入口判 priv/RO 仍是注释占位; 参数透传留未来真激活
 
     // ----------------------------------------------------------------------------
     // 入口判: priv 要求 + RO 写检查 (csr 编号自带权限位段, riscv.h CSR_ADDR_PRIV_*)
     //
-    // a_01_5_a 注释占位; a_01_5_b cpu_t 加 trap_csrs_t + helper 真路径后激活:
+    // 注释占位 (fixture 不构造非法 csr 访问, 跳过这两条检查):
     //
     //   uint32_t required_priv = (csr_addr >> CSR_ADDR_PRIV_SHIFT) & CSR_ADDR_PRIV_MASK;
     //   if (hart->priv < required_priv) {
-    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // 不返回 (longjmp)
+    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn longjmp
     //   }
     //
     //   uint32_t is_ro = ((csr_addr >> CSR_ADDR_RO_SHIFT) & CSR_ADDR_RO_MASK) == CSR_ADDR_RO_VALUE;
-    //   // RV spec §2.1.2: CSRRS/RC/RSI/RCI + new_val=0 不视为写 (副作用不发生);
-    //   //                  CSRRW/RWI 总是写 (rs1=x0 / zimm=0 时也写)
     //   uint32_t is_write = (op == CSR_OP_RW) || (new_val != 0);
     //   if (is_ro && is_write) {
-    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // 不返回 (longjmp)
+    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn longjmp
     //   }
     //
-    // a_01_5_a 阶段假设 fixture 不构造非法 csr 访问, 跳过这两条检查; helper 真接 longjmp
-    // 后这条入口判会比小 helper 调用先触发 trap, 路径切换。
+    // 真用到 (例如 fixture 写 mhartid 这种 RO csr) 时解开。
     // ----------------------------------------------------------------------------
 
     // ----------------------------------------------------------------------------
     // 大 switch: 按 csr_addr 分发到具体 csr 的小 r/w helper, 算 read_old + write_back。
     //
     // 加新 csr 时只在这里加 case + 写一对 csr_<name>_<r/w> file-static helper (上方)。
-    // 不存在的 csr addr 走 default → fprintf 占位 (a_01_5_a) / a_01_5_b 改
-    // trap_raise_exception(2, raw_inst)。
+    // 不存在的 csr addr 走 default → 当前 fprintf + 返回 0 (一时占位, 真用 trap 还没接);
+    // 未来某个 fixture 写不存在的 csr 时, 解开 trap_raise_exception(2, raw_inst)。
     // ----------------------------------------------------------------------------
     uint32_t read_old;
     switch (csr_addr) {
@@ -148,10 +169,10 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
         default:
-            // a_01_5_a 占位: fprintf + 返回 0; a_01_5_b 改:
-            //   trap_raise_exception(hart, /*cause*/2, raw_inst);  // 不返回
+            // 占位: fprintf + 返回 0; 未来真用 trap 时换成:
+            //   trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn
             fprintf(stderr,
-                    "[csr_a stub] unknown csr addr=0x%03" PRIx32 " (a_01_5_b: trap cause 2)\n",
+                    "[csr] unknown csr addr=0x%03" PRIx32 " (would trap cause 2)\n",
                     csr_addr);
             return 0;
     }
@@ -165,9 +186,7 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
     }
 
     // RV spec §2.1.2: RS/RC + new_val=0 不写 (副作用不发生)。RW 总是写。
-    // 对 csr_<name>_write 而言, 写 read_old 等价 NO-OP, 但有 fprintf 副作用 (a_01_5_a 占位
-    // 期间会多一行 stderr); 真路径下这条优化是为了 RO csr 不误触发 RO-write trap (上面
-    // 入口判已经过了, 这里也不再触发, 但保持 RV 语义最严)。
+    // 这条同时为 RO csr 提供保护 (RS/RC + 0 不触发"写 RO" trap; 当然入口判已经放过了)。
     int do_write = (op == CSR_OP_RW) || (new_val != 0);
     if (do_write) {
         switch (csr_addr) {

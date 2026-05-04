@@ -31,36 +31,36 @@
 //
 // III. 迭代头 perf 同步 / mtime 推进 / 中断检查 (a_03 真接入)
 //
-// a_01_5_b 当前形态: while(hart->trap.in_trap < 3) 多块循环。
-//   - sigsetjmp 仍不调 (helper 还不长跳, 等 a_01_5_c 加 _Noreturn 真激活)
-//   - 退出条件: hart->trap.in_trap >= 3 (triple fault, 项目内部停机协议; 见 dummy.txt §1)
-//     trap_set_state 内部 in_trap >= 3 时早 return 不 deliver (候选 A); main 端拿回控制后
-//     fprintf 表 halt + 未来 reset 接入。这是项目当前的"标准停机机制", 直到未来 MMIO
-//     bus / sifive_test 起来后改 MMIO finisher 路径。
-//   - mmu_translate_pc 改造后 (a_01_5_b): rc != 0 → continue (trap_set_state 已设字段 +
-//     regs[0]=xtvec, while 条件接管)。a_01_4 的 fetch fprintf + return 1 路径删除。
-//   - count==0 break 删除: a_01_4 该路径用于 ecall→OP_UNSUPPORTED→silent halt;
-//     a_01_5_b 起 OP_UNSUPPORTED 改 trap_raise_exception, count 永远 > 0 不再走 break。
-//
-// 完整形态 (a_01_5_c 后):
-//   sigsetjmp(*hart->jmp_buf_ptr, 1);   /* 一次性, while 外, 见 dummy.txt §1 */
-//   while (hart->trap.in_trap < 3) {
-//       /* perf_advance / mtime 推进 / 中断检查 (a_03) */
-//       /* block 1 + 2 + 3 */
-//   }
+// a_01_5_c 当前形态: sigsetjmp 一次性 + while(hart->trap.in_trap < 3) 多块循环。
+//   - sigsetjmp(*hart->jmp_buf_ptr, 1) 在 dispatcher 入口一次性建立永久落点 (见 dummy.txt §1
+//     机制 (1) "为什么 sigsetjmp 在 while 外"段)。落点同时承接两种路径:
+//       (i)  初次进入 dispatcher (sigsetjmp 返回 0, 顺序到 while 顶判条件)
+//       (ii) helper longjmp 跳来 (siglongjmp 返回非 0, 控制流到 sigsetjmp 落点, 顺序到
+//            while 顶重新判 in_trap; trap_set_state 内已设 hart->regs[0]=xtvec, 自然
+//            从 trap handler 继续)
+//     sigsetjmp 返回值不被分流 — longjmp 不携带"trap 错误"语义, 只是无条件控制流原语。
+//   - 退出条件: hart->trap.in_trap >= 3 (triple fault, 项目内部停机协议)。
+//     trap_set_state 内 in_trap >= 3 时早 return 不 deliver (候选 A); main 端拿回控制后
+//     fprintf 表 halt + 未来 reset 接入。
+//   - mmu_translate_pc 路径 (dummy.txt §1 路径 C, 不长跳): rc != 0 → continue, 让 while
+//     条件接管。
+//   - total_count 必须 volatile (跨 longjmp 不被编译器放 callee-saved 寄存器丢值, 见
+//     dummy.txt §1 末段)。声明 + 初始化要在 sigsetjmp 调用之前, 否则 longjmp 跳回时会
+//     重新执行初始化, 累计丢失。
 // ============================================================================
 
 
 int dispatcher(cpu_t *hart) {
     // sigsetjmp / siglongjmp 协议见 src/dummy.txt §1。
-    // a_01_5_b: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
-    //           (helper 还不 longjmp; a_01_5_c 加 _Noreturn 真激活时 sigsetjmp 一次性
-    //            放 while 外)。实体在 dispatcher 栈帧上 (cpu_t 只持指针, 见 dummy.txt §1)。
     sigjmp_buf dispatch_env;
     hart->jmp_buf_ptr = &dispatch_env;
 
-    uint32_t total_count = 0;     // 累加 local_count, halted 时一并报告
-                                   // (a_01_5_c 加 sigsetjmp 后改 volatile, 见 dummy.txt §1 末段)
+    // total_count: 跨 longjmp 累加, volatile 强制放栈 (dummy.txt §1 末段); 必须在 sigsetjmp
+    // 之前声明 + 初始化, 否则 longjmp 跳回时重新执行初始化, 累计丢失。
+    volatile uint32_t total_count = 0;
+
+    // 一次性 sigsetjmp 建立永久落点; 返回值不分流 (dummy.txt §1 机制 (3) "dispatcher 视角"段)。
+    sigsetjmp(*hart->jmp_buf_ptr, 1);
 
     while (hart->trap.in_trap < 3) {
 

@@ -31,11 +31,10 @@
 //     in_trap++ 后返回。返回 in_trap 当前值, 给 mmu_translate_pc 那种 caller 用作 0/非0
 //     状态传给 dispatcher (省一次读 hart->trap.in_trap)。
 //
-//   trap_raise_exception(hart, cause, tval) -> void
-//     a_01_5_b: 内部调 trap_set_state, 普通 return; caller (interpreter) goto out 退出
-//                fetch loop, dispatcher 通过 while(in_trap<3) 接管退出判断
-//     a_01_5_c: 标 _Noreturn, 内部 trap_set_state + siglongjmp; caller goto out 变 dead
-//                但保留无害
+//   trap_raise_exception(hart, cause, tval) -> _Noreturn (a_01_5_c 起)
+//     内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
+//     一次性 sigsetjmp 落点。caller (interpreter) 内 goto out 变 unreachable 但保留无害
+//     (GCC -Wunreachable-code 默认 disabled, 不警告)。
 //
 
 #ifndef CORE_TRAP_H
@@ -124,17 +123,16 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval);
 
 
 // ----------------------------------------------------------------------------
-// trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口
+// trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口 (a_01_5_c 起 _Noreturn)
 //
 // 调用方: interpreter case (OP_UNSUPPORTED / WRITE_PC_OR_TRAP 内 misalign / csr 权限失败
 // 等), 未来 JIT translator emit 出来的 host code 同样接本 helper。
 //
-// a_01_5_b 形态: 内部调 trap_set_state, 普通 return; caller goto out 退出 fetch loop,
-//                dispatcher 通过 while(in_trap < 3) 接管退出判断 (不依赖 longjmp)。
-// a_01_5_c 形态: 标 _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1);
-//                caller 内 goto out 变 dead 但保留无害。
+// a_01_5_c 形态: _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回
+//                dispatcher 入口的一次性 sigsetjmp 落点。caller 内 goto out 变 unreachable
+//                但保留无害 (GCC -Wunreachable-code 默认 disabled, 不警告)。
 //
-// 接口形态稳定, 切 a_01_5_c 时 caller 不动。
-void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval);
+// 接口形态稳定, caller 不动。
+_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval);
 
 #endif //CORE_TRAP_H
