@@ -279,6 +279,12 @@ int main(int argc, char **argv) {
     // 注: regs 已被 memset 0; 以上两行显式赋值是 boot protocol 文档化, 等价于 memset 后的现状。
     //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
 
+    // a_01_5_b: 手动设 mtvec 指向 fixture 内 trap handler 的起点。a_01_5_c csr.c 真接 csr
+    //           读写后, fixture 自己用 csrw mtvec, x.. 设, main.c 这条移除。
+    //           跟 a_01_5_b/c fixture 协议: handler 起点 = GUEST_RAM_START + 0x10 (即 main
+    //           程序前 16 字节是主程序, 其后是 handler 起点)。当前 02_trap_arch_basic 遵守此约定。
+    hart->trap.xtvec[PRIV_M] = GUEST_RAM_START + 0x10u;
+
     // ------------------------------------------------------------------------
     // a_01_4: 跑 fixture, dispatcher 进 while(1) 多块循环, 每块调 interpret_one_block;
     // branch/jal/jalr 命中 is_block_boundary_inst 后退出 fetch loop, dispatcher 累加
@@ -307,6 +313,16 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n",
             hart->regs[0], hart->regs[1], hart->regs[2], hart->regs[3]);
+
+    // a_01_5_b: trap dump (验 trap_set_state 写字段对; 候选 A 早 return 行为下,
+    // in_trap=3 时字段保留第 2 次状态作 root cause)。a_01 单 hart, 只 dump [PRIV_M] 槽
+    // (a_01_5 v0 deliver_priv hard-code M; S 槽永远 0)。
+    // 未来 reset 接入时, 这里换成"halt 原因分流 + reset hart" 的逻辑。
+    fprintf(stderr,
+            "[main] trap dump: in_trap=%u mcause=%u mtval=0x%08x mepc=0x%08x mtvec=0x%08x\n",
+            hart->trap.in_trap,
+            hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
+            hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
 
     cpu_destroy(hart);
     return 0;

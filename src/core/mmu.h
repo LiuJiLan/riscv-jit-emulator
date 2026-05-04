@@ -52,44 +52,54 @@
 //     这种 ISA 下 U 直接走 BARE。当前 a_01 默认 MSU 三态, 不实现这条分支。
 //
 // ============================================================================
-// 错误模型 —— mmu_translate_pc 和 mmu_walker_* 走两条不同路径
+// 错误模型 —— mmu_translate_pc 和 mmu_walker_* 都对接 trap, 但路径不同
 // ============================================================================
 //
-// (1) mmu_translate_pc (本文件唯一对外接口, dispatcher 直接调):
-//     失败时 return 值 = RV cause code (Privileged Spec, table 3.6):
+// 跨文件协议见 src/dummy.txt §1 (sigsetjmp / 大入口 vs 直调辅助函数)。两条路径:
+//
+// (1) mmu_translate_pc (本文件唯一对外接口, dispatcher 直接调; dummy.txt §1 路径 2b):
+//     失败时**内部直调 trap_set_state(hart, cause, tval)** 设架构状态 (写 xcause/xtval/xepc/
+//     regs[0]=xtvec[deliver_priv]), 不长跳 (调用栈浅, 直接 return 给 dispatcher 接管即可)。
+//     return 值仅是 0/非0 的状态信号:
+//       0  = fetch OK, pa_out / hva_out 已填, dispatcher 进 block 3
+//       非0 = trap 已 deliver, dispatcher continue 让 while(in_trap < 3) 接管退出判断
+//     fetch 失败的 cause 集 (mmu_translate_pc 内部填给 trap_set_state):
 //       1  = Instruction Access Fault   (PA 落在不可执行物理区域: MMIO / 不存在内存 / PMP 拒绝)
 //       12 = Instruction Page Fault     (Sv32 walker 翻译失败: PTE 无效 / X 位 / U 位等)
-//     dispatcher 看 return 值, 自己调 trap_raise(hart, cause) 走 trap 路径; mmu 不 longjmp。
+//     tval = 触发 fault 的 GVA = hart->regs[0] (a_01_5_b 起 mmu 自己填, dispatcher 不再填)。
 //
-// (2) mmu_walker_load/store/amo (a01_3+ 接入, JIT block / interpreter 调):
-//     失败时不通过 return 值报 cause —— 直接调 trap_raise helper, helper 内部
-//     setup CSRs + siglongjmp 到 dispatcher 的 sigsetjmp landing。调用方 (jit/interp) 不
-//     会真拿到 return 值, longjmp 已经跳走。
-//     这一族的 cause 集 (在调 trap_raise 时由调用方传入):
+// (2) mmu_walker_load/store/amo (a_01_6+ 接入, JIT block / interpreter 调; dummy.txt §1 路径 2a):
+//     失败时调 **trap_raise_exception** (含长跳); helper 内部 trap_set_state + siglongjmp 到
+//     dispatcher 的 sigsetjmp landing (a_01_5_c 起真接通)。调用方 (jit/interp) 不会真拿到
+//     return 值 (longjmp 已跳走)。
+//     这一族的 cause 集 (调 trap_raise_exception 时由调用方传入):
 //       5  = Load Access Fault          (load: PA 落在不可访问区域 / PMP)
 //       7  = Store/AMO Access Fault     (store/amo: PA 落在不可写区域)
 //       13 = Load Page Fault
 //       15 = Store/AMO Page Fault
 //
-// 为什么两条路径不同: mmu_translate_pc 调用栈浅 (dispatcher 直接调, 1 层), 能优雅 return;
-// mmu_walker_* 在 jit block 深栈, 没法 return, 必须 longjmp。
+// 两条路径调用同一个 trap_set_state 内核 (dummy.txt §1 (2)), 区别只是"控制流如何回到
+// dispatcher": mmu_translate_pc 直接 return + continue, mmu_walker_* 经 longjmp。
 //
 // ============================================================================
-// trap_raise helper 职责 (a_03 trap.c 接入; 当前仅设计意图)
+// trap helper 职责 (a_01_5_b 实接, trap.c)
 // ============================================================================
 //
-// trap_raise(hart, cause) 内部:
-//   - 不决定 cause —— cause 由调用方传入 (mmu_walker_*, csr 写 helper, ecall, 等)
-//   - 选择写哪一组 trap CSR (m{cause/tval/epc/tvec} 还是 s{cause/tval/epc/tvec})
-//     由 priv 等级 + medeleg / sedeleg + 未来 H 扩展的 V 位决定
-//   - 写 *cause = cause; *tval = hart->regs[0] (= GVA = 触发 fault 的 PC); *epc = hart->regs[0]
-//   - push priv (mstatus.MPP / sstatus.SPP / mstatus.MIE/MPIE 等)
-//   - 设 hart->regs[0] = *tvec
-//   - siglongjmp 到 dispatcher sigsetjmp landing
+// trap.h 暴露两层 helper:
 //
-// (mmu_translate_pc 不调 trap_raise, 它只 return cause; dispatcher 拿到 return 值后
-//  自己调 trap_raise(hart, cause) 走相同的"setup CSR + longjmp"逻辑。这两路最终汇在
-//  dispatcher 的 sigsetjmp landing 重入下一轮迭代。)
+//   trap_set_state(hart, cause, tval) —— 架构语义层 (不长跳)
+//     in_trap++; >= 3 早 return (候选 A: 不 deliver, 字段保留第二次状态作 root cause)
+//     否则: 选 deliver_priv (a_01_5_b v0 = PRIV_M; 未来 mideleg/medeleg-driven)
+//           写 xcause/xtval/xepc[deliver_priv]; regs[0] = xtvec[deliver_priv]; (TODO: 切 priv)
+//     返回 in_trap 当前值 (mmu_translate_pc 透传给 dispatcher 当 0/非0 状态信号)。
+//
+//   trap_raise_exception(hart, cause, tval) —— interpreter / JIT 长跳入口
+//     a_01_5_b: 调 trap_set_state + 普通 return (caller goto out)
+//     a_01_5_c: 标 _Noreturn, 调 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1)
+//
+// mmu_translate_pc 调路径 (1) trap_set_state, dispatcher 通过 return rc 接管;
+// mmu_walker_* / interpreter case 调路径 (2) trap_raise_exception, 经 longjmp 跳回 dispatcher
+// (a_01_5_c 起真激活)。两路最终都靠 dispatcher 的 while(in_trap < 3) 退出判断。
 //
 // ============================================================================
 // PA 落 MMIO 时的行为差异
@@ -173,50 +183,31 @@ typedef enum {
 //   pa_out      — 出参; 成功时填 PA (供 dispatcher 查 jit_cache)
 //   hva_out     — 出参; 成功时填 HVA (供 dispatcher 传 interp_one_block, 解释器直接取字节)
 //
-// 返回值 (RV cause code):
-//   0  = OK,  pa_out / hva_out 已填
-//   1  = Instruction Access Fault — PA 落不可执行物理区 (MMIO / 不存在内存 / 未来 PMP 拒绝)
-//   12 = Instruction Page Fault   — Sv32 walker 翻译失败 (a_01 不会触发, 接口预留)
+// 返回值 (a_01_5_b 起改成 0/非0 状态, 不再返回 cause):
+//   0   = OK,  pa_out / hva_out 已填, dispatcher 进 block 3
+//   非0 = trap 已 deliver (内部已调 trap_set_state 写 xcause/xtval/xepc/regs[0]=xtvec),
+//          dispatcher continue 让 while(in_trap < 3) 接管退出判断
 //
-// 失败时不填 pa_out / hva_out。失败原因 mtval 应该是触发 fault 的 GVA = hart->regs[0],
-// 由 dispatcher 自己填 (mmu 不知道 cpu_t 里 mtval 字段在哪)。
+// 失败时不填 pa_out / hva_out (不需要, dispatcher continue 跳过本轮 block; 下一轮 fetch
+// 从 xtvec 开始)。
+//
+// 不再需要 dispatcher 自己填 mtval — mmu_translate_pc 自己调 trap_set_state 时已经填好
+// (cause/tval/epc/regs[0] 都设)。
 //
 // ============================================================================
-// dispatcher 的预期使用形态 (示意; 简化形态见 dispatcher.c)
+// dispatcher 的预期使用形态 (a_01_5_b 实际形态, 见 dispatcher.c)
 // ============================================================================
 //
-//   /* dispatcher block 1: 算 (regime, current_tlb) 派发包 (D25 后下游只吃 current_tlb;
-//      D25.1 修订后 dispatcher 内部仍持 regime 本地变量) */
-//   regime_t regime;
-//   tlb_t   *current_tlb;
-//   if (hart->priv == PRIV_M || (hart->satp >> 31) == 0) {
-//       regime      = REGIME_BARE;
-//       current_tlb = NULL;        /* Trust regime: bypass TLB */
-//   } else {
-//       regime      = REGIME_SV32;
-//       uint32_t asid = (hart->satp >> 22) & ASID_MASK;
-//       current_tlb = hart->tlb_table[hart->priv][asid];
-//       /* future lazy alloc here */
-//   }
+//   while (hart->trap.in_trap < 3) {
+//       /* block 1: regime / current_tlb */
+//       ...
+//       int rc = mmu_translate_pc(hart, current_tlb, &pa, &hva);
+//       if (rc != 0) continue;     /* trap 已 deliver, regs[0] 已是 xtvec, continue */
 //
-//   uint32_t pa;
-//   uint8_t *hva;
-//   int cause = mmu_translate_pc(hart, current_tlb, &pa, &hva);  /* 只 pass current_tlb */
-//   if (cause != 0) {
-//       /* 未来 cpu_t 加 in_trap 字段后 (仅注释):    */
-//       /* if (hart->in_trap) { fprintf("Double Fault"); exit(2); }     */
-//       /* hart->in_trap = 1;                                            */
-//       /* trap_raise(hart, cause); 内部:                                */
-//       /*   - 选 m/s 那组 cause/tval/epc/tvec CSR (priv + medeleg/sedeleg) */
-//       /*   - 写 *cause = cause; *tval = hart->regs[0]; *epc = hart->regs[0] */
-//       /*   - push priv; 设 hart->regs[0] = *tvec                       */
-//       continue;  /* 回 dispatcher loop top, sigsetjmp 重落 */
+//       /* block 3: interpret / JIT */
+//       interpret_one_block(hart, current_tlb, hva, &local_count);
 //   }
-//   /* OK: dispatcher 把 pa 用于 jit_cache 查找; hva 传给 interp / JIT 块 */
-//
-// 注: cpu_t 当前没有 in_trap / mcause / mtval / mepc / mtvec / mstatus / scause / stval /
-//     sepc / stvec / medeleg / sedeleg / sstatus 等字段 —— 这些 a_03 trap.c 接入 + a01_5
-//     dispatcher 真激活时一并加。 全部仅注释示意, 不真改 cpu_t。
+//   /* dispatcher 退出: in_trap == 3, main 端 fprintf 表 halt + 未来 reset */
 //
 // ----------------------------------------------------------------------------
 int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,

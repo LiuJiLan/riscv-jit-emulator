@@ -13,44 +13,10 @@
 #include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
 #include "decode.h"
 #include "tlb.h"
+#include "trap.h"       // trap_raise_exception 真 helper (a_01_5_b; 替换 a_01_4 的 file-static 占位)
 
-#include <inttypes.h>   // PRIx32 for trap_raise_exception fprintf
 #include <stdint.h>
-#include <stdio.h>      // fprintf for trap_raise_exception 占位
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing
-
-// ----------------------------------------------------------------------------
-// trap_raise_exception —— 同步异常入口 (a_01_4 临时形态, 解释器 + 未来 JIT 共用)
-//
-// 接口契约:
-//   - mepc 隐式 = hart->regs[0] (= 触发指令的 PC)。caller 必须在调本 helper 前
-//     不动 hart->regs[0] (control flow case 走 WRITE_PC_OR_TRAP 宏满足: 对齐
-//     检查在写 pc 之前; 其它 case 也满足: case 头部触发 trap, 没动过 pc)。
-//   - tval 是 cause-specific:
-//       cause 0  (instruction-address-misaligned): tval = target_pc
-//       cause 2  (illegal instruction):            tval = raw_inst
-//       cause 4/6 (load/store-address-misaligned): tval = effective_address
-//       cause 12/13/15 (page fault):                tval = bad_va
-//   - xtval / xcause / xepc 中 x 是哪个 priv (M / S) 由 helper 内部根据 mideleg /
-//     medeleg 决定, caller 不需要知道 (这个分流在 a_01_5 真接 trap.c 时落地)。
-//
-// 演进路径:
-//   a_01_4: fprintf 占位 (本 helper); 函数返回, caller 必须 goto out 退出 fetch loop。
-//   a_01_5: trap.c 接入。helper 内部:
-//     (1) 走 mideleg/medeleg 决定 trap deliver 到哪个 priv;
-//     (2) 设 xcause / xtval / xepc, 切 priv mode, 跳 xtvec;
-//     (3) siglongjmp(*hart->jmp_buf_ptr) 跳回 dispatcher 主循环。
-//     helper 不返回, 可以加 _Noreturn 让编译器知道 (caller 内 goto out 变 dead 但
-//     无害; 不强制删除)。
-//   解释器 / JIT 共用 helper 接口形态 (cpu_t*, cause, tval); JIT translator emit
-//   的 host code 在每个 may-trap 点也插入对齐检查 + 调本 helper, 与解释器同模式。
-// ----------------------------------------------------------------------------
-static void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval) {
-    fprintf(stderr,
-            "[trap_raise_exception] cause=%u tval=0x%08" PRIx32
-            " mepc(=hart pc)=0x%08" PRIx32 "  (a_01_4 placeholder)\n",
-            cause, tval, hart->regs[0]);
-}
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint32_t *count_out) {
@@ -260,12 +226,14 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                                        CSR_OP_RC, d.raw_inst));
                 break;
 
-            // ---- 兜底 ----
+            // ---- 兜底 ---- (a_01_5_b 接 trap_raise_exception 真路径)
             case OP_UNSUPPORTED:
-                // 不写 rd, 不 advance pc — pc 停在触发指令上 (RV trap 语义对齐: 真接 trap.c
-                // 后这里改为 trap_raise(2, mtval=d.raw_inst) + longjmp, dispatcher 主循环
-                // 不返回这里; 当前 a01_3 用 break 让 dispatcher 看 count_out 知道 block
-                // 跑了多少条, fixture 末尾 ecall 触发即停)。
+                // RV cause 2 = illegal instruction; tval = raw_inst (RV spec §3.1.16)。
+                // a_01_5_b: helper 内部调 trap_set_state (写 xcause/xtval/xepc, regs[0]=xtvec),
+                //           普通 return; 这里 goto out 退出 fetch loop, dispatcher 通过
+                //           while(in_trap < 3) 接管 (in_trap=3 时退出 dispatcher)。
+                // a_01_5_c: helper 标 _Noreturn longjmp, goto out 变 unreachable 但保留无害。
+                trap_raise_exception(hart, /*cause*/2u, /*tval*/d.raw_inst);
                 goto out;
         }
 

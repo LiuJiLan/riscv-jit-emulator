@@ -8,7 +8,7 @@
 // a_01_5_a 阶段范围:
 //   - 不依赖 hart->trap.* 字段 (a_01_5_b 才加 trap_csrs_t 内嵌 cpu_t)
 //   - 小 r/w helper 全部是 fprintf 占位 + 返回 0 (read) / fprintf 参数 (write); a_01_5_b
-//     改成真读写 hart->trap._xxx
+//     改成真读写 hart->trap 的对应字段 (xcause / xtval / xepc / xtvec[PRIV_M], _mstatus 半边)
 //   - csr_op 入口的 priv / RO 检查路径用注释占位 (trap_raise_exception 还没真接 longjmp,
 //     a_01_5_c 才接); 当前 fixture 不构造非法 csr 访问, 这条路径不会被触发
 //   - 不存在的 csr addr 走 default 路径, 现在用 fprintf + 返回 0; a_01_5_c 改 trap
@@ -27,7 +27,7 @@
 // 小 r/w helper —— 每个 csr 一对, file-static, csr_op 大 switch 调用
 //
 // a_01_5_a: 全部 fprintf 占位 + read 返 0 / write fprintf 参数。设计保留接口形态稳定,
-// a_01_5_b 改实现 (内部读写 hart->trap._xxx) 时不动 csr_op 大 switch 的调用现场。
+// a_01_5_b 改实现 (内部读写 hart->trap 的对应字段) 时不动 csr_op 大 switch 的调用现场。
 // ============================================================================
 
 // ---- mstatus 半边 (mstatus 物理 64 位, mstatus = 低 32, mstatush = 高 32) ----
@@ -56,7 +56,7 @@ static void csr_mstatush_write(cpu_t *hart, uint32_t v) {
     fprintf(stderr, "[csr_a stub] write mstatush = 0x%08" PRIx32 "\n", v);
 }
 
-// ---- mtvec / mepc / mcause / mtval (a_01_5_b 后映射到 hart->trap._tvec[PRIV_M] 等) ----
+// ---- mtvec / mepc / mcause / mtval (a_01_5_b 后映射到 hart->trap.xtvec[PRIV_M] 等) ----
 
 static uint32_t csr_mtvec_read(cpu_t *hart) {
     (void)hart;

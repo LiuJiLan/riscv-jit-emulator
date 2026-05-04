@@ -25,7 +25,7 @@
 // 未来扩展 (a01_2 不含):
 //   - isa/fpu 进来时加 fcsr 指针 (POD 外挂, 不嵌入主结构)
 //   - monitor / 调试需要时加 perf_counters 指针
-//   - trap / CSR 状态字段 (mstatus / mip / mcause / mtval / mepc / mtvec 等)
+//   - csr 状态 (mip / mie / mideleg / medeleg ...) 真接 OS / S-mode 时加
 //
 // 报错风格见 src/dummy.txt §5。
 //
@@ -37,8 +37,14 @@
 #include <stdint.h>
 
 #include "tlb.h"   // tlb_t * 类型 (tlb_table 元素是 tlb_t **)
+#include "trap.h"  // trap_csrs_t 内嵌字段类型 (a_01_5_b 加; trap.h forward decl cpu_t,
+                   // 单向链 trap.h ← cpu.h, 不循环)
 
-typedef struct {
+// struct tag "cpu_s" 是为了让 trap.h 能 forward typedef cpu_t (trap.h helper 签名要 cpu_t*,
+// 但 trap.h 不能 #include cpu.h 形成循环)。tag 名 cpu_s 仅服务 forward decl, 没人直接用
+// "struct cpu_s" 这个写法; 项目代码全用 cpu_t typedef。零运行时成本 (struct 加 tag 不改
+// ABI / 字段布局)。
+typedef struct cpu_s {
     // _Alignas(64) 在第一字段, 强制整个 struct 以 64B (cache line) 对齐。
     // cpu_create 用 aligned_alloc(64, sizeof(cpu_t)) 分配, 与之配套。
     //
@@ -49,6 +55,9 @@ typedef struct {
     uint32_t              satp;             // Sv32 satp; a_01 = 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
+    trap_csrs_t           trap;             // trap-related CSR 镜像 + host trap 流程状态
+                                            // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
+                                            // 见 trap.h 顶部 doc + dummy.txt §1
 } cpu_t;
 
 // 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。

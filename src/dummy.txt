@@ -91,7 +91,7 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
        已经在 block 控制流深处, 退栈到 dispatcher 的清理代价大于直接 longjmp。
        trap_raise_exception 内部:
          a. 调 trap_set_state(hart, cause, tval) 设架构状态
-            (in_trap++; 写 _cause/_tval/_epc; 跳 _tvec)
+            (in_trap++; 写 xcause/xtval/xepc; 跳 xtvec)
          b. siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 的落点
        trap_raise_exception 标 _Noreturn, 不返回 caller。
 
@@ -107,9 +107,9 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
     longjmp(路径 a)还是 普通 return + continue(路径 b)。
 
     [trap_set_state 在 in_trap >= 3 时的行为]
-      早 return, 不写 _cause/_tval/_epc, 不跳 _tvec。理由: 第三次进 trap_
+      早 return, 不写 xcause/xtval/xepc, 不跳 xtvec。理由: 第三次进 trap_
       set_state 已经是"硬件 reset 信号", 字段保留第二次的状态作为 root cause
-      给 main 端 fprintf 看, 比覆盖成第三次的"_tvec 死循环造成的"信息更有用。
+      给 main 端 fprintf 看, 比覆盖成第三次的"xtvec 死循环造成的"信息更有用。
 
 (3) 控制流路径
 
@@ -133,7 +133,7 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
             → siglongjmp(*cpu->jmp_buf_ptr, 1)
         → 回到 dispatcher 入口的 sigsetjmp 落点 (栈帧已退到 dispatcher)
         → 顺序执行到 while 条件, 重新判 in_trap < 3
-        → 满足 → 继续下一轮 (regs[0] 已是 _tvec, 自然从 trap handler 起点 fetch)
+        → 满足 → 继续下一轮 (regs[0] 已是 xtvec, 自然从 trap handler 起点 fetch)
         → 不满足 (in_trap == 3) → 退出 dispatcher
 
     路径 C(dispatcher fetch trap, 不 longjmp):
@@ -151,7 +151,7 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
       早退 / 中断 fast-forward / 其它"省略中间过程回归 dispatcher"的路径
       也共用这个落点,不需要新机制。
       退出唯一靠 while 条件 (in_trap < 3); 派发动作唯一靠状态字段
-      (regs[0]/_cause/_tval/_epc/_tvec)。两件事完全解耦。
+      (regs[0]/xcause/xtval/xepc/xtvec)。两件事完全解耦。
 
 
 --------------------------------------------------------------------------------

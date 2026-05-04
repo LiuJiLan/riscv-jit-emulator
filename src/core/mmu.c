@@ -13,6 +13,7 @@
 #include "platform/ram.h"
 #include "riscv.h"
 #include "tlb.h"
+#include "trap.h"     // trap_set_state (a_01_5_b: fetch fault 直调, 不长跳, dummy.txt §1 路径 2b)
 
 #include <stddef.h>   // NULL (D25 后 if (current_tlb == NULL) 第一次用到)
 #include <stdint.h>
@@ -64,7 +65,10 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     if (current_tlb == NULL) {
         uint32_t pa = gva;          // identity 映射
         if (pa_to_fetch_hva(pa, hva_out) != 0) {
-            return 1;               // RV cause 1 = Instruction Access Fault
+            // a_01_5_b: 直调 trap_set_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
+            // cause=1 (Instruction Access Fault, RV spec §3.1.16 cause table); tval=fetch GVA.
+            // 返回 in_trap 当前值给 dispatcher (0/非0 信号; dispatcher continue 让 while 兜底)。
+            return (int)trap_set_state(hart, /*cause*/1u, /*tval*/gva);
         }
         *pa_out = pa;
         return 0;
@@ -91,7 +95,11 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
             // tag + V 命中 → 检查取指权限 (X 位)
             // (S/U 还要查 PTE_U + SUM/MXR; 等 a_05+ Sv32 真接入时按 priv emit-bake 加上)
             if ((entry->pte_flags & PTE_X) == 0) {
-                return 12;          // RV cause 12 = Instruction Page Fault (X 不允许)
+                // a_01_5_b: 同 BARE 路径, 直调 trap_set_state; cause=12 (Instruction Page Fault,
+                // PTE 翻译失败 — X 位不允许); tval=fetch GVA。
+                // a_01 不会触发 (priv 恒 M, current_tlb == NULL → 走 BARE 不进 SV32), SV32
+                // 路径占位等 a_01_7 SV32 walker 接入时真激活。
+                return (int)trap_set_state(hart, /*cause*/12u, /*tval*/gva);
             }
             uint8_t *hva = entry->host_ptr + (gva & 0xFFFu);
             *hva_out = hva;
@@ -106,10 +114,11 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     //
     // 真上 Sv32 后:
     //   ret = mmu_walk(hart, gva, PERM_X, &pa, &fault_cause);
-    //   if (ret != 0) return 12;     // page fault
+    //   if (ret != 0) return (int)trap_set_state(hart, fault_cause, gva);  // page fault
     //
-    // a_01 占位: 直接 return 12 (本来就走不到 SV32 分支, 因为 priv 恒 M)
-    return 12;
+    // a_01 占位: 直接走 trap_set_state(12) (本来就走不到 SV32 分支, 因为 priv 恒 M;
+    // a_01_5_b 形式上保持接口对齐, 未来 SV32 walker 替换上方那行 mmu_walk 调用即可)。
+    return (int)trap_set_state(hart, /*cause*/12u, /*tval*/gva);
 
     // (Step 3-5 在 walker 接入时一并填; a_01 不会执行到)
 }

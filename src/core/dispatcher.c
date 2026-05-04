@@ -1,7 +1,6 @@
 //
 // Created by liujilan on 2026/4/28.
-// a01_3 dispatcher 实现 (block 1+2+3 真调度起步; 临时 if(1) 限制单次, 等 a_03 trap.c
-// + a01_5 完整 dispatcher 时改 while(1) + sigsetjmp)。
+// dispatcher 实现 (block 1+2+3 调度; a_01_5_b: while(in_trap < 3) + mmu rc continue)。
 // 跨文件协议见 src/dummy.txt §1 (sigsetjmp) / §4 (TLB 分发机制)。
 //
 
@@ -28,42 +27,42 @@
 //    - PA 给 JIT hash (jit_cache 用 PA 为 key 找 host_code_ptr)
 //    - HVA 给解释器直接读字节取指 (依赖块边界保证不跨 4K page)
 //
-// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing) - 等 a_01_5 trap.c 真接入
+// II. 在 helper longjmp 跳回时承接控制流 (sigsetjmp landing, a_01_5_c 真激活)
 //
-// III. 迭代头 perf 同步 / mtime 推进 / 中断检查 - 等 a_01_5 / a_03 真接入
+// III. 迭代头 perf 同步 / mtime 推进 / 中断检查 (a_03 真接入)
 //
-// 完整形态 (a_01_5 后):
-//   while (1) {
-//       sigsetjmp(*hart->jmp_buf_ptr, 1);
-//       /* 迭代头扫尾: hart->cycle += local_counter; local_counter = 0;
-//                       mtime 推进 + 中断检查 */
+// a_01_5_b 当前形态: while(hart->trap.in_trap < 3) 多块循环。
+//   - sigsetjmp 仍不调 (helper 还不长跳, 等 a_01_5_c 加 _Noreturn 真激活)
+//   - 退出条件: hart->trap.in_trap >= 3 (triple fault, 项目内部停机协议; 见 dummy.txt §1)
+//     trap_set_state 内部 in_trap >= 3 时早 return 不 deliver (候选 A); main 端拿回控制后
+//     fprintf 表 halt + 未来 reset 接入。这是项目当前的"标准停机机制", 直到未来 MMIO
+//     bus / sifive_test 起来后改 MMIO finisher 路径。
+//   - mmu_translate_pc 改造后 (a_01_5_b): rc != 0 → continue (trap_set_state 已设字段 +
+//     regs[0]=xtvec, while 条件接管)。a_01_4 的 fetch fprintf + return 1 路径删除。
+//   - count==0 break 删除: a_01_4 该路径用于 ecall→OP_UNSUPPORTED→silent halt;
+//     a_01_5_b 起 OP_UNSUPPORTED 改 trap_raise_exception, count 永远 > 0 不再走 break。
+//
+// 完整形态 (a_01_5_c 后):
+//   sigsetjmp(*hart->jmp_buf_ptr, 1);   /* 一次性, while 外, 见 dummy.txt §1 */
+//   while (hart->trap.in_trap < 3) {
+//       /* perf_advance / mtime 推进 / 中断检查 (a_03) */
 //       /* block 1 + 2 + 3 */
 //   }
-//
-// a_01_4 当前形态: while(1) 多块循环, count==0 break 退出。
-//   - sigsetjmp 仍不调 (a_01_4 没有 helper 会 longjmp; trap_raise_exception 是 fprintf
-//     占位 + return; 真激活等 a_01_5 trap.c)
-//   - 停止条件 = local_count == 0: 表示当前块没成功跑任何指令, 即:
-//       (a) OP_UNSUPPORTED 立即 goto out (fixture 末尾 ecall 触发, count=0)
-//       (b) trap_raise_exception fprintf 后 caller goto out (本项目 IALIGN=16 + jal/branch
-//           imm[0]=0 + jalr & ~1u 路径下不可达, 仅占位)
-//     a_01_5 真接 trap.c 后, 这条改成 sigsetjmp 返回值分流 (cause-driven retry vs halt)。
-//   - block 3: 完整 jit_cache_hit/else 派发结构作为注释保留 (设计意图);
-//              其下方临时调 interpret_one_block 一次, 完整派发 a_01_5+ 激活时换上
 // ============================================================================
 
 
 int dispatcher(cpu_t *hart) {
     // sigsetjmp / siglongjmp 协议见 src/dummy.txt §1。
-    // a_01_4: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
-    //         (没 helper 会 longjmp; 真激活等 a_01_5 trap.c)。
-    //         实体在 dispatcher 栈帧上 (cpu_t 只持指针, 紧凑布局, 见 dummy.txt §1)。
+    // a_01_5_b: jmp_buf 实体声明 + jmp_buf_ptr 赋值, 但**不调 sigsetjmp**
+    //           (helper 还不 longjmp; a_01_5_c 加 _Noreturn 真激活时 sigsetjmp 一次性
+    //            放 while 外)。实体在 dispatcher 栈帧上 (cpu_t 只持指针, 见 dummy.txt §1)。
     sigjmp_buf dispatch_env;
     hart->jmp_buf_ptr = &dispatch_env;
 
     uint32_t total_count = 0;     // 累加 local_count, halted 时一并报告
+                                   // (a_01_5_c 加 sigsetjmp 后改 volatile, 见 dummy.txt §1 末段)
 
-    while (1) {  // a_01_4 真激活: 多块循环, local_count==0 break 退出
+    while (hart->trap.in_trap < 3) {
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb) [D23 + D25 + D25.1 路线]
@@ -129,23 +128,16 @@ int dispatcher(cpu_t *hart) {
     // ========================================================================
     uint32_t pa;
     uint8_t *hva;
-    int cause = mmu_translate_pc(hart, current_tlb, &pa, &hva);
+    int rc = mmu_translate_pc(hart, current_tlb, &pa, &hva);
+    (void)pa;       // 未来给 JIT 查 jit_cache 用, a_01_5_b 不消费
 
     // ========================================================================
-    // a_01_4 取指 trap 临时处理 (a_01_5 trap.c 接入后改为 trap_raise_exception):
-    //
-    // 真接入后 dispatcher 不在这里 fprintf + return; 而是 trap_raise_exception + 走
-    // sigsetjmp landing 重入下一轮迭代 (mmu.h 顶部 trap_raise 段 + dispatcher 预期使用
-    // 伪码)。当前 fixture 全部走 RAM 内 BARE 路径, cause = 0; 这条仅为防 fixture 写错时
-    // 给个有用错误信息。pa 仅在未来给 JIT 查 jit_cache 用, a_01_4 不消费 (cast to void)。
+    // a_01_5_b: mmu_translate_pc 已在内部直调 trap_set_state 设好 xcause/xtval/xepc/
+    // regs[0]=xtvec, rc 是 in_trap 当前值 (0/非0 状态)。
+    // 非 0 → continue 让 while(in_trap < 3) 接管 (in_trap 已 ≥ 1, 第 3 次时退出 dispatcher)。
+    // dummy.txt §1 路径 C (mmu fetch trap 不长跳)。
     // ========================================================================
-    (void)pa;
-
-    if (cause != 0) {
-        fprintf(stderr, "[dispatcher] fetch trap: cause=%d pc=0x%08" PRIx32 "\n",
-                cause, hart->regs[0]);
-        return 1;
-    }
+    if (rc != 0) continue;
 
     // ========================================================================
     // block 3: 派发到 jit / interpreter
@@ -168,20 +160,19 @@ int dispatcher(cpu_t *hart) {
     // ========================================================================
     uint32_t local_count = 0;
     interpret_one_block(hart, current_tlb, hva, &local_count);
-    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_01_5 / a_03 接入)
+    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_03 接入)
 
     total_count += local_count;
 
-    // 停止条件: local_count == 0 表示当前块没成功跑任何指令 (OP_UNSUPPORTED 立即 goto out,
-    // 或 trap_raise_exception 占位 fprintf 后 caller goto out)。a_01_4 临时方案;
-    // a_01_5 trap.c 接入后改 sigsetjmp landing 区分 (cause-driven retry vs halt)。
-    if (local_count == 0) break;
+    // a_01_4 的 count==0 break 已删: OP_UNSUPPORTED 改 trap_raise_exception 后, count 永远
+    // > 0 (trap 是发生在 case 头部, 之前的 boundary 指令至少一条已计入); 退出条件统一靠
+    // while 顶 in_trap < 3。
 
-    }  /* while (1) */
+    }  /* while (in_trap < 3) */
 
     fprintf(stderr,
-            "[dispatcher] halted: total_count=%u pc=0x%08" PRIx32 "\n",
-            total_count, hart->regs[0]);
+            "[dispatcher] halted: in_trap=%u total_count=%u pc=0x%08" PRIx32 "\n",
+            hart->trap.in_trap, total_count, hart->regs[0]);
 
     return 0;
 }
