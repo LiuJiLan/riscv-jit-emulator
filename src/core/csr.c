@@ -26,6 +26,7 @@
 #include "config.h"     // IALIGN_MASK
 #include "cpu.h"
 #include "riscv.h"
+#include "trap.h"       // trap_raise_exception (a_01_7 csr_op 入口判 priv/RO 失败时长跳)
 
 #include <inttypes.h>
 #include <stdint.h>
@@ -51,9 +52,30 @@ static uint32_t csr_mstatus_read(cpu_t *hart) {
 }
 
 static void csr_mstatus_write(cpu_t *hart, uint32_t v) {
-    // 低 32 位换成 v, 高 32 位保留。
-    // RV spec mstatus 字段 WARL: MIE/MPIE/MPP 等是合法位, 当前 a_01 全部接受不截断
-    // (a_03 真做中断时按 spec 加 WARL 截断: e.g. MPP 写非法 priv 编码时落到合法值)。
+    // 低 32 位换成 v (经 WARL 截断), 高 32 位保留。
+    //
+    // a_01_7 WARL 截断 (按字段递增加, 当前只截 MPP; MIE/MPIE 等不截):
+    //   MPP (bits 12:11): 项目支持 priv 集 = {PRIV_U=0, PRIV_S=1, PRIV_M=3}; PRIV_H=2 在没 H
+    //     扩展时非法。RV spec WARL 允许实现自由选择 fallback; 项目选 PRIV_U=0 落点 ("least-priv
+    //     风险最小": mret 切到 U 比切到 M 安全)。
+    //
+    // !!! 未来 H 扩展 / SVxx-mode 真做时这里要改 !!!
+    //   - H 扩展: PRIV_H=2 编码不再保留, 项目 priv 集变成 {U=0, S=1, H=2, M=3}, 写 2 不截
+    //   - 严格按 spec 的实现可能选 fallback 到"上次合法值"而不是 PRIV_U; 那时 csr.c 需要保留
+    //      MPP 历史状态 (file-static prev_mpp 之类)
+    //   - S-mode + sstatus 入口加进来时, sstatus.SPP 也要类似 WARL (1-bit, 只允许 0/1)
+    //
+    // MIE / MPIE 当前不截 (RV spec 允许实现接受任意位值; 只是行为体现是中断使能)。
+    // a_03 真做中断时, 如果 MIE 字段需要更细的 WARL (比如某些子字段保留), 在这里加。
+    {
+        uint32_t mpp = (v >> MSTATUS_MPP_SHIFT) & MSTATUS_MPP_MASK;
+        if (mpp == PRIV_H) {
+            /* PRIV_H = 2, 项目当前不支持 → 落 PRIV_U = 0
+             * 操作: 清 MPP 字段位; 因 PRIV_U = 0, 不需要再 OR 设新值。 */
+            v &= ~MSTATUS_MPP;
+        }
+    }
+
     hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                         | (uint64_t)v;
 }
@@ -127,31 +149,41 @@ static void csr_mtval_write(cpu_t *hart, uint32_t v) {
 
 
 // ============================================================================
-// csr_op —— 大 helper, decode 分发入口 (与 a_01_5_a 形态相同, 不动)
+// csr_op —— 大 helper, decode 分发入口
+//
+// 演进: a_01_5_a 框架 + 注释占位入口判; a_01_5_c 6 小 helper 真读写 hart->trap;
+//       a_01_7 入口判 priv/RO 真激活 (替换注释占位; 真接 trap_raise_exception)。
 // ============================================================================
 
 uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
                 csr_op_t op, uint32_t raw_inst) {
-    (void)raw_inst;     // a_01_5_c 入口判 priv/RO 仍是注释占位; 参数透传留未来真激活
-
     // ----------------------------------------------------------------------------
     // 入口判: priv 要求 + RO 写检查 (csr 编号自带权限位段, riscv.h CSR_ADDR_PRIV_*)
     //
-    // 注释占位 (fixture 不构造非法 csr 访问, 跳过这两条检查):
+    // a_01_7 真激活 (替换 a_01_5_a 注释占位):
+    //   - csr_addr[9:8] = 最低 priv 要求 (RV Privileged Spec §2.1):
+    //       00=U, 01=S, 10=H/VS, 11=M
+    //     hart->priv < required_priv → cause 2 illegal instruction trap
+    //     注意: PRIV_M=3 是最高, 数字最大; 比较用 `<` 即可
+    //   - csr_addr[11:10] = RO 标识: 0b11 表 RO; 写 RO csr → cause 2
+    //     "写"判断: CSR_OP_RW 永远算写; CSR_OP_RS/RC + new_val=0 不写 (RV spec §2.1.2 副作用
+    //     不发生 — 跟下方 do_write 标志一致)
     //
-    //   uint32_t required_priv = (csr_addr >> CSR_ADDR_PRIV_SHIFT) & CSR_ADDR_PRIV_MASK;
-    //   if (hart->priv < required_priv) {
-    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn longjmp
-    //   }
-    //
-    //   uint32_t is_ro = ((csr_addr >> CSR_ADDR_RO_SHIFT) & CSR_ADDR_RO_MASK) == CSR_ADDR_RO_VALUE;
-    //   uint32_t is_write = (op == CSR_OP_RW) || (new_val != 0);
-    //   if (is_ro && is_write) {
-    //       trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn longjmp
-    //   }
-    //
-    // 真用到 (例如 fixture 写 mhartid 这种 RO csr) 时解开。
+    // tval = raw_inst (RV spec §3.1.16: illegal instruction trap 的 mtval = 触发指令编码)
     // ----------------------------------------------------------------------------
+    {
+        uint32_t required_priv = (csr_addr >> CSR_ADDR_PRIV_SHIFT) & CSR_ADDR_PRIV_MASK;
+        if (hart->priv < required_priv) {
+            trap_raise_exception(hart, /*cause*/2u, raw_inst);  // _Noreturn longjmp
+        }
+
+        uint32_t is_ro = ((csr_addr >> CSR_ADDR_RO_SHIFT) & CSR_ADDR_RO_MASK)
+                         == CSR_ADDR_RO_VALUE;
+        uint32_t is_write = (op == CSR_OP_RW) || (new_val != 0);
+        if (is_ro && is_write) {
+            trap_raise_exception(hart, /*cause*/2u, raw_inst);  // _Noreturn longjmp
+        }
+    }
 
     // ----------------------------------------------------------------------------
     // 大 switch: 按 csr_addr 分发到具体 csr 的小 r/w helper, 算 read_old + write_back。

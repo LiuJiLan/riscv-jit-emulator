@@ -5,15 +5,17 @@
 // 职责: 把 RV32 32-bit 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst) 的纯数据结构,
 //       给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
 //
-// op_kind_t 当前范围 (a01_3 + a01_4 + a01_5_a + a01_5_c):
+// op_kind_t 当前范围 (a01_3 + a01_4 + a01_5_a + a01_5_c + a01_6):
 //   - a01_3:    算术 / 逻辑 / 立即数子集 (21 个真 op)
 //   - a01_4:    控制流 (branch 6 + jal + jalr = 8 个真 op)
 //   - a01_5_a:  csr 6 变体 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
 //   - a01_5_c:  system 3 op (ECALL / EBREAK / MRET); SRET / WFI / SFENCE.VMA 等仍归
 //               OP_UNSUPPORTED (S-mode / 中断 真做时再加)
-//   共 38 个真 op + 1 个 OP_UNSUPPORTED 兜底。
-//   不在此范围的 opcode (load / store / fence / amo / SRET / WFI / SFENCE.VMA / 等)
-//   decode 全部归 OP_UNSUPPORTED。
+//   - a01_6:    load 5 (LB/LH/LW/LBU/LHU) + store 3 (SB/SH/SW); FENCE / AMO / LR/SC 仍归
+//               OP_UNSUPPORTED (M / Zifencei / A 扩展真做时再加)
+//   共 46 个真 op + 1 个 OP_UNSUPPORTED 兜底。
+//   不在此范围的 opcode (fence / amo / SRET / WFI / SFENCE.VMA / 等) decode 全部归
+//   OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -150,9 +152,64 @@ typedef enum {
     OP_EBREAK,
     OP_MRET,
 
+    // ---- I-type LOAD (5), opcode 0x03 ---- a_01_6
+    // funct3 编码 (RV spec):
+    //   000 = LB    (Load Byte,           sign-ext 8-bit)
+    //   001 = LH    (Load Halfword,       sign-ext 16-bit)
+    //   010 = LW    (Load Word,           32-bit)
+    //   100 = LBU   (Load Byte Unsigned,  zero-ext 8-bit)
+    //   101 = LHU   (Load Halfword Unsigned, zero-ext 16-bit)
+    //   011 / 110 / 111 = reserved (RV64 LD/LWU 等), decode 归 OP_UNSUPPORTED
+    //
+    // 字段约定 (与 ADDI 等 I-type 一致):
+    //   d.rd       = inst[11:7]: 写目标寄存器 (rd=x0 → dummy.txt §2 dead store)
+    //   d.rs1      = inst[19:15]: 基地址寄存器 (ea = READ_REG(d.rs1) + d.imm)
+    //   d.imm      = sign-ext inst[31:20] (12 位有符号, 复用 ADDI 路径)
+    //   d.rs2      = inst[24:20] = imm 低 5 位 garbage (decode 顶部统一提取, 不特判)
+    //   d.pc_step  = PC_STEP_RV (普通 +4)
+    //
+    // load 不是块边界 (is_block_boundary_inst → 0); 内存访问不改控制流, 块内可连续多条。
+    // 实际访问 case 内调 load_helper (isa/lsu.h, static inline; BARE 路径直接 host load,
+    // SV32 路径 a_01_7+ 加 TLB lookup + walker_helper_load miss); sext/zext 由 case 各自做
+    // (LB: int8_t cast → int32_t; LH: int16_t cast; LBU/LHU: 直接 zero-ext; LW: 直传)。
+    // dummy.txt §1 末段 "load inline / store helper" 不对称设计。
+    OP_LB,
+    OP_LH,
+    OP_LW,
+    OP_LBU,
+    OP_LHU,
+
+    // ---- S-type STORE (3), opcode 0x23 ---- a_01_6
+    // funct3 编码 (RV spec):
+    //   000 = SB    (Store Byte,     8-bit)
+    //   001 = SH    (Store Halfword, 16-bit)
+    //   010 = SW    (Store Word,     32-bit)
+    //   011 / 100..111 = reserved (RV64 SD 等), decode 归 OP_UNSUPPORTED
+    //
+    // S-type 立即数 12 位有符号, 由 inst 中两段拼接 (RV spec Vol I, Memory Access):
+    //   imm[11:5] = inst[31:25]    (高 7 位)
+    //   imm[4:0]  = inst[11:7]     (低 5 位)
+    // 不是连续段位 — 这是 RV 的设计取舍 (让 rs1/rs2 字段位置在所有指令类型保持一致, decoder
+    // 可以先无脑提取 rs1/rs2/funct3 再按 opcode 算 imm)。
+    //
+    // 字段约定:
+    //   d.rs1 = inst[19:15]: 基地址寄存器 (ea = READ_REG(d.rs1) + d.imm)
+    //   d.rs2 = inst[24:20]: 源寄存器 (写入内存的值 = READ_REG(d.rs2))
+    //   d.imm = sign-ext { inst[31:25], inst[11:7] } (12 位)
+    //   d.rd  = inst[11:7] = imm 低 5 位 garbage (decode 顶部统一提取, 不特判)
+    //   d.pc_step = PC_STEP_RV
+    //
+    // store 不是块边界 (is_block_boundary_inst → 0)。
+    // 实际访问 case 内调 store_helper (isa/lsu.c extern; BARE 路径直接 host store, SV32 路径
+    // a_01_7+ 加 TLB lookup + walker_helper_store miss); reservation 清除 + SMC 检测 + 未来
+    // bus_dispatch 都在 helper 内, 解释器 case 不感知。dummy.txt §1 末段不对称设计。
+    OP_SB,
+    OP_SH,
+    OP_SW,
+
     // ---- 兜底 ----
-    // 不在当前范围的 opcode (load 0x03 / store 0x23 / fence 0x0F / system 0x73 / amo 0x2F /
-    // 真非法 opcode / 真非法 funct3 子段) 全部归这里。
+    // 不在当前范围的 opcode (fence 0x0F / amo 0x2F / 真非法 opcode / 真非法 funct3 子段)
+    // 全部归这里。
     // interpreter 收到这个 case break 出 fetch loop, dispatcher 看 count_out 知道
     // 本次 block 跑了多少条; 未来 a_01_5 trap.c 接入后改为 trap_raise(2) Illegal Instruction
     // (RV cause code 2), mtval = decoded.raw_inst (RV 规范要求)。
@@ -213,6 +270,9 @@ decoded_inst_t decode(uint32_t inst);
 //   注: file_plan §7.decode G3 说 "所有 CSR 写都视为硬边界 (过度刷新允许)" 简化策略, 即
 //       CSR 读 (CSRRS rd, csr, x0 = 读) 不一定要 boundary; 但保险起见统一视为 boundary
 //       (未来真细化时按 csr_addr 分流, 现在统一)
+// a_01_6 加 op (NON-boundary): LB/LH/LW/LBU/LHU + SB/SH/SW (8 个); load/store 不改控制流,
+//   只动内存; 块内可连续多条。trap 路径 (misalign / access fault) 经 trap_raise_exception
+//   _Noreturn longjmp 跳回 dispatcher, 不走 boundary 路径。
 //
 // 软边界 (块长度上限) 不在这里, 由 interpreter / translator 各自循环维护计数器,
 // 见 file_plan §7.decode G4 / §8.interpreter R3 + plan.md §1.23.2 (默认 64)。
@@ -265,6 +325,13 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         // ECALL/EBREAK 触发 trap → pc 跳 xtvec; MRET → pc 跳 xepc。都改 pc, 必须块尾。
         case OP_ECALL: case OP_EBREAK: case OP_MRET:
             return 1;
+
+        // ---- a_01_6 load/store 8 op (非 boundary) ----
+        // 只动内存不改控制流 (pc += 4 普通推进); trap 路径 (misalign cause 4/6, access fault
+        // cause 5/7) 经 trap_raise_exception _Noreturn longjmp 跳回 dispatcher, 不走 boundary。
+        case OP_LB:  case OP_LH:  case OP_LW:  case OP_LBU: case OP_LHU:
+        case OP_SB:  case OP_SH:  case OP_SW:
+            return 0;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
 }

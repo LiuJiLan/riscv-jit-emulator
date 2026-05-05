@@ -12,6 +12,7 @@
 #include "cpu.h"
 #include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
 #include "decode.h"
+#include "isa/lsu.h"    // load_helper (static inline) + store_helper (extern), a_01_6 5 load + 3 store
 #include "riscv.h"      // PRIV_M (a_01_5_c MRET 读 hart->trap.xepc[PRIV_M])
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception 真 helper (a_01_5_b; 替换 a_01_4 的 file-static 占位)
@@ -21,7 +22,8 @@
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint32_t *count_out) {
-    (void)current_tlb;          // a01_3 不用 (load/store + mmu_walker_* 没接)
+    // a_01_6: current_tlb 透传给 load_helper / store_helper (BARE: NULL; SV32: 非 NULL)。
+    // 不再 (void)current_tlb 抑制 unused — 真用了。
 
     // dummy.txt §2 局部垃圾桶变量: 写 x0 的 dead store 落点。
     // 编译器 DCE 会把这个 store 干掉, 等于 NO-OP; 保留是为统一 "所有写都通过同一个宏" 风格,
@@ -239,28 +241,128 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // EBREAK: cause 3 (breakpoint, RV spec); 不分 priv。tval 一般 = 0
             //          (实现 debug 子集时可填触发 PC, 项目当前 = 0)。
             //
-            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径的反操作:
-            //          - hart->trap.in_trap = 0  (复位嵌套链, 跟 mret 语义"trap 完成"对齐;
-            //                                      不是 in_trap-- 模拟"退一层"; mret 整体重置)
-            //          - hart->regs[0] = hart->trap.xepc[PRIV_M]  (从 mepc 恢复 PC)
-            //          - TODO a_03+: 切 priv from _mstatus.MPP, 恢复 _mstatus.MIE = MPIE 等
-            //                         (当前 a_01 hart->priv 永远 PRIV_M, _mstatus 字段不重要,
-            //                          注释占位)
+            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径 + trap_set_state
+            //          的反操作 (a_01_7 真激活, 替换 a_01_5_c 简化版):
+            //          - hart->priv = mstatus.MPP                 (从 MPP 恢复 caller priv)
+            //          - mstatus.MIE  = mstatus.MPIE              (恢复 interrupt-enable)
+            //          - mstatus.MPIE = 1                          (RV spec 要求)
+            //          - mstatus.MPP  = PRIV_U                     (RV spec least-priv reset)
+            //          - hart->regs[0] = hart->trap.xepc[PRIV_M]   (从 mepc 恢复 PC)
+            //          - hart->trap.in_trap = 0                    (复位嵌套链)
+            //
             //          case 末 break (不 goto out): fetch loop 末 += PC_STEP_NONE (=0, NOP),
             //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
             //          boundary) → goto out 退出 fetch loop, dispatcher 重派发 from xepc。
+            //
+            //          权限要求: MRET 仅在 priv >= M 时合法 (M-mode CSR 入口); a_01_7 csr_op 入口判
+            //          激活后, 由 csrw mepc / csrr mepc 这条 csr 入口判把关; 但 MRET 本身不是 csr
+            //          指令, 是 system 指令, 没走 csr_op。当前 fixture 只在 M-mode 跑 MRET; 真做
+            //          U/S-mode 时, MRET 在 U/S 触发 cause=2 (illegal instruction) 是 spec 要求,
+            //          a_01_7 暂不接 (本次 fixture 不构造 U-mode mret, 留 a_01_8+)。
             case OP_ECALL:
                 trap_raise_exception(hart, /*cause*/8u + hart->priv, /*tval*/0u);
                 goto out;
             case OP_EBREAK:
                 trap_raise_exception(hart, /*cause*/3u, /*tval*/0u);
                 goto out;
-            case OP_MRET:
+            case OP_MRET: {
+                uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+
+                /* hart->priv = MPP (从 mstatus 恢复 caller priv) */
+                hart->priv = (uint8_t)((mstatus_lo >> MSTATUS_MPP_SHIFT) & MSTATUS_MPP_MASK);
+
+                /* mstatus.MIE = mstatus.MPIE */
+                if (mstatus_lo & MSTATUS_MPIE) mstatus_lo |=  MSTATUS_MIE;
+                else                           mstatus_lo &= ~MSTATUS_MIE;
+
+                /* mstatus.MPIE = 1 (RV spec) */
+                mstatus_lo |= MSTATUS_MPIE;
+
+                /* mstatus.MPP = PRIV_U = 0 (RV spec least-priv reset) */
+                mstatus_lo &= ~MSTATUS_MPP;
+                /* PRIV_U=0 已是清零默认; 显式 `| (PRIV_U << MSTATUS_MPP_SHIFT)` 是 0, 省略 */
+
+                hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+                                    | (uint64_t)mstatus_lo;
+
                 hart->trap.in_trap = 0;
                 hart->regs[0]      = hart->trap.xepc[PRIV_M];
-                // TODO a_03+: 切 priv (hart->priv = (_mstatus >> MPP_SHIFT) & MPP_MASK);
-                //              恢复 mstatus.MIE = mstatus.MPIE; mstatus.MPIE = 1; mstatus.MPP = U
                 break;
+            }
+
+            // ---- I-type LOAD (5 op, a_01_6) ----
+            //
+            // 不对称设计 (file_plan §8.interpreter D 区, dummy.txt §1 末段): load 走
+            // static inline load_helper (isa/lsu.h, fast path); BARE 路径直接 host load,
+            // SV32 路径 a_01_7+ 加 TLB lookup + walker_helper_load miss。
+            //
+            // 方案 A (helper 不知 signed): load_helper 返回低 size 字节有效 + 高位 0 的 uint32_t,
+            // case 自做 sext (LB int8_t / LH int16_t cast → int32_t 再 cast 回 uint32_t) 或
+            // zext (LBU/LHU 直接传, 高位已是 0)。LW size=4 直传整 32 位。
+            //
+            // ea 算成 uint32_t (RV32 wraparound 算术; gva = rs1 + imm 自然 wrap)。imm 是
+            // int32_t (decode 已 sign-ext), 加到 uint32_t 上要先 cast (避免 -Wsign-conversion;
+            // 跟 a_01_4 BRANCH_IF / WRITE_PC_OR_TRAP 路径同模式)。
+            //
+            // 错误路径 (load_helper 内部 trap_raise_exception _Noreturn longjmp):
+            //   misalign (gva & (size-1)) != 0    → cause 4
+            //   PA 不在 RAM (a_01_6 BARE)         → cause 5 + fprintf "MMIO not implemented"
+            //   SV32 路径 (a_01_6 不可达)         → cause 13 + fprintf "SV32 not implemented"
+            // 长跳走 dispatcher 落点; 这里 break 后的 fetch loop 末尾 += pc_step / count++ /
+            // boundary 检查不会执行。
+            case OP_LB: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t) load_helper(hart, current_tlb, ea, 1u));
+                break;
+            }
+            case OP_LH: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t)load_helper(hart, current_tlb, ea, 2u));
+                break;
+            }
+            case OP_LW: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 4u));
+                break;
+            }
+            case OP_LBU: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 1u));
+                break;
+            }
+            case OP_LHU: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 2u));
+                break;
+            }
+
+            // ---- S-type STORE (3 op, a_01_6) ----
+            //
+            // 不对称设计: store 走 extern store_helper (isa/lsu.c, slow path)。helper 内部
+            // 处理 misalign / RAM 检查 / host store / reservation 清除占位 / 未来 SMC 检测;
+            // 解释器 case 不感知。a_01_5_c 跟 a_01_5_b 比 case 数量增加, 但 store path 形态
+            // 跟 csr_op 入口风格一致 (caller 简洁, helper 内做事)。
+            //
+            // SB/SH/SW 写多少字节由 size 决定; value = READ_REG(d.rs2) 整 32 位传给 helper,
+            // helper 内部 memcpy size 字节 (SB 写低 8 位, SH 写低 16 位, SW 写全 32 位)。
+            //
+            // 错误路径 (store_helper 内部 trap_raise_exception _Noreturn longjmp):
+            //   misalign → cause 6; 不在 RAM → cause 7 + fprintf; SV32 占位 → cause 15。
+            case OP_SB: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 1u);
+                break;
+            }
+            case OP_SH: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 2u);
+                break;
+            }
+            case OP_SW: {
+                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
+                break;
+            }
 
             // ---- 兜底 ---- (a_01_5_b 接 trap_raise_exception 真路径)
             case OP_UNSUPPORTED:

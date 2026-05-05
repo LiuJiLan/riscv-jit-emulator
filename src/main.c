@@ -210,7 +210,38 @@ static int decode_test(void) {
     // MRET = 0x30200073
     CASE(0x30200073, OP_MRET,   /*rd*/0, /*rs1*/0, /*rs2*/2, 0x302, 0x30200073, PC_STEP_NONE);
 
-    // ---- a_01_6 待加 (LB/LH/LW/LBU/LHU + SB/SH/SW; S-type 立即数 bit[31:25, 11:7]) ----
+    // ---- a_01_6 LOAD 5 + STORE 3 (I-type / S-type 立即数边界值)----
+    //
+    // LOAD I-type 立即数复用 ADDI 同型 (sign-ext inst[31:20]); S-type 立即数 12 位拼接:
+    //   imm[11:5] = inst[31:25] (高 7 位); imm[4:0] = inst[11:7] (低 5 位)。
+    // 选取规则 (跟 a_01_4 boundary 风格一致): 5 LOAD 各 1 case (各 funct3 验路由);
+    // 3 STORE 各 1 case + S-type 立即数 max+/max-/0 边界各 1 case = 6 个; 共 11 case。
+    // 实际只测 8 case (5 load + 3 store, max+/max- 走 LW/SW, 0 走 LB), 简化覆盖。
+
+    // LB x1, 0(x2) = 0x00010083 (rd=1, rs1=2, imm=0, funct3=0 LB; rs2 garbage = imm[4:0] = 0)
+    CASE(0x00010083, OP_LB,  /*rd*/1, /*rs1*/2, /*rs2*/0,  0,    0x00010083, PC_STEP_RV);
+    // LH x3, -2(x4) = 0xFFE21183 (imm=-2 = 0xFFE; rs2 garbage = imm[4:0] = 30)
+    //   -2 编码 12 位 = 0xFFE = inst[31:20] = 0b111111111110
+    //   rs2 字段 inst[24:20] = 0b11110 = 30
+    CASE(0xFFE21183, OP_LH,  /*rd*/3, /*rs1*/4, /*rs2*/30, -2,   0xFFE21183, PC_STEP_RV);
+    // LW x5, 2047(x6) = 0x7FF32283 (I-type max+, imm=0x7FF=2047; rs2 garbage = 0x1F)
+    CASE(0x7FF32283, OP_LW,  /*rd*/5, /*rs1*/6, /*rs2*/31, 2047, 0x7FF32283, PC_STEP_RV);
+    // LBU x7, 1(x8) = 0x00144383 (rd=7, rs1=8, imm=1, funct3=4; rs2 garbage = 1)
+    CASE(0x00144383, OP_LBU, /*rd*/7, /*rs1*/8, /*rs2*/1,  1,    0x00144383, PC_STEP_RV);
+    // LHU x9, -2048(x10) = 0x80055483 (I-type max-, imm=-2048=0x800; rs2 garbage = 0)
+    CASE(0x80055483, OP_LHU, /*rd*/9, /*rs1*/10, /*rs2*/0, -2048, 0x80055483, PC_STEP_RV);
+
+    // SB x1, 0(x2) = 0x00110023 (rs1=2, rs2=1, imm=0, funct3=0 SB; rd garbage = imm[4:0] = 0)
+    CASE(0x00110023, OP_SB,  /*rd*/0,  /*rs1*/2,  /*rs2*/1, 0,    0x00110023, PC_STEP_RV);
+    // SH x3, -4(x4) = 0xFE321E23 (imm=-4; imm[11:5]=0x7F=inst[31:25], imm[4:0]=0x1C=inst[11:7])
+    //   -4 = 0xFFC = 0b111111111100; imm[11:5]=0b1111111=0x7F, imm[4:0]=0b11100=28
+    //   rd garbage = inst[11:7] = 28
+    CASE(0xFE321E23, OP_SH,  /*rd*/28, /*rs1*/4,  /*rs2*/3, -4,   0xFE321E23, PC_STEP_RV);
+    // SW x5, 2047(x6) = 0x7E532FA3 (S-type max+, imm=0x7FF=2047)
+    //   imm[11:5] = 0x3F = inst[31:25]=0b0111111; imm[4:0]=0x1F=inst[11:7]=0b11111
+    //   rd garbage = inst[11:7] = 31
+    CASE(0x7E532FA3, OP_SW,  /*rd*/31, /*rs1*/6,  /*rs2*/5, 2047, 0x7E532FA3, PC_STEP_RV);
+
     // ---- 未来 RVC 扩展 (C.MV / C.ADD / C.LUI / C.SUB / ... 真翻译) ----
 
     #undef CASE
@@ -337,6 +368,15 @@ int main(int argc, char **argv) {
             hart->trap.in_trap,
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
+
+    // a_01_7: state dump (验 trap_set_state / OP_MRET 真切 priv + 写 mstatus.MPP/MPIE/MIE)。
+    // 只 dump _mstatus 低 32 位 (mstatus 入口); 高 32 位 (mstatush) a_01 全 0, 不 dump 节省噪声。
+    // priv 是当前 hart->priv (deliver_priv hard-code M 时, M 自我 trap 后 priv 仍 M; mret 后
+    // 按 MPP 恢复, U/S-mode fixture 真激活时 priv 才会切非 M)。
+    fprintf(stderr,
+            "[main] state dump: priv=%u mstatus=0x%08x\n",
+            (uint32_t)hart->priv,
+            (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));
 
     cpu_destroy(hart);
     return 0;

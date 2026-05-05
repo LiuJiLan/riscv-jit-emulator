@@ -288,9 +288,59 @@ decoded_inst_t decode(uint32_t inst) {
             break;
         }
 
+        // ---- I-type LOAD ---- a_01_6
+        case 0x03: {
+            // I-type 12 位有符号立即数 (与 OP-IMM 同型, 复用 ((int32_t)inst) >> 20 算术右移)。
+            // 字段 rd / rs1 已由 decode 顶部统一提取; rs2 是 garbage = imm 低 5 位 (顶部提取)。
+            // pc_step 默认 PC_STEP_RV; 不动。
+            d.imm = ((int32_t)inst) >> 20;
+            switch (funct3) {
+                case 0: d.kind = OP_LB;   break;
+                case 1: d.kind = OP_LH;   break;
+                case 2: d.kind = OP_LW;   break;
+                case 4: d.kind = OP_LBU;  break;
+                case 5: d.kind = OP_LHU;  break;
+                case 3: case 6: case 7:
+                default:
+                    // funct3=011 (LD, RV64) / 110 (LWU, RV64) / 111 reserved by RV32 spec.
+                    // 真上 RV64 时再加 op_kind; 现在 OP_UNSUPPORTED。
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
+        // ---- S-type STORE ---- a_01_6
+        case 0x23: {
+            // S-type 12 位有符号立即数, 由 inst 中两段拼接:
+            //   imm[11:5] = inst[31:25]    (高 7 位)
+            //   imm[4:0]  = inst[11:7]     (低 5 位)
+            // sign-ext 用 ((int32_t)(inst & 0x80000000u)) >> 19 → bit 31:12 全填 sign;
+            // 然后 OR 上 inst[31:25] << 5 (覆盖 bit 11:5; bit 11 重复设置无害, sign bit 同值)
+            // OR 上 inst[11:7] (bit 4:0)。
+            // 这跟 decode.c B-type 的 4 段拼接风格一致。
+            const int32_t imm =
+                  (((int32_t)(inst & 0x80000000u)) >> 19)            /* sign-ext bit 31:12 */
+                | (int32_t)(((inst >> 25) & 0x7Fu) << 5)              /* bits 11:5 */
+                | (int32_t)((inst >> 7)  & 0x1Fu);                   /* bits 4:0 */
+            d.imm = imm;
+            // rs1 / rs2 已由 decode 顶部统一提取 (S-type rs2 在 inst[24:20], 跟通用提取一致);
+            // rd 是 garbage = imm[4:0] = inst[11:7] (顶部提取)。pc_step = PC_STEP_RV。
+            switch (funct3) {
+                case 0: d.kind = OP_SB;   break;
+                case 1: d.kind = OP_SH;   break;
+                case 2: d.kind = OP_SW;   break;
+                case 3: case 4: case 5: case 6: case 7:
+                default:
+                    // funct3=011 (SD, RV64) / 100..111 reserved by RV32 spec; OP_UNSUPPORTED。
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
         // ---- 其他 opcode ----
-        // 0x03 LOAD / 0x23 STORE / 0x0F FENCE / 0x2F AMO / 真非法 opcode 全部走默认的
-        // OP_UNSUPPORTED (a_01_6 加 LOAD/STORE; AMO 等更后)。
+        // 0x0F FENCE / 0x2F AMO / 真非法 opcode 全部走默认的 OP_UNSUPPORTED。
         default:
             // 已经初始化为 OP_UNSUPPORTED, 保持。
             break;

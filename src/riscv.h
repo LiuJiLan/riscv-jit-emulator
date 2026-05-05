@@ -96,4 +96,42 @@
 #define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
 #define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
 
+// ----------------------------------------------------------------------------
+// mstatus 字段位段 (RV Privileged Spec Vol II, fig 3.6 mstatus register)
+//
+// a_01_7 增量: 只展开 trap_set_state / OP_MRET 真切 priv 用到的字段:
+//   MIE  (bit  3): M-mode global interrupt enable
+//   MPIE (bit  7): saved MIE on trap entry; mret 时恢复 MIE = MPIE
+//   MPP  (bits 11:10? 不, 11:11 +12; 实际 MPP 占 bits 12:11 即 2-bit 字段, shift=11):
+//                  saved priv on trap entry; mret 时 priv = MPP
+//
+// 实际 mstatus bit 编号 (RV Spec):
+//   bit  0  = SD (Status Dirty, RV32 dirty 派生); a_01 不实现 F/D, SD=0
+//   bit  1  = SIE (S-mode interrupt enable, S-mode 真做时加)
+//   bit  3  = MIE
+//   bit  5  = SPIE
+//   bit  7  = MPIE
+//   bit  8  = SPP (1-bit, S-mode 真做时加)
+//   bits 12:11 = MPP (2-bit, 编码 PRIV_U=00, PRIV_S=01, PRIV_M=11; PRIV_H=10 在没 H 扩展时
+//                      非法, 项目 WARL 落 PRIV_U=0 — csr.c csr_mstatus_write 内做)
+//   bit 17 = SUM (S-mode 真做 SV32 时加)
+//   bit 19 = MXR (S-mode 真做 SV32 时加)
+//   ... 其余 (FS/VS/XS/UBE/SBE/MBE/MPV/...) a_01 全部 0, 相关 fixture 不构造非零写入
+//
+// 增量原则: SIE/SPIE/SPP/SUM/MXR 留 a_01_8 SV32 真用时再展开; 当前 a_01_7 只暴露 trap 必需的
+// MIE/MPIE/MPP 三组宏。
+//
+// 命名风格: <field>_SHIFT (bit position) + <field> (single-bit mask) 单 bit 字段;
+//            <field>_SHIFT + <field>_MASK 多 bit 字段。
+// ----------------------------------------------------------------------------
+#define MSTATUS_MIE_SHIFT   3U
+#define MSTATUS_MIE         (1U << MSTATUS_MIE_SHIFT)        /* = 0x00000008 */
+
+#define MSTATUS_MPIE_SHIFT  7U
+#define MSTATUS_MPIE        (1U << MSTATUS_MPIE_SHIFT)       /* = 0x00000080 */
+
+#define MSTATUS_MPP_SHIFT   11U
+#define MSTATUS_MPP_MASK    0x3U                              /* 2-bit field */
+#define MSTATUS_MPP         (MSTATUS_MPP_MASK << MSTATUS_MPP_SHIFT)  /* = 0x00001800 */
+
 #endif //RISCV_H
