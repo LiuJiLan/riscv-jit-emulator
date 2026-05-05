@@ -11,9 +11,8 @@
 //   3. csr 编号自带权限位段 (riscv.h CSR_ADDR_PRIV_* / CSR_ADDR_RO_*), 入口直接判:
 //        - priv < 要求 → trap_raise_exception(hart, 2 /*illegal*/, raw_inst); 不返回
 //        - 写 RO csr   → trap_raise_exception(hart, 2 /*illegal*/, raw_inst); 不返回
-//      a_01_5_a 这两条路径用注释占位 (trap_raise_exception 还没真接 longjmp), Step 4 接
-//      interpreter 后真激活的是 helper 调用; a_01_5_b cpu_t 加 trap_csrs_t + helper 真路径
-//      后这条入口判错路径才真触发 trap。
+//      a_01_7 真激活 (替换 a_01_5_a 注释占位); 入口判失败走 _Noreturn longjmp 跳回 dispatcher
+//      sigsetjmp 落点。
 //
 // "I 变体" (RWI / RSI / RCI) 与"普通变体" (RW / RS / RC) 在 csr 侧无差别:
 //   - csr_op 不感知 op 是不是 I 变体, 它只看 (op_kind, new_val); caller 在 RWI/RSI/RCI
@@ -64,7 +63,7 @@
 // "纯读不写"判定 (RV spec §2.1.2):
 //   CSRRS / CSRRC / CSRRSI / CSRRCI + new_val == 0 时, 视为不写 (副作用不发生; 写 RO csr
 //   不 trap)。CSRRW / CSRRWI 总是写 (rs1=x0 / zimm=0 时也写, 用 0 覆盖)。
-//   csr_op 入口的 RO 写 trap 检查由这条规则裁剪 (a_01_5_a 注释占位)。
+//   csr_op 入口的 RO 写 trap 检查由这条规则裁剪 (a_01_7 真激活)。
 typedef enum {
     CSR_OP_RW,      /* CSRRW  / CSRRWI */
     CSR_OP_RS,      /* CSRRS  / CSRRSI */
@@ -82,12 +81,12 @@ typedef enum {
 //
 // 返回值: read_old —— csr 旧值, caller 写 rd (rd=x0 时由 WRITE_REG 宏丢)
 //
-// trap 路径 (a_01_5_b 真接通后):
-//   - priv < csr 要求 → trap_raise_exception(hart, 2, raw_inst), 不返回
-//   - 写 RO csr       → trap_raise_exception(hart, 2, raw_inst), 不返回
-//   - 不存在的 csr addr → trap_raise_exception(hart, 2, raw_inst), 不返回
-// a_01_5_a: 上述三条用注释占位 (helper 还没真接 longjmp), 走"返回 0 + stderr fprintf"
-//          路径; fixture 不构造非法 csr 访问, 这条不被触发。
+// trap 路径 (a_01_7 全部真激活):
+//   - priv < csr 要求   → trap_raise_exception(hart, 2, raw_inst), 不返回 (入口判)
+//   - 写 RO csr         → trap_raise_exception(hart, 2, raw_inst), 不返回 (入口判)
+//   - 不存在的 csr addr → fprintf 提示 + trap_raise_exception(hart, 2, raw_inst), 不返回
+//                          (大 switch default; 跟 lsu.h/c BARE 不在 RAM 路径 fprintf+trap 同
+//                          风格, dev-friendly 定位 + 跟 RV spec §2.1 一致)
 uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
                 csr_op_t op, uint32_t raw_inst);
 

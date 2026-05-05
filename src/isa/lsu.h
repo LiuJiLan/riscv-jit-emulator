@@ -42,6 +42,7 @@
 #include "core/tlb.h"        // tlb_t (current_tlb 参数类型)
 #include "core/trap.h"       // trap_raise_exception (_Noreturn longjmp)
 #include "platform/ram.h"    // gpa_to_hva_offset (BARE host load 解地址)
+#include "riscv.h"           // CAUSE_LOAD_* (Exception Code 宏)
 
 
 // ----------------------------------------------------------------------------
@@ -73,7 +74,7 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
                                    uint32_t gva, uint32_t size) {
     // Step 1: misalign (Spike 风格严格对齐)。size=1 时 mask=0, LB/LBU 永远过。
     if ((gva & (size - 1u)) != 0u) {
-        trap_raise_exception(hart, /*cause*/4u, /*tval*/gva);  // _Noreturn longjmp
+        trap_raise_exception(hart, CAUSE_LOAD_ADDR_MISALIGNED, /*tval*/gva);  // _Noreturn longjmp
     }
 
     // Step 2: REGIME_BARE (current_tlb == NULL) — identity + RAM 检查 + host load
@@ -87,7 +88,7 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
             fprintf(stderr,
                     "[lsu] load: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented in a_01_6)\n",
                     pa);
-            trap_raise_exception(hart, /*cause*/5u, /*tval*/gva);  // _Noreturn longjmp
+            trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
         }
 
         uint8_t *host_ptr = gpa_to_hva_offset + pa;
@@ -108,7 +109,7 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
     fprintf(stderr,
             "[lsu] load: SV32 path not implemented in a_01_6 (gva=0x%08x size=%u)\n",
             gva, size);
-    trap_raise_exception(hart, /*cause*/13u, /*tval*/gva);  // _Noreturn longjmp
+    trap_raise_exception(hart, CAUSE_LOAD_PAGE_FAULT, /*tval*/gva);  // _Noreturn longjmp
 }
 
 

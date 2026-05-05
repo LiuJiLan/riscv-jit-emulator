@@ -201,6 +201,11 @@ int dispatcher(cpu_t *hart) {
     //   >= 10     项目内部硬停机编码 (退出 hart, 不 reset; 例如 MMIO sifive_test finisher
     //              触发时, trap_set_state 直接把 in_trap 设到 10+ 而不是 ++ 到 3)
     //
+    // 注: 这是项目自定义 host-side 计数协议; 跟 RV Smdbltrp 扩展 (riscv.h CAUSE_DOUBLE_TRAP=16,
+    // 硬件检查 mstatus.MDT 字段触发 cause=16) 无关。项目当前不实现 Smdbltrp; 未来若实现, trap
+    // delivery 路径会按 spec 走 cause=16, 跟这里的 in_trap 嵌套计数协议是两条独立机制 (会并存
+    // 但语义不重叠 — Smdbltrp 是规范层 trap 投递机制, in_trap 是 host emulator 退出协议)。
+    //
     // 规范: cpu 的分配 + 初始化 + 销毁都在 dispatcher 之外 (cpu_create / cpu_destroy 由 main
     // 调用)。cpu_reset 是状态重置 (不是 alloc/destroy), 是规范的合法例外, 允许由 dispatcher
     // 调用; 它在 cpu.c 实现, 跟 cpu_create / cpu_destroy 接口对称。

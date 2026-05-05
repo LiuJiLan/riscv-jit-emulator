@@ -91,6 +91,15 @@ typedef struct {
     //   3+ = handler 又 trap (triple, 候选 A 早 return 不 deliver, dispatcher 看 while
     //        条件 in_trap < 3 失败退出)
     // mret 路径复位为 0 (a_01_5_c 加 OP_MRET 时实现)。
+    //
+    // 注意: 这是项目自定义协议, 跟 RV Smdbltrp 扩展定义的 double trap 不同:
+    //   - RV Smdbltrp (Machine Double-Trap, riscv.h CAUSE_DOUBLE_TRAP=16): 标准扩展, trap
+    //     entry 时硬件检查 mstatus.MDT 字段, 若 MDT=1 (上次 trap 还没退) 触发 cause=16 trap
+    //     由硬件 deliver。这是规范定义的 trap delivery 机制。
+    //   - 本字段 in_trap: 项目自定义计数器, 跟 mstatus.MDT 不是同一个东西; 候选 A 早 return
+    //     是 host emulator 自己实现的 "triple fault halt" 退出协议, 跟 cause=16 没关系。
+    //   项目不实现 Smdbltrp 扩展, mcause 字段不会出现 16 这个值; CAUSE_DOUBLE_TRAP 宏先列在
+    //   riscv.h 是为了 Exception Code 表完整 + 未来真做扩展时直接引用, 当前代码不引用此宏。
     uint8_t   in_trap;
 } trap_csrs_t;
 

@@ -134,4 +134,42 @@
 #define MSTATUS_MPP_MASK    0x3U                              /* 2-bit field */
 #define MSTATUS_MPP         (MSTATUS_MPP_MASK << MSTATUS_MPP_SHIFT)  /* = 0x00001800 */
 
+// ----------------------------------------------------------------------------
+// Exception Code (RV Privileged Spec Vol II, table 3.6 sync exception code)
+//
+// 用途: trap_raise_exception / trap_set_state 的 cause 参数 + mcause/scause 字段值。
+// 命名: CAUSE_<event> (跟 Spike riscv-sim CAUSE_* 一致; 跟 mcause 字段名直接对应)。
+//
+// 部分编号 (10/14/17/20+) 是 RV spec reserved, 项目不暴露宏 (避免误用); 真用到时再加。
+// 部分扩展 trap (16 Smdbltrp double trap, 18 Smcsrind software check, 19 hardware error)
+// 项目暂不实现, 但宏先列出方便未来引用 + grep 时直接知道编号语义。
+//
+// trap_raise_exception 调用方应该用 CAUSE_* 宏 (不再写裸数字), 跟 PRIV_* / MSTATUS_* 风格一致。
+// ----------------------------------------------------------------------------
+#define CAUSE_INST_ADDR_MISALIGNED   0U   /* Instruction address misaligned   */
+#define CAUSE_INST_ACCESS_FAULT      1U   /* Instruction access fault         */
+#define CAUSE_ILLEGAL_INSTRUCTION    2U   /* Illegal instruction              */
+#define CAUSE_BREAKPOINT             3U   /* Breakpoint                       */
+#define CAUSE_LOAD_ADDR_MISALIGNED   4U   /* Load address misaligned          */
+#define CAUSE_LOAD_ACCESS_FAULT      5U   /* Load access fault                */
+#define CAUSE_STORE_ADDR_MISALIGNED  6U   /* Store/AMO address misaligned     */
+#define CAUSE_STORE_ACCESS_FAULT     7U   /* Store/AMO access fault           */
+#define CAUSE_ECALL_FROM_U           8U   /* Environment call from U-mode     */
+#define CAUSE_ECALL_FROM_S           9U   /* Environment call from S-mode     */
+/* 10: Reserved */
+#define CAUSE_ECALL_FROM_M          11U   /* Environment call from M-mode     */
+#define CAUSE_INST_PAGE_FAULT       12U   /* Instruction page fault           */
+#define CAUSE_LOAD_PAGE_FAULT       13U   /* Load page fault                  */
+/* 14: Reserved */
+#define CAUSE_STORE_PAGE_FAULT      15U   /* Store/AMO page fault             */
+#define CAUSE_DOUBLE_TRAP           16U   /* Double trap (Smdbltrp 扩展, 项目不实现) */
+/* 17: Reserved */
+#define CAUSE_SOFTWARE_CHECK        18U   /* Software check                   */
+#define CAUSE_HARDWARE_ERROR        19U   /* Hardware error                   */
+/* 20+: Reserved / Designated for custom use */
+
+// 巧合: PRIV_U=0 / PRIV_S=1 / PRIV_M=3 与 ECALL cause 8/9/11 差 8 (PRIV_H=2 跟 cause 10
+// reserved 对应也"巧合"); 调用方可写 (CAUSE_ECALL_FROM_U + hart->priv) 一行覆盖三 priv。
+// Spike / QEMU 同写法 (跟 RV spec 编码巧合一致, 不是项目自定的"魔法")。
+
 #endif //RISCV_H

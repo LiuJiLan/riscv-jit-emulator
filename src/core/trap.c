@@ -32,6 +32,10 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
 
     // 候选 A: 第三次 (含) 进 trap_set_state 早 return, 不 deliver。
     // 字段保留第二次状态作为 root cause, 给 main 端 dump 用。
+    //
+    // 注: 这是项目自定义"triple fault halt" 协议 (跟 x86 triple fault → reset 风格类似), 不
+    // 是 RV Smdbltrp 扩展 (riscv.h CAUSE_DOUBLE_TRAP=16, Smdbltrp 由硬件检查 mstatus.MDT 字段
+    // 触发 cause=16 trap; 项目不实现该扩展, 这里 in_trap 计数 + 早 return 跟 Smdbltrp 没关系)。
     if (hart->trap.in_trap >= 3) {
         return hart->trap.in_trap;
     }

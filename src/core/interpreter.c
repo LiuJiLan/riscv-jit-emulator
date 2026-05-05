@@ -48,7 +48,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     #define WRITE_PC_OR_TRAP(target) do {                                  \
         uint32_t _t = (target);                                            \
         if ((_t & IALIGN_MASK) != 0u) {                                    \
-            trap_raise_exception(hart, /*cause*/0u, /*tval*/_t);            \
+            trap_raise_exception(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/_t); \
             goto out;                                                      \
         }                                                                  \
         hart->regs[0] = _t;                                                \
@@ -260,10 +260,12 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //          U/S-mode 时, MRET 在 U/S 触发 cause=2 (illegal instruction) 是 spec 要求,
             //          a_01_7 暂不接 (本次 fixture 不构造 U-mode mret, 留 a_01_8+)。
             case OP_ECALL:
-                trap_raise_exception(hart, /*cause*/8u + hart->priv, /*tval*/0u);
+                /* RV 编码巧合: PRIV_U=0/S=1/M=3 ↔ cause 8/9/11 (= CAUSE_ECALL_FROM_U + priv).
+                 * Spike / QEMU 同写法; PRIV_H=2 在没 H 扩展下不会触发 (hart->priv ∉ {2}). */
+                trap_raise_exception(hart, CAUSE_ECALL_FROM_U + hart->priv, /*tval*/0u);
                 goto out;
             case OP_EBREAK:
-                trap_raise_exception(hart, /*cause*/3u, /*tval*/0u);
+                trap_raise_exception(hart, CAUSE_BREAKPOINT, /*tval*/0u);
                 goto out;
             case OP_MRET: {
                 uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
@@ -371,7 +373,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 //           普通 return; 这里 goto out 退出 fetch loop, dispatcher 通过
                 //           while(in_trap < 3) 接管 (in_trap=3 时退出 dispatcher)。
                 // a_01_5_c: helper 标 _Noreturn longjmp, goto out 变 unreachable 但保留无害。
-                trap_raise_exception(hart, /*cause*/2u, /*tval*/d.raw_inst);
+                trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, /*tval*/d.raw_inst);
                 goto out;
         }
 

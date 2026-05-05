@@ -28,7 +28,7 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
                   uint32_t gva, uint32_t value, uint32_t size) {
     // Step 1: misalign (Spike 风格严格对齐)。size=1 时 mask=0, SB 永远过。
     if ((gva & (size - 1u)) != 0u) {
-        trap_raise_exception(hart, /*cause*/6u, /*tval*/gva);  // _Noreturn longjmp
+        trap_raise_exception(hart, CAUSE_STORE_ADDR_MISALIGNED, /*tval*/gva);  // _Noreturn longjmp
     }
 
     // Step 2: REGIME_BARE (current_tlb == NULL) — identity + RAM 检查 + host store
@@ -42,7 +42,7 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
             fprintf(stderr,
                     "[lsu] store: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented in a_01_6)\n",
                     pa);
-            trap_raise_exception(hart, /*cause*/7u, /*tval*/gva);  // _Noreturn longjmp
+            trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
         }
 
         uint8_t *host_ptr = gpa_to_hva_offset + pa;
@@ -88,5 +88,5 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
     fprintf(stderr,
             "[lsu] store: SV32 path not implemented in a_01_6 (gva=0x%08x value=0x%08x size=%u)\n",
             gva, value, size);
-    trap_raise_exception(hart, /*cause*/15u, /*tval*/gva);  // _Noreturn longjmp
+    trap_raise_exception(hart, CAUSE_STORE_PAGE_FAULT, /*tval*/gva);  // _Noreturn longjmp
 }

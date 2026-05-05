@@ -7,6 +7,9 @@
 // 演进:
 //   a_01_5_a: csr_op 框架 + 6 小 helper fprintf 占位 (read 返 0, write 仅 fprintf)
 //   a_01_5_c: 6 小 helper 改真读写 hart->trap 的对应字段; 删 fprintf; 大 switch 不变
+//   a_01_7:   csr_op 入口判 priv/RO 真激活 (替换 a_01_5_a 注释占位); csr_mstatus_write 加 MPP
+//             WARL (PRIV_H=2 → PRIV_U=0); 大 switch default 解开为 fprintf+trap_raise (访问
+//             未实现 csr → cause 2)
 //
 // csr 编号 → trap_csrs_t 字段映射:
 //   mstatus  (0x300) → _mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
@@ -16,9 +19,6 @@
 //                       when IALIGN=16; mepc[1:0]=0 when IALIGN=32)
 //   mcause   (0x342) → xcause[PRIV_M]
 //   mtval    (0x343) → xtval[PRIV_M]
-//
-// csr_op 入口的 priv / RO 检查路径仍是注释占位 (fixture 不构造非法访问, a_01_5_b 起
-//   trap_raise_exception 已可调用, 但当前未真接到入口判路径; 真接见下方 csr_op 注释段)。
 //
 
 #include "csr.h"
@@ -174,14 +174,14 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
     {
         uint32_t required_priv = (csr_addr >> CSR_ADDR_PRIV_SHIFT) & CSR_ADDR_PRIV_MASK;
         if (hart->priv < required_priv) {
-            trap_raise_exception(hart, /*cause*/2u, raw_inst);  // _Noreturn longjmp
+            trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
         }
 
         uint32_t is_ro = ((csr_addr >> CSR_ADDR_RO_SHIFT) & CSR_ADDR_RO_MASK)
                          == CSR_ADDR_RO_VALUE;
         uint32_t is_write = (op == CSR_OP_RW) || (new_val != 0);
         if (is_ro && is_write) {
-            trap_raise_exception(hart, /*cause*/2u, raw_inst);  // _Noreturn longjmp
+            trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
         }
     }
 
@@ -189,8 +189,9 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
     // 大 switch: 按 csr_addr 分发到具体 csr 的小 r/w helper, 算 read_old + write_back。
     //
     // 加新 csr 时只在这里加 case + 写一对 csr_<name>_<r/w> file-static helper (上方)。
-    // 不存在的 csr addr 走 default → 当前 fprintf + 返回 0 (一时占位, 真用 trap 还没接);
-    // 未来某个 fixture 写不存在的 csr 时, 解开 trap_raise_exception(2, raw_inst)。
+    // 不存在的 csr addr 走 default: a_01_7 末解开为 fprintf 提示 + trap_raise_exception 真路径
+    // (跟 lsu.h/c BARE 不在 RAM 路径同风格 — fprintf 留下 dev-friendly 定位信息, trap 走 RV
+    // spec §2.1 "访问未实现 csr → illegal instruction" 路径)。
     // ----------------------------------------------------------------------------
     uint32_t read_old;
     switch (csr_addr) {
@@ -201,12 +202,10 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
         default:
-            // 占位: fprintf + 返回 0; 未来真用 trap 时换成:
-            //   trap_raise_exception(hart, /*cause*/2, raw_inst);  // _Noreturn
             fprintf(stderr,
-                    "[csr] unknown csr addr=0x%03" PRIx32 " (would trap cause 2)\n",
+                    "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2\n",
                     csr_addr);
-            return 0;
+            trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
     }
 
     // 算 new + write_back; switch on csr_op_t (3 case 全覆盖, -Wswitch-enum 强制)
@@ -229,7 +228,9 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
             default:
-                // 上面 read 路径的 default 已 fprintf + return 0, 不会到这里。
+                // a_01_7 末: 上面 read 路径的 default 已 fprintf + trap_raise_exception
+                // (_Noreturn longjmp), 控制流到此不可达; 保留 default break 作 -Wswitch
+                // 默认防御 (switch on uint32_t 不受 -Wswitch-enum 约束, 但写出来更稳)。
                 break;
         }
     }

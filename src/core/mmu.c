@@ -68,7 +68,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
             // a_01_5_b: 直调 trap_set_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
             // cause=1 (Instruction Access Fault, RV spec §3.1.16 cause table); tval=fetch GVA.
             // 返回 in_trap 当前值给 dispatcher (0/非0 信号; dispatcher continue 让 while 兜底)。
-            return (int)trap_set_state(hart, /*cause*/1u, /*tval*/gva);
+            return (int)trap_set_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
         }
         *pa_out = pa;
         return 0;
@@ -99,7 +99,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
                 // PTE 翻译失败 — X 位不允许); tval=fetch GVA。
                 // a_01 不会触发 (priv 恒 M, current_tlb == NULL → 走 BARE 不进 SV32), SV32
                 // 路径占位等 a_01_7 SV32 walker 接入时真激活。
-                return (int)trap_set_state(hart, /*cause*/12u, /*tval*/gva);
+                return (int)trap_set_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
             }
             uint8_t *hva = entry->host_ptr + (gva & 0xFFFu);
             *hva_out = hva;
@@ -118,7 +118,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     //
     // a_01 占位: 直接走 trap_set_state(12) (本来就走不到 SV32 分支, 因为 priv 恒 M;
     // a_01_5_b 形式上保持接口对齐, 未来 SV32 walker 替换上方那行 mmu_walk 调用即可)。
-    return (int)trap_set_state(hart, /*cause*/12u, /*tval*/gva);
+    return (int)trap_set_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
 
     // (Step 3-5 在 walker 接入时一并填; a_01 不会执行到)
 }
