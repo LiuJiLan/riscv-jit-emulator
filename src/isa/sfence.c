@@ -7,6 +7,7 @@
 
 #include "sfence.h"
 
+#include <stddef.h>          // NULL (a_01_8 v01 加; sfence.c 内 if (tlb_table[priv] != NULL) 用)
 #include <stdint.h>
 
 #include "config.h"          // ASID_MAX, ASID_MASK
@@ -35,27 +36,34 @@ void sfence_vma_helper(cpu_t *hart,
      * 记忽略对应维度; vaddr=0/asid=0 是合法的实值不算忽略。详见 sfence.h 接口 doc。 */
     int single_asid_mode = (rs1 == 0u) && (rs2 != 0u);
 
+    /* tlb_table[priv] 是 ASID 容器指针; 容器自身可能 NULL (该 priv 没 eager-allocate 容器).
+     * a_01_8 现状:
+     *   [PRIV_S] 容器 eager 分配 (cpu_create), 永远非 NULL
+     *   [PRIV_H] 容器 a_01_8 不分配, 永远 NULL (留 H 扩展激活时分配)
+     *   [PRIV_M] / [PRIV_U] 见 D13 (此处不动)
+     * 索引 tlb_table[priv][asid] 前必须 check 容器非 NULL — 否则 NULL[asid] 是 host 段错
+     * (a_01_8 v01 fixture (g) 跑 sfence.vma 时 ASan 抓到本 bug). */
+
     if (single_asid_mode) {
-        /* (c) 单 ASID 清:
-         *   - asid 来自 caller 传的 asid_val (= READ_REG(rs2)); rs2!=0 时是真值, rs2==0
-         *     时 caller 传 0 (但本分支已判 rs2!=0, 不可达) — 接口契约让代码自洽。
-         *   - WARL 截断到 ASID_MASK 位 (跟 csr.c csr_satp_write 路径同); host 内存安全防线
-         *     (满足 dummy.txt §3 satp 合法性契约的精神 — 无论 satp 还是 sfence 路径, 进
-         *     tlb_table[][asid] 索引前 asid 必须合法)。
-         */
+        /* (c) 单 ASID 清: WARL 截 asid 到 ASID_MASK 位 (跟 csr_satp_write 同, host 内存安全) */
         uint32_t asid = asid_val & ASID_MASK;
-        tlb_clear(hart->tlb_table[PRIV_S][asid]);     /* 主目标 (ASID 容器内对应槽) */
-        tlb_clear(hart->tlb_table[PRIV_H][asid]);     /* a_01_8 永远 NULL → no-op;
-                                                         留写法方便未来 H 扩展激活 */
+        if (hart->tlb_table[PRIV_S] != NULL) {
+            tlb_clear(hart->tlb_table[PRIV_S][asid]);     /* 主目标 */
+        }
+        if (hart->tlb_table[PRIV_H] != NULL) {
+            tlb_clear(hart->tlb_table[PRIV_H][asid]);     /* a_01_8 不到这, H 扩展时激活 */
+        }
     } else {
-        /* (a)/(b)/(d) 全清: 遍历所有 ASID 槽位调 tlb_clear。
-         *   - tlb_clear(NULL) 是 no-op (tlb.h 设计), 没懒分配的槽位天然跳过。
-         *   - [PRIV_U] 是 [PRIV_S] 别名 (cpu.c eager 设), 不重复清。
-         *   - [PRIV_M] D23 路线永远 NULL, sfence.vma 按 RV spec 也不影响 M-mode TLB, 不动。
-         */
-        for (uint32_t asid = 0; asid < ASID_MAX; asid++) {
-            tlb_clear(hart->tlb_table[PRIV_S][asid]);
-            tlb_clear(hart->tlb_table[PRIV_H][asid]);
+        /* (a)/(b)/(d) 全清: 遍历所有 ASID 槽位调 tlb_clear (tlb_clear(NULL) no-op) */
+        if (hart->tlb_table[PRIV_S] != NULL) {
+            for (uint32_t asid = 0; asid < ASID_MAX; asid++) {
+                tlb_clear(hart->tlb_table[PRIV_S][asid]);
+            }
+        }
+        if (hart->tlb_table[PRIV_H] != NULL) {
+            for (uint32_t asid = 0; asid < ASID_MAX; asid++) {
+                tlb_clear(hart->tlb_table[PRIV_H][asid]);
+            }
         }
     }
 }

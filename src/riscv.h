@@ -122,6 +122,63 @@
 //   M=3 > S=1)。
 #define CSR_SATP       0x180U
 
+// Supervisor-level CSRs (a_01_8 Step 6 加; sret 必带的最小集 — sstatus + sepc)
+//
+// sstatus (0x100): mstatus 的 masked view; 物理存储 = trap._mstatus 的同一份, sstatus
+// 入口只能访问 SSTATUS_MASK 内的字段位 (SIE/SPIE/SPP/SUM/MXR + 未来 FS/VS/XS/SD/UBE)。
+// csr_sstatus_read = _mstatus & SSTATUS_MASK; csr_sstatus_write = (_mstatus & ~MASK) |
+// (v & MASK) — 不影响 mstatus M-mode-only 字段 (MIE/MPIE/MPP)。
+//
+// sepc (0x141): S-mode 异常 / 中断的"返回 PC"; 物理存储 = trap.xepc[PRIV_S] (按 priv 索引
+// 数组的 [PRIV_S] 槽, 跟 mepc=xepc[PRIV_M] 同形态)。WARL: 同 mepc 截 IALIGN 对齐位。
+// a_01_8 deliver_priv hard-code PRIV_M, trap_set_state 不写 sepc; sepc 由 fixture (sret
+// 路径) 通过 csrw sepc 显式设。
+//
+// 不做 (留下个 session): stvec/scause/stval/sscratch (其余 S-mode CSR), medeleg, S-handler
+// delivery (deliver_priv 仍 hard-code PRIV_M)。
+#define CSR_SSTATUS    0x100U
+#define CSR_SEPC       0x141U
+
+// ----------------------------------------------------------------------------
+// Unprivileged and User-Level Custom CSRs (a_01_8 临时, 等 uart 实装后删除)
+//
+// 0x800-0x8FF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "Unprivileged and
+// User-Level Custom Read/Write" CSRs:
+//   bits[11:10] = 0b10 → Custom RW
+//   bits[9:8]   = 0b00 → U-level priv min (任何 priv 都能访问 — priv >= U=0 永远成立)
+//
+// CSR_TOHOST 用作 fixture 流式输出 (跟 spike tohost / qemu semihosting 风格类似):
+// fixture `csrw 0x800, x..` 立即触发 fprintf "[tohost] 0x..." 输出到 stderr (csr.c
+// csr_tohost_write 内直接 fprintf, 不缓存 cpu_t 字段; 跟 CSR_PRIVRD 同形态 "csrw 即输出")。
+// 不污染 guest GPR (避免 fixture 用 x10/x11 标记跟 fixture 内部计算冲突)。
+//
+// 删除时机: a_03+ uart 实装 + ROM-based putchar 接入后, fixture 用 putchar 输出, 这条
+// CSR + csr.c csr_tohost_* helper 一起删。
+// ----------------------------------------------------------------------------
+#define CSR_TOHOST     0x800U
+
+// ----------------------------------------------------------------------------
+// CSR_PRIVRD (a_01_8 临时, 等 uart 实装后删除) —— "作弊" 寄存器, 读当前 priv
+//
+// 0xCC0-0xCFF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "User-level Custom
+// Read-Only" CSRs:
+//   bits[11:10] = 0b11 → Custom RO
+//   bits[9:8]   = 0b00 → U-level priv min (任何 priv 都能读 — priv >= U=0 永远成立)
+//   bits[7:6]   = 0b11 → Custom 编号段
+//
+// 写检查: csr_op 入口判 [11:10]=0b11 = RO → 写时 trap cause=2; csrr (RO 路径) OK.
+//
+// CSR_PRIVRD 真"作弊" 用途: csrr x.., 0xCC0 立即触发 fprintf "[priv] X" 输出 (X = M/S/H/U
+// 之一, csr.c csr_privrd_read 直接 fprintf 不缓存; 跟 CSR_TOHOST 同形态 "csrr 即输出"),
+// 同时 return (uint32_t)hart->priv 让 GPR 也能拿到 (兼容性)。
+// RV spec 不允许 User-mode 知道当前 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换
+// 正确性 — 控制台直接看到 priv 字符比构造 ecall+trap+handler 路径验更直接。
+//
+// 删除时机: 跟 CSR_TOHOST 一起 (a_03+ uart 实装后, fixture 用 putchar + 真 trap 路径
+// 验 priv 状态, 不需要这个 backdoor)。
+// ----------------------------------------------------------------------------
+#define CSR_PRIVRD     0xCC0U
+
 // ----------------------------------------------------------------------------
 // mstatus 物理存储 + 字段位段 (RV Privileged Spec Vol II §3.1.6)
 //
@@ -225,6 +282,21 @@
 
 #define MSTATUS_MXR_SHIFT   19U
 #define MSTATUS_MXR         (1U << MSTATUS_MXR_SHIFT)        /* = 0x00080000 */
+
+// ----------------------------------------------------------------------------
+// SSTATUS_MASK (a_01_8 Step 6 加) —— sstatus 是 mstatus 的 masked view
+//
+// sstatus 入口可访问 _mstatus 的字段位; mstatus M-mode-only 字段 (MIE/MPIE/MPP/TVM/TW/TSR
+// 等) 不在 sstatus 视图内, 写入忽略读出 0。
+//
+// 项目当前真用的 S-mode 字段: SIE / SPIE / SPP / SUM / MXR (Step 1 已暴露宏); 跟 a_01_8
+// fixture (a) sret 切 priv + walker SUM/MXR 配套。其他 S-mode 字段 (UBE bit 6, VS bits 10:9,
+// FS bits 14:13, XS bits 16:15, SD bit 31) 项目不实现 F/D/V/XS, mask 暂不覆盖 — 跟"真用到
+// 一个加一个" 原则一致; 未来真做 F/D/V 扩展时把对应位加进 mask。
+//
+// 注: SD 是 read-only derived from FS/VS/XS dirty 状态 (RV spec); 严格说 sstatus 应能 read
+// 到 SD 但 write 时 ignore — 项目不实现 FS/VS/XS, SD 永远 0, 不进 mask 也不影响行为。
+#define SSTATUS_MASK   (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR)
 
 // ----------------------------------------------------------------------------
 // future-proof 字段宏 (a_01_8 加; user 主导拍, 见 a_01_session_011 — RV64 切换时启用)

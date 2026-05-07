@@ -59,6 +59,9 @@ typedef struct cpu_s {
                                             // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
                                             // 见 trap.h 顶部 doc + dummy.txt §1
 } cpu_t;
+// 注: a_01_8 v01 加过 tohost 字段, 后改为 csr_tohost_write 直接 fprintf 流式输出 (不存
+//     字段) — 跟 csr_privrd_read 同形态. 删字段后这两条 csr 都是"接 csr.c 入口直接 console
+//     输出, 不污染 cpu_t / GPR / main.c dump"。等 uart 实装后两条 csr 一起删。
 
 // 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。
 // 失败返回 NULL, 内部已 fprintf。

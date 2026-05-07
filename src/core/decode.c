@@ -288,6 +288,10 @@ decoded_inst_t decode(uint32_t inst) {
                             d.kind    = OP_MRET;
                             d.pc_step = PC_STEP_NONE;   /* MRET 写 pc=xepc, 不让 fetch loop +4 */
                             break;
+                        case 0x102:
+                            d.kind    = OP_SRET;        /* a_01_8 Step 6; 跟 MRET 同形态 */
+                            d.pc_step = PC_STEP_NONE;
+                            break;
                         default:
                             d.kind = OP_UNSUPPORTED;
                             break;

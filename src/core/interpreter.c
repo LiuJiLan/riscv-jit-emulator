@@ -293,6 +293,45 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
+            // ---- a_01_8 Step 6 SRET (跟 OP_MRET 同形态; S-mode 字段段 + sepc) ----
+            //
+            // RV Privileged Spec Vol II §3.3.2:
+            //   priv = SPP (1-bit; 0=U, 1=S)
+            //   SIE  = SPIE
+            //   SPIE = 1
+            //   SPP  = PRIV_U = 0 (least-priv reset)
+            //   pc   = sepc (= trap.xepc[PRIV_S])
+            //   in_trap = 0 (项目复位嵌套链, 跟 MRET 同)
+            //
+            // 权限要求 (a_01_8 暂不接, 跟 a_01_7 OP_MRET 风格一致):
+            //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction.
+            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2). 当前 fixture (a) M→S→U→M
+            //   只在 S-mode 跑 SRET (S→U), 不构造 U-mode SRET / TSR=1; 真做 priv 检查留 a_03+
+            //   时跟 MRET 一起补 (interpreter case 入口或 csr_op 风格的 priv 检查段)。
+            case OP_SRET: {
+                uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+
+                /* hart->priv = SPP (1-bit; 0=U, 1=S) */
+                hart->priv = (uint8_t)((mstatus_lo & MSTATUS_SPP) >> MSTATUS_SPP_SHIFT);
+
+                /* mstatus.SIE = mstatus.SPIE */
+                if (mstatus_lo & MSTATUS_SPIE) mstatus_lo |=  MSTATUS_SIE;
+                else                           mstatus_lo &= ~MSTATUS_SIE;
+
+                /* mstatus.SPIE = 1 (RV spec) */
+                mstatus_lo |= MSTATUS_SPIE;
+
+                /* mstatus.SPP = PRIV_U = 0 (RV spec least-priv reset; SPP 是 1-bit, 清 0) */
+                mstatus_lo &= ~MSTATUS_SPP;
+
+                hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+                                    | (uint64_t)mstatus_lo;
+
+                hart->trap.in_trap = 0;
+                hart->regs[0]      = hart->trap.xepc[PRIV_S];   /* sepc */
+                break;
+            }
+
             // ---- I-type LOAD (5 op, a_01_6) ----
             //
             // 不对称设计 (file_plan §8.interpreter D 区, dummy.txt §1 末段): load 走

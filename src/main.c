@@ -210,6 +210,8 @@ static int decode_test(void) {
     CASE(0x00100073, OP_EBREAK, /*rd*/0, /*rs1*/0, /*rs2*/1, 0x001, 0x00100073, PC_STEP_NONE);
     // MRET = 0x30200073
     CASE(0x30200073, OP_MRET,   /*rd*/0, /*rs1*/0, /*rs2*/2, 0x302, 0x30200073, PC_STEP_NONE);
+    // SRET = 0x10200073 (a_01_8 Step 6; imm=0x102; rs2 garbage = imm[4:0] = 2)
+    CASE(0x10200073, OP_SRET,   /*rd*/0, /*rs1*/0, /*rs2*/2, 0x102, 0x10200073, PC_STEP_NONE);
 
     // ---- a_01_6 LOAD 5 + STORE 3 (I-type / S-type 立即数边界值)----
     //
@@ -580,9 +582,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dispatcher returned %d (fetch trap or other failure)\n", rc);
     }
 
+    /* a_01_8 Step 6 (新): dump 范围扩到 x4-x15, 让 fixture 用的标记寄存器 (典型 x10-x15
+     * 输出, x4-x7 临时) 都能看到。短期方案; 长期 user 拍 "用 0x800-0x8FF custom CSR 做
+     * mtohost-style 输出" 留 csr 重组讨论一起做 (那时这个扩 dump 可缩回)。 */
     fprintf(stderr,
-            "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n",
-            hart->regs[0], hart->regs[1], hart->regs[2], hart->regs[3]);
+            "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n"
+            "[main] regs (a_01_8 fixture 调试用): x4=0x%08x x5=0x%08x x6=0x%08x x7=0x%08x\n"
+            "[main] regs (cont): x10=%u x11=%u x12=%u x13=%u x14=%u x15=%u\n",
+            hart->regs[0],  hart->regs[1],  hart->regs[2],  hart->regs[3],
+            hart->regs[4],  hart->regs[5],  hart->regs[6],  hart->regs[7],
+            hart->regs[10], hart->regs[11], hart->regs[12], hart->regs[13],
+            hart->regs[14], hart->regs[15]);
 
     // a_01_5_b: trap dump (验 trap_set_state 写字段对; 候选 A 早 return 行为下,
     // in_trap=3 时字段保留第 2 次状态作 root cause)。a_01 单 hart, 只 dump [PRIV_M] 槽
@@ -602,6 +612,8 @@ int main(int argc, char **argv) {
             "[main] state dump: priv=%u mstatus=0x%08x\n",
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));
+    /* a_01_8 v01: tohost / privrd 改为 csr.c 内部直接 fprintf 流式输出 (csr_tohost_write
+     * + csr_privrd_read), 不再 cpu_t 缓存, main.c 也不需要 dump (csrw/csrr 时输出已发生)。 */
 
     cpu_destroy(hart);
     return 0;

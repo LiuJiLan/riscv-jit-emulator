@@ -108,11 +108,21 @@ int dispatcher(cpu_t *hart) {
         regime      = REGIME_SV32;
         uint32_t asid = (xatp >> 22) & ASID_MASK;
         current_tlb = hart->tlb_table[hart->priv][asid];
-        // future 懒分配 (a_01 不会到这, SV32 在 a_01 不触发):
-        //   if (current_tlb == NULL) {
-        //       current_tlb = tlb_alloc();
-        //       hart->tlb_table[hart->priv][asid] = current_tlb;
-        //   }
+        // a_01_8 Step 6 (新) 末段解开 (从 Step 8 提前的"必要部分"): SV32 路径需 current_tlb
+        // 非 NULL 才走 walker; 不解开的话切 S 后 current_tlb=NULL 让 mmu_translate_pc 走
+        // BARE 路径, 不验 SV32 walker (fixture (g) 跑不通)。tlb_alloc 失败简化处理 (return
+        // -1 + fprintf, 跟 ram_init / cpu_create 失败同形态); 不接 trap 路径 (host 内存
+        // 耗尽是致命 host 错, 跟 guest 行为无关)。
+        if (current_tlb == NULL) {
+            current_tlb = tlb_alloc();
+            if (current_tlb == NULL) {
+                fprintf(stderr,
+                        "[dispatcher] tlb_alloc failed for priv=%u asid=%u\n",
+                        (uint32_t)hart->priv, asid);
+                return -1;
+            }
+            hart->tlb_table[hart->priv][asid] = current_tlb;
+        }
     }
     // regime 显式算出表达 D25.1 设计意图 ("两个独立的派发概念, 现阶段恰好一致, 未来 H 扩展
     // 真打破 1:1 时这里不重新引入变量"); 当前下游只吃 current_tlb (NULL 编码 regime), regime

@@ -189,6 +189,78 @@ static void csr_satp_write(cpu_t *hart, uint32_t v) {
 }
 
 
+// ---- sstatus / sepc (a_01_8 Step 6 加; sret 必带的最小集) ----
+//
+// sstatus 是 _mstatus 的 masked view (SSTATUS_MASK = SIE | SPIE | SPP | SUM | MXR; 详见
+// riscv.h SSTATUS_MASK 段); 物理存储跟 mstatus 共用 trap._mstatus, csr_sstatus_read/write
+// 通过 mask 操作只访问 sstatus 视图字段位, mstatus M-mode-only 字段 (MIE/MPIE/MPP) 不被影响。
+//
+// sepc 物理存储 = trap.xepc[PRIV_S] (按 priv 索引数组的 [PRIV_S] 槽, 跟 mepc=xepc[PRIV_M]
+// 同形态)。WARL 截 IALIGN 对齐位 (跟 mepc 同)。
+
+static uint32_t csr_sstatus_read(cpu_t *hart) {
+    /* 取 _mstatus 低 32 位 (mstatus 视图) ∩ SSTATUS_MASK = sstatus 视图 */
+    return (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu) & SSTATUS_MASK;
+}
+
+static void csr_sstatus_write(cpu_t *hart, uint32_t v) {
+    /* 只改 sstatus mask 内的位; 保留 _mstatus 其余字段 (M-mode-only + 高 32 位) */
+    const uint64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;
+    const uint64_t set  = (uint64_t)(v & SSTATUS_MASK);
+    hart->trap._mstatus = keep | set;
+}
+
+static uint32_t csr_sepc_read(cpu_t *hart) {
+    return hart->trap.xepc[PRIV_S];
+}
+
+static void csr_sepc_write(cpu_t *hart, uint32_t v) {
+    /* WARL 截 IALIGN 对齐位 (跟 mepc 同; RV spec §3.1.15 / sepc 同样要求) */
+    hart->trap.xepc[PRIV_S] = v & ~IALIGN_MASK;
+}
+
+
+// ---- tohost (a_01_8 临时 fixture 流式输出; CSR 0x800; 等 uart 实装后删除) ----
+//
+// 设计意图: csrw 0x800 立即 fprintf 输出到 stderr, 不存 cpu_t 字段; fixture 用作"流式
+// 调试输出" 不污染 GPR (跟 spike tohost / qemu semihosting 风格类似但 user-level)。
+// 跟 csr_privrd_read 同形态 — 都是"接 csr.c 入口直接 console 输出, 不缓存"。
+// 任何 priv 都能 csrw/csrr (priv >= U=0; csr_op 入口判通过); 不影响 trap_csrs_t 任何字段.
+
+static uint32_t csr_tohost_read(cpu_t *hart) {
+    /* read 不缓存, 不存值; return 0 让 csrr 不 trap (csr_op 大 switch case 必须有
+     * read helper, 否则 default → fprintf+trap_raise illegal). fixture 不应 csrr 0x800. */
+    (void)hart;
+    return 0;
+}
+
+static void csr_tohost_write(cpu_t *hart, uint32_t v) {
+    /* 直接 fprintf 流式输出, 不存字段. cpu_t 不再有 tohost 字段 (a_01_8 v01 删). */
+    (void)hart;
+    fprintf(stderr, "[tohost] 0x%08" PRIx32 "\n", v);
+}
+
+
+// ---- privrd (a_01_8 临时"作弊" CSR; 0xCC0; 等 uart 实装后删除) ----
+//
+// 设计意图: csrr 0xCC0 立即 fprintf "[priv] X" 输出 (X = M/S/H/U 之一), 同时 return
+// (uint32_t)hart->priv 让 fixture 也能 GPR 读到 (兼容性). RV spec 不允许 User-mode 直接
+// 知道 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换 — fprintf 让控制台可见, GPR
+// return 仍可用 (fixture 选择用 GPR 标记还是 console 输出都行)。
+// RO csr — csr_op 入口判 [11:10]=0b11 时 trap 写; 没 write helper.
+
+static char priv_to_char(uint8_t priv) {
+    /* priv encoding (riscv.h PRIV_*): U=0, S=1, H=2 (项目占位 reserved), M=3 */
+    static const char chars[4] = { 'U', 'S', 'H', 'M' };
+    return chars[priv & 0x3u];
+}
+
+static uint32_t csr_privrd_read(cpu_t *hart) {
+    fprintf(stderr, "[priv] %c\n", priv_to_char(hart->priv));
+    return (uint32_t)hart->priv;
+}
+
+
 // ============================================================================
 // csr_op —— 大 helper, decode 分发入口
 //
@@ -243,6 +315,10 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
         case CSR_SATP:     read_old = csr_satp_read    (hart); break;   /* a_01_8 */
+        case CSR_SSTATUS:  read_old = csr_sstatus_read (hart); break;   /* a_01_8 Step 6 */
+        case CSR_SEPC:     read_old = csr_sepc_read    (hart); break;   /* a_01_8 Step 6 */
+        case CSR_TOHOST:   read_old = csr_tohost_read  (hart); break;   /* a_01_8 临时, 删除时一起 */
+        case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* a_01_8 临时 RO, RO 写 trap 由入口判 */
         default:
             fprintf(stderr,
                     "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2\n",
@@ -270,6 +346,9 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
             case CSR_SATP:     csr_satp_write    (hart, to_write); break;   /* a_01_8 */
+            case CSR_SSTATUS:  csr_sstatus_write (hart, to_write); break;   /* a_01_8 Step 6 */
+            case CSR_SEPC:     csr_sepc_write    (hart, to_write); break;   /* a_01_8 Step 6 */
+            case CSR_TOHOST:   csr_tohost_write  (hart, to_write); break;   /* a_01_8 临时 */
             default:
                 // a_01_7 末: 上面 read 路径的 default 已 fprintf + trap_raise_exception
                 // (_Noreturn longjmp), 控制流到此不可达; 保留 default break 作 -Wswitch

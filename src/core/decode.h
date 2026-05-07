@@ -152,6 +152,21 @@ typedef enum {
     OP_EBREAK,
     OP_MRET,
 
+    // ---- I-type SYSTEM SRET (a_01_8 Step 6) ----
+    // opcode 0x73, funct3=0, imm[11:0]=0x102 (= inst[31:20]); rd=0, rs1=0 (RV spec)。
+    // 跟 OP_MRET 同形态, 不同点:
+    //   - MRET: priv=MPP; MIE=MPIE; MPIE=1; MPP=U; pc=mepc; in_trap=0
+    //   - SRET: priv=SPP; SIE=SPIE; SPIE=1; SPP=U; pc=sepc; in_trap=0
+    //   操作的是 _mstatus 的不同位段 (M-mode 段 vs S-mode 段); pc 来源不同
+    //   (mepc=trap.xepc[PRIV_M] vs sepc=trap.xepc[PRIV_S])
+    //
+    // 权限要求: SRET 仅在 hart->priv >= S 时合法 (M/S 模式可用; U 模式触发 cause 2 illegal)。
+    // 加 mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause 2; a_01_8 不实现 TSR 检查, fixture
+    // 不构造 TSR=1)。
+    //
+    // is_block_boundary_inst → 1 (改 pc, 必须块尾)。
+    OP_SRET,
+
     // ---- I-type LOAD (5), opcode 0x03 ---- a_01_6
     // funct3 编码 (RV spec):
     //   000 = LB    (Load Byte,           sign-ext 8-bit)
@@ -359,6 +374,11 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         // ---- a_01_5_c system 3 op (硬边界) ----
         // ECALL/EBREAK 触发 trap → pc 跳 xtvec; MRET → pc 跳 xepc。都改 pc, 必须块尾。
         case OP_ECALL: case OP_EBREAK: case OP_MRET:
+            return 1;
+
+        // ---- a_01_8 Step 6 SRET (硬边界) ----
+        // SRET 跟 MRET 同形态: 改 pc 跳 sepc, 必须块尾。
+        case OP_SRET:
             return 1;
 
         // ---- a_01_6 load/store 8 op (非 boundary) ----

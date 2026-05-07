@@ -23,6 +23,17 @@
 #include <string.h>   // memcpy (a_01_8 walker 读写 PT, walker_helper_* host load/store)
 
 // ----------------------------------------------------------------------------
+// forward decl —— check_perm (实现在 mmu_walk 之后, a_01_8 段内)
+// ----------------------------------------------------------------------------
+//
+// a_01_8 Step 6 (新): mmu_translate_pc SV32 路径调用 check_perm 复用 walker 内 perm 检查
+// (D18 设计点 8: 不重写 fetch perm, 复用 walker 的 check_perm 跟 mmu_walk 路径同步)。
+// check_perm 实现位置不动 (a_01_8 段内, 紧贴 mmu_walk + walker_helpers); forward decl 让
+// 上方 mmu_translate_pc 编译时找到符号。
+static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm);
+
+
+// ----------------------------------------------------------------------------
 // pa_to_fetch_hva —— PA → 取指 HVA
 //
 // 给定 PA, 返回该地址在 host 端能直接读字节的 HVA。失败说明 PA 不在任何"可执行物理区域",
@@ -79,30 +90,36 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     }
 
     // ========================================================================
-    // REGIME_SV32 (Checked): TLB + walker + PTE 权限检查
+    // REGIME_SV32 (Checked): TLB + walker + PTE 权限检查 (a_01_8 Step 6 真接入)
     //
-    // 5 步 (a_01 大部分占位; a_05+ Sv32 walker 接入时填):
-    //   1. 试图命中 current_tlb
-    //   2. miss → mmu_walk 走页表 (a_01: 占位 return 12)
-    //   3. PMP / PMA 检查 (a_01: 全开 skip)
-    //   4. PA → HVA via pa_to_fetch_hva
-    //   5. TLB insert (walker 路径填; entry 内容从 PTE 实际位拷贝)
+    // 流程:
+    //   1. 试图命中 current_tlb (TLB hit fast path; check_perm 复用 walker 逻辑)
+    //   2. miss → mmu_walk(MMU_PERM_X) → pa + pte_flags
+    //      - walk 失败 → trap_set_state(fault_cause, gva); fault_cause 是 walker 选的
+    //        (page fault 12 / access fault 1)
+    //   3. PA 在 RAM 区检查 (用 pa_to_fetch_hva, 跟 BARE 路径同; 取指不能从 MMIO 拿, 不
+    //      在 RAM → access fault cause 1; 未来 ROM 接入时 pa_to_fetch_hva 内加 ROM 分支)
+    //   4. fill TLB (D14 lazy refresh: 在 ram check 后, 即将"成功"前 fill)
+    //   5. 返回 PA + HVA
+    //
+    // 跟 mmu_walker_helper_load/store 不同: 这里 trap 用 trap_set_state (路径 2b 不长跳),
+    // 因为 mmu_translate_pc 在 dispatcher 主循环帧内 return 给 dispatcher 接管即可 (跟
+    // BARE 路径风格一致); walker_helper_* 在解释器深栈用 trap_raise_exception 长跳。
     // ========================================================================
 
-    // Step 1: 命中尝试 current_tlb
+    // Step 1: 命中尝试 current_tlb (TLB hit fast path)
+    //
+    // A 位检查冗余: walker 进 TLB 时永远 set A=1, fast path 检查永远过, 可 skip;
+    // check_perm 内不查 A (D18 设计点 5)。check_perm 复用 walker 内 perm 逻辑 — 同步
+    // fetch perm 检查跟 walker 内 fetch 路径不重写两份, D18 设计点 8。
     {
         const uint32_t vpn = gva >> 12;
         const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
         tlb_e_t *entry = &current_tlb->e[index];
 
         if ((entry->pte_flags & PTE_V) && entry->gva_tag == vpn) {
-            // tag + V 命中 → 检查取指权限 (X 位)
-            // (S/U 还要查 PTE_U + SUM/MXR; 等 a_05+ Sv32 真接入时按 priv emit-bake 加上)
-            if ((entry->pte_flags & PTE_X) == 0) {
-                // a_01_5_b: 同 BARE 路径, 直调 trap_set_state; cause=12 (Instruction Page Fault,
-                // PTE 翻译失败 — X 位不允许); tval=fetch GVA。
-                // a_01 不会触发 (priv 恒 M, current_tlb == NULL → 走 BARE 不进 SV32), SV32
-                // 路径占位等 a_01_7 SV32 walker 接入时真激活。
+            // tag + V 命中 → fetch perm 检查 (X + priv/PTE_U + SUM)
+            if (!check_perm(hart, (uint32_t)entry->pte_flags, MMU_PERM_X)) {
                 return (int)trap_set_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
             }
             uint8_t *hva = entry->host_ptr + (gva & 0xFFFu);
@@ -114,17 +131,35 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
         // 未命中: tag 不匹配 或 V = 0 → 走 Step 2
     }
 
-    // Step 2: miss → mmu_walk
-    //
-    // 真上 Sv32 后:
-    //   ret = mmu_walk(hart, gva, PERM_X, &pa, &fault_cause);
-    //   if (ret != 0) return (int)trap_set_state(hart, fault_cause, gva);  // page fault
-    //
-    // a_01 占位: 直接走 trap_set_state(12) (本来就走不到 SV32 分支, 因为 priv 恒 M;
-    // a_01_5_b 形式上保持接口对齐, 未来 SV32 walker 替换上方那行 mmu_walk 调用即可)。
-    return (int)trap_set_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
+    // Step 2: miss → mmu_walk (a_01_8 Step 6 真接入)
+    {
+        uint32_t pa, pte_flags, fault_cause;
+        if (mmu_walk(hart, gva, MMU_PERM_X, &pa, &pte_flags, &fault_cause) != 0) {
+            /* walker 失败 cause: X 路径 page fault 12 (V=0 / perm 错 / superpage misaligned),
+             * 或 access fault 1 (PT 不在 RAM, 未来 PMP 路径) */
+            return (int)trap_set_state(hart, fault_cause, /*tval*/gva);
+        }
 
-    // (Step 3-5 在 walker 接入时一并填; a_01 不会执行到)
+        // Step 3: PA 在 RAM 区检查 (取指不能从 MMIO 拿; 用 pa_to_fetch_hva 跟 BARE 路径同)
+        uint8_t *hva;
+        if (pa_to_fetch_hva(pa, &hva) != 0) {
+            return (int)trap_set_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
+        }
+
+        // Step 4: fill TLB (D14 lazy refresh; 在 ram check 后, return 0 之前 — 副作用要在
+        // 即将"成功" 前 fill)
+        const uint32_t vpn   = gva >> 12;
+        const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
+        tlb_e_t *entry = &current_tlb->e[index];
+        entry->gva_tag   = vpn;
+        entry->pte_flags = (uint16_t)pte_flags;
+        entry->host_ptr  = hva - (gva & 0xFFFu);    /* page 起点 host 地址 */
+
+        // Step 5: 返回 PA + HVA
+        *pa_out  = pa;
+        *hva_out = hva;
+        return 0;
+    }
 }
 
 
