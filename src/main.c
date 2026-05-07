@@ -11,6 +11,7 @@
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
+#include "core/mmu.h"   // mmu_walk + mmu_perm_t (a_01_8 Step 5b decision M sanity check)
 #include "loader.h"
 #include "platform/ram.h"
 #include "riscv.h"
@@ -242,6 +243,25 @@ static int decode_test(void) {
     //   rd garbage = inst[11:7] = 31
     CASE(0x7E532FA3, OP_SW,  /*rd*/31, /*rs1*/6,  /*rs2*/5, 2047, 0x7E532FA3, PC_STEP_RV);
 
+    // ---- a_01_8 SFENCE.VMA (验 funct7=0x09 路由 + d.rs1/d.rs2 字段透传)----
+    //
+    // 编码 (RV Privileged Spec §10.6.1): opcode=0x73 + funct3=0 + funct7=0x09 + rd=0 +
+    // rs1=vaddr_reg + rs2=asid_reg。decode.c funct3=0 子段先看 funct7=0x09 → SFENCE.VMA,
+    // 否则按 imm[11:0] 区分 ECALL/EBREAK/MRET (跟 a_01_5_c 路径并存)。
+    //
+    // d.imm 字段是 decode 顶部 inst[31:20] 提取所得 (case 0x73 line 249), 即 funct7|rs2:
+    //   d.imm = (0x09 << 5) | rs2 = 0x120 + rs2
+    // sfence case 不读 d.imm (语义不需要), 仅供 raw_inst trap 路径备查; CASE 期望值按通用提取
+    // 规则填。d.pc_step = PC_STEP_RV (sfence 不是 control flow, +4; 块边界由 is_block_boundary_inst
+    // 处理, 见 decode.h)。
+
+    // sfence.vma x0, x0 = 0x12000073 (全清形态 — a_01_8 简化方案 4.a 真用; rs1=0, rs2=0)
+    //   funct7=0x09 + rs2=0 → imm = 0x09<<5 | 0 = 0x120
+    CASE(0x12000073, OP_SFENCE_VMA, /*rd*/0, /*rs1*/0,  /*rs2*/0,  0x120, 0x12000073, PC_STEP_RV);
+    // sfence.vma x1, x2 = 0x12208073 (普通形态; rs1=1, rs2=2 — 验 d.rs1/d.rs2 字段透传)
+    //   funct7=0x09 + rs2=2 → imm = 0x09<<5 | 2 = 0x122
+    CASE(0x12208073, OP_SFENCE_VMA, /*rd*/0, /*rs1*/1,  /*rs2*/2,  0x122, 0x12208073, PC_STEP_RV);
+
     // ---- 未来 RVC 扩展 (C.MV / C.ADD / C.LUI / C.SUB / ... 真翻译) ----
 
     #undef CASE
@@ -250,6 +270,202 @@ static int decode_test(void) {
         fprintf(stderr, "[decode_test] PASS (%d/%d)\n", total - fail, total);
     } else {
         fprintf(stderr, "[decode_test] FAIL (%d/%d)\n", total - fail, total);
+    }
+    return fail;
+}
+
+// ----------------------------------------------------------------------------
+// mmu_walk_test (Step 5b decision M, a_01_session_010 末段拍; 临时调试 helper,
+// Step 9 整 a_01_8 跑通后删 — 全部代码 + 调用 + #include "core/mmu.h" 一起删)
+//
+// 在 cpu_create + hart 字段初始化 之后, dispatcher 之前调用; sanity check mmu_walk
+// 算法不依赖 fixture 真跑解释器路径。
+//
+// 流程: build PT bytes 在 RAM 内 (避开 fixture program 区, 选 1 MiB 偏移; fixture < 1 MiB);
+// 临时设 hart->satp / priv 让 mmu_walk 走 SV32 路径; 调 mmu_walk 验返回值 + 验 walker
+// 已 set A/D 写回 PT; 测完恢复 hart 字段 + 清 PT bytes 避免污染 fixture program。
+//
+// 8 个用例覆盖典型路径:
+//   1. 4KB page typical (R access, U=1, PRIV_U)              → 成功, 验 pa + A=1 set
+//   2. 4KB page W access (同 PT 槽, R+W+U=1)                 → 成功, 验 pa + A+D=1 set
+//   3. V=0 PTE (level=0)                                     → fail, cause=13
+//   4. level=0 leaf misformatted (V=1 + R/W/X 全 0)          → fail, cause=13
+//   5. PRIV_U + PTE.U=0                                       → fail, cause=13
+//   6. 4MB superpage misaligned (level=1 leaf, PPN[0]≠0)     → fail, cause=13
+//   7. 4MB superpage 正常 (level=1 leaf, PPN[0]=0)           → 成功, 验 pa (4MB-aligned)
+//   8. PT 不在 RAM (satp.PPN 指向 RAM 外)                     → fail, cause=5 (access fault)
+// ----------------------------------------------------------------------------
+static int mmu_walk_test(cpu_t *hart) {
+    int fail  = 0;
+    int total = 0;
+
+    /* PT 位置: GUEST_RAM_START + 1 MiB 偏移 (避开 fixture program; fixture 都 < 1 MiB) */
+    const uint32_t root_pt_pa   = GUEST_RAM_START + 0x00100000UL;
+    const uint32_t leaf_pt_pa   = GUEST_RAM_START + 0x00101000UL;
+    const uint32_t leaf_page_pa = GUEST_RAM_START + 0x00102000UL;
+
+    /* 备份 hart 字段 (测完恢复) */
+    const uint32_t orig_satp    = hart->satp;
+    const uint8_t  orig_priv    = hart->priv;
+    const uint64_t orig_mstatus = hart->trap._mstatus;
+
+    /* 临时设 satp.MODE=1 (SV32) + ASID=0 + PPN=root_pt_pa>>12; mstatus 默认 (SUM=0, MXR=0) */
+    hart->satp = (1u << 31) | (0u << 22) | (root_pt_pa >> 12);
+
+    #define EXPECT_OK(_perm, _gva, _expected_pa, _exp_a, _exp_d) do {                  \
+        total++;                                                                       \
+        uint32_t _pa, _flags, _cause;                                                  \
+        int _rc = mmu_walk(hart, (uint32_t)(_gva), (_perm), &_pa, &_flags, &_cause);   \
+        int _a_set = ((_flags & PTE_A) != 0);                                          \
+        int _d_set = ((_flags & PTE_D) != 0);                                          \
+        if (_rc != 0 || _pa != (uint32_t)(_expected_pa)                                \
+            || _a_set != (_exp_a) || _d_set != (_exp_d)) {                             \
+            fprintf(stderr,                                                            \
+                    "[mmu_walk_test] case %d FAIL: rc=%d pa=0x%08x flags=0x%x "        \
+                    "(expected pa=0x%08x A=%d D=%d)\n",                                \
+                    total, _rc, _pa, _flags,                                           \
+                    (uint32_t)(_expected_pa), (_exp_a), (_exp_d));                     \
+            fail++;                                                                    \
+        }                                                                              \
+    } while (0)
+
+    #define EXPECT_FAIL(_perm, _gva, _expected_cause) do {                             \
+        total++;                                                                       \
+        uint32_t _pa, _flags, _cause;                                                  \
+        int _rc = mmu_walk(hart, (uint32_t)(_gva), (_perm), &_pa, &_flags, &_cause);   \
+        if (_rc == 0 || _cause != (uint32_t)(_expected_cause)) {                       \
+            fprintf(stderr,                                                            \
+                    "[mmu_walk_test] case %d FAIL: rc=%d cause=%u (expected fail cause=%u)\n", \
+                    total, _rc, _cause, (uint32_t)(_expected_cause));                  \
+            fail++;                                                                    \
+        }                                                                              \
+    } while (0)
+
+    /* ---- case 1: 4KB page typical (R access, U=1, PRIV_U) → 成功, A=1 set ---- */
+    {
+        memset(gpa_to_hva_offset + root_pt_pa, 0, 4096);
+        memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+        /* root PT[0] = pointer-to-next-level (V=1, R/W/X=0; PPN=leaf_pt>>12) */
+        uint32_t pte1 = PTE_V | ((leaf_pt_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + root_pt_pa + 0, &pte1, 4);
+        /* leaf PT[0] = leaf PTE (V=1, R=1, U=1; PPN=leaf_page>>12) */
+        uint32_t pte0 = PTE_V | PTE_R | PTE_U | ((leaf_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + leaf_pt_pa + 0, &pte0, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_OK(MMU_PERM_R, /*gva=*/0x00000004UL,
+                  /*pa=*/leaf_page_pa + 4UL, /*A=*/1, /*D=*/0);
+    }
+
+    /* ---- case 2: 4KB page W access → 成功, A+D set ---- */
+    {
+        /* 重置 leaf PTE (清 case 1 walker set 的 A bit), 改 R+W+U */
+        memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+        uint32_t pte0 = PTE_V | PTE_R | PTE_W | PTE_U | ((leaf_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + leaf_pt_pa + 0, &pte0, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_OK(MMU_PERM_W, /*gva=*/0x00000008UL,
+                  /*pa=*/leaf_page_pa + 8UL, /*A=*/1, /*D=*/1);
+    }
+
+    /* ---- case 3: V=0 PTE (level=0) → fail, cause=13 ---- */
+    {
+        memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+        /* leaf PT[0] = V=0 (整个 0; root PT[0] 仍指向 leaf_pt) */
+
+        hart->priv = PRIV_U;
+        EXPECT_FAIL(MMU_PERM_R, /*gva=*/0x00000004UL,
+                    /*cause=*/CAUSE_LOAD_PAGE_FAULT);
+    }
+
+    /* ---- case 4: level=0 leaf misformatted (V=1 + R/W/X 全 0) → fail, cause=13 ---- */
+    {
+        memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+        /* level=0 必须 leaf, 但 R/W/X 全 0 在 level=0 是 misformatted (level=0 不能 pointer);
+         * V=1 + R/W/X=0 在 level=0 → page fault */
+        uint32_t pte0 = PTE_V | ((leaf_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + leaf_pt_pa + 0, &pte0, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_FAIL(MMU_PERM_R, /*gva=*/0x00000004UL,
+                    /*cause=*/CAUSE_LOAD_PAGE_FAULT);
+    }
+
+    /* ---- case 5: PRIV_U + PTE.U=0 → fail, cause=13 (U 不能访问 kernel page) ---- */
+    {
+        memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+        /* leaf PT[0] = V=1 + R=1 + U=0 (kernel page); U=0 PTE 在 PRIV_U 不允许 */
+        uint32_t pte0 = PTE_V | PTE_R | ((leaf_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + leaf_pt_pa + 0, &pte0, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_FAIL(MMU_PERM_R, /*gva=*/0x00000004UL,
+                    /*cause=*/CAUSE_LOAD_PAGE_FAULT);
+    }
+
+    /* ---- case 6: 4MB superpage misaligned (level=1 leaf, PPN[0]≠0) → fail, cause=13 ---- */
+    {
+        memset(gpa_to_hva_offset + root_pt_pa, 0, 4096);
+        /* root PT[0] = level=1 leaf (V=1, R=1, U=1; PPN[0]=非0 → misaligned superpage)
+         * leaf_page_pa>>12 = 0x80102; PPN[0]=0x80102 & 0x3FF = 0x102 ≠ 0 → misaligned. */
+        uint32_t pte1 = PTE_V | PTE_R | PTE_U | ((leaf_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + root_pt_pa + 0, &pte1, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_FAIL(MMU_PERM_R, /*gva=*/0x00000004UL,
+                    /*cause=*/CAUSE_LOAD_PAGE_FAULT);
+    }
+
+    /* ---- case 7: 4MB superpage 正常 (PPN[0]=0) → 成功, 验 pa (4MB-aligned) ---- */
+    {
+        /* superpage_page_pa 选 GUEST_RAM_START + 4MiB = 0x80400000, 4MB 自然对齐 →
+         * (super >> 12) = 0x80400; PPN[0] = 0x80400 & 0x3FF = 0x000 ✓ aligned;
+         * PPN[1] = 0x80400 >> 10 = 0x201
+         *
+         * gva = VPN[1]=0, VPN[0]=4, offset=0xC → gva = 0x0000400C
+         * 期望 pa = (PPN[1] << 22) | (VPN[0] << 12) | offset
+         *        = 0x80400000 | 0x4000 | 0xC = 0x8040400C */
+        const uint32_t super_page_pa = GUEST_RAM_START + 0x00400000UL;
+
+        memset(gpa_to_hva_offset + root_pt_pa, 0, 4096);
+        uint32_t pte1 = PTE_V | PTE_R | PTE_U | ((super_page_pa >> 12) << 10);
+        memcpy(gpa_to_hva_offset + root_pt_pa + 0, &pte1, 4);
+
+        hart->priv = PRIV_U;
+        EXPECT_OK(MMU_PERM_R, /*gva=*/0x0000400CUL,
+                  /*pa=*/0x8040400CUL, /*A=*/1, /*D=*/0);
+    }
+
+    /* ---- case 8: PT 不在 RAM (satp.PPN 指向 RAM 外) → fail, cause=5 (access fault) ---- */
+    {
+        /* 临时改 satp.PPN 指向 RAM 外: PPN=0x10000 → root_pa=0x10000000 (不在 [RAM_START,
+         * RAM_END)); walker 第一步算 pte1_pa, ram check 失败 → access fault (跟 mmu.h doc
+         * "PT 物理地址检查 — 用 RAM 区检查代替 PMP" 一致). 这条 fixture (Step 9 reject test)
+         * 也会测, 但 5b sanity 先在这里 catch 一遍. */
+        hart->satp = (1u << 31) | (0u << 22) | 0x10000UL;
+        hart->priv = PRIV_U;
+
+        EXPECT_FAIL(MMU_PERM_R, /*gva=*/0x00000004UL,
+                    /*cause=*/CAUSE_LOAD_ACCESS_FAULT);
+    }
+
+    #undef EXPECT_OK
+    #undef EXPECT_FAIL
+
+    /* 恢复 hart 字段 */
+    hart->satp          = orig_satp;
+    hart->priv          = orig_priv;
+    hart->trap._mstatus = orig_mstatus;
+
+    /* 清 PT bytes (mmu_walk 已 set A/D 写回; 不清的话残留可能跨进 fixture program 区) */
+    memset(gpa_to_hva_offset + root_pt_pa, 0, 4096);
+    memset(gpa_to_hva_offset + leaf_pt_pa, 0, 4096);
+
+    if (fail == 0) {
+        fprintf(stderr, "[mmu_walk_test] PASS (%d/%d)\n", total - fail, total);
+    } else {
+        fprintf(stderr, "[mmu_walk_test] FAIL (%d/%d)\n", total - fail, total);
     }
     return fail;
 }
@@ -329,6 +545,15 @@ int main(int argc, char **argv) {
     // 启动协议: hart 创建后默认所有 trap 字段 0 (cpu_create memset 0); fixture 在执行 trap
     // 触发指令前必须先 csrw mtvec 设好, 否则 trap 跳 0 → fetch fail → triple fault → 退出。
     // 这跟真实 hart reset 后 mtvec=0 由 firmware 设的行为一致。
+
+    // a_01_8 Step 5b decision M (临时调试 helper, Step 9 整 a_01_8 跑通后删):
+    // sanity check mmu_walk 算法 — 不依赖 fixture 真跑解释器路径, 直接 build PT bytes +
+    // 调 mmu_walk 验返回值。FAIL 时 return 1 不让 fixture 跑 (test-driven 模式)。
+    if (mmu_walk_test(hart) != 0) {
+        fprintf(stderr, "mmu_walk_test failed\n");
+        cpu_destroy(hart);
+        return 1;
+    }
 
     // ------------------------------------------------------------------------
     // a_01_4: 跑 fixture, dispatcher 进 while(1) 多块循环, 每块调 interpret_one_block;

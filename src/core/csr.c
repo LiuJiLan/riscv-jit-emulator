@@ -10,15 +10,19 @@
 //   a_01_7:   csr_op 入口判 priv/RO 真激活 (替换 a_01_5_a 注释占位); csr_mstatus_write 加 MPP
 //             WARL (PRIV_H=2 → PRIV_U=0); 大 switch default 解开为 fprintf+trap_raise (访问
 //             未实现 csr → cause 2)
+//   a_01_8:   加 satp 入口 (csr_satp_read/write + 大 switch case); satp_write WARL ASID 截断
+//             到 ASID_MASK 位 — dummy.txt §3 satp 合法性契约的"生产者"职责
 //
-// csr 编号 → trap_csrs_t 字段映射:
-//   mstatus  (0x300) → _mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
-//   mstatush (0x310) → _mstatus 高 32 位 (RV32-only csr 入口)
-//   mtvec    (0x305) → xtvec[PRIV_M]; write WARL mask 低 2 位 (项目不实现 Vectored, 强制 Direct)
-//   mepc     (0x341) → xepc[PRIV_M];  write WARL mask 低 IALIGN_MASK 位 (RV spec mepc[0]=0
+// csr 编号 → 字段映射 (a_01_8 起 satp 不在 trap_csrs_t 里, 改名"字段映射"):
+//   mstatus  (0x300) → trap._mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
+//   mstatush (0x310) → trap._mstatus 高 32 位 (RV32-only csr 入口)
+//   mtvec    (0x305) → trap.xtvec[PRIV_M]; write WARL mask 低 2 位 (项目不实现 Vectored, 强制 Direct)
+//   mepc     (0x341) → trap.xepc[PRIV_M];  write WARL mask 低 IALIGN_MASK 位 (RV spec mepc[0]=0
 //                       when IALIGN=16; mepc[1:0]=0 when IALIGN=32)
-//   mcause   (0x342) → xcause[PRIV_M]
-//   mtval    (0x343) → xtval[PRIV_M]
+//   mcause   (0x342) → trap.xcause[PRIV_M]
+//   mtval    (0x343) → trap.xtval[PRIV_M]
+//   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
+//                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
 //
 
 #include "csr.h"
@@ -147,6 +151,43 @@ static void csr_mtval_write(cpu_t *hart, uint32_t v) {
     hart->trap.xtval[PRIV_M] = v;
 }
 
+// ---- satp (a_01_8 加; dummy.txt §3 satp 合法性契约的"生产者"职责) ----
+//
+// satp 物理存储在 hart->satp (cpu_t 顶层字段, 不在 trap_csrs_t 内 — satp 不属于
+// trap-related CSR 范畴, 设计意图见 cpu.h)。
+
+static uint32_t csr_satp_read(cpu_t *hart) {
+    return hart->satp;
+}
+
+static void csr_satp_write(cpu_t *hart, uint32_t v) {
+    // satp 字段 (RV32 Sv32; RV Privileged Spec Vol II §4.1.11 fig 4.11):
+    //   bit  31     = MODE  (1-bit; 0 = Bare 恒等, 1 = Sv32)
+    //   bits 30:22 = ASID  (Sv32 spec 9 位; 项目 ASIDLEN = TLB_ASID_BITS = 4 位)
+    //   bits 21:0  = PPN   (root page table physical page number; root PA = PPN << 12)
+    //
+    // WARL 截断 (dummy.txt §3):
+    //   - ASID 截到 ASID_MASK 位 (= 0xF, 4 位); dispatcher 直接按 cpu->satp.ASID 索引
+    //     tlb_table[priv][asid] 无 bounds check, 本截断是 host 内存安全的根防线。
+    //   - MODE 是 RV32 单 bit, 0/1 都合法, 不需截 (RV64 4-bit MODE 才需要落到合法值)。
+    //   - PPN 不截; RV spec 不强制 WARL, 非法 PPN 由 walker 访问时按权限/范围检查触发 fault。
+    //
+    // satp 写不自动 sfence.vma (RV spec + plan §1.8 + dummy.txt §3): guest 软件必须显式
+    // sfence.vma 才让新 ASID/MODE 在 TLB 生效。本 helper 只更新 hart->satp 字段, 不动 TLB;
+    // dispatcher 下次 block 入口算 (regime, current_tlb) 时按新 satp 选叶 TLB, 但旧 ASID 槽
+    // 的 entries 不被 invalidate (RV spec 设计 — 切回原 ASID 时缓存仍可用)。
+    //
+    // 未来 mstatus.TVM 检查 (a_01_8 不实现; 留 a_03+):
+    //   RV spec §3.1.6.5: TVM=1 + S-mode 写 satp → trap cause 2 (illegal). a_01_8 fixture
+    //   不构造 TVM=1, 真做 OS 隔离时在本 helper 入口或 csr_op 入口判段加。
+
+    uint32_t mode = (v >> 31) & 0x1u;
+    uint32_t asid = ((v >> 22) & 0x1FFu) & ASID_MASK;     /* WARL 截 ASID 到 ASID_MASK 位 */
+    uint32_t ppn  = v & 0x3FFFFFu;                         /* PPN 22 位, 不截 */
+
+    hart->satp = (mode << 31) | (asid << 22) | ppn;
+}
+
 
 // ============================================================================
 // csr_op —— 大 helper, decode 分发入口
@@ -201,6 +242,7 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MEPC:     read_old = csr_mepc_read    (hart); break;
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
+        case CSR_SATP:     read_old = csr_satp_read    (hart); break;   /* a_01_8 */
         default:
             fprintf(stderr,
                     "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2\n",
@@ -227,6 +269,7 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
             case CSR_MEPC:     csr_mepc_write    (hart, to_write); break;
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
+            case CSR_SATP:     csr_satp_write    (hart, to_write); break;   /* a_01_8 */
             default:
                 // a_01_7 末: 上面 read 路径的 default 已 fprintf + trap_raise_exception
                 // (_Noreturn longjmp), 控制流到此不可达; 保留 default break 作 -Wswitch

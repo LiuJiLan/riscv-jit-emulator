@@ -255,12 +255,26 @@ decoded_inst_t decode(uint32_t inst) {
                 case 6: d.kind = OP_CSRRSI; break;
                 case 7: d.kind = OP_CSRRCI; break;
                 case 0:
-                    // funct3=000 system 类: 由 imm[11:0] = inst[31:20] 进一步区分
-                    //   imm = 0x000 → ECALL
-                    //   imm = 0x001 → EBREAK
-                    //   imm = 0x302 → MRET
-                    //   其他 (SRET=0x102 / WFI=0x105 / SFENCE.VMA / ...) → OP_UNSUPPORTED, a_01
-                    //   不做 (S-mode / 中断 / TLB sfence 真做时再加 op_kind + case)
+                    // funct3=000 system 类: 两层区分:
+                    //   funct7 = 0x09 (= 0b0001001) → SFENCE.VMA  (rs1=vaddr, rs2=asid; a_01_8)
+                    //   funct7 = 0x00 / 0x18       → 由 imm[11:0] 区分 ECALL/EBREAK/MRET
+                    //
+                    // 为什么 sfence.vma 不能用 imm[11:0] switch 识别: imm[4:0] = rs2 是变量
+                    // (寄存器号 0..31), imm[11:0] 不固定值, 32 种变种。所以先看 funct7。
+                    //
+                    // 其他 funct7 + funct3=0 的指令 (SRET=imm 0x102, WFI=imm 0x105 等):
+                    // 走 imm switch 末 default → OP_UNSUPPORTED。a_01 不做 (S-mode / 中断 真做
+                    // 时再加 op_kind + case)。
+                    if (funct7 == 0x09u) {
+                        // SFENCE.VMA rs1, rs2 (a_01_8)
+                        // d.rs1, d.rs2 已由 decode 顶部统一提取 (rs1=vaddr 寄存器, rs2=asid 寄存器);
+                        // d.rd, d.imm 不用 (RV spec 要求 rd=0; imm 字段被 funct7|rs2 复用, 但 case
+                        // 不读, 仅供 raw_inst trap 路径备查)。
+                        // d.pc_step = PC_STEP_RV (默认; sfence 不是 control flow, +4 推进; 块边界
+                        // 由 is_block_boundary_inst → 1 + fetch loop 末 goto out 处理)。
+                        d.kind = OP_SFENCE_VMA;
+                        break;
+                    }
                     switch ((uint32_t)d.imm) {
                         case 0x000:
                             d.kind    = OP_ECALL;

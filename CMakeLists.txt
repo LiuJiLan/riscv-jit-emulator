@@ -73,7 +73,9 @@ add_executable(riscv_jit_emulator
         src/core/csr.c
         src/core/csr.h
         src/isa/lsu.c
-        src/isa/lsu.h)
+        src/isa/lsu.h
+        src/isa/sfence.c
+        src/isa/sfence.h)
 
 # Test
 enable_testing()

@@ -207,6 +207,41 @@ typedef enum {
     OP_SH,
     OP_SW,
 
+    // ---- I-type SYSTEM SFENCE.VMA (a_01_8) ----
+    // 语义上属于 a_01_5_c SYSTEM 段 (opcode 0x73 funct3=0), 时序上 a_01_8 才加, 故位置放在
+    // a_01_6 LOAD/STORE 之后 + OP_UNSUPPORTED 之前 — enum 增量按时序追加, 不重排已有顺序。
+    //
+    // 编码 (RV Privileged Spec Vol II §10.6.1):
+    //   opcode  = 0x73 (SYSTEM)                       inst[6:0]
+    //   rd      = 0    (RV spec 要求, 否则 reserved)  inst[11:7]
+    //   funct3  = 0                                    inst[14:12]
+    //   rs1     = vaddr 寄存器号                       inst[19:15]
+    //              rs1 == x0 → 操作覆盖所有 vaddr  (a_01_8 简化方案 4.a 全清/单 ASID 全清)
+    //   rs2     = asid 寄存器号                        inst[24:20]
+    //              rs2 == x0 → 操作覆盖所有 asid  (a_01_8 简化方案 4.a)
+    //   funct7  = 0x09 (= 0b0001001)                   inst[31:25]
+    //
+    // 跟 ECALL/EBREAK/MRET 用 imm[11:0] 区分不同, sfence.vma 由 funct7=0x09 区分; 因为
+    // imm[4:0] = rs2 字段 (5-bit 寄存器号) 是变量, imm[11:0] 不固定值 (rs2 ∈ 0..31, 32 个变种)。
+    //
+    // 字段约定:
+    //   d.rs1 = vaddr 寄存器号 (interpreter case 内 READ_REG(d.rs1) 拿 vaddr 值)
+    //   d.rs2 = asid 寄存器号  (interpreter case 内 READ_REG(d.rs2) 拿 asid 值, 截断到 ASID_MASK
+    //                            位由 sfence helper 内部做)
+    //   d.rd  = 0 (RV spec; decode 顶部统一提取 = 0)
+    //   d.imm = funct7|rs2 = 0x120..0x13F (decode 顶部 imm = inst[31:20] 提取所得; sfence case
+    //            不读此字段, 仅供 raw_inst trap 路径用)
+    //   d.pc_step = PC_STEP_RV (sfence 不是 control flow, +4 推进; 但是硬边界, fetch loop 末
+    //                            is_block_boundary_inst → 1 → goto out, dispatcher 重派发)
+    //
+    // 是块边界 (硬边界): sfence.vma 改 TLB 状态, 块内后续指令译码假设 (TLB / current_tlb 路径)
+    // 失效; dispatcher 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
+    //
+    // 未来 mstatus.TVM 检查 (a_01_8 不实现): TVM=1 + S-mode sfence.vma → trap cause 2;
+    // a_01_8 fixture 不构造 TVM=1, 真做 OS 隔离时在 interpreter case 入口 (或 sfence helper 入口)
+    // 加。
+    OP_SFENCE_VMA,
+
     // ---- 兜底 ----
     // 不在当前范围的 opcode (fence 0x0F / amo 0x2F / 真非法 opcode / 真非法 funct3 子段)
     // 全部归这里。
@@ -332,6 +367,12 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_LB:  case OP_LH:  case OP_LW:  case OP_LBU: case OP_LHU:
         case OP_SB:  case OP_SH:  case OP_SW:
             return 0;
+
+        // ---- a_01_8 SFENCE.VMA (硬边界) ----
+        // 改 TLB 状态; 块内后续指令译码假设 (current_tlb 路径) 失效, 必须块尾。dispatcher
+        // 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
+        case OP_SFENCE_VMA:
+            return 1;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
 }

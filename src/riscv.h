@@ -56,13 +56,21 @@
 // PTE bit:  9 8 7 6 5 4 3 2 1 0
 //          [RSW][D][A][G][U][X][W][R][V]
 //
-// 增量加: 当前用到 V (TLB entry 有效位) + R/W/X (取指/读/写权限位; M/bare TLB fill 合成全权限);
-// U/G/A/D 后续真用到时 (Sv32 walker 接入) 再加宏化。
+// 增量加 (按"真用到一个加一个"原则):
+//   a_01_2:  V (TLB entry 有效位) + R/W/X (取指/读/写权限位; M/bare TLB fill 合成全权限)
+//   a_01_8:  U (User-mode 访问标记, walker check_perm 用) + G (Global, 项目 G-agnostic 不读
+//             但暴露宏让 fixture 可设) + A (Accessed, hw-managed walker 顺手 set) + D (Dirty,
+//             hw-managed W 访问时 set, fast path 检查决定 fall back)
+// RSW (bits 9:8) 是 sw 保留, 不暴露宏 (fixture 真用到时再加)。
 // ----------------------------------------------------------------------------
 #define PTE_V  (1U << 0)
 #define PTE_R  (1U << 1)
 #define PTE_W  (1U << 2)
 #define PTE_X  (1U << 3)
+#define PTE_U  (1U << 4)
+#define PTE_G  (1U << 5)
+#define PTE_A  (1U << 6)
+#define PTE_D  (1U << 7)
 
 // ----------------------------------------------------------------------------
 // CSR 编号 (Privileged Spec Vol II, table of Machine-Level CSRs / §2.2)
@@ -96,33 +104,89 @@
 #define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
 #define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
 
+// Supervisor-level CSRs (a_01_8 加; SV32 walker 路径真用; csr.c 大 switch 同步加 case)
+//
+// satp 字段布局 (Sv32; RV Privileged Spec Vol II §4.1.11 fig 4.11):
+//   bit  31     = MODE  (0 = Bare 恒等映射, 1 = Sv32; 项目仅支持这两值, csr 写 helper
+//                         应做 WARL 截断到 {0,1})
+//   bits 30:22 = ASID  (Sv32 ASIDMAX=9 位; 项目 ASIDLEN=TLB_ASID_BITS=4, csr 写 helper
+//                         必须 WARL 截断到 ASID_MASK 位 — dummy.txt §3 satp 合法性契约,
+//                         dispatcher 直接按截断后的 ASID 索引 tlb_table[priv][asid] 不再
+//                         做 bounds check)
+//   bits 21:0  = PPN   (root page table physical page number; root PT 起点 PA = PPN << 12)
+//
+// 编码位段验证 (csr_addr 自带的权限位段, riscv.h CSR_ADDR_*):
+//   0x180 → bits[11:10] = 01 (RW), bits[9:8] = 00 (U-min)。等等, satp 是 S-level CSR, 应该
+//   是 bits[9:8] = 01 (S-min)。0x180 = 0001_1000_0000, [9:8] = 01 ✓ S-mode minimum;
+//   [11:10] = 00 (RW 普通)。csr_op 入口判 priv >= S 才能访问; M 模式访问也合法 (priv 数字
+//   M=3 > S=1)。
+#define CSR_SATP       0x180U
+
 // ----------------------------------------------------------------------------
-// mstatus 字段位段 (RV Privileged Spec Vol II, fig 3.6 mstatus register)
+// mstatus 物理存储 + 字段位段 (RV Privileged Spec Vol II §3.1.6)
 //
-// a_01_7 增量: 只展开 trap_set_state / OP_MRET 真切 priv 用到的字段:
-//   MIE  (bit  3): M-mode global interrupt enable
-//   MPIE (bit  7): saved MIE on trap entry; mret 时恢复 MIE = MPIE
-//   MPP  (bits 11:10? 不, 11:11 +12; 实际 MPP 占 bits 12:11 即 2-bit 字段, shift=11):
-//                  saved priv on trap entry; mret 时 priv = MPP
+// 物理存储: trap_csrs_t._mstatus (uint64_t, cpu.h 内嵌)。csr 入口拆访问 (RV32 ABI):
+//   csr 0x300 mstatus  → _mstatus[31:0]  (RV32 mstatus 形态, fig 3.6)
+//   csr 0x310 mstatush → _mstatus[63:32] (RV32 mstatush 形态, fig 3.7; RV64 不存在此入口)
+//   csr 0x100 sstatus  → _mstatus 的 masked view (S-mode 真做时加 csr_sstatus_*)
+// 未来切 RV64: csr 0x300 mstatus 直接 64 位访问 _mstatus 整体, mstatush 入口废弃;
+//   部分字段位号迁移 (主要是 SD 从 bit 31 → bit 63, 加 UXL/SXL); 详见末尾 RV64-only 段。
 //
-// 实际 mstatus bit 编号 (RV Spec):
-//   bit  0  = SD (Status Dirty, RV32 dirty 派生); a_01 不实现 F/D, SD=0
-//   bit  1  = SIE (S-mode interrupt enable, S-mode 真做时加)
-//   bit  3  = MIE
-//   bit  5  = SPIE
-//   bit  7  = MPIE
-//   bit  8  = SPP (1-bit, S-mode 真做时加)
-//   bits 12:11 = MPP (2-bit, 编码 PRIV_U=00, PRIV_S=01, PRIV_M=11; PRIV_H=10 在没 H 扩展时
-//                      非法, 项目 WARL 落 PRIV_U=0 — csr.c csr_mstatus_write 内做)
-//   bit 17 = SUM (S-mode 真做 SV32 时加)
-//   bit 19 = MXR (S-mode 真做 SV32 时加)
-//   ... 其余 (FS/VS/XS/UBE/SBE/MBE/MPV/...) a_01 全部 0, 相关 fixture 不构造非零写入
+// === RV32 mstatus low 32 bits (= _mstatus[31:0]; fig 3.6) ===
+//   bit  0     = WPRI
+//   bit  1     = SIE       (S-mode global interrupt enable)
+//   bit  2     = WPRI
+//   bit  3     = MIE       (M-mode global interrupt enable)
+//   bit  4     = WPRI
+//   bit  5     = SPIE      (saved SIE on S-trap entry; sret 时恢复)
+//   bit  6     = UBE       (User-mode big-endian; 项目 LE 不真用)
+//   bit  7     = MPIE      (saved MIE on M-trap entry; mret 时恢复)
+//   bit  8     = SPP       (saved priv on S-trap; 1-bit; sret 时恢复)
+//   bits 10:9  = VS[1:0]   (V extension state; 项目不实现 V)
+//   bits 12:11 = MPP[1:0]  (saved priv on M-trap; 2-bit, 编码 PRIV_*; mret 时恢复)
+//   bits 14:13 = FS[1:0]   (F/D extension state; 项目不实现 F/D)
+//   bits 16:15 = XS[1:0]   (extension state aggregate)
+//   bit  17    = MPRV      (Modify Privilege; load/store 用 MPP 指定的 priv 检查)
+//   bit  18    = SUM       (Supervisor User Memory access; SV32 walker S-priv 路径用)
+//   bit  19    = MXR       (Make eXecutable Readable; SV32 walker load 路径用)
+//   bit  20    = TVM       (Trap Virtual Memory; satp / sfence.vma trap to M)
+//   bit  21    = TW        (Timeout Wait; wfi 超时 trap)
+//   bit  22    = TSR       (Trap SRET)
+//   bit  23    = SPELP     (Supervisor Preserved ELP, Smcfilp 扩展)
+//   bit  24    = SDT       (Supervisor Double-Trap, Ssdbltrp 扩展)
+//   bits 30:25 = WPRI
+//   bit  31    = SD (RV32) (Status Dirty; FS/VS/XS 任一 dirty 派生)
 //
-// 增量原则: SIE/SPIE/SPP/SUM/MXR 留 a_01_8 SV32 真用时再展开; 当前 a_01_7 只暴露 trap 必需的
-// MIE/MPIE/MPP 三组宏。
+// === RV32 mstatush high 32 bits (= _mstatus[63:32]; fig 3.7) ===
+// 物理位置在 _mstatus 64 位字段里 = mstatush 字段位号 + 32:
+//   _mstatus bit 32 (mstatush[0])  = WPRI
+//   _mstatus bit 36 (mstatush[4])  = SBE       (Supervisor Big-Endian)
+//   _mstatus bit 37 (mstatush[5])  = MBE       (Machine Big-Endian)
+//   _mstatus bit 38 (mstatush[6])  = GVA       (Guest Virtual Address; H 扩展)
+//   _mstatus bit 39 (mstatush[7])  = MPV       (Machine Previous Virt mode; H 扩展)
+//   _mstatus bit 41 (mstatush[9])  = MPELP     (M-mode Preserved ELP, Smcfilp)
+//   _mstatus bit 42 (mstatush[10]) = MDT       (M-mode Double-Trap, Smdbltrp)
 //
-// 命名风格: <field>_SHIFT (bit position) + <field> (single-bit mask) 单 bit 字段;
-//            <field>_SHIFT + <field>_MASK 多 bit 字段。
+// === RV64-only 字段 (切 RV64 时启用; RV32 模式下这些位置或在 mstatush 是 WPRI, 或位号
+//     迁移) ===
+//   bits 33:32 = UXL[1:0]  (U-mode XLEN; RV64 才有; RV32 在 mstatush[1:0] 是 WPRI)
+//   bits 35:34 = SXL[1:0]  (S-mode XLEN; RV64 才有; RV32 在 mstatush[3:2] 是 WPRI)
+//   bit  63    = SD (RV64) (RV32 SD 在 mstatus[31]; RV64 SD 迁移到 mstatus[63])
+// 其余 RV64 高位字段 (SBE/MBE/GVA/MPV/MPELP/MDT) 跟 RV32 mstatush 物理位置完全一致
+// (因 RV64 mstatus 高 32 位 = RV32 mstatush 内容 + UXL/SXL 扩展 + SD 顶位迁移)。
+//
+// ----------------------------------------------------------------------------
+// 字段宏增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。
+//   - a_01_5_a 加: trap 路径必备 5 csr 编号 (CSR_MSTATUS / CSR_MTVEC / ... 见上方)
+//   - a_01_7   加: MIE / MPIE / MPP    (trap_set_state + OP_MRET 真切 priv 用)
+//   - a_01_8   加: SIE / SPIE / SPP / SUM / MXR    (SV32 walker / fixture 切 S 用)
+//   - a_01_8   future-proof 加: SD (RV32 真启用 + RV64 #if 0); UXL/SXL (RV64 #if 0)
+//   其余 (UBE / MPRV / TVM / TW / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP/MDT 等) 真用时再加。
+//
+// 命名风格:
+//   单 bit 字段: <field>_SHIFT + <field>            (single-bit mask)
+//   多 bit 字段: <field>_SHIFT + <field>_MASK + <field>   (合成 mask)
+//   shift > 31 的字段 (mstatush 内容 / RV64 高位): 用 1ULL 替代 1U (因 _mstatus 是 64 位)
 // ----------------------------------------------------------------------------
 #define MSTATUS_MIE_SHIFT   3U
 #define MSTATUS_MIE         (1U << MSTATUS_MIE_SHIFT)        /* = 0x00000008 */
@@ -133,6 +197,66 @@
 #define MSTATUS_MPP_SHIFT   11U
 #define MSTATUS_MPP_MASK    0x3U                              /* 2-bit field */
 #define MSTATUS_MPP         (MSTATUS_MPP_MASK << MSTATUS_MPP_SHIFT)  /* = 0x00001800 */
+
+// a_01_8 增量 (SV32 walker / sret / fixture 切 S 路径真用; 命名风格跟 MIE/MPIE/MPP 一致):
+//   SIE  (bit  1): S-mode global interrupt enable。a_01_8 中断不真做 (留 a_03+); 字段先暴露,
+//                   让 fixture csrw mstatus, x.. 设值时不被 WARL 误截断丢。
+//   SPIE (bit  5): saved SIE on S-mode trap entry (sret 时恢复 SIE = SPIE)。a_01_8 不接 sret,
+//                   字段先暴露。
+//   SPP  (bit  8): saved priv on S-mode trap entry (1-bit; sret 时 priv = SPP)。a_01_8 fixture
+//                   走 mret 切 S (mstatus.MPP = PRIV_S), 不走 sret, 但字段暴露不亏。
+//   SUM  (bit 18): permit Supervisor User Memory access。SV32 walker 在 S 模式访问 PTE.U=1
+//                   page 时按本位决定: SUM=0 → 不放过 (cause 13/15 page fault); SUM=1 → 放过
+//                   (S 模式可读写 U-page)。默认 SUM=0 (跟 fixture "S 不该碰 U-page" 直觉一致)。
+//   MXR  (bit 19): make eXecutable Readable。SV32 walker load 路径按本位决定:
+//                   MXR=0 → 严格按 PTE.R 位 (X=1 R=0 page 不可读, 触发 cause 13);
+//                   MXR=1 → PTE.X=1 page 也算可读 (X 兼任 R)。默认 MXR=0。
+#define MSTATUS_SIE_SHIFT   1U
+#define MSTATUS_SIE         (1U << MSTATUS_SIE_SHIFT)        /* = 0x00000002 */
+
+#define MSTATUS_SPIE_SHIFT  5U
+#define MSTATUS_SPIE        (1U << MSTATUS_SPIE_SHIFT)       /* = 0x00000020 */
+
+#define MSTATUS_SPP_SHIFT   8U
+#define MSTATUS_SPP         (1U << MSTATUS_SPP_SHIFT)        /* = 0x00000100 */
+
+#define MSTATUS_SUM_SHIFT   18U
+#define MSTATUS_SUM         (1U << MSTATUS_SUM_SHIFT)        /* = 0x00040000 */
+
+#define MSTATUS_MXR_SHIFT   19U
+#define MSTATUS_MXR         (1U << MSTATUS_MXR_SHIFT)        /* = 0x00080000 */
+
+// ----------------------------------------------------------------------------
+// future-proof 字段宏 (a_01_8 加; user 主导拍, 见 a_01_session_011 — RV64 切换时启用)
+//
+// 原则: _mstatus 物理 64 位, 但当前 RV32 ABI 拆 mstatus + mstatush 入口暴露; 字段位号
+// 在 RV32 / RV64 视角下不一样的, 同时给出两版宏 (RV64 版用 #if 0 包占位)。a_01_8 真用的
+// 5 个字段 (SIE/SPIE/SPP/SUM/MXR) 在 RV32 / RV64 位置一致, 已在上方加宏, 不需要双版本。
+//
+// 当前 a_01_8 不真激活 SD / UXL / SXL (fixture 不构造 FS/VS dirty, 也不切 RV64);
+// 字段宏先暴露便于未来切 RV64 / 接 F/D 扩展时一处启用, 不需要回头加。
+// ----------------------------------------------------------------------------
+
+// SD (Status Dirty): RV32 在 mstatus[31], RV64 在 mstatus[63]。
+#define MSTATUS_SD_RV32_SHIFT   31U
+#define MSTATUS_SD_RV32         (1U << MSTATUS_SD_RV32_SHIFT)         /* = 0x80000000 */
+
+#if 0  /* RV64 切换时启用 */
+#define MSTATUS_SD_RV64_SHIFT   63U
+#define MSTATUS_SD_RV64         (1ULL << MSTATUS_SD_RV64_SHIFT)
+#endif
+
+// UXL / SXL: RV64 才有的 XLEN 字段; RV32 同位置在 mstatush[1:0] / mstatush[3:2] 是 WPRI。
+// _mstatus 64 位字段里 UXL = bits[33:32], SXL = bits[35:34]。
+#if 0  /* RV64 切换时启用 */
+#define MSTATUS_UXL_SHIFT       32U
+#define MSTATUS_UXL_MASK        0x3ULL                                  /* 2-bit field */
+#define MSTATUS_UXL             (MSTATUS_UXL_MASK << MSTATUS_UXL_SHIFT)
+
+#define MSTATUS_SXL_SHIFT       34U
+#define MSTATUS_SXL_MASK        0x3ULL
+#define MSTATUS_SXL             (MSTATUS_SXL_MASK << MSTATUS_SXL_SHIFT)
+#endif
 
 // ----------------------------------------------------------------------------
 // Exception Code (RV Privileged Spec Vol II, table 3.6 sync exception code)

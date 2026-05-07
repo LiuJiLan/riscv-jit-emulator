@@ -13,6 +13,7 @@
 #include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
 #include "decode.h"
 #include "isa/lsu.h"    // load_helper (static inline) + store_helper (extern), a_01_6 5 load + 3 store
+#include "isa/sfence.h" // sfence_vma_helper (extern), a_01_8 OP_SFENCE_VMA case
 #include "riscv.h"      // PRIV_M (a_01_5_c MRET 读 hart->trap.xepc[PRIV_M])
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception 真 helper (a_01_5_b; 替换 a_01_4 的 file-static 占位)
@@ -365,6 +366,35 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
                 break;
             }
+
+            // ---- a_01_8 SFENCE.VMA ----
+            //
+            // 接口方案 B (a_01_session_011 user 拍): helper 接 4 个独立信息, 分两组 — 寄存器
+            // **值** (vaddr_val/asid_val, 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
+            // (rs1/rs2, 0..31)。两组语义独立不可互相推导:
+            //   - 值: 真做事用 (helper 4.a 简化下只用 asid_val; vaddr_val 是 (b)/(d) 精确实现
+            //          的预留, 当前 (void) 抑制 unused)
+            //   - 号: 判 RV spec "rs1=x0/rs2=x0" magic 编码 (= "忽略对应维度")
+            // 不能用 vaddr_val=0 推断 rs1=x0 — 因 vaddr=0 是合法实值不等同"忽略"。详见
+            // sfence.h 接口 doc。
+            //
+            // 透传 4 项 (按方案 B 参数顺序):
+            //   READ_REG(d.rs1)  → vaddr_val   (READ_REG 处理 d.rs1==0 → 0 的 x0 编码)
+            //   READ_REG(d.rs2)  → asid_val    (同上)
+            //   d.rs1            → rs1 编号    (helper 内判 d.rs1==0 即 RV spec rs1=x0)
+            //   d.rs2            → rs2 编号    (同上)
+            //
+            // d.rs1 = vaddr 寄存器号; d.rs2 = asid 寄存器号 (decode.h SFENCE.VMA 字段约定段)。
+            //
+            // case 末 break (不 goto out): fetch loop 末 += PC_STEP_RV (=4, decode 顶部
+            // case 0x73 默认), count++, boundary 检查 (sfence.vma 是 boundary, decode.h
+            // is_block_boundary_inst → 1) → goto out 退出 fetch loop, dispatcher 重派发
+            // 时 block 1 重新算 (regime, current_tlb), 因为 TLB 状态已变。
+            case OP_SFENCE_VMA:
+                sfence_vma_helper(hart,
+                                  READ_REG(d.rs1), READ_REG(d.rs2),
+                                  d.rs1,           d.rs2);
+                break;
 
             // ---- 兜底 ---- (a_01_5_b 接 trap_raise_exception 真路径)
             case OP_UNSUPPORTED:
