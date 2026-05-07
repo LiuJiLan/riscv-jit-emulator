@@ -23,6 +23,9 @@
 #include <stdio.h>      // fprintf
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
+#include "config.h"          // TLB_NUM_ENTRIES (a_01_8 Step 7 SV32 fast path 用)
+#include "core/mmu.h"        // mmu_walker_helper_store (a_01_8 Step 7 SV32 fall back)
+
 
 void store_helper(cpu_t *hart, tlb_t *current_tlb,
                   uint32_t gva, uint32_t value, uint32_t size) {
@@ -76,17 +79,38 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
         return;
     }
 
-    // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup + walker_helper_store miss
+    // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup fast path + miss/D=0 fall back
     //
-    // a_01_7+ 真做时:
-    //   - TLB hit (V + tag + W 位 + priv/SUM 检查) → host store + reservation 清除 + SMC 设 dirty
-    //   - TLB miss → walker_helper_store(hart, gva, value, size) (mmu.c 加, 走页表 + fill TLB +
-    //                  host store + reservation/SMC 副作用; 接口设计 a_01_7 真做时定)
-    //   - TLB hit 权限错 → trap_raise_exception(15 store page fault, gva)
+    // fast path: V + tag + W + D 全命中 → host store (简化 perm 检查; 不查 priv/SUM; corner
+    // case S 模式访问 PTE.U=1 没 SUM 留 a01_9 — 跟 lsu.h load 路径同; D18 设计点 5 A 位
+    // 永远 1 不查, D 位检查必需)。
     //
-    // a_01_6 占位: 不可达 (priv 恒 PRIV_M); fprintf + trap_raise(15) 防御。
-    fprintf(stderr,
-            "[lsu] store: SV32 path not implemented in a_01_6 (gva=0x%08x value=0x%08x size=%u)\n",
-            gva, value, size);
-    trap_raise_exception(hart, CAUSE_STORE_PAGE_FAULT, /*tval*/gva);  // _Noreturn longjmp
+    // 不命中 (miss / V=0 / W=0 / D=0 / 任何不齐) → fall back mmu_walker_helper_store —
+    // walker 内 check_perm 做完整 perm 检查 + set A+D 写回 PT + fill TLB; 失败 trap_raise
+    // (cause 15 page fault / cause 7 access fault) 长跳, 不返回 caller。
+    //
+    // D=0 + W=1 + store 是 hw-managed D 关键路径 (D18 设计点 5 时序场景 step 3-4): walker
+    // 第一次 set D 写回 PT + 重 fill TLB; 之后 fast path 直接 host store。
+    {
+        const uint32_t vpn   = gva >> 12;
+        const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
+        tlb_e_t *entry = &current_tlb->e[index];
+
+        /* fast path: V + tag + W + D 命中 (A 位 walker 进 TLB 时永远 set, 此处 skip; D 位
+         * 必查 — load 路径 walker 不 set D, store 时 D=0 需 fall back walker 重 set) */
+        if ((entry->pte_flags & PTE_V)
+            && entry->gva_tag == vpn
+            && (entry->pte_flags & PTE_W)
+            && (entry->pte_flags & PTE_D)) {
+            uint8_t *host_ptr = entry->host_ptr + (gva & 0xFFFu);
+            memcpy(host_ptr, &value, size);
+
+            /* reservation 清除 (LR/SC) + SMC page_dirty 占位 — 跟 BARE 路径同形态;
+             * a_01 没接 LR/SC, jit/smc.c 还没接, 占位等 a_03+ A 扩展 / B 阶段 JIT 真做。 */
+            return;
+        }
+    }
+    /* fall back to walker (含完整 perm 检查 + set A+D 写回 PT + fill TLB; 失败 trap_raise
+     * 长跳; reservation/SMC 副作用一并由 walker_helper_store 内做) */
+    mmu_walker_helper_store(hart, current_tlb, gva, value, size);
 }

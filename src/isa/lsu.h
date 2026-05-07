@@ -37,12 +37,13 @@
 #include <stdio.h>      // fprintf (BARE access fault / SV32 占位 提示)
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
-#include "config.h"          // GUEST_RAM_START / GUEST_RAM_SIZE
+#include "config.h"          // GUEST_RAM_START / GUEST_RAM_SIZE / TLB_NUM_ENTRIES
 #include "core/cpu.h"        // cpu_t
+#include "core/mmu.h"        // mmu_walker_helper_load (a_01_8 Step 7 SV32 fall back)
 #include "core/tlb.h"        // tlb_t (current_tlb 参数类型)
 #include "core/trap.h"       // trap_raise_exception (_Noreturn longjmp)
 #include "platform/ram.h"    // gpa_to_hva_offset (BARE host load 解地址)
-#include "riscv.h"           // CAUSE_LOAD_* (Exception Code 宏)
+#include "riscv.h"           // CAUSE_LOAD_* (Exception Code 宏) + PTE_* 位
 
 
 // ----------------------------------------------------------------------------
@@ -97,19 +98,33 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
         return value;
     }
 
-    // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup + walker_helper_load miss
+    // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup fast path + miss/perm 错 fall back
     //
-    // a_01_7+ 真做时:
-    //   - TLB hit (V + tag + R 位 + priv/SUM/MXR 检查) → host load + 返回
-    //   - TLB miss → walker_helper_load(hart, gva, size) (mmu.c 加, 走页表 + fill TLB + return)
-    //   - TLB hit 权限错 → trap_raise_exception(13 load page fault, gva)
+    // fast path: V + tag + R 全命中 → host load (简化 perm 检查; 不查 priv/SUM/MXR; D18
+    // 设计点 5 A 位永远 1 不查; corner case 留 a01_9 解决 — S 模式访问 PTE.U=1 page 没 SUM
+    // 时 fast path 可能错放过, 真做 OS 时改用 mmu.h 暴露 check_perm 复用)。
     //
-    // a_01_6 占位: priv 恒 PRIV_M, current_tlb 永远 NULL, SV32 路径不可达; 形式上保接口对齐
-    // 让 a_01_7 改造时只动本段。fprintf 提示 + trap_raise(13) 防御。
-    fprintf(stderr,
-            "[lsu] load: SV32 path not implemented in a_01_6 (gva=0x%08x size=%u)\n",
-            gva, size);
-    trap_raise_exception(hart, CAUSE_LOAD_PAGE_FAULT, /*tval*/gva);  // _Noreturn longjmp
+    // 不命中 (miss / V=0 / R=0 / 任何不齐) → fall back mmu_walker_helper_load — walker 内
+    // check_perm 做完整 priv+SUM/MXR/X-via-MXR 检查 + 必要时 set A 写回 PT + fill TLB; 失败
+    // 时 walker_helper 内 trap_raise_exception (cause 13 page fault / cause 5 access fault)
+    // 长跳, 不返回 caller。
+    {
+        const uint32_t vpn   = gva >> 12;
+        const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
+        tlb_e_t *entry = &current_tlb->e[index];
+
+        /* fast path: V + tag + R 命中 (A 位 walker 进 TLB 时永远 set, 此处 skip) */
+        if ((entry->pte_flags & PTE_V)
+            && entry->gva_tag == vpn
+            && (entry->pte_flags & PTE_R)) {
+            uint8_t *host_ptr = entry->host_ptr + (gva & 0xFFFu);
+            uint32_t value = 0;
+            memcpy(&value, host_ptr, size);
+            return value;
+        }
+    }
+    /* fall back to walker (含完整 perm 检查 + fill TLB; 失败 trap_raise_exception 长跳) */
+    return mmu_walker_helper_load(hart, current_tlb, gva, size);
 }
 
 
