@@ -88,7 +88,38 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             d.imm  = (int32_t)nzuimm;            // unsigned 10-bit, 高位 0 自然
             return d;
         }
-        // 其他 C0 子段: C.LW (funct3=010) / C.SW (funct3=110) — step 4 加
+        // C.LW (funct3=010, CL-format) / C.SW (funct3=110, CS-format):
+        //   inst[12:10] = uimm[5:3]
+        //   inst[9:7]   = rs1' (rs1 = rs1' + 8)
+        //   inst[6]     = uimm[2]
+        //   inst[5]     = uimm[6]
+        //   inst[4:2]   = rd' (LW) / rs2' (SW); +8 扩展到 x8-x15
+        //   uimm 7-bit unsigned, [1:0]=0 (4-byte align), range [0, 124]
+        //   翻译: OP_LW rd=rd', rs1=rs1', imm=uimm
+        //        OP_SW rs1=rs1', rs2=rs2', imm=uimm
+        //   pc_step = PC_STEP_RVC (load/store 不是 control flow, 顺序推进)
+        if (funct3 == 0x2 || funct3 == 0x6) {
+            const uint32_t uimm =
+                  ((inst >> 10) & 0x7u) << 3      // uimm[5:3]
+                | ((inst >> 6)  & 0x1u) << 2      // uimm[2]
+                | ((inst >> 5)  & 0x1u) << 6;     // uimm[6]
+            const uint32_t rs1_p = ((inst >> 7) & 0x7u) + 8;
+            const uint32_t op_p  = ((inst >> 2) & 0x7u) + 8;   // rd' (LW) or rs2' (SW)
+            if (funct3 == 0x2) {
+                d.kind = OP_LW;
+                d.rd   = op_p;
+                d.rs1  = rs1_p;
+                d.imm  = (int32_t)uimm;
+            } else {
+                d.kind = OP_SW;
+                d.rs1  = rs1_p;
+                d.rs2  = op_p;
+                d.imm  = (int32_t)uimm;
+            }
+            return d;
+        }
+
+        // 其他 C0 子段: F/D 扩展 (RVC 不支持) 或 reserved, 全 OP_UNSUPPORTED
         return d;
     }
 
@@ -372,7 +403,44 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             return d;
         }
 
-        // 其他 C2 子段: C.LWSP (010) / C.SWSP (110) — step 4 加
+        // C.LWSP (funct3=010, CI-format with uimm): lw rd, uimm(x2)
+        //   inst[12]    = uimm[5]
+        //   inst[11:7]  = rd (5-bit, x1-x31; rd=0 reserved)
+        //   inst[6:4]   = uimm[4:2]
+        //   inst[3:2]   = uimm[7:6]
+        //   uimm 8-bit unsigned, [1:0]=0 (4-byte align), range [0, 252]
+        //   翻译: OP_LW rd, rs1=x2 (sp), imm=uimm
+        if (funct3 == 0x2) {
+            if (rd_full == 0) return d;              // reserved
+            const uint32_t uimm =
+                  ((inst >> 12) & 0x1u) << 5         // uimm[5]
+                | ((inst >> 4)  & 0x7u) << 2         // uimm[4:2]
+                | ((inst >> 2)  & 0x3u) << 6;        // uimm[7:6]
+            d.kind = OP_LW;
+            d.rd   = rd_full;
+            d.rs1  = 2;                              // x2 (sp)
+            d.imm  = (int32_t)uimm;
+            return d;
+        }
+
+        // C.SWSP (funct3=110, CSS-format): sw rs2, uimm(x2)
+        //   inst[12:9]  = uimm[5:2]
+        //   inst[8:7]   = uimm[7:6]
+        //   inst[6:2]   = rs2 (5-bit)
+        //   uimm 8-bit unsigned, [1:0]=0 (4-byte align), range [0, 252]
+        //   翻译: OP_SW rs1=x2 (sp), rs2, imm=uimm
+        if (funct3 == 0x6) {
+            const uint32_t uimm =
+                  ((inst >> 9) & 0xFu) << 2         // uimm[5:2]
+                | ((inst >> 7) & 0x3u) << 6;        // uimm[7:6]
+            d.kind = OP_SW;
+            d.rs1  = 2;                              // x2 (sp)
+            d.rs2  = rs2_full;
+            d.imm  = (int32_t)uimm;
+            return d;
+        }
+
+        // 其他 C2 子段: F/D 扩展 (RVC 不支持) 或 reserved, 全 OP_UNSUPPORTED
         return d;
     }
 
