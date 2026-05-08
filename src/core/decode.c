@@ -223,6 +223,38 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             return d;
         }
 
+        // C.JAL (funct3=001) / C.J (funct3=101, CJ-format): jump-and-link / jump
+        //   inst[12]    = imm[11] (sign)
+        //   inst[11]    = imm[4]
+        //   inst[10:9]  = imm[9:8]
+        //   inst[8]     = imm[10]
+        //   inst[7]     = imm[6]
+        //   inst[6]     = imm[7]
+        //   inst[5:3]   = imm[3:1]
+        //   inst[2]     = imm[5]
+        //   imm[0]      = 0 (隐含 2-byte align)
+        //   翻译: OP_JAL rd = (funct3==1 ? x1 : x0), imm12
+        //         pc_step = PC_STEP_RVC (case 内 ra = pc + d.pc_step + goto out 跳过 fetch
+        //         loop 末段, 跟 32-bit JAL 同形态; ra = pc + 2 for RVC, 跟 RV spec 一致)
+        //   注: C.JAL 是 RV32-only (RV64 此位段是 C.ADDIW); 项目当前 RV32, 不冲突
+        if (funct3 == 0x1 || funct3 == 0x5) {
+            int32_t offset = (int32_t)(
+                  ((inst >> 12) & 0x1u) << 11    // imm[11] (sign)
+                | ((inst >> 11) & 0x1u) << 4     // imm[4]
+                | ((inst >> 9)  & 0x3u) << 8     // imm[9:8]
+                | ((inst >> 8)  & 0x1u) << 10    // imm[10]
+                | ((inst >> 7)  & 0x1u) << 6     // imm[6]
+                | ((inst >> 6)  & 0x1u) << 7     // imm[7]
+                | ((inst >> 3)  & 0x7u) << 1     // imm[3:1]
+                | ((inst >> 2)  & 0x1u) << 5);   // imm[5]
+            if (offset & (1 << 11)) offset |= (int32_t)0xFFFFF000u;  // sign-ext bit 12+
+            d.kind    = OP_JAL;
+            d.rd      = (funct3 == 0x1) ? 1u : 0u;   // C.JAL: x1 (ra); C.J: x0
+            d.imm     = offset;
+            d.pc_step = PC_STEP_RVC;
+            return d;
+        }
+
         // C.BEQZ / C.BNEZ (funct3=110/111, CB-format): branch if rs1' == 0 / != 0
         //   inst[12]    = offset[8] (sign)
         //   inst[11:10] = offset[4:3]
@@ -308,7 +340,35 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
                 d.rs2  = rs2_full;
                 return d;
             }
-            // bit12 + rs2=0 子段: C.JR / C.JALR / C.EBREAK — step 3 加
+            // bit12 + rs2=0 子段: C.JR / C.JALR / C.EBREAK (a_01_10 (7) step 3 加)
+            //   [12]=0 + rs1!=0:        C.JR    → OP_JALR rd=x0, rs1, imm=0
+            //   [12]=1 + rs1=0:         C.EBREAK → OP_EBREAK
+            //   [12]=1 + rs1!=0:        C.JALR  → OP_JALR rd=x1, rs1, imm=0
+            //   [12]=0 + rs1=0:         reserved
+            // pc_step = PC_STEP_RVC for C.JR/C.JALR (跟 32-bit JALR 同形态, ra = pc + 2);
+            // pc_step = PC_STEP_NONE for C.EBREAK (跟 32-bit EBREAK 同, trap 路径不顺序推进)
+            if (bit12 == 0) {
+                if (rd_full == 0) return d;              // C.JR rs1=0 reserved
+                d.kind    = OP_JALR;
+                d.rd      = 0;                           // C.JR: rd=x0 (不写 ra)
+                d.rs1     = rd_full;                     // rs1 字段在 inst[11:7]
+                d.imm     = 0;
+                d.pc_step = PC_STEP_RVC;
+                return d;
+            }
+            // bit12 == 1, rs2 == 0
+            if (rd_full == 0) {
+                // C.EBREAK
+                d.kind    = OP_EBREAK;
+                d.pc_step = PC_STEP_NONE;                // trap 路径; 跟 32-bit EBREAK 同
+                return d;
+            }
+            // C.JALR (rs1!=0, rs2=0, bit12=1)
+            d.kind    = OP_JALR;
+            d.rd      = 1;                               // C.JALR: rd=x1 (ra)
+            d.rs1     = rd_full;
+            d.imm     = 0;
+            d.pc_step = PC_STEP_RVC;
             return d;
         }
 
@@ -463,7 +523,11 @@ decoded_inst_t decode(uint32_t inst) {
                 | (int32_t)(inst & 0xFF000u);                          /* bits 19:12, 在原位 */
             d.kind    = OP_JAL;
             d.imm     = imm;
-            d.pc_step = PC_STEP_NONE;
+            /* a_01_10 (7) step 3 修: JAL d.pc_step = 实际长度 (跟 branch 修复同形态) — 让
+             * interpreter case 内 ra = pc + d.pc_step (RV=4 / RVC=2 future C.JAL); case 末 goto
+             * out 跳过 fetch loop 末段 += d.pc_step (避免破坏 case 写的 jump target). 同时也是
+             * 修复历史 bug — JAL ra hardcoded `pc + 4u` 不兼容未来 RVC C.JAL (ra 应 = pc + 2)。 */
+            d.pc_step = PC_STEP_RV;
             break;
         }
 
@@ -476,7 +540,8 @@ decoded_inst_t decode(uint32_t inst) {
             // 由 interpreter / translator 在 case 内做 (Step 3 WRITE_PC_OR_TRAP 的事)。
             d.kind    = OP_JALR;
             d.imm     = ((int32_t)inst) >> 20;
-            d.pc_step = PC_STEP_NONE;
+            /* a_01_10 (7) step 3 修: 同 JAL — d.pc_step = 实际长度, 兼容 RVC C.JR/C.JALR */
+            d.pc_step = PC_STEP_RV;
             break;
 
         // ---- I-type SYSTEM ---- a_01_5_a 加 csr 6 变体

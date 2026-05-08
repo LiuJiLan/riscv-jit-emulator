@@ -152,23 +152,23 @@ static int decode_test(void) {
     // JAL x0, +0x100 = 0x1000006F
     //   imm=0x100=256: imm[20]=0, imm[19:12]=0, imm[11]=0, imm[10:1]=0x080 (bit 8 only), imm[0]=0
     //   rs1 garbage (bits 19:15) = imm[19:15] = 0; rs2 garbage (bits 24:20) = 0
-    CASE(0x1000006F, OP_JAL,  /*rd*/0,  /*rs1*/0,  /*rs2*/0,  0x100,    0x1000006F, PC_STEP_NONE);
+    CASE(0x1000006F, OP_JAL,  /*rd*/0,  /*rs1*/0,  /*rs2*/0,  0x100,    0x1000006F, PC_STEP_RV);
     // JAL x0, -0x100 = 0xF01FF06F (sign-ext 验证)
     //   imm=-256: imm[20]=1, imm[19:12]=0xFF, imm[11]=1, imm[10:1]=0x380, imm[0]=0
     //   rs1 garbage (bits 19:15) = imm[19:15] = 0x1F = 31
     //   rs2 garbage (bits 24:20) = imm[10:6] from inst[24:21]+inst[20] = ...inst[20]=imm[11]=1
     //                              + inst[24:21]=imm[10:7]=0b1110 → 0b00001 + 0b1110<<1
     //                              简单做: (inst >> 20) & 0x1F = 0xF01 & 0x1F = 1
-    CASE(0xF01FF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/1,  -0x100,   0xF01FF06F, PC_STEP_NONE);
+    CASE(0xF01FF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/1,  -0x100,   0xF01FF06F, PC_STEP_RV);
     // JAL x0, +max(0xFFFFE) = 0x7FFFF06F (J-type max+, imm[20]=0 + 其他位全 1)
     //   imm=0xFFFFE=1048574: imm[20]=0, imm[19:12]=0xFF, imm[11]=1, imm[10:1]=0x3FF, imm[0]=0
     //   rs1 garbage = 0x1F = 31; rs2 garbage = (inst>>20)&0x1F = 0x7FF & 0x1F = 0x1F = 31
-    CASE(0x7FFFF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/31, 0xFFFFE,  0x7FFFF06F, PC_STEP_NONE);
+    CASE(0x7FFFF06F, OP_JAL,  /*rd*/0,  /*rs1*/31, /*rs2*/31, 0xFFFFE,  0x7FFFF06F, PC_STEP_RV);
 
     // JALR x0, x1, +4 = 0x00408067 (I-type 立即数, 与 ADDI sign-ext 路径同源, 此处仅验证
     //   opcode=0x67 + funct3=0 路由对 + pc_step=PC_STEP_NONE)
     //   rs2 garbage (bits 24:20) = imm[4:0] = 4
-    CASE(0x00408067, OP_JALR, /*rd*/0,  /*rs1*/1,  /*rs2*/4,  4,        0x00408067, PC_STEP_NONE);
+    CASE(0x00408067, OP_JALR, /*rd*/0,  /*rs1*/1,  /*rs2*/4,  4,        0x00408067, PC_STEP_RV);
 
     // ---- a_01_5_a I-type SYSTEM CSR 6 变体 (7 case: 6 op_kind 各 1 + csr_addr=0 边界)----
     //

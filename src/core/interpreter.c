@@ -268,18 +268,27 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // 编码下永远不命中, 顺序问题在本项目不构成实际正确性 bug; 但为了"语义严格",
             // 之后 (a_01_5 真接 trap) 可以重构成 "先算 target → 检查对齐 → 写 rd → 写 pc"。
             // 当前先按"写 rd 再 WRITE_PC_OR_TRAP"形态走, 简洁 + 与现状语义一致。
+            // a_01_10 (7) step 3 修 (跟 BRANCH_IF taken 同形态): JAL/JALR 是 "总跳" control
+            // flow, case 自写 pc 后必须 goto out 跳过 fetch loop 末段 (避免 += d.pc_step 破坏
+            // case 写的 jump target). ra = pc + d.pc_step (替代 hardcoded pc+4u; RV=4 / RVC=2,
+            // 兼容 RVC C.JAL / C.JALR ra=pc+2 spec). count++ + SYNC_COUNT 在 goto out 之前
+            // 显式做。
             case OP_JAL:
-                WRITE_REG(d.rd, pc + 4u);
+                WRITE_REG(d.rd, pc + d.pc_step);
                 WRITE_PC_OR_TRAP(pc + (uint32_t)d.imm);
-                break;
+                count++;
+                SYNC_COUNT();
+                goto out;
 
             // ---- I-type JALR (a_01_4) ----
             // 同 JAL, 区别: 目标 = (rs1 + imm) & ~1u (RV spec 强制 mask LSB; mask 后 bit[0]
             // 永远 0, 即 IALIGN=16 永远过)。
             case OP_JALR:
-                WRITE_REG(d.rd, pc + 4u);
+                WRITE_REG(d.rd, pc + d.pc_step);
                 WRITE_PC_OR_TRAP((READ_REG(d.rs1) + (uint32_t)d.imm) & ~1u);
-                break;
+                count++;
+                SYNC_COUNT();
+                goto out;
 
             // ---- I-type SYSTEM CSR 6 变体 (a_01_5_a) ----
             // 6 个 op_kind 在 csr 侧映射到 3 个内核操作 (csr_op_t) + new_val 来源:
