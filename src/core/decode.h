@@ -266,20 +266,28 @@ typedef enum {
     OP_UNSUPPORTED,
 } op_kind_t;
 
-// PC 步进量, 由 decode 一次决定, fetch loop 末尾统一 hart->regs[0] += d.pc_step。
-//   PC_STEP_RV    : 普通 RV 指令 (RV32 / RV64 都是 4 字节固定长度), fetch loop +4
-//   PC_STEP_RVC   : 16-bit C 扩展 (compressed), fetch loop +2
-//   PC_STEP_NONE  : control flow op (branch / jal / jalr / mret / sret / ...), case
-//                   自描述 pc, fetch loop += 0 是 NOP (case 内必须 hart->regs[0] = ...,
-//                   漏 = 死循环 → 64 hard limit 立刻 break, 容易发现)
+// pc_step: PC 步进量
 //
-// 设计动机: pc 推进数据驱动 (decode 决定), fetch loop 不 if (is_boundary), 与 ISA 长度
-// 处理统一 (RVC 与 control flow 在 fetch loop 看法一致, 都是"d.pc_step 多少就推多少")。
+// 起步设计 (a_01_4): "由 decode 一次决定, fetch loop 末尾统一 hart->regs[0] += d.pc_step"。
 //
-// 注: 块边界 (is_block_boundary_inst) 与 pc_step 是两个独立维度:
-//   - branch 跳/不跳: pc_step=PC_STEP_NONE (case 自设 pc), is_boundary=true (块尾)
-//   - sfence.vma:    pc_step=PC_STEP_RV (普通 +4), is_boundary=true (改 TLB)
-//   - addi:          pc_step=PC_STEP_RV, is_boundary=false
+// 修订 (a_01_10 (7) step 2): 问题出现在 branch — branch 本质有三种情况:
+//   1. 转跳:           case set pc 后, pc 再 += 0
+//   2. 不转跳 RV:       += 4
+//   3. 不转跳 RVC:      += 2
+//
+// PC_STEP_NONE 的本质是 "怕忘记 case 写 pc" 的兜底; 在运行时判断 (转跳 / 不转跳) 不能提前
+// 预知的情况下, 应该优先保证"PC 步进量"这一语义 — 所以 branch d.pc_step 设 PC_STEP_RV /
+// PC_STEP_RVC (按指令长度), BRANCH_IF 宏 taken case 内 goto out 跳过 fetch loop 末段
+// (避免 += d.pc_step 破坏 case 写好的 target), not-taken 让末段 += d.pc_step 自动推进。
+//
+// 当前归类:
+//   PC_STEP_RV   : 普通 RV 指令 + 32-bit branch (B-type)
+//   PC_STEP_RVC  : 16-bit C 扩展 + RVC branch (C.BEQZ / C.BNEZ)
+//   PC_STEP_NONE : "总跳" control flow op (jal / jalr / mret / sret / ecall / ebreak),
+//                  case 自描述 pc 总是覆盖, fetch loop += 0 NOP
+//
+// 注: 块边界 (is_block_boundary_inst) 与 pc_step 独立 — branch / sfence.vma 都
+// pc_step != PC_STEP_NONE 但 is_boundary=true。
 #define PC_STEP_RV    4u
 #define PC_STEP_RVC   2u
 #define PC_STEP_NONE  0u

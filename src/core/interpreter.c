@@ -56,14 +56,44 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         hart->regs[0] = _t;                                                \
     } while (0)
 
-    // BRANCH_IF: 6 个 branch case 的统一封装 (taken → WRITE_PC_OR_TRAP; not-taken → +4)。
-    //   not-taken 走 pc + 4 (32-bit 分支固定 4 字节; 未来 RVC 真支持 C.BEQZ/C.BNEZ 时, 那
-    //   两个新 op_kind 单独处理 +2; 不混进本宏)。pc + 4 一定 IALIGN=16 对齐 (pc 自身已对齐),
-    //   不需 check, 直接写。
-    //   隐式捕获: hart, pc, d.imm。
+    // BRANCH_IF: 6 个 branch case 的统一封装 (taken → WRITE_PC_OR_TRAP + goto out;
+    //                                       not-taken → 不写 pc, 让 fetch loop 末段 +=
+    //                                       d.pc_step 自动推进)。
+    //
+    // a_01_10 (7) step 2 修 (user D9 主导): branch 是 control flow 特例 —
+    //   - taken: case 自写 pc (跳到 imm 目标), 必须 goto out 跳过 fetch loop 末段, 否则
+    //            末段 += d.pc_step 会破坏 pc (= taken_target + 2/4); count++ + SYNC_COUNT
+    //            在 goto out 之前显式做 (跟 fetch loop 末段一致语义)
+    //   - not-taken: 不写 pc (进 case 时 hart->regs[0] = branch PC, 顺序推进的下一条 = pc +
+    //                 实际指令长度); fetch loop 末段 hart->regs[0] += d.pc_step 自动推进 →
+    //                 pc + 2 (RVC) 或 pc + 4 (32-bit); 然后 boundary check goto out
+    //                 (branch is hard boundary)
+    //
+    // d.pc_step 含 (decode_rvc CB / 32-bit B-type):
+    //   - 32-bit branch: PC_STEP_RV = 4
+    //   - RVC C.BEQZ/C.BNEZ: PC_STEP_RVC = 2
+    //   两条路径都通过 d.pc_step 在 not-taken 端自动适配, BRANCH_IF 不需要再判断 raw_inst
+    //   位段 (decode 阶段已知信息透传到 d.pc_step)。
+    //
+    // 历史 bug (a_01_4 起步): branch d.pc_step 设 PC_STEP_NONE = 0 — 当时只考虑 taken 路径
+    //   (case 自写 pc + fetch loop 末段 += 0 NOP), 忘了 not-taken 是顺序推进 (需 += 2 或 4)。
+    //   bug 导致 not-taken 路径 pc 不动, dispatcher 重派发还从 branch PC 取指, 死循环。
+    //   a_01_4 fixture 实际 PASS 是因为 BRANCH_IF 当时 hardcoded `pc + 4u` 帮 case 写 pc,
+    //   绕开 d.pc_step. 现在修复 — d.pc_step 透传指令长度, BRANCH_IF 走 fetch loop 末段。
+    //
+    // pc + 2 / pc + 4 都一定 IALIGN-aligned (pc 自身已对齐, +2/+4 不破坏对齐), 不需 check,
+    // fetch loop 末段直接 += 即可。taken 路径仍走 WRITE_PC_OR_TRAP 做 misalign check (branch
+    // target = pc + imm 可能 misalign)。
+    //
+    // 隐式捕获: hart, pc, d.imm, count, count_out。
     #define BRANCH_IF(cond) do {                                           \
-        if (cond) WRITE_PC_OR_TRAP(pc + (uint32_t)d.imm);                  \
-        else      hart->regs[0] = pc + 4u;                                 \
+        if (cond) {                                                        \
+            WRITE_PC_OR_TRAP(pc + (uint32_t)d.imm);                        \
+            count++;                                                       \
+            SYNC_COUNT();                                                  \
+            goto out;                                                      \
+        }                                                                  \
+        /* not-taken: 不写 pc, fetch loop 末段 += d.pc_step + boundary out */ \
     } while (0)
 
     // SYNC_COUNT —— 把当前 count 同步到 dispatcher 的 count_out 指针 (a_01_10 (7) step 1 加)。

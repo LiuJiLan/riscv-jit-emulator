@@ -223,8 +223,37 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             return d;
         }
 
-        // 其他 C1 子类: C.JAL (001) / C.J (101) — step 3 (jump);
-        //               C.BEQZ (110) / C.BNEZ (111) — step 2 (branch)
+        // C.BEQZ / C.BNEZ (funct3=110/111, CB-format): branch if rs1' == 0 / != 0
+        //   inst[12]    = offset[8] (sign)
+        //   inst[11:10] = offset[4:3]
+        //   inst[9:7]   = rs1' (rs1 = rs1' + 8)
+        //   inst[6:5]   = offset[7:6]
+        //   inst[4:3]   = offset[2:1]
+        //   inst[2]     = offset[5]
+        //   offset[0]   = 0 (隐含 2-byte align, 跟 RV B-type imm 同形态)
+        //   翻译: BEQ/BNE rs1', x0, offset (decode_rvc 复用 OP_BEQ/OP_BNE; pc_step =
+        //   PC_STEP_NONE control flow case 自写 pc; BRANCH_IF 宏内 not-taken 根据 raw_inst
+        //   [1:0] 区分 RVC pc+2 / 32-bit pc+4)
+        if (funct3 == 0x6 || funct3 == 0x7) {
+            int32_t offset = (int32_t)(
+                  ((inst >> 12) & 0x1u) << 8     // offset[8] (sign)
+                | ((inst >> 10) & 0x3u) << 3     // offset[4:3]
+                | ((inst >> 5)  & 0x3u) << 6     // offset[7:6]
+                | ((inst >> 3)  & 0x3u) << 1     // offset[2:1]
+                | ((inst >> 2)  & 0x1u) << 5);   // offset[5]
+            if (offset & (1 << 8)) offset |= (int32_t)0xFFFFFE00u;  // sign-ext bit 9+
+            const uint32_t rs1_p = ((inst >> 7) & 0x7u) + 8;
+            d.kind    = (funct3 == 0x6) ? OP_BEQ : OP_BNE;
+            d.rs1     = rs1_p;
+            d.rs2     = 0;                       // x0 (BEQZ/BNEZ 跟 0 比)
+            d.imm     = offset;
+            d.pc_step = PC_STEP_RVC;             // a_01_10 (7) step 2 修: branch d.pc_step =
+                                                 // 实际长度 (跟 32-bit branch 同, BRANCH_IF
+                                                 // 宏 taken goto out / not-taken 走末段)
+            return d;
+        }
+
+        // 其他 C1 子类: C.JAL (001) / C.J (101) — step 3 (jump)
         return d;
     }
 
@@ -392,7 +421,12 @@ decoded_inst_t decode(uint32_t inst) {
                 | (int32_t)(((inst >> 8)  & 0xFu)  << 1)               /* bits 4:1 */
                 | (int32_t)(((inst >> 7)  & 0x1u)  << 11);             /* bit 11 */
             d.imm     = imm;
-            d.pc_step = PC_STEP_NONE;     /* control flow: case 自描述 pc, fetch loop +=0 NOP */
+            /* a_01_10 (7) step 2 修 (user D9 主导): branch 是 control flow 中的特例 — taken
+             * case 自写 pc, not-taken 顺序推进 (= pc + 指令长度)。a_01_4 起步设 PC_STEP_NONE
+             * 是 bug: 只考虑 taken set pc 路径, 忘了 not-taken 顺序推进。修复 — 设实际指令长度
+             * (RV=4 / RVC=2 in decode_rvc), BRANCH_IF 宏 taken case goto out 跳过 fetch loop
+             * 末段, not-taken 走末段 += d.pc_step 自动推进. */
+            d.pc_step = PC_STEP_RV;
             switch (funct3) {
                 case 0: d.kind = OP_BEQ;  break;
                 case 1: d.kind = OP_BNE;  break;
