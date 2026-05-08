@@ -123,6 +123,67 @@ static int decode_test(void) {
     //   rd=3, rs1=0 (mv = add rd, x0, rs2), rs2=1, imm=0, pc_step=PC_STEP_RVC
     CASE(0x8186, OP_ADD, /*rd*/3, /*rs1*/0, /*rs2*/1, 0, 0x8186, PC_STEP_RVC);
 
+    // ====================================================================
+    // a_01_10 (7) step 5: RVC 代表性 case (每类 RVC 一个, future regression 兜底)
+    // 完整 ~22 case + imm 边界穷举留下次 session 单独 task
+    // ====================================================================
+
+    // C.NOP = 0x0001 (C1 funct3=000 边界 case: rd=0+imm=0 → ADDI x0,x0,0)
+    //   000 0 00000 00000 01 → kind=OP_ADDI, rd=0, rs1=0, imm=0
+    CASE(0x0001, OP_ADDI, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x0001, PC_STEP_RVC);
+
+    // C.LUI x18, 0x10 = 0x6941 (C1 funct3=011, rd!=0,2; nzimm = 0x10 << 12 = 0x10000)
+    //   011 0 10010 10000 01 → kind=OP_LUI, rd=18, imm=0x10000
+    CASE(0x6941, OP_LUI, /*rd*/18, /*rs1*/0, /*rs2*/0, 0x10000, 0x6941, PC_STEP_RVC);
+
+    // C.ADDI4SPN x8, sp, 16 = 0x0800 (C0 funct3=000, CIW; nzuimm[5:4]=01 → 16)
+    //   000 0100 00000 0 0 000 00 → kind=OP_ADDI, rd=8 (rd'=0+8), rs1=2(sp), imm=16
+    CASE(0x0800, OP_ADDI, /*rd*/8, /*rs1*/2, /*rs2*/0, 16, 0x0800, PC_STEP_RVC);
+
+    // C.ADDI16SP sp, 64 = 0x6121 (C1 funct3=011, rd=2; imm[6]=1 → 64)
+    //   011 0 00010 0 0 1 00 0 01 → kind=OP_ADDI, rd=2, rs1=2, imm=64
+    CASE(0x6121, OP_ADDI, /*rd*/2, /*rs1*/2, /*rs2*/0, 64, 0x6121, PC_STEP_RVC);
+
+    // C.SLLI x4, 4 = 0x0212 (C2 funct3=000; rd!=0; shamt=4, RV32 shamt[5]=0)
+    //   000 0 00100 00100 10 → kind=OP_SLLI, rd=4, rs1=4, imm=4
+    CASE(0x0212, OP_SLLI, /*rd*/4, /*rs1*/4, /*rs2*/0, 4, 0x0212, PC_STEP_RVC);
+
+    // C.SUB x12, x9 = 0x8E05 (C1 funct3=100 sub=11 op_sel=00; rd_p=4→x12, rs2_p=1→x9)
+    //   100 0 11 100 00 001 01 → kind=OP_SUB, rd=12, rs1=12, rs2=9
+    CASE(0x8E05, OP_SUB, /*rd*/12, /*rs1*/12, /*rs2*/9, 0, 0x8E05, PC_STEP_RVC);
+
+    // C.BEQZ x8, +4 = 0xC011 (C1 funct3=110, CB; rs1'=0→x8, offset[2:1]=10 → 4)
+    //   110 0 00 000 00 10 0 01 → kind=OP_BEQ, rs1=8, rs2=0(x0), imm=4, pc_step=RVC
+    CASE(0xC011, OP_BEQ, /*rd*/0, /*rs1*/8, /*rs2*/0, 4, 0xC011, PC_STEP_RVC);
+
+    // C.J +4 = 0xA011 (C1 funct3=101, CJ; imm[3:1]=010 → 4)
+    //   101 0 0 00 0 0 0 010 0 01 → kind=OP_JAL, rd=0, imm=4, pc_step=RVC
+    CASE(0xA011, OP_JAL, /*rd*/0, /*rs1*/0, /*rs2*/0, 4, 0xA011, PC_STEP_RVC);
+
+    // C.JR x1 = 0x8082 (C2 funct3=100 bit12=0+rs1!=0+rs2=0)
+    //   100 0 00001 00000 10 → kind=OP_JALR, rd=0, rs1=1, imm=0, pc_step=RVC
+    CASE(0x8082, OP_JALR, /*rd*/0, /*rs1*/1, /*rs2*/0, 0, 0x8082, PC_STEP_RVC);
+
+    // C.EBREAK = 0x9002 (C2 funct3=100 bit12=1+rs1=0+rs2=0)
+    //   100 1 00000 00000 10 → kind=OP_EBREAK, rd=0, rs1=0, rs2=0, imm=0, pc_step=NONE
+    CASE(0x9002, OP_EBREAK, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x9002, PC_STEP_NONE);
+
+    // C.LW x10, 0(x8) = 0x4008 (C0 funct3=010, CL; rs1'=0→x8, rd'=2→x10, uimm=0)
+    //   010 000 000 0 0 010 00 → kind=OP_LW, rd=10, rs1=8, imm=0
+    CASE(0x4008, OP_LW, /*rd*/10, /*rs1*/8, /*rs2*/0, 0, 0x4008, PC_STEP_RVC);
+
+    // C.SW x9, 0(x8) = 0xC004 (C0 funct3=110, CS; rs1'=0→x8, rs2'=1→x9, uimm=0)
+    //   110 000 000 0 0 001 00 → kind=OP_SW, rd=0(default), rs1=8, rs2=9, imm=0
+    CASE(0xC004, OP_SW, /*rd*/0, /*rs1*/8, /*rs2*/9, 0, 0xC004, PC_STEP_RVC);
+
+    // C.LWSP x12, 16(sp) = 0x4642 (C2 funct3=010, CI uimm; rd=12, uimm[4:2]=100 → 16)
+    //   010 0 01100 100 00 10 → kind=OP_LW, rd=12, rs1=2(sp), imm=16
+    CASE(0x4642, OP_LW, /*rd*/12, /*rs1*/2, /*rs2*/0, 16, 0x4642, PC_STEP_RVC);
+
+    // C.SWSP x11, 16(sp) = 0xC82E (C2 funct3=110, CSS; uimm[5:2]=0100 → 16, rs2=11)
+    //   110 0100 00 01011 10 → kind=OP_SW, rd=0, rs1=2(sp), rs2=11, imm=16
+    CASE(0xC82E, OP_SW, /*rd*/0, /*rs1*/2, /*rs2*/11, 16, 0xC82E, PC_STEP_RVC);
+
     // ---- a_01_4 boundary 立即数解码 (8 case, max+ / max- / 0 / off-by-one 边界值)----
     //
     // 选取规则 (与之前 chat 拍的一致): B-type 4 case (近距正负 + 0 + max+) + J-type 3 case
@@ -378,34 +439,49 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dispatcher returned %d (fetch trap or other failure)\n", rc);
     }
 
-    /* a_01_8 Step 6: dump 范围扩到 x4-x15, 让 fixture 用的标记寄存器 (典型 x10-x15
-     * 输出, x4-x7 临时) 都能看到。短期方案; 长期 user 拍 "用 0x800-0x8FF custom CSR 做
-     * mtohost-style 输出" 留 csr 重组讨论一起做 (那时这个扩 dump 可缩回)。
-     *
-     * a_01_10 (7) step 1 加 (RVC 算术 fixture): 新增 x8/x9 + x16-x31 dump 行 (hex 风格,
-     * 跟 x4-x7 同), 让 RVC fixture 用 x8/x9 (3-bit 范围 RVC 寄存器之外的 ALU rd) + x16-x31
-     * (5-bit only RVC 寄存器, 仅 C.LI/C.ADDI/C.LUI/C.SLLI/C.MV/C.ADD 可用) 全可见, 单 fixture
-     * 装下 ~16 case RVC 算术。x10-x15 decimal 行不动 (兼容 a_01_8 fixture 04-09 + a_01_10/
-     * 01-02 已 PASS dump 期望; RVC 位运算指令用 x8-x9 hex 看位段更直观, 用 x10-x15 也行
-     * 只是 decimal 显示位运算不直观, fixture 设计时绕开这点即可)。 */
+    /* dump 格式 (a_01_10 (7) step 5 整理, user 主导):
+     *   - pc 放 state dump 末行, hex 显示
+     *   - reg 分 [reg dec] + [reg hex] 两段, 每段 x1-x31 (x0 跳过, 占位 pc)
+     *   - ABI 标注 xN(abi), space padding 到 9 char 宽度对齐 (x8(s0/fp) 9 char 不单独优化)
+     *   - 每行 4 reg (decimal %11u / hex 0x%08x), 行头 \t
+     * 历史: a_01_8 Step 6 加 x4-x15; a_01_10 (7) step 1 加 x8/x9+x16-x31 hex; step 5 重排 */
     fprintf(stderr,
-            "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n"
-            "[main] regs (a_01_8 fixture 调试用): x4=0x%08x x5=0x%08x x6=0x%08x x7=0x%08x\n"
-            "[main] regs (cont): x10=%u x11=%u x12=%u x13=%u x14=%u x15=%u\n"
-            "[main] regs ext (a_01_10 RVC): x8=0x%08x x9=0x%08x"
-            " x16=0x%08x x17=0x%08x x18=0x%08x x19=0x%08x\n"
-            "[main] regs ext: x20=0x%08x x21=0x%08x x22=0x%08x x23=0x%08x"
-            " x24=0x%08x x25=0x%08x x26=0x%08x x27=0x%08x\n"
-            "[main] regs ext: x28=0x%08x x29=0x%08x x30=0x%08x x31=0x%08x\n",
-            hart->regs[0],  hart->regs[1],  hart->regs[2],  hart->regs[3],
-            hart->regs[4],  hart->regs[5],  hart->regs[6],  hart->regs[7],
-            hart->regs[10], hart->regs[11], hart->regs[12], hart->regs[13],
-            hart->regs[14], hart->regs[15],
-            hart->regs[8],  hart->regs[9],
-            hart->regs[16], hart->regs[17], hart->regs[18], hart->regs[19],
-            hart->regs[20], hart->regs[21], hart->regs[22], hart->regs[23],
-            hart->regs[24], hart->regs[25], hart->regs[26], hart->regs[27],
-            hart->regs[28], hart->regs[29], hart->regs[30], hart->regs[31]);
+            "[main] reg dec:\n"
+            "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u\n"
+            "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u\n"
+            "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u\n"
+            "\tx13(a3)   = %11u  |  x14(a4)   = %11u  |  x15(a5)   = %11u  |  x16(a6)   = %11u\n"
+            "\tx17(a7)   = %11u  |  x18(s2)   = %11u  |  x19(s3)   = %11u  |  x20(s4)   = %11u\n"
+            "\tx21(s5)   = %11u  |  x22(s6)   = %11u  |  x23(s7)   = %11u  |  x24(s8)   = %11u\n"
+            "\tx25(s9)   = %11u  |  x26(s10)  = %11u  |  x27(s11)  = %11u  |  x28(t3)   = %11u\n"
+            "\tx29(t4)   = %11u  |  x30(t5)   = %11u  |  x31(t6)   = %11u\n",
+            hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
+            hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
+            hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
+            hart->regs[13], hart->regs[14], hart->regs[15], hart->regs[16],
+            hart->regs[17], hart->regs[18], hart->regs[19], hart->regs[20],
+            hart->regs[21], hart->regs[22], hart->regs[23], hart->regs[24],
+            hart->regs[25], hart->regs[26], hart->regs[27], hart->regs[28],
+            hart->regs[29], hart->regs[30], hart->regs[31]);
+
+    fprintf(stderr,
+            "[main] reg hex:\n"
+            "\tx1(ra)    = 0x%08x  |  x2(sp)    = 0x%08x  |  x3(gp)    = 0x%08x  |  x4(tp)    = 0x%08x\n"
+            "\tx5(t0)    = 0x%08x  |  x6(t1)    = 0x%08x  |  x7(t2)    = 0x%08x  |  x8(s0/fp) = 0x%08x\n"
+            "\tx9(s1)    = 0x%08x  |  x10(a0)   = 0x%08x  |  x11(a1)   = 0x%08x  |  x12(a2)   = 0x%08x\n"
+            "\tx13(a3)   = 0x%08x  |  x14(a4)   = 0x%08x  |  x15(a5)   = 0x%08x  |  x16(a6)   = 0x%08x\n"
+            "\tx17(a7)   = 0x%08x  |  x18(s2)   = 0x%08x  |  x19(s3)   = 0x%08x  |  x20(s4)   = 0x%08x\n"
+            "\tx21(s5)   = 0x%08x  |  x22(s6)   = 0x%08x  |  x23(s7)   = 0x%08x  |  x24(s8)   = 0x%08x\n"
+            "\tx25(s9)   = 0x%08x  |  x26(s10)  = 0x%08x  |  x27(s11)  = 0x%08x  |  x28(t3)   = 0x%08x\n"
+            "\tx29(t4)   = 0x%08x  |  x30(t5)   = 0x%08x  |  x31(t6)   = 0x%08x\n",
+            hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
+            hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
+            hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
+            hart->regs[13], hart->regs[14], hart->regs[15], hart->regs[16],
+            hart->regs[17], hart->regs[18], hart->regs[19], hart->regs[20],
+            hart->regs[21], hart->regs[22], hart->regs[23], hart->regs[24],
+            hart->regs[25], hart->regs[26], hart->regs[27], hart->regs[28],
+            hart->regs[29], hart->regs[30], hart->regs[31]);
 
     // a_01_5_b: trap dump (验 trap_set_state 写字段对; 候选 A 早 return 行为下,
     // in_trap=3 时字段保留第 2 次状态作 root cause)。
@@ -423,11 +499,13 @@ int main(int argc, char **argv) {
             hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
     // a_01_7: state dump (验 trap_set_state / OP_MRET 真切 priv + 写 mstatus.MPP/MPIE/MIE)。
+    // a_01_10 (7) step 5: 加 pc dump (从原 result 行挪到这里, hex 显示)。
     // 只 dump _mstatus 低 32 位 (mstatus 入口); 高 32 位 (mstatush) a_01 全 0, 不 dump 节省噪声。
     // priv 是当前 hart->priv (deliver_priv hard-code M 时, M 自我 trap 后 priv 仍 M; mret 后
     // 按 MPP 恢复, U/S-mode fixture 真激活时 priv 才会切非 M)。
     fprintf(stderr,
-            "[main] state dump: priv=%u mstatus=0x%08x\n",
+            "[main] state dump: pc=0x%08x  priv=%u  mstatus=0x%08x\n",
+            hart->regs[0],
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));
     /* a_01_8 v01: tohost / privrd 改为 csr.c 内部直接 fprintf 流式输出 (csr_tohost_write
