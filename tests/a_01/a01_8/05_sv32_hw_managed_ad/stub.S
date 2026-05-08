@@ -1,0 +1,104 @@
+# a_01_8 / 05_sv32_hw_managed_ad
+# 验 SV32 walker 内 hw-managed A/D —— PT init PTE.A=0 D=0; 经一次 store 后 walker 应
+# set A=1 + D=1 写回 PT。fixture 04 是 PTE.A=1+D=1 直接走 fast path; 05 让起步是 0,
+# 强制 walker fall back 路径 + 验 PT 真被改。设计点 D18 #5 (hw-managed A/D) 单测。
+#
+# 跟 fixture 04 同模板 (.S+.c, 4KB 页路径, 同 PT 位置 + 同 vaddr 数据段); 区别两处:
+#   1. main.c setup_pt(): leaf_pt[1] PTE 起步 = 0x20080007 (V|R|W, A=0 D=0)
+#   2. stub.S handler 段加 lw 验 PT @ leaf_pt[1] 已被 walker set 到 0x200800C7
+#
+# PT layout (跟 fixture 04 同, 仅 leaf_pt[1] 起步 A=0 D=0):
+#   root_pt @ PA 0x80100000:
+#     [0x200] = 0x20040401 (pointer-to-next-level)
+#   leaf_pt @ PA 0x80101000:
+#     [0]  = 0x2000004B (代码段, V|R|X|A; A=1 让 fetch fast path 命中, 不验 fetch hw-managed)
+#     [1]  = 0x20080007 (数据段, V|R|W; A=0 D=0 起步, 验 store hw-managed)
+#
+# 控制流:
+#   1. M setup: sp + mtvec; call setup_pt(); csrw satp + sfence; mret 切 S
+#   2. S phase 走 walker leaf_pt[1] 4KB 页:
+#      sw 0xCAFEBABE → vaddr 0x80001000:
+#        TLB miss → store_helper fall back walker → check_perm OK →
+#        set A+D 写回 PT (leaf_pt[1]: 0x20080007 → 0x200800C7) →
+#        fill TLB → host store
+#      lw  vaddr 0x80001000 → x10:
+#        TLB hit fast path (V+tag+R 命中, A 不查) → host load → x10 = 0xCAFEBABE
+#      ecall (cause=9 from S)
+#   3. M handler:
+#      csrr mcause → x12 (期望 9)
+#      lui x14, 0x80101 → x14 = leaf_pt PA (M-mode BARE identity)
+#      lw  x15, 4(x14)  → x15 = leaf_pt[1] PTE 当前值 (期望 0x200800C7, A+D 都 1)
+#      ecall → triple fault halt
+#
+# 期望 main.c dump:
+#   x10 = 0xCAFEBABE     (sw 写进数据 page, lw 读出来)
+#   x12 = 9              (ecall_from_S)
+#   x14 = 0x80101000     (leaf_pt PA)
+#   x15 = 0x200800C7     (PT 内 leaf_pt[1] 经 walker set A+D 后的值; 起步是 0x20080007)
+#   mcause = 11          (handler 末 ecall_from_M, 字段保留第 2 次)
+#   priv = 3, in_trap = 3
+#
+# 关键验证点:
+#   - x10 对 → sw → walker → host store 链路真走通 (而不是 walker 跳过没实际写)
+#   - x15 = 0x200800C7 → walker 真在 PT 上 set A+D=1 写回 (起始 0x20080007, set 后高位 0xC7)
+#   - 跟 fixture 04 比 (PT init 已 A+D=1), 05 强制 walker fall back 路径
+
+.equ CSR_TOHOST, 0x800
+.equ CSR_PRIVRD, 0xCC0
+
+.section .text
+.option norvc
+.globl _start
+_start:
+    # ---- 设 sp ----
+    lui  sp, 0x80300
+
+    # ---- 设 M handler ----
+    la   x4, m_handler
+    csrw mtvec, x4
+
+    # ---- C 函数建 PT (BARE M-mode, identity, walker 未激活) ----
+    call setup_pt
+
+    # ---- 设 satp: MODE=Sv32 + PPN=0x80100 ----
+    lui  x6, 0x80080
+    addi x6, x6, 0x100              # satp = 0x80080100
+    csrw satp, x6
+    sfence.vma
+
+    # ---- 设 mret 目标 = s_target identity vaddr ----
+    la   x7, s_target
+    csrw mepc, x7
+
+    # ---- 设 mstatus.MPP = PRIV_S ----
+    addi x4, x0, 1
+    slli x4, x4, 11                 # x4 = 0x800
+    csrw mstatus, x4
+
+    mret                            # M→S, pc=identity vaddr
+
+s_target:
+    # ---- S phase, 走 walker hw-managed A/D 路径 ----
+    lui  x4, 0x80001                # x4 = 0x80001000 (数据段 vaddr)
+
+    # 第一次 sw —— TLB miss → store_helper fall back walker → walker check_perm OK
+    # → set A+D 写回 PT (leaf_pt[1]: 0x20080007 → 0x200800C7) → fill TLB → host store
+    li   x5, 0xCAFEBABE
+    sw   x5, 0(x4)
+
+    # lw —— TLB hit fast path (上次 sw 已 fill; V+tag+R 命中, A 不查) → host load
+    lw   x10, 0(x4)                 # x10 = 0xCAFEBABE
+
+    ecall                           # cause=9 from S; trap deliver M
+
+m_handler:
+    # ---- M handler ----
+    csrr x12, mcause                # x12 = 9 (ecall from S)
+
+    # 读 PT 验 leaf_pt[1] 已被 walker set 到 A+D=1
+    lui  x14, 0x80101               # x14 = 0x80101000 (leaf_pt PA, M BARE identity)
+    lw   x15, 4(x14)                # x15 = leaf_pt[1] = 0x200800C7 (期望)
+
+halt:
+    csrw mtvec, x0
+    ecall                           # cause=11 from M → mmu fail → triple fault
