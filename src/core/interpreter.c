@@ -49,6 +49,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     #define WRITE_PC_OR_TRAP(target) do {                                  \
         uint32_t _t = (target);                                            \
         if ((_t & IALIGN_MASK) != 0u) {                                    \
+            SYNC_COUNT();                                                  \
             trap_raise_exception(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/_t); \
             goto out;                                                      \
         }                                                                  \
@@ -64,6 +65,37 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         if (cond) WRITE_PC_OR_TRAP(pc + (uint32_t)d.imm);                  \
         else      hart->regs[0] = pc + 4u;                                 \
     } while (0)
+
+    // SYNC_COUNT —— 把当前 count 同步到 dispatcher 的 count_out 指针 (a_01_10 (7) step 1 加)。
+    //
+    // 使用场景 (跟 JIT prologue/epilogue 哲学一致, dummy.txt §1):
+    //   在"可能 trap / 回 dispatcher" 的边界同步 count, 让 longjmp 路径下 dispatcher 收到
+    //   "trap 触发指令前已成功执行的指令数" — 跟 RV precise trap 一致 (trap 那条不算入)。
+    //
+    // 不在每条指令都同步 (避免 pure case 多付一次 store; 跟 JIT 内部 hot path 不付 store
+    // 同哲学); 只在已知 may-trap 位置插入。具体位置:
+    //   - WRITE_PC_OR_TRAP 内 trap_raise 之前 (misalign target; branch/jal/jalr 共用此宏)
+    //   - case OP_ECALL / OP_EBREAK / OP_UNSUPPORTED — trap_raise_exception 之前
+    //   - case OP_LB/LH/LW/LBU/LHU — load_helper 调用之前 (helper 内可能 trap_raise)
+    //   - case OP_SB/SH/SW         — store_helper 调用之前
+    //   - CSR 6 case (CSRRW/RS/RC/WI/SI/CI) — csr_op 调用之前 (csr_op 内可能 trap_raise
+    //     illegal csr / privilege violation)
+    //
+    // 不需要插入的位置:
+    //   - 算术 / 逻辑 / 移位 / NOP / LUI / AUIPC: pure case, 不可能 trap
+    //   - OP_MRET / OP_SRET: csr 路径 + trap_set_state (dummy.txt §1 path 2b 不长跳)
+    //   - OP_SFENCE_VMA: sfence_vma_helper 4.a 简化方案不 trap
+    //   - branch / jal / jalr 自身: 通过 WRITE_PC_OR_TRAP 间接覆盖 (target misalign 才 trap)
+    //
+    // 漏标检测: 漏写 SYNC_COUNT 的 may-trap case → fixture 跑后 total_count 偏小 (缺该
+    // block 的 count); cosmetic 不影响功能, 但 dump count 不对会立即提示, bug 浅显 (跟
+    // dummy.txt §1 末段 helper may_trap/pure 标注不同, 那个漏标会让寄存器脏污难追)。
+    //
+    // 实施: 单赋值用 do-while(0) 包装让 SYNC_COUNT(); 像 statement (跟 BRANCH_IF /
+    // WRITE_PC_OR_TRAP 同形态)。
+    //
+    // 隐式捕获: count (interpret_one_block 内局部变量), count_out (函数参数指针)。
+    #define SYNC_COUNT() do { *count_out = count; } while (0)
 
     uint32_t count = 0;
 
@@ -83,6 +115,35 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         // 用 rs2 寄存器值的低 5 位 (RV 规范要求; mini-rv32ima 同)。
         const uint32_t shamt_i = (uint32_t)d.imm & 0x1Fu;
 
+        // ====================================================================
+        // count_out 同步协议 (a_01_10 (7) step 1 加; SYNC_COUNT 宏 doc 见上方)
+        // ====================================================================
+        //
+        // count 跨 longjmp 跳走时, dispatcher 必须收到"trap 触发指令前已成功执行" 的
+        // count_out 值; SYNC_COUNT() 是同步动作。两条同步路径覆盖所有 case:
+        //
+        //   (1) may-trap 路径 — case 内 SYNC_COUNT() 在 trap_raise / helper-call 之前
+        //       覆盖: ECALL / EBREAK / UNSUPPORTED / CSR 6 case / load 5 case /
+        //              store 3 case / WRITE_PC_OR_TRAP misalign (branch / jal / jalr
+        //              共用宏)
+        //       逻辑: 进 trap_raise / helper 后可能 _Noreturn longjmp, count_out 必须
+        //              在 longjmp 之前已写, 否则 dispatcher 收到旧值 (跟 RV precise
+        //              trap 一致, 触发指令本身不算入)
+        //
+        //   (2) boundary 路径 (托底) — case 末 break, fetch loop 末段 count++ +
+        //       is_block_boundary_inst(&d) → goto out → out: 段 SYNC_COUNT()
+        //       覆盖: CSR / SFENCE.VMA / MRET / SRET / 所有 branch / jal / jalr (不走
+        //              trap 路径时); 跟 decode.h is_block_boundary_inst 列表一致
+        //       逻辑: 这些"特殊指令"不需要 case 内 SYNC_COUNT 因为 csr_op /
+        //              sfence_vma_helper 内 trap 路径自己 longjmp 前会 SYNC_COUNT
+        //              (case 顶部已加); 不 trap 时 case 末 break, boundary check 必命中
+        //              (因这些都是 hard boundary), 走 out 段 SYNC_COUNT 托底
+        //
+        // pure case (算术 / 逻辑 / 移位 / NOP / LUI / AUIPC) 既不 may-trap 也不 boundary,
+        // case 末 break 后 fetch loop 末段 count++ 不 goto out, 继续下一轮 while; 这条路径
+        // 不需要同步 (count 在 interp_one_block 栈帧上累加, 不影响 dispatcher 直到 block
+        // 结束). 详见 SYNC_COUNT 宏 doc "不需要插入的位置" 段。
+        // ====================================================================
         switch (d.kind) {
             // ---- U-type ----
             case OP_LUI:
@@ -206,26 +267,32 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // d.raw_inst 是 32-bit 原始指令编码 (decode 顶部已填), 给 csr_op 内 trap 路径
             // 填 mtval 用 (a_01_5_b 真接 trap.c 后激活)。
             case OP_CSRRW:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
                                        CSR_OP_RW, d.raw_inst));
                 break;
             case OP_CSRRS:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
                                        CSR_OP_RS, d.raw_inst));
                 break;
             case OP_CSRRC:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
                                        CSR_OP_RC, d.raw_inst));
                 break;
             case OP_CSRRWI:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
                                        CSR_OP_RW, d.raw_inst));
                 break;
             case OP_CSRRSI:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
                                        CSR_OP_RS, d.raw_inst));
                 break;
             case OP_CSRRCI:
+                SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, (uint32_t)d.rs1,
                                        CSR_OP_RC, d.raw_inst));
                 break;
@@ -263,9 +330,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             case OP_ECALL:
                 /* RV 编码巧合: PRIV_U=0/S=1/M=3 ↔ cause 8/9/11 (= CAUSE_ECALL_FROM_U + priv).
                  * Spike / QEMU 同写法; PRIV_H=2 在没 H 扩展下不会触发 (hart->priv ∉ {2}). */
+                SYNC_COUNT();
                 trap_raise_exception(hart, CAUSE_ECALL_FROM_U + hart->priv, /*tval*/0u);
                 goto out;
             case OP_EBREAK:
+                SYNC_COUNT();
                 trap_raise_exception(hart, CAUSE_BREAKPOINT, /*tval*/0u);
                 goto out;
             case OP_MRET: {
@@ -354,26 +423,31 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // boundary 检查不会执行。
             case OP_LB: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t) load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LH: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t)load_helper(hart, current_tlb, ea, 2u));
                 break;
             }
             case OP_LW: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 4u));
                 break;
             }
             case OP_LBU: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LHU: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 2u));
                 break;
             }
@@ -392,16 +466,19 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //   misalign → cause 6; 不在 RAM → cause 7 + fprintf; SV32 占位 → cause 15。
             case OP_SB: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 1u);
                 break;
             }
             case OP_SH: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 2u);
                 break;
             }
             case OP_SW: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                SYNC_COUNT();
                 store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
                 break;
             }
@@ -442,6 +519,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 //           普通 return; 这里 goto out 退出 fetch loop, dispatcher 通过
                 //           while(in_trap < 3) 接管 (in_trap=3 时退出 dispatcher)。
                 // a_01_5_c: helper 标 _Noreturn longjmp, goto out 变 unreachable 但保留无害。
+                SYNC_COUNT();
                 trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, /*tval*/d.raw_inst);
                 goto out;
         }
@@ -465,10 +543,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     }
 
 out:
-    *count_out = count;
+    /* boundary 路径 (case 末 break + fetch loop 末段 count++ + is_block_boundary_inst → goto out)
+     * 的 count_out 同步; 跟 may-trap 路径的 SYNC_COUNT() 共用同一份同步语义 */
+    SYNC_COUNT();
 
     #undef READ_REG
     #undef WRITE_REG
     #undef WRITE_PC_OR_TRAP
     #undef BRANCH_IF
+    #undef SYNC_COUNT
 }

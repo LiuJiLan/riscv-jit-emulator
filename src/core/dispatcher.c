@@ -47,6 +47,35 @@
 //   - total_count 必须 volatile (跨 longjmp 不被编译器放 callee-saved 寄存器丢值, 见
 //     dummy.txt §1 末段)。声明 + 初始化要在 sigsetjmp 调用之前, 否则 longjmp 跳回时会
 //     重新执行初始化, 累计丢失。
+//
+//   - count 同步契约 (a_01_10 (7) step 1 加, 跟 JIT prologue/epilogue 哲学一致):
+//     dispatcher 持 local_count 接 interpret_one_block 出参 count_out; interpreter 内
+//     count 是栈局部变量, longjmp 跳走时 *count_out = count 必须已写过, 否则 dispatcher
+//     收到 local_count = 0 (初始值), total_count 累加 0 = 丢一个 block 的 count。
+//
+//     interpreter 端协议 (interpret_one_block 内 SYNC_COUNT 宏 doc + switch 顶部协议段):
+//       (a) may-trap 路径: case 内 SYNC_COUNT() 在 trap_raise / helper-call 之前
+//       (b) boundary 路径: case 末 break + fetch loop 末段 boundary check → goto out →
+//                          out 段 SYNC_COUNT() 托底 (csr/sfence/mret/branch/jal/jalr
+//                          走这条 — decode.h is_block_boundary_inst 列表)
+//       (c) pure case: 不需要同步 (走完 fetch loop 末段 count++ 后下轮 while 继续;
+//                       count 直到 (b) boundary out 才传出)
+//
+//     dispatcher 端 (session_002 D1 项 4 关键: 扫尾搬迭代头):
+//       (1) local_count 必须 volatile + 提到 sigsetjmp 之前声明 — 跟 total_count 同
+//           处理, 跨 longjmp 持久 (longjmp 不动栈, sigsetjmp 之前声明的栈上变量值保留)
+//       (2) 累加 + reset 搬到迭代头 (while 体顶, block 1 之前):
+//             total_count += local_count;
+//             local_count = 0;
+//           不能放迭代尾 (block 3 之后) — longjmp 跳回 setjmp 落点会跳过迭代尾,
+//           上一轮 SYNC_COUNT 写好的 local_count 会被下一轮 reset 覆盖, 总值丢失
+//       (3) longjmp 路径跟正常 continue 路径都经过迭代头, 两条路径同形态扫尾
+//
+//     RV precise trap 语义对齐: trap 触发指令本身不算入 count_out (count++ 在 case 末,
+//     但 SYNC_COUNT 在 trap_raise 之前; 所以 trap 那条 count 没 ++)。
+//
+//     未来扫尾搬头的同类工作 (session_002 D1 项 4 一并搬): mtime 推进 / 中断检查 /
+//     等也应放迭代头, 不放迭代尾。当前 a_01 没接 mtime / 中断, 占位等 a_03+。
 // ============================================================================
 
 
@@ -55,14 +84,36 @@ int dispatcher(cpu_t *hart) {
     sigjmp_buf dispatch_env;
     hart->jmp_buf_ptr = &dispatch_env;
 
-    // total_count: 跨 longjmp 累加, volatile 强制放栈 (dummy.txt §1 末段); 必须在 sigsetjmp
-    // 之前声明 + 初始化, 否则 longjmp 跳回时重新执行初始化, 累计丢失。
+    // total_count + local_count: 跨 longjmp 累加 / 持久, volatile 强制放栈 (dummy.txt §1
+    // 末段)。两个变量都必须在 sigsetjmp 之前声明 + 初始化, 否则 longjmp 跳回时重新执行初始化,
+    // local_count 丢失上一轮 SYNC_COUNT 写好的值, total_count 累加丢失。
+    //
+    // local_count 之前 (a_01_5_b ~ a_01_10) 在 while 体内每轮重新声明 (块作用域局部), 触发
+    // session_002 D1 项 4 的 bug — longjmp 跳回 setjmp 落点 → 进 while 体 → local_count
+    // 重新声明初始化 0, 上一轮 SYNC_COUNT 写好的 27 被覆盖。a_01_10 (7) step 1 修: 提到
+    // sigsetjmp 之前 + volatile (跟 total_count 同形态)。
     volatile uint32_t total_count = 0;
+    volatile uint32_t local_count = 0;
 
     // 一次性 sigsetjmp 建立永久落点; 返回值不分流 (dummy.txt §1 机制 (3) "dispatcher 视角"段)。
     sigsetjmp(*hart->jmp_buf_ptr, 1);
 
     while (hart->trap.in_trap < 3) {
+
+    // ========================================================================
+    // 迭代头扫尾 (session_002 D1 项 4 关键; a_01_10 (7) step 1 实施):
+    //   - 累加上一轮 block 的 local_count 进 total_count
+    //   - 重置 local_count, 准备下一轮 block 写入
+    //
+    // 必须放迭代头 (而不是迭代尾 block 3 之后): longjmp 跳回 setjmp 落点会跳过迭代尾,
+    // 但跳到 while 顶后顺序进 while 体, 必经过迭代头; 跟正常 continue (mmu_translate_pc
+    // fail 走 path 2b return rc → continue) 路径一样必经过迭代头。两条路径同形态扫尾。
+    //
+    // 未来 mtime 推进 / 中断检查 / perf_advance 等扫尾工作一并放迭代头 (session_002 D1
+    // 项 4); 当前 a_01 没接, 占位等 a_03+。
+    // ========================================================================
+    total_count += local_count;
+    local_count = 0;
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb) [D23 + D25 + D25.1 路线]
@@ -168,17 +219,23 @@ int dispatcher(cpu_t *hart) {
     // a_01_4 临时调用 (jit_cache 没接 / 热度计数没接): 直接 interp 一次, 块边界由解释器
     // 末尾 is_block_boundary_inst 自然产生 (branch/jal/jalr 命中后退出 fetch loop)。
     // ========================================================================
-    uint32_t local_count = 0;
-    interpret_one_block(hart, current_tlb, hva, &local_count);
-    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_03 接入)
-
-    total_count += local_count;
+    /* local_count 提到 sigsetjmp 之前 + volatile (a_01_10 (7) step 1 修, session_002 D1 项 4):
+     * 跨 longjmp 持久, 不再每轮 while 体重新声明 (避免上一轮 SYNC_COUNT 写好的值被 0 覆盖)。
+     * 累加 + reset 已搬到迭代头 (block 1 之前); 这里只做 interpret_one_block 调用本身。
+     * (uint32_t *) cast 因 interpret_one_block 接口非 volatile 指针; 调用期间 volatile 语义
+     * 不影响 (helper 内部本地操作), 调用前后 dispatcher 端 volatile 读写仍生效。 */
+    interpret_one_block(hart, current_tlb, hva, (uint32_t *)&local_count);
+    // perf_advance(hart, local_count);  // 占位, dispatcher 不消费 (a_03 接入); 真做时也搬迭代头
 
     // a_01_4 的 count==0 break 已删: OP_UNSUPPORTED 改 trap_raise_exception 后, count 永远
     // > 0 (trap 是发生在 case 头部, 之前的 boundary 指令至少一条已计入); 退出条件统一靠
     // while 顶 in_trap < 3。
 
     }  /* while (in_trap < 3) */
+
+    // 退出循环后再做一次扫尾累加 — 最后一轮 block 的 local_count 还没进 total_count
+    // (迭代头扫尾负责的是"上一轮", 最后一轮没下一轮迭代头来扫)。
+    total_count += local_count;
 
     fprintf(stderr,
             "[dispatcher] halted: in_trap=%u total_count=%u pc=0x%08" PRIx32 "\n",
