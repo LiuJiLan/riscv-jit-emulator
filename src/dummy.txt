@@ -244,13 +244,23 @@ store/restore。否决理由:
 未来改进点
 --------------------------------------------------------------------------------
 
-(F1) Store fast path inline 化
-     初版所有 store 都走 store_helper,因此每次 store 都付寄存器保护
-     代价。未来 store fast path inline 化后:
-       - store_helper 不再是高频路径
-       - 寄存器保护代价集中在真正 may-longjmp 的低频路径上
-     这等于自动消化了"统一保护"在 store 路径上的成本。
-     完整设计见 file_plan.md 待办。
+(F1) store_helper inline 化(命名澄清:不是"store 变 fast path")
+     **重要术语澄清**:历史命名"store fast path inline 化"有误导性。
+     store_helper 内部所有操作(misalign 检查 / TLB lookup / walker
+     fall back / reservation 清除 / SMC 检测)都是 slow path 性质的
+     操作,改进后这些操作仍全部是 slow path。inline 化只是改 store_helper
+     的链接形态(extern 函数 → static inline 函数 / 或 JIT emit-equiv),
+     消除每次 store 付的函数 call/ret 开销(5-15 cycle)+ 寄存器保护代价。
+
+     初版所有 store 都走 store_helper(extern 函数 call),因此每次 store
+     都付:(a) call/ret 开销;(b) 寄存器保护代价(dummy.txt §1 "统一保护")。
+     未来 store_helper inline 化后:
+       - 函数 call 开销消失(代码内联进调用方 case)
+       - 寄存器保护代价集中在 helper 内真正 may-longjmp 的子段
+         (reservation 清除 / 真正 fall back walker 的路径)上
+     这等于自动消化了"统一保护"在 store 路径上的成本,但 store_helper 仍是
+     slow path —— 只是这条 slow path 的边界从"函数边界"挪到"代码块边界"。
+     完整设计见 file_plan.md 待办(对齐时一并修正命名误导)。
 
 (F2) 性能 profile 后,如果某个低频 pure helper 意外成为热点,可以单独
      为它加 "no_save" 标注。这是局部优化,不破坏架构。
@@ -315,8 +325,10 @@ store_helper 内部翻译形态(2026-05-05 拍方案 1, a_01_6 起步前对齐):
     解释器本来就慢路径,代价占比小。
   - JIT:每个 store emit 一个 helper call 而非 inline。**这正是 dummy.txt
     §1 "统一保护"所付的代价**(每次 store 都付寄存器 store/restore)。
-  - 未来 store fast path inline 化(file_plan.md 待办)会同时解决 JIT
-    和(可选)解释器的 store 性能问题。
+  - 未来 store_helper inline 化(file_plan.md 待办;命名澄清见本文 F1)
+    会同时消除 JIT 和(可选)解释器的 store 函数 call 开销。注意
+    inline 化后 store_helper 内部仍全是 slow path 操作,只是边界从
+    函数边界挪到代码块边界。
 
 → 这个不对称在 §2.tlb / §3.mmu / §8.interpreter 各自的 D 区都有体现,
   此处只是把它和 longjmp 协议的关系说清楚。
@@ -714,8 +726,13 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
     命名前缀: 下划线 "_"
     类型: uint64_t
     示例:
-      _mstatus  — csr 入口 mstatus + mstatush 拆访问低/高 32 位 (sstatus 是 mstatus
-                  的 masked view, 同字段共用)
+      _mstatus  — 物理一份 uint64_t 字段; 三个 csr 入口同级看这一份字段:
+                    mstatus  (0x300) — 低 32 位
+                    mstatush (0x310) — 高 32 位
+                    sstatus  (0x100) — 低 32 位 ∩ SSTATUS_MASK
+                  三个入口都是 _mstatus 字段的访问通道, sstatus 不是"mstatus 的派生",
+                  跟 mstatus / mstatush 同级 (实现上 csr.c 三个 read/write helper 各自
+                  对 _mstatus 字段做 mask/shift, 互相不调)。
       _medeleg  — RV32 单 csr 入口 (无 medelegh), 但物理 64 位为 RV64 future-proof
       _mideleg  — 同 _medeleg
 
@@ -738,30 +755,36 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
     这也是为什么 _mstatus / _medeleg / _mideleg 当前都用 uint64_t 而不是 uint32_t — 哪怕
     a_01 RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
 
-(2) 第二类 — 副本类 (一个物理字段被多个访问通道共享)
+(2) 第二类 — 副本类 (一个物理字段被多个 csr 入口看, 入口之间不存在派生关系, 各看不同 mask)
     命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)
     分两种子情况:
-      (2a) 权级副本 — 一个 csr 是另一个 csr 的 mask 视图
-           示例: sstatus 是 mstatus 的 mask 视图 (SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR);
-                 物理共用 _mstatus 字段, sstatus 的 read/write helper 通过 mask 操作只访问
-                 SSTATUS_MASK 内字段位, 不影响 mstatus M-mode-only 字段 (MIE/MPIE/MPP)。
+      (2a) 权级副本 — 同一份物理字段, 多个 csr 入口同级看不同 mask 子集
+           示例: _mstatus 字段被 mstatus / sstatus 两个 csr 入口看 (mstatush 跟 sstatus
+                 不算副本关系, 是低/高半边关系, 见 (1)+(2a) 特殊段); mstatus 入口看低 32
+                 位全部, sstatus 入口看低 32 位 ∩ SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR;
+                 两入口实现独立 (csr.c 三个 helper 不互调), 关系是"同级看不同 mask",
+                 不是"sstatus 派生于 mstatus"。
       (2b) csr / MMIO 副本 — 一个物理字段同时被 csr 入口和 MMIO load/store 读写
            示例: _mtime (CLINT MMIO 0xBFF8 同时被 csrr time 读 + MMIO load 读, 两路径同源字段)
 
-    项目当前 (2a) 真字段 = sstatus (复用 _mstatus); (2b) 没遇到真字段 (clint / plic 真做时加)。
+    项目当前 (2a) 真字段 = _mstatus (mstatus + sstatus 两入口看); (2b) 没遇到真字段
+    (clint / plic 真做时加)。
 
-(*) (1) + (2a) 特殊例子: mstatus / fcsr / vcsr — 同时满足"内部一个长字段, 外部多 csr
-    入口看不同 sub-view"
-    类 (1) 的本质是"内部字段长度 ≠ 外部 csr 入口长度", 模拟器内一份大字段, 外部通过多 csr
-    入口拆 / mask / shift 看子段; 类 (2a) 是"一个 csr 是另一个 csr 的 mask 视图" — 两者
-    在 sub-view 关系里其实重叠。下列 csr 同时属 (1) + (2a), 命名统一取 "_" 前缀:
-      _mstatus  — 物理 64 位; 外部 mstatus(32) + mstatush(32) 拆访问 (1); sstatus 是
-                  _mstatus 的 mask 视图 (2a, SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR)。
+(*) (1) + (2a) 特殊例子: _mstatus / _fcsr / _vcsr — 同时满足"物理一份长字段, 多 csr 入口
+    同级看不同 sub-view"
+    类 (1) 的本质是"物理字段长度 ≠ 任一 csr 入口长度", 模拟器内一份大字段, 多 csr 入口各自
+    通过 mask / shift 看子段; 类 (2a) 是"同一份字段被多 csr 入口同级看不同 mask 子集" — 两者
+    在 sub-view 关系里其实重叠 (一份字段, 多入口同级看不同 view)。下列字段同时属 (1) + (2a),
+    命名统一取 "_" 前缀:
+      _mstatus  — 物理 64 位; 三个 csr 入口同级看: mstatus(0x300, 低 32) +
+                  mstatush(0x310, 高 32) [类 (1) 拆 xlen 访问] + sstatus(0x100, 低 32
+                  ∩ SSTATUS_MASK) [类 (2a) mask 子集; SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR]。
       _fcsr     — RV spec 规定 fcsr 32 位 (项目当前未实装 F 扩展; 真做时按本协议加)。
-                  外部 fcsr(32) / fflags(5 bit, fcsr[4:0]) / frm(3 bit, fcsr[7:5]) 三 csr
-                  入口共享物理字段; fflags/frm 是 fcsr 的 sub-view (2a)。
-      _vcsr     — RV spec 规定 vcsr 是 vxsat + vxrm 的组合视图; 外部 vcsr / vxsat(bit 0) /
-                  vxrm(bit 2:1) 三 csr 入口共享 (跟 _fcsr 同形态)。
+                  三 csr 入口同级看: fcsr(32 位全部) + fflags(5 bit, fcsr[4:0]) +
+                  frm(3 bit, fcsr[7:5]); fflags/frm 是 _fcsr 字段的 mask 子集 (2a) — 跟
+                  fcsr 入口同级, 不是 fcsr 入口的派生。
+      _vcsr     — RV spec 规定 vcsr 是 vxsat + vxrm 的组合视图; 三 csr 入口同级看:
+                  vcsr / vxsat(bit 0) / vxrm(bit 2:1) (跟 _fcsr 同形态)。
 
 (3) 第三类 — priv 无关独立寄存器 (单字段, 单 csr 入口, 无 sub-view / 无副本)
     命名前缀: 不带前缀 (普通字段名)

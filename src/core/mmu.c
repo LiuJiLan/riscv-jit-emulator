@@ -23,14 +23,13 @@
 #include <string.h>   // memcpy (a_01_8 walker 读写 PT, walker_helper_* host load/store)
 
 // ----------------------------------------------------------------------------
-// forward decl —— check_perm (实现在 mmu_walk 之后, a_01_8 段内)
+// check_perm —— 提到 mmu.h 作 static inline (a01_10 (6) SUM 议程)
 // ----------------------------------------------------------------------------
 //
-// a_01_8 Step 6 (新): mmu_translate_pc SV32 路径调用 check_perm 复用 walker 内 perm 检查
-// (D18 设计点 8: 不重写 fetch perm, 复用 walker 的 check_perm 跟 mmu_walk 路径同步)。
-// check_perm 实现位置不动 (a_01_8 段内, 紧贴 mmu_walk + walker_helpers); forward decl 让
-// 上方 mmu_translate_pc 编译时找到符号。
-static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm);
+// a_01_8 时 check_perm 是本文件 file-static, 通过 forward decl 让上方 mmu_translate_pc
+// 找到符号。a01_10 (6) SUM 议程修 lsu fast path corner case (S+PTE.U=1+SUM=0 错放过) 时,
+// check_perm 提到 mmu.h 作 static inline, 三处共用 (mmu_translate_pc / load_helper /
+// store_helper); 详细背景见 mmu.h check_perm 段 doc。本文件不再保留 forward decl + 实现。
 
 
 // ----------------------------------------------------------------------------
@@ -195,57 +194,8 @@ static uint32_t af_cause_for(mmu_perm_t perm) {
 }
 
 
-// ---- check_perm —— priv + SUM/MXR + PTE.U/R/W/X 权限检查 (file-static inline) ----
-//
-// 返回: 1 = 权限通过; 0 = 权限不通过 (caller 报 page fault)
-//
-// 检查顺序 (RV Privileged Spec Vol II §4.3.1, 4.4):
-//   1. priv 跟 PTE.U 匹配:
-//      - PRIV_U: 必须 PTE.U=1 (U 模式只能访问 user pages)
-//      - PRIV_S: PTE.U=0 默认允许; PTE.U=1 仅 mstatus.SUM=1 + perm != X 时允许
-//                (S 模式访问 user pages 受 SUM 控制; 即使 SUM=1, 也不允许 fetch X-on-U)
-//      - PRIV_M: walker 不应在 M 调用 (caller 防御); 不特检 (信任 caller)
-//   2. R/W/X 位:
-//      - load (PERM_R): 需要 R=1, 或 mstatus.MXR=1 + X=1 (X-on-readable)
-//      - store (PERM_W): 需要 W=1; W=1+R=0 spec reserved 但项目跟 spike 风格不查 (caller
-//                         若构造 W=1+R=0 PTE, 项目当合法; 真做时按 spec 查可补)
-//      - fetch (PERM_X): 需要 X=1
-//
-// 注意: PTE.A/PTE.D 检查不在此函数里 — 项目 hw-managed 风格, walker 内 mmu_walk 顺手
-// set A/D 写回 PT (见下方 mmu_walk 实现); 不像 Svade 风格那样把 A=0/D=0 当 fault。
-
-static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
-    uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
-    int sum = (mstatus_lo & MSTATUS_SUM) != 0;
-    int mxr = (mstatus_lo & MSTATUS_MXR) != 0;
-    int pte_u = (pte & PTE_U) != 0;
-
-    // priv + PTE.U 检查
-    if (hart->priv == PRIV_U) {
-        if (!pte_u) return 0;
-    } else if (hart->priv == PRIV_S) {
-        if (pte_u) {
-            if (!sum) return 0;
-            if (perm == MMU_PERM_X) return 0;     /* S+SUM 不允许 X-on-U-page */
-        }
-    }
-    /* PRIV_M: 信任 caller (walker 不应在 M 调用); PRIV_H 槽 a_01_8 永远 NULL 不到此 */
-
-    // R/W/X 位检查 — switch on perm 跟 mmu_perm_t enum 配 -Wswitch-enum 联动
-    switch (perm) {
-        case MMU_PERM_R:
-            if ((pte & PTE_R) == 0 && !(mxr && (pte & PTE_X))) return 0;
-            break;
-        case MMU_PERM_W:
-            if ((pte & PTE_W) == 0) return 0;
-            /* W=1+R=0 RV spec reserved; 项目跟 spike 风格不查 */
-            break;
-        case MMU_PERM_X:
-            if ((pte & PTE_X) == 0) return 0;
-            break;
-    }
-    return 1;
-}
+// check_perm 实现已提到 mmu.h 作 static inline (a01_10 (6) SUM 议程)。
+// 本文件 mmu_walk + mmu_translate_pc 都通过 mmu.h 的 inline 函数调用。
 
 
 // ============================================================================

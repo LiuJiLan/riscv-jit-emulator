@@ -81,27 +81,38 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
 
     // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup fast path + miss/D=0 fall back
     //
-    // fast path: V + tag + W + D 全命中 → host store (简化 perm 检查; 不查 priv/SUM; corner
-    // case S 模式访问 PTE.U=1 没 SUM 留 a01_9 — 跟 lsu.h load 路径同; D18 设计点 5 A 位
-    // 永远 1 不查, D 位检查必需)。
+    // 注意: store_helper 整体是 slow path (extern 函数, 已付 helper call 开销), 这段 "TLB
+    // 命中 fast path" 是 helper 内的快速路径 — 跟 load_helper (lsu.h static inline 真 fast
+    // path) 性质不同。命中段调 check_perm 是 inline 还是 extern 都可以, 当前用 mmu.h 的
+    // static inline 形态跟 load_helper / mmu_translate_pc 共用一份。命名澄清见 dummy.txt §1
+    // F1 段 (store_helper inline 化 ≠ store 变 fast path)。
     //
-    // 不命中 (miss / V=0 / W=0 / D=0 / 任何不齐) → fall back mmu_walker_helper_store —
-    // walker 内 check_perm 做完整 perm 检查 + set A+D 写回 PT + fill TLB; 失败 trap_raise
+    // 命中条件 (a01_10 (6) SUM 议程修): V + tag + D + check_perm(MMU_PERM_W)
+    //   D 位必查 — load 路径 walker 不 set D, store 时 D=0 必 fall back walker 重 set
+    //   (hw-managed D 关键路径; D18 设计点 5 时序场景 step 3-4: walker 第一次 set D 写回
+    //   PT + 重 fill TLB; 之后 fast path 直接 host store)
+    //   check_perm 内查 priv/PTE_U/SUM + W 位; W=1+R=0 reserved 不查 (跟 spike 同)
+    //
+    // a_01_8 旧形态 (V + tag + W + D 简化命中) 错放过 corner case (S+PTE.U=1+SUM=0):
+    //   旧 fast path 看 W=1 + D=1 就 host store 通过, 但 S 模式访问 user page 没 SUM 时
+    //   spec 规定应 store page fault。提 check_perm inline 后命中段跟 walker 对齐, 不再错
+    //   放过。
+    //
+    // 不命中 (miss / V=0 / D=0 / perm 不齐) → fall back mmu_walker_helper_store —
+    // walker 内重做 walk + check_perm + set A+D 写回 PT + fill TLB; 失败 trap_raise
     // (cause 15 page fault / cause 7 access fault) 长跳, 不返回 caller。
-    //
-    // D=0 + W=1 + store 是 hw-managed D 关键路径 (D18 设计点 5 时序场景 step 3-4): walker
-    // 第一次 set D 写回 PT + 重 fill TLB; 之后 fast path 直接 host store。
     {
         const uint32_t vpn   = gva >> 12;
         const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
         tlb_e_t *entry = &current_tlb->e[index];
 
-        /* fast path: V + tag + W + D 命中 (A 位 walker 进 TLB 时永远 set, 此处 skip; D 位
-         * 必查 — load 路径 walker 不 set D, store 时 D=0 需 fall back walker 重 set) */
+        /* 命中: V + tag + D + check_perm(W) (A 位 walker 进 TLB 时永远 set, check_perm 内
+         * 不查 A; D 位必查 — load 路径 walker 不 set D, store 时 D=0 需 fall back walker 重
+         * set; check_perm 完整覆盖 priv/PTE_U/SUM + W 位, 跟 walker 同源) */
         if ((entry->pte_flags & PTE_V)
             && entry->gva_tag == vpn
-            && (entry->pte_flags & PTE_W)
-            && (entry->pte_flags & PTE_D)) {
+            && (entry->pte_flags & PTE_D)
+            && check_perm(hart, (uint32_t)entry->pte_flags, MMU_PERM_W)) {
             uint8_t *host_ptr = entry->host_ptr + (gva & 0xFFFu);
             memcpy(host_ptr, &value, size);
 

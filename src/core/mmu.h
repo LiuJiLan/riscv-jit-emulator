@@ -124,6 +124,7 @@
 
 #include "cpu.h"
 #include "tlb.h"
+#include "riscv.h"   // PTE_R/W/X/U / MSTATUS_SUM/MXR / PRIV_U/S/M (check_perm static inline 用)
 
 // ----------------------------------------------------------------------------
 // regime_t —— 执行 regime 的 concept-level 命名 (D25 后不作为函数参数)
@@ -175,6 +176,83 @@ typedef enum {
     MMU_PERM_W = 1,    // store / AMO 访问
     MMU_PERM_X = 2,    // fetch 访问 (未来 mmu_translate_pc 真接 SV32 时用)
 } mmu_perm_t;
+
+
+// ----------------------------------------------------------------------------
+// check_perm —— priv + SUM/MXR + PTE.U/R/W/X 权限检查 (static inline, 三处共用)
+//
+// 三处调用方 (a01_10 整理):
+//   1. mmu_translate_pc (mmu.c) — TLB hit 后调 check_perm(MMU_PERM_X);
+//      per-block 1 次 slow path, inline 与否性能差别小, 调用形态 OK
+//   2. load_helper (lsu.h, fast path inline) — 真 fast path, 命中条件内联展开
+//      check_perm(MMU_PERM_R); inline 形态消除函数 call 开销 (每条 lw/lh/lb 都跑)
+//   3. store_helper (lsu.c, slow path helper) — 整体 slow path, 内部命中段调
+//      check_perm(MMU_PERM_W); store_helper 已是 helper call, inline 与否差别小
+//
+// 三处共用一份 check_perm 实现 → 跟 walker (mmu_walk) 内的 perm 检查同源, 不会两份
+// 维护偏离 (a_01_8 之前 check_perm 是 mmu.c file-static, fast path 命中条件简化版本
+// 漏 SUM/MXR/U-vs-priv corner case; a01_10 提 inline 后修)。
+//
+// 返回: 1 = 权限通过; 0 = 权限不通过 (caller 报 fault, page fault cause 由 caller 选)
+//
+// 检查顺序 (RV Privileged Spec Vol II §4.3.1, §4.4):
+//   1. priv 跟 PTE.U 匹配:
+//      - PRIV_U: 必须 PTE.U=1 (U 模式只能访问 user pages)
+//      - PRIV_S: PTE.U=0 默认允许; PTE.U=1 仅 mstatus.SUM=1 + perm != X 时允许
+//                (S 模式访问 user pages 受 SUM 控制; 即使 SUM=1, 也不允许 fetch X-on-U)
+//      - PRIV_M: walker 不应在 M 调用 (caller 防御); 不特检 (信任 caller)
+//   2. R/W/X 位:
+//      - load (PERM_R): 需要 R=1, 或 mstatus.MXR=1 + X=1 (X-on-readable)
+//      - store (PERM_W): 需要 W=1; W=1+R=0 spec reserved 但项目跟 spike 风格不查
+//      - fetch (PERM_X): 需要 X=1
+//
+// 注意: PTE.A/PTE.D 检查不在此函数里 — 项目 hw-managed 风格, walker 内 mmu_walk 顺手
+// set A/D 写回 PT (见 mmu.c 实现); 不像 Svade 风格那样把 A=0/D=0 当 fault。
+//
+// fast path 调用形态 (lsu.h load_helper):
+//   if ((entry->pte_flags & PTE_V)
+//       && entry->gva_tag == vpn
+//       && check_perm(hart, entry->pte_flags, MMU_PERM_R)) { /* host load */ }
+//   else { /* fall back walker_helper_load */ }
+//
+// SMP / 立即生效说明:
+//   check_perm 每次都读 hart->trap._mstatus 当前值 (SUM/MXR), 不缓存; 配合 csr 写
+//   是块边界 (decode.h is_block_boundary_inst), 块内 mstatus 不变, 块间重派发用新值。
+//   见 mmu.h 段 "立即生效语义"。
+// ----------------------------------------------------------------------------
+static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
+    /* 物理上 _mstatus 一份 uint64_t 字段 (dummy.txt §6 (1)+(2a) 特殊); SUM/MXR 在低
+     * 32 位, 直接 mask 即可 (不需要先 cast 低 32 位再 mask) */
+    int sum = (hart->trap._mstatus & MSTATUS_SUM) != 0;
+    int mxr = (hart->trap._mstatus & MSTATUS_MXR) != 0;
+    int pte_u = (pte & PTE_U) != 0;
+
+    /* priv + PTE.U 检查 */
+    if (hart->priv == PRIV_U) {
+        if (!pte_u) return 0;
+    } else if (hart->priv == PRIV_S) {
+        if (pte_u) {
+            if (!sum) return 0;
+            if (perm == MMU_PERM_X) return 0;     /* S+SUM 不允许 X-on-U-page */
+        }
+    }
+    /* PRIV_M: 信任 caller (walker 不应在 M 调用); PRIV_H 槽 a_01 永远 NULL 不到此 */
+
+    /* R/W/X 位检查 — switch on perm 跟 mmu_perm_t enum 配 -Wswitch-enum 联动 */
+    switch (perm) {
+        case MMU_PERM_R:
+            if ((pte & PTE_R) == 0 && !(mxr && (pte & PTE_X))) return 0;
+            break;
+        case MMU_PERM_W:
+            if ((pte & PTE_W) == 0) return 0;
+            /* W=1+R=0 RV spec reserved; 项目跟 spike 风格不查 */
+            break;
+        case MMU_PERM_X:
+            if ((pte & PTE_X) == 0) return 0;
+            break;
+    }
+    return 1;
+}
 
 
 // ----------------------------------------------------------------------------
@@ -265,7 +343,9 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
 //   - store 路径: store_helper 整体 slow path (extern 函数 call), 但内部仍有
 //                  "TLB lookup 短路径"避免每次 walk PT; "fall back" 在 store 路径意思
 //                  store_helper 内 inline 查 → mmu_walker_helper_store 函数 (helper 之间分层)
-//   - 未来 file_plan §F1 改进: store fast path inline 化, 那时整 store 路径才跟 load 对称
+//   - 未来 file_plan §F1 改进: store_helper inline 化 (extern → static inline; 命名澄清见
+//                  dummy.txt §1 F1 段, 不是"store 变 fast path", store_helper 内部仍全 slow
+//                  path), 消除 store 每次付的函数 call 开销; load fast path inline 性质不变
 //
 // ----------------------------------------------------------------------------
 // hw-managed A/D 设计 (RV Privileged Spec Vol II §4.3.1, 非 Svade 路径)

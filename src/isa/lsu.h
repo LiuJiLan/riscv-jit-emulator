@@ -8,7 +8,11 @@
 //                    命中, 只有 miss 才走 walker_helper_load slow path (a_01_7+ 加)。
 //   - store_helper: extern 函数在 lsu.c, 总是走 helper call (slow path)。
 //                    理由: LR/SC reservation 清除 / 未来 SMC 检测 / 未来副作用扩展, 都需 helper
-//                    介入; store fast path inline 化是 file_plan 待办的未来改进。
+//                    介入; store_helper 整体仍是 slow path, 只是初版用 extern 函数 call 形态。
+//                    file_plan §F1 待办: 把 store_helper 改成 static inline (放 lsu.h),
+//                    消除函数 call 开销; helper 内部 misalign / TLB lookup / walker / reservation
+//                    / SMC 仍全是 slow path 操作 (命名"fast path inline 化"有误导性, 实际是
+//                    "helper 链接形态从 extern 变 inline", 见 dummy.txt §1 F1)。
 //   interpreter 与 (未来) translator 都遵守这条不对称, 完整背景见 dummy.txt §1 末段。
 //
 // trap 协议 (dummy.txt §1 路径 2a, helper 长跳):
@@ -100,23 +104,32 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
 
     // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup fast path + miss/perm 错 fall back
     //
-    // fast path: V + tag + R 全命中 → host load (简化 perm 检查; 不查 priv/SUM/MXR; D18
-    // 设计点 5 A 位永远 1 不查; corner case 留 a01_9 解决 — S 模式访问 PTE.U=1 page 没 SUM
-    // 时 fast path 可能错放过, 真做 OS 时改用 mmu.h 暴露 check_perm 复用)。
+    // fast path 命中条件 (a01_10 (6) SUM 议程修):
+    //   V + tag + check_perm(MMU_PERM_R) — check_perm 是 mmu.h 的 static inline, 跟 walker
+    //   同源, 完整查 priv/PTE_U/SUM/MXR + R-or-(MXR&&X)。inline 展开后 fast path 多 ~8 条
+    //   ALU 指令 (mstatus load 1 次 cache 友好 + SUM/MXR mask + priv 分支 + R/MXR 检查),
+    //   现代 OoO CPU 跟 host load 并行 dispatch, 实际 cycle 增加 ~1-2 / load。
     //
-    // 不命中 (miss / V=0 / R=0 / 任何不齐) → fall back mmu_walker_helper_load — walker 内
-    // check_perm 做完整 priv+SUM/MXR/X-via-MXR 检查 + 必要时 set A 写回 PT + fill TLB; 失败
-    // 时 walker_helper 内 trap_raise_exception (cause 13 page fault / cause 5 access fault)
-    // 长跳, 不返回 caller。
+    // a_01_8 旧形态 (V + tag + R 简化命中) 错放过 corner case (S+PTE.U=1+SUM=0):
+    //   S 模式访问 PTE.U=1 page 没 SUM 时, 旧 fast path 看 R=1 就 host load 通过, 但 spec
+    //   规定应 page fault。提 check_perm inline 后 fast path 跟 walker 对齐, 不再错放过。
+    //
+    // D18 设计点 5 (A 位永远 set, 不查): walker 进 TLB 时永远 set A=1, fast path / check_perm
+    // 都不查 A 位; D 位 load 路径不查 (load 时 walker 不 set D, store fast path 才必查)。
+    //
+    // 不命中 (miss / V=0 / perm 不齐 / 任何不齐) → fall back mmu_walker_helper_load —
+    // walker 内重做 walk + check_perm + 必要时 set A 写回 PT + fill TLB; 失败时 walker_helper
+    // 内 trap_raise_exception (cause 13 page fault / cause 5 access fault) 长跳, 不返回 caller。
     {
         const uint32_t vpn   = gva >> 12;
         const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
         tlb_e_t *entry = &current_tlb->e[index];
 
-        /* fast path: V + tag + R 命中 (A 位 walker 进 TLB 时永远 set, 此处 skip) */
+        /* fast path: V + tag + check_perm(R) 命中 (A 位 walker 进 TLB 时永远 set, check_perm
+         * 内不查 A; check_perm 完整覆盖 priv/PTE_U/SUM/MXR/R-or-(MXR&&X), 跟 walker 同源) */
         if ((entry->pte_flags & PTE_V)
             && entry->gva_tag == vpn
-            && (entry->pte_flags & PTE_R)) {
+            && check_perm(hart, (uint32_t)entry->pte_flags, MMU_PERM_R)) {
             uint8_t *host_ptr = entry->host_ptr + (gva & 0xFFFu);
             uint32_t value = 0;
             memcpy(&value, host_ptr, size);
