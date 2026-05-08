@@ -117,10 +117,11 @@ static int decode_test(void) {
     //   预期: kind=OP_ADDI, rd=3, rs1=3 (C.ADDI 是 rd=rd+imm), imm=5
     CASE(0x0195, OP_ADDI, /*rd*/3, /*rs1*/3, /*rs2*/0, 5, 0x0195, PC_STEP_RVC);
 
-    // RVC OP_UNSUPPORTED (其他 RVC 指令 a_01_4 起步不识别): C.MV x3, x1 = 0x8186
-    //   100 0 00011 00001 10 (funct3=100, op=10 即 C2 quadrant); 我们只翻译 C1 (op=01)
-    //   decode_rvc C2 路径全部归 OP_UNSUPPORTED, 验证 fetch loop +=2 路径
-    CASE(0x8186, OP_UNSUPPORTED, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x8186, PC_STEP_RVC);
+    // C.MV x3, x1 = 0x8186 (a_01_10 (7) step 1 加, C2 funct3=100 bit12=0+rs2!=0 路径):
+    //   100 0 00011 00001 10 (funct3=100, op=10 即 C2 quadrant)
+    //   bit12=0, rs2_full=1 (!=0) → C.MV: 翻译 OP_ADD rd, x0, rs2
+    //   rd=3, rs1=0 (mv = add rd, x0, rs2), rs2=1, imm=0, pc_step=PC_STEP_RVC
+    CASE(0x8186, OP_ADD, /*rd*/3, /*rs1*/0, /*rs2*/1, 0, 0x8186, PC_STEP_RVC);
 
     // ---- a_01_4 boundary 立即数解码 (8 case, max+ / max- / 0 / off-by-one 边界值)----
     //
@@ -377,17 +378,34 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dispatcher returned %d (fetch trap or other failure)\n", rc);
     }
 
-    /* a_01_8 Step 6 (新): dump 范围扩到 x4-x15, 让 fixture 用的标记寄存器 (典型 x10-x15
+    /* a_01_8 Step 6: dump 范围扩到 x4-x15, 让 fixture 用的标记寄存器 (典型 x10-x15
      * 输出, x4-x7 临时) 都能看到。短期方案; 长期 user 拍 "用 0x800-0x8FF custom CSR 做
-     * mtohost-style 输出" 留 csr 重组讨论一起做 (那时这个扩 dump 可缩回)。 */
+     * mtohost-style 输出" 留 csr 重组讨论一起做 (那时这个扩 dump 可缩回)。
+     *
+     * a_01_10 (7) step 1 加 (RVC 算术 fixture): 新增 x8/x9 + x16-x31 dump 行 (hex 风格,
+     * 跟 x4-x7 同), 让 RVC fixture 用 x8/x9 (3-bit 范围 RVC 寄存器之外的 ALU rd) + x16-x31
+     * (5-bit only RVC 寄存器, 仅 C.LI/C.ADDI/C.LUI/C.SLLI/C.MV/C.ADD 可用) 全可见, 单 fixture
+     * 装下 ~16 case RVC 算术。x10-x15 decimal 行不动 (兼容 a_01_8 fixture 04-09 + a_01_10/
+     * 01-02 已 PASS dump 期望; RVC 位运算指令用 x8-x9 hex 看位段更直观, 用 x10-x15 也行
+     * 只是 decimal 显示位运算不直观, fixture 设计时绕开这点即可)。 */
     fprintf(stderr,
             "[main] result: pc=0x%08x x1=%u x2=%u x3=%u\n"
             "[main] regs (a_01_8 fixture 调试用): x4=0x%08x x5=0x%08x x6=0x%08x x7=0x%08x\n"
-            "[main] regs (cont): x10=%u x11=%u x12=%u x13=%u x14=%u x15=%u\n",
+            "[main] regs (cont): x10=%u x11=%u x12=%u x13=%u x14=%u x15=%u\n"
+            "[main] regs ext (a_01_10 RVC): x8=0x%08x x9=0x%08x"
+            " x16=0x%08x x17=0x%08x x18=0x%08x x19=0x%08x\n"
+            "[main] regs ext: x20=0x%08x x21=0x%08x x22=0x%08x x23=0x%08x"
+            " x24=0x%08x x25=0x%08x x26=0x%08x x27=0x%08x\n"
+            "[main] regs ext: x28=0x%08x x29=0x%08x x30=0x%08x x31=0x%08x\n",
             hart->regs[0],  hart->regs[1],  hart->regs[2],  hart->regs[3],
             hart->regs[4],  hart->regs[5],  hart->regs[6],  hart->regs[7],
             hart->regs[10], hart->regs[11], hart->regs[12], hart->regs[13],
-            hart->regs[14], hart->regs[15]);
+            hart->regs[14], hart->regs[15],
+            hart->regs[8],  hart->regs[9],
+            hart->regs[16], hart->regs[17], hart->regs[18], hart->regs[19],
+            hart->regs[20], hart->regs[21], hart->regs[22], hart->regs[23],
+            hart->regs[24], hart->regs[25], hart->regs[26], hart->regs[27],
+            hart->regs[28], hart->regs[29], hart->regs[30], hart->regs[31]);
 
     // a_01_5_b: trap dump (验 trap_set_state 写字段对; 候选 A 早 return 行为下,
     // in_trap=3 时字段保留第 2 次状态作 root cause)。

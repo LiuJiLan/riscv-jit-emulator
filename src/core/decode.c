@@ -19,15 +19,34 @@
 // ----------------------------------------------------------------------------
 // decode_rvc —— 16-bit C 扩展 (compressed) 指令的 decode 路径
 //
-// a_01_3 起步 (用户拍 viii): 只翻译 C.LI + C.ADDI 两个最常用 RVC 算术指令到 RV32I
-// op_kind (decoded_inst_t 复用 RV32I 的 OP_ADDI 等, 不为 RVC 单立 op_kind enum —
-// RVC 是"指令长度变化", 不是"语义变化", 与 RV32I 同源)。
-// 其他 RVC 指令暂时归 OP_UNSUPPORTED + pc_step=PC_STEP_RVC (fetch loop 仍 +2 推进
-// 位置正确, 但解释器到这条立即 break)。
+// 演进:
+//   a_01_3 起步: 只翻译 C.LI + C.ADDI 两个 RVC 算术 case (用户拍 viii)
+//   a_01_10 (7) step 1: 加完整 RVC 算术 + sp 设置 case (~16 case 含展开 SUB/XOR/OR/AND);
+//                       控制流 (C.JAL/J/JR/JALR/BEQZ/BNEZ/EBREAK) 留 step 2-3, load/store
+//                       (C.LW/SW/LWSP/SWSP) 留 step 4
+//
+// 所有 RVC 复用现有 RV32I op_kind, 不为 RVC 单立 op_kind enum — RVC 是"指令长度变化",
+// 不是"语义变化", 与 RV32I 同源 (decoded_inst_t.pc_step = PC_STEP_RVC = 2 区分 fetch
+// loop 推进; OP_xxx 跟 32-bit 路径一致, interpreter / 未来 translator 不感知 RVC)。
 //
 // RVC 编码 (RISC-V Spec Vol I §16):
 //   inst[1:0] != 11 → 16-bit RVC; inst[1:0] = 11 → 32-bit (或更长)
 //   inst[15:13] + inst[1:0] 是 RVC 的 opcode 分类 (C0/C1/C2 三个 quadrant × 8 个 funct3)
+//
+// 3-bit 寄存器编码 (rd' / rs1' / rs2' = inst 子段 + 8, 范围 x8-x15 子集):
+//   inst[9:7]  → rd' / rs1' (CIW/CL/CS/CB-format)
+//   inst[4:2]  → rs2' (CL/CS/CA-format) 或 rd' (CIW-format)
+//   解码: ((inst >> 9) & 0x7) + 8 / ((inst >> 2) & 0x7) + 8
+//
+// imm 解码: 每条 RVC 指令 imm 的位段拼装规则不同, 需仔细对照 spec § 16 各 format
+//   (CI/CIW/CL/CS/CB/CA/CJ/CR), 详见每 case 内 spec 引用注释。
+//
+// 边界 case 处理:
+//   - C.NOP (funct3=000+rd=0+imm=0): 显式 NOP 语义 → OP_ADDI x0, x0, 0
+//   - rd=0 hint reserved (C.LI / C.SRLI 等): 留 OP_UNSUPPORTED (项目不实现 hint)
+//   - nzimm/nzuimm = 0 reserved (C.LUI / C.ADDI4SPN / C.ADDI16SP): 留 OP_UNSUPPORTED
+//   - RV32 shamt[5]=1 reserved (C.SLLI / C.SRLI / C.SRAI inst[12]=1): 留 OP_UNSUPPORTED
+//   - C.SUB/XOR/OR/AND inst[12]=1 是 RV64 SUBW/ADDW: RV32 reserved, 留 OP_UNSUPPORTED
 //
 // 本 helper 拿 16-bit inst (低 16 位有效, 高 16 位是 fetch over-read 残值)。
 // ----------------------------------------------------------------------------
@@ -41,37 +60,233 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
     d.imm      = 0;
     d.pc_step  = PC_STEP_RVC;            // 16-bit 指令统一 pc 步进 2
 
-    const uint32_t op    = inst & 0x3u;          // C 扩展 quadrant (0/1/2)
-    const uint32_t funct3 = (inst >> 13) & 0x7u; // 类别
+    const uint32_t op     = inst & 0x3u;            // C 扩展 quadrant (0/1/2)
+    const uint32_t funct3 = (inst >> 13) & 0x7u;    // 类别
 
-    // ---- C1 quadrant (op = 01) ----
-    if (op == 0x1) {
-        // C.ADDI (funct3=000): rd != 0; addi rd, rd, sign-ext(imm6)
-        // C.LI   (funct3=010): rd != 0; addi rd, x0, sign-ext(imm6)
-        // imm6 编码: bit[12]=imm[5] (sign), bit[6:2]=imm[4:0]
-        if (funct3 == 0x0 || funct3 == 0x2) {
-            const uint32_t rd = (inst >> 7) & 0x1Fu;
-            if (rd == 0) return d;          // C.ADDI rd=0 是 C.NOP (这里也归 unsupported,
-                                            // 真要支持 C.NOP 需 funct3=0 + rd=0 + imm=0
-                                            // 翻译为 OP_ADDI x0, x0, 0; 留未来)
-            // imm6 sign-ext to 32-bit
-            uint32_t imm5 = (inst >> 12) & 0x1u;        // bit 5
-            uint32_t imm4_0 = (inst >> 2) & 0x1Fu;      // bit 4..0
-            int32_t imm = (int32_t)(imm5 << 5 | imm4_0);
-            if (imm5) imm |= (int32_t)0xFFFFFFC0u;      // sign-ext bit 6+
-
+    // ========================================================================
+    // C0 quadrant (op = 00) —— C.ADDI4SPN / (C.LW step 4) / (C.SW step 4)
+    // ========================================================================
+    if (op == 0x0) {
+        // C.ADDI4SPN (funct3=000, CIW-format): addi rd', x2, nzuimm10
+        //   inst[12:11] = nzuimm[5:4]
+        //   inst[10:7]  = nzuimm[9:6]
+        //   inst[6]     = nzuimm[2]
+        //   inst[5]     = nzuimm[3]
+        //   inst[4:2]   = rd' (rd = rd' + 8)
+        //   nzuimm = 0 reserved (spec § 16.5)
+        if (funct3 == 0x0) {
+            const uint32_t nzuimm =
+                  ((inst >> 11) & 0x3u) << 4    // nzuimm[5:4]
+                | ((inst >> 7)  & 0xFu) << 6    // nzuimm[9:6]
+                | ((inst >> 6)  & 0x1u) << 2    // nzuimm[2]
+                | ((inst >> 5)  & 0x1u) << 3;   // nzuimm[3]
+            if (nzuimm == 0) return d;          // reserved
+            const uint32_t rd_p = ((inst >> 2) & 0x7u) + 8;
             d.kind = OP_ADDI;
-            d.rd   = rd;
-            d.rs1  = (funct3 == 0x0) ? rd : 0u;         // C.ADDI: rs1=rd; C.LI: rs1=0
-            d.imm  = imm;
+            d.rd   = rd_p;
+            d.rs1  = 2;                          // x2 = sp
+            d.imm  = (int32_t)nzuimm;            // unsigned 10-bit, 高位 0 自然
             return d;
         }
-        // 其他 C1 子类 (C.JAL / C.J / C.BEQZ / C.BNEZ / C.LUI / C.SRLI / C.SRAI / ...)
-        // 留 OP_UNSUPPORTED, 真做时按 funct3 + 子位段加 case
+        // 其他 C0 子段: C.LW (funct3=010) / C.SW (funct3=110) — step 4 加
         return d;
     }
 
-    // C0 / C2 quadrant 全部留 OP_UNSUPPORTED (load/store/jr/jalr/mv/add 等真做时加)
+    // ========================================================================
+    // C1 quadrant (op = 01) —— 算术 + sp + 控制流 (控制流 step 2/3 加)
+    // ========================================================================
+    if (op == 0x1) {
+        const uint32_t rd_full = (inst >> 7) & 0x1Fu;
+        const uint32_t imm5    = (inst >> 12) & 0x1u;     // CI imm[5] = inst[12]
+        const uint32_t imm4_0  = (inst >> 2)  & 0x1Fu;    // CI imm[4:0] = inst[6:2]
+
+        // C.NOP / C.ADDI / C.LI (funct3=000 / 010, CI-format):
+        //   funct3=000: rd=0+imm=0 → C.NOP (OP_ADDI x0,x0,0); rd=0+imm!=0 hint reserved;
+        //               rd!=0 → C.ADDI rd, rd, sign-ext(imm6)
+        //   funct3=010: rd=0 hint reserved; rd!=0 → C.LI: addi rd, x0, sign-ext(imm6)
+        if (funct3 == 0x0 || funct3 == 0x2) {
+            int32_t imm = (int32_t)(imm5 << 5 | imm4_0);
+            if (imm5) imm |= (int32_t)0xFFFFFFC0u;        // sign-ext bit 6+
+
+            if (funct3 == 0x0 && rd_full == 0) {
+                // C.NOP 边界 (spec § 16.5: rd=0+imm=0 显式 NOP; rd=0+imm!=0 hint reserved)
+                if (imm != 0) return d;                   // hint reserved
+                d.kind = OP_ADDI;
+                d.rd   = 0;
+                d.rs1  = 0;
+                d.imm  = 0;
+                return d;
+            }
+            if (rd_full == 0) return d;                   // C.LI rd=0 hint reserved
+            d.kind = OP_ADDI;
+            d.rd   = rd_full;
+            d.rs1  = (funct3 == 0x0) ? rd_full : 0u;      // C.ADDI rs1=rd; C.LI rs1=0
+            d.imm  = imm;
+            return d;
+        }
+
+        // C.ADDI16SP / C.LUI (funct3=011, CI-format):
+        //   rd = 2  → C.ADDI16SP: addi x2, x2, nzimm10
+        //             imm[9]   = inst[12]
+        //             imm[4]   = inst[6]
+        //             imm[6]   = inst[5]
+        //             imm[8:7] = inst[4:3]
+        //             imm[5]   = inst[2]
+        //             nzimm = 0 reserved
+        //   rd != 0,2 → C.LUI: lui rd, nzimm18 (sign-ext)
+        //             imm[17]    = inst[12]
+        //             imm[16:12] = inst[6:2]
+        //             nzimm = 0 reserved (项目不实现 hint)
+        //   rd = 0 reserved
+        if (funct3 == 0x3) {
+            if (rd_full == 0) return d;                   // reserved
+            if (rd_full == 2) {
+                // C.ADDI16SP
+                int32_t nzimm = (int32_t)(
+                      ((inst >> 12) & 0x1u) << 9         // imm[9] (sign)
+                    | ((inst >> 6)  & 0x1u) << 4         // imm[4]
+                    | ((inst >> 5)  & 0x1u) << 6         // imm[6]
+                    | ((inst >> 3)  & 0x3u) << 7         // imm[8:7]
+                    | ((inst >> 2)  & 0x1u) << 5);       // imm[5]
+                if (nzimm == 0) return d;                // reserved
+                if (nzimm & (1 << 9)) nzimm |= (int32_t)0xFFFFFC00u;  // sign-ext bit 10+
+                d.kind = OP_ADDI;
+                d.rd   = 2;
+                d.rs1  = 2;
+                d.imm  = nzimm;
+                return d;
+            }
+            // C.LUI
+            int32_t nzimm = (int32_t)(
+                  ((inst >> 12) & 0x1u) << 17            // imm[17] (sign)
+                | ((inst >> 2)  & 0x1Fu) << 12);         // imm[16:12]
+            if (nzimm == 0) return d;                    // reserved
+            if (nzimm & (1 << 17)) nzimm |= (int32_t)0xFFFC0000u;  // sign-ext bit 18+
+            d.kind = OP_LUI;
+            d.rd   = rd_full;
+            d.rs1  = 0;                                  // LUI 无 rs1
+            d.imm  = nzimm;
+            return d;
+        }
+
+        // C.MISC-ALU (funct3=100): 子段按 inst[11:10]
+        //   00: C.SRLI (rd', rd', shamt6)
+        //   01: C.SRAI (rd', rd', shamt6)
+        //   10: C.ANDI (rd', rd', sign-ext imm6)
+        //   11: C.SUB / C.XOR / C.OR / C.AND (rd', rd', rs2'; 由 inst[12]/[6:5] 区分)
+        //              inst[12]=1 是 RV64 C.SUBW/C.ADDW reserved
+        if (funct3 == 0x4) {
+            const uint32_t sub  = (inst >> 10) & 0x3u;
+            const uint32_t rd_p = ((inst >> 7) & 0x7u) + 8;
+
+            if (sub == 0x0 || sub == 0x1) {
+                // C.SRLI / C.SRAI (CB-format with shamt):
+                //   shamt[5]   = inst[12]
+                //   shamt[4:0] = inst[6:2]
+                //   RV32: shamt[5] 必 0 (spec § 16.5 RV32 reserved)
+                if (imm5 != 0) return d;                 // RV32 shamt[5]=1 reserved
+                const uint32_t shamt = imm4_0;
+                d.kind = (sub == 0x0) ? OP_SRLI : OP_SRAI;
+                d.rd   = rd_p;
+                d.rs1  = rd_p;
+                d.imm  = (int32_t)shamt;
+                return d;
+            }
+            if (sub == 0x2) {
+                // C.ANDI (rd', rd', sign-ext imm6); imm 解码跟 C.ADDI 同
+                int32_t imm = (int32_t)(imm5 << 5 | imm4_0);
+                if (imm5) imm |= (int32_t)0xFFFFFFC0u;
+                d.kind = OP_ANDI;
+                d.rd   = rd_p;
+                d.rs1  = rd_p;
+                d.imm  = imm;
+                return d;
+            }
+            // sub == 0x3: C.SUB / C.XOR / C.OR / C.AND (CA-format)
+            //   inst[12]    = 0 (RV32) / 1 (RV64 SUBW/ADDW reserved 在 RV32)
+            //   inst[6:5]   = funct (00 SUB / 01 XOR / 10 OR / 11 AND)
+            //   inst[9:7]   = rd' = rs1'
+            //   inst[4:2]   = rs2'
+            if (imm5 != 0) return d;                     // RV32: inst[12]=1 reserved
+            const uint32_t rs2_p  = ((inst >> 2) & 0x7u) + 8;
+            const uint32_t op_sel = (inst >> 5) & 0x3u;
+            switch (op_sel) {
+                case 0x0: d.kind = OP_SUB; break;
+                case 0x1: d.kind = OP_XOR; break;
+                case 0x2: d.kind = OP_OR;  break;
+                case 0x3: d.kind = OP_AND; break;
+                default:  return d;                      // 不可达 (op_sel 2 位)
+            }
+            d.rd  = rd_p;
+            d.rs1 = rd_p;
+            d.rs2 = rs2_p;
+            return d;
+        }
+
+        // 其他 C1 子类: C.JAL (001) / C.J (101) — step 3 (jump);
+        //               C.BEQZ (110) / C.BNEZ (111) — step 2 (branch)
+        return d;
+    }
+
+    // ========================================================================
+    // C2 quadrant (op = 10) —— C.SLLI / 控制流 + 算术 / load/store (后两段后续 step 加)
+    // ========================================================================
+    if (op == 0x2) {
+        const uint32_t rd_full  = (inst >> 7) & 0x1Fu;
+        const uint32_t rs2_full = (inst >> 2) & 0x1Fu;
+
+        // C.SLLI (funct3=000, CI-format with shamt): slli rd, rd, shamt6
+        //   shamt[5]   = inst[12]
+        //   shamt[4:0] = inst[6:2]
+        //   inst[11:7] = rd
+        //   RV32: shamt[5] 必 0 (reserved); rd = 0 reserved (项目不实现 hint)
+        if (funct3 == 0x0) {
+            if (rd_full == 0) return d;                  // hint reserved
+            const uint32_t shamt5 = (inst >> 12) & 0x1u;
+            if (shamt5 != 0) return d;                   // RV32 shamt[5]=1 reserved
+            const uint32_t shamt = (inst >> 2) & 0x1Fu;
+            d.kind = OP_SLLI;
+            d.rd   = rd_full;
+            d.rs1  = rd_full;
+            d.imm  = (int32_t)shamt;
+            return d;
+        }
+
+        // C.MV / C.ADD (funct3=100, CR-format): 共用 funct3 跟 C.JR/JALR/EBREAK
+        //   inst[12] + rs2 区分:
+        //     [12]=0 + rs2=0: C.JR        (step 3)
+        //     [12]=0 + rs2!=0: C.MV       → ADD rd, x0, rs2 (rd!=0; rd=0 reserved)
+        //     [12]=1 + rs1=rs2=0: C.EBREAK (step 3)
+        //     [12]=1 + rs1!=0 + rs2=0: C.JALR (step 3)
+        //     [12]=1 + rs2!=0: C.ADD     → ADD rd, rd, rs2 (rd!=0; rd=0 reserved)
+        if (funct3 == 0x4) {
+            const uint32_t bit12 = (inst >> 12) & 0x1u;
+            if (bit12 == 0 && rs2_full != 0) {
+                // C.MV
+                if (rd_full == 0) return d;              // reserved
+                d.kind = OP_ADD;
+                d.rd   = rd_full;
+                d.rs1  = 0;                              // mv = add rd, x0, rs2
+                d.rs2  = rs2_full;
+                return d;
+            }
+            if (bit12 == 1 && rs2_full != 0) {
+                // C.ADD
+                if (rd_full == 0) return d;              // reserved
+                d.kind = OP_ADD;
+                d.rd   = rd_full;
+                d.rs1  = rd_full;
+                d.rs2  = rs2_full;
+                return d;
+            }
+            // bit12 + rs2=0 子段: C.JR / C.JALR / C.EBREAK — step 3 加
+            return d;
+        }
+
+        // 其他 C2 子段: C.LWSP (010) / C.SWSP (110) — step 4 加
+        return d;
+    }
+
     return d;
 }
 
