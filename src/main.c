@@ -327,7 +327,7 @@ int main(int argc, char **argv) {
     // tlb_t **tlb_table[4] 是 cpu_t 字段; sigjmp_buf *jmp_buf_ptr 暂留 NULL (memset 0 已置)。
     // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc;
     // [PRIV_S][asid] 的 entries 由 dispatcher 懒分配 (a_01 仍 #if 0)。
-    cpu_t *hart = cpu_create(0);
+    cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/0);
     if (hart == NULL) {                            // cpu_create 内部已 fprintf "why"
         fprintf(stderr, "cpu_create failed\n");
         return 1;
@@ -340,10 +340,11 @@ int main(int argc, char **argv) {
     hart->satp    = 0;                      // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
     hart->priv    = PRIV_M;                 // M 模式
     // 下面的来自参考 https://docs.kernel.org/arch/riscv/boot.html
-    // hart->regs[10] = 0;  // a0 = hartid #0    (Linux RV boot protocol; x10 = a0)
+    hart->regs[10] = hart->per_hart_info.mhartid;  // a0 = hartid (Linux RV boot protocol; x10 = a0)
     // hart->regs[11] = 0;  // a1 = device tree pointer (暂无 dtb; x11 = a1)
-    // 注: regs 已被 memset 0; 以上两行显式赋值是 boot protocol 文档化, 等价于 memset 后的现状。
-    //     真上 OS 跑 (hartid > 0 / 有 dtb) 时解开注释 + 改右值。
+    // 注: a0 真从 mhartid 读 (a01_9 step 3 加; cpu_create 入参设 hart->per_hart_info.mhartid); 单 hart fixture
+    //     mhartid=0, regs[10] 仍 = 0, 跟之前 memset 0 行为一致。a1 暂无 dtb, 仍注释占位; 真做时
+    //     改右值 (dtb 物理地址)。
 
     // a_01_5_c 起 csr.c 真接 csr 读写, fixture 自己用 csrw mtvec, x.. 设 trap handler 地址,
     // main.c 不再 hard-code (a_01_5_b 时为方便测试临时设的, 现在 fixture 自包含)。

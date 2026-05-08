@@ -24,9 +24,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-cpu_t *cpu_create(uint32_t misa) {
-    (void)misa;   // a_01 不读; 为未来 misa 驱动初始化预留 (MU-only / F/D/V 扩展 等)。
+// cpu_info_shared_default — 多 hart 共享出场信息 RO CSR (a01_9 step 3 加, cpu_t::shared_info 指向)
+//
+// 制造商信息 (mvendorid/marchid/mimpid) 是机器整体属性, 不区分 hart; 当前 open-source
+// 项目全 0 (RV spec: 0 = no JEDEC vendor / no architecture ID / no impl ID, 合法值)。
+// 异构 SMP 时这里加多份 cpu_info_shared_default_a/b 给不同 hart 组; 项目当前同构, 单份。
+//
+// 注: misa 不在这里 (per-hart 私有, 进 cpu_info_per_hart_t — 异构 SMP 时不同 hart 的扩展
+// 字段不同; mhartid 同理)。
+static const cpu_info_shared_t cpu_info_shared_default = {
+    .mvendorid = 0,
+    .marchid   = 0,
+    .mimpid    = 0,
+};
 
+cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
     cpu_t *hart = aligned_alloc(64, sizeof(cpu_t));
     if (hart == NULL) {
         fprintf(stderr, "cpu_create: aligned_alloc(64, %zu) failed: %s\n",
@@ -37,6 +49,16 @@ cpu_t *cpu_create(uint32_t misa) {
 
     hart->priv = PRIV_M;    // a_01: M 模式常量
     hart->satp = 0;         // a_01: bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
+
+    // a01_9 step 3 加 — per-hart 私有 RO CSR 数据 (mhartid + misa); cpu_create 入参直接
+    // 写入 cpu_t.per_hart_info 字段。misa 入参当前仅作为 csr_misa_read 返回值 (不真按 misa
+    // 派发 lifecycle, 例如 F/D 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
+    hart->per_hart_info.mhartid = mhartid;
+    hart->per_hart_info.misa    = misa;
+
+    // a01_9 step 3 加 — 多 hart 共享 RO CSR 数据 (mvendorid/marchid/mimpid); 指针指向
+    // 全局 static const default。
+    hart->shared_info = &cpu_info_shared_default;
 
     // ------------------------------------------------------------------------
     // tlb_table[4] 装载 (MSU 默认 misa; D23 后: Trust regime bypass TLB)

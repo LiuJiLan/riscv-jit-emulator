@@ -682,3 +682,151 @@ stderr vs stdout
   - 本协议不覆盖"helper 通过 longjmp 跳走"的路径(那是 §1 的范畴,
     不走这套 fprintf)。
   - 本协议不规定日志级别 / 日志文件 / syslog;a_01 全部走 stderr 即可。
+
+
+================================================================================
+## §6. CSR 物理存储字段命名四类划分
+================================================================================
+
+涉及文件:
+  - src/core/trap.h          (trap_csrs_t 字段; _mstatus / _medeleg / xtvec[4] 等)
+  - src/core/cpu.h           (cpu_t 内嵌 trap_csrs_t; cpu_info_per_hart_t / cpu_info_shared_t)
+  - src/core/csr.c           (csr 入口 read/write helper 按命名前缀直读字段)
+  - 未来 isa/fpu.h           (F/D 扩展; _fcsr 类 1 拆 fcsr/fflags/frm 三入口)
+  - 未来 isa/vector.h        (V 扩展; vstart/vtype/vl 等)
+
+
+--------------------------------------------------------------------------------
+背景
+--------------------------------------------------------------------------------
+
+CSR 在 RV spec 里数量很多 (M-mode 几十个, S-mode 几十个, F/V/Debug 扩展更多)。
+项目把这些 CSR 物理存储分散在不同 struct(trap_csrs_t / cpu_info_per_hart_t /
+cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper 按命名
+直读字段。命名规则统一才能在不同 struct 间一致, 让"读到字段名就知道访问形态"。
+
+
+--------------------------------------------------------------------------------
+四类划分
+--------------------------------------------------------------------------------
+
+(1) 第一类 — RV32 物理 64 位, csr 入口拆 32 位访问
+    命名前缀: 下划线 "_"
+    类型: uint64_t
+    示例:
+      _mstatus  — csr 入口 mstatus + mstatush 拆访问低/高 32 位 (sstatus 是 mstatus
+                  的 masked view, 同字段共用)
+      _medeleg  — RV32 单 csr 入口 (无 medelegh), 但物理 64 位为 RV64 future-proof
+      _mideleg  — 同 _medeleg
+
+    csr.c read/write helper 模式:
+      static uint32_t csr_mstatus_read (cpu_t *hart) {
+          return (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+      }
+      static uint32_t csr_mstatush_read(cpu_t *hart) {
+          return (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu);
+      }
+
+(2) 第二类 — 副本类 (一个物理字段被多个访问通道共享)
+    命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)
+    分两种子情况:
+      (2a) 权级副本 — 一个 csr 是另一个 csr 的 mask 视图
+           示例: sstatus 是 mstatus 的 mask 视图 (SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR);
+                 物理共用 _mstatus 字段, sstatus 的 read/write helper 通过 mask 操作只访问
+                 SSTATUS_MASK 内字段位, 不影响 mstatus M-mode-only 字段 (MIE/MPIE/MPP)。
+      (2b) csr / MMIO 副本 — 一个物理字段同时被 csr 入口和 MMIO load/store 读写
+           示例: _mtime (CLINT MMIO 0xBFF8 同时被 csrr time 读 + MMIO load 读, 两路径同源字段)
+
+    项目当前 (2a) 真字段 = sstatus (复用 _mstatus); (2b) 没遇到真字段 (clint / plic 真做时加)。
+
+(*) (1) + (2a) 特殊例子: mstatus / fcsr / vcsr — 同时满足"内部一个长字段, 外部多 csr
+    入口看不同 sub-view"
+    类 (1) 的本质是"内部字段长度 ≠ 外部 csr 入口长度", 模拟器内一份大字段, 外部通过多 csr
+    入口拆 / mask / shift 看子段; 类 (2a) 是"一个 csr 是另一个 csr 的 mask 视图" — 两者
+    在 sub-view 关系里其实重叠。下列 csr 同时属 (1) + (2a), 命名统一取 "_" 前缀:
+      _mstatus  — 物理 64 位; 外部 mstatus(32) + mstatush(32) 拆访问 (1); sstatus 是
+                  _mstatus 的 mask 视图 (2a, SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR)。
+      _fcsr     — RV spec 规定 fcsr 32 位 (项目当前未实装 F 扩展; 真做时按本协议加)。
+                  外部 fcsr(32) / fflags(5 bit, fcsr[4:0]) / frm(3 bit, fcsr[7:5]) 三 csr
+                  入口共享物理字段; fflags/frm 是 fcsr 的 sub-view (2a)。
+      _vcsr     — RV spec 规定 vcsr 是 vxsat + vxrm 的组合视图; 外部 vcsr / vxsat(bit 0) /
+                  vxrm(bit 2:1) 三 csr 入口共享 (跟 _fcsr 同形态)。
+
+(3) 第三类 — priv 无关独立寄存器 (单字段, 单 csr 入口, 无 sub-view / 无副本)
+    命名前缀: 不带前缀 (普通字段名)
+    示例: 项目当前没遇到真字段; 未来:
+      - RV Unprivileged Vector CSRs 中的独立部分:
+          vstart  — 单字段 (vector start position)
+          vtype   — 单字段 (vector type, RW with WARL)
+          vl      — 单字段 (vector length, RO from M-mode 写视角; vsetvl 指令写)
+        各自单 csr 入口, 单字段, 没 sub-view; 跟 vcsr 系列 (上面 (*) 特殊) 区分。
+
+(4) 第四类 — 按 priv 索引数组
+    命名前缀: "x" 前缀 (跟 RV 手册风格一致, 手册用 xepc 同时指代 mepc/sepc)
+    数组下标 = deliver priv (PRIV_M=3 / PRIV_S=1 / PRIV_U=0 占位 / PRIV_H=2 占位)
+    示例:
+      xcause[4]   — mcause (xcause[PRIV_M]) / scause (xcause[PRIV_S])
+      xtval[4]    — mtval / stval
+      xepc[4]     — mepc / sepc
+      xtvec[4]    — mtvec / stvec
+      xscratch[4] — mscratch / sscratch
+
+    csr.c read/write helper 模式:
+      static uint32_t csr_mepc_read(cpu_t *hart) { return hart->trap.xepc[PRIV_M]; }
+      static uint32_t csr_sepc_read(cpu_t *hart) { return hart->trap.xepc[PRIV_S]; }
+
+
+--------------------------------------------------------------------------------
+适用范围
+--------------------------------------------------------------------------------
+
+本协议适用于所有 csr 字段, 不限 trap_csrs_t:
+
+  - trap_csrs_t (cpu.h 内嵌, trap.h 定义)
+      _mstatus / _medeleg / _mideleg / xtvec[4] / xepc[4] / xcause[4] / xtval[4] /
+      xscratch[4] 等
+
+  - cpu_info_per_hart_t (cpu.h)
+      per-hart 私有 RO csr (mhartid / misa); 严格说不属于上面四类 cover 范畴 (本协议
+      管"共用同一物理字段的视图/投影"); per-hart 私有字段直接命名 (不加前缀)
+
+  - cpu_info_shared_t (cpu.h)
+      多 hart 共享 RO csr (mvendorid / marchid / mimpid); 同上, 不需前缀
+
+  - 未来 fcsr (isa/fpu.h)
+      _fcsr 类 (1)+(2a) 特殊 — RV spec 规定 fcsr 32 位; csr 入口 fcsr / fflags / frm 共享
+      物理字段, fflags 和 frm 是 fcsr 的 sub-view (跟 sstatus 是 _mstatus 的 sub-view 同
+      形态)。命名 "_" 前缀。
+
+  - 未来 vector csr (isa/vector.h)
+      混类:
+        _vcsr 类 (1)+(2a) 特殊 — vcsr / vxsat / vxrm 共享物理字段 (跟 _fcsr 同形态);
+              命名 "_" 前缀。
+        vstart / vtype / vl 类 3 — 各自单字段单 csr 入口, 不带前缀。
+
+
+--------------------------------------------------------------------------------
+为什么这样命名
+--------------------------------------------------------------------------------
+
+  (1) 看到字段名就知道访问形态
+      - _foo:   物理 64 位, csr 入口拆 32 位访问 (read/write helper 加 mask/shift)
+      - xfoo[4]: priv 索引, helper 用 [PRIV_M] / [PRIV_S] 区分 csr addr
+      - foo:    单一独立字段 (helper 直读)
+
+  (2) 跟 RV 手册风格对齐
+      手册用 xepc 同时指代 mepc / sepc; 项目代码 xepc[4] 直接对应
+
+  (3) future-proof RV64
+      _mstatus / _medeleg / _mideleg 等 64 位字段在 RV32 拆 csr 入口访问, RV64 时
+      直接 64 位整体访问; 字段类型不变 (uint64_t), 改的只是 csr 入口形态
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不规定字段在 struct 内的顺序 / 对齐 / padding
+  - 本协议不规定 RO/RW/WARL 行为 (那是 csr.c 各 helper 自己的事)
+  - 本协议不规定 cpu_info_per_hart_t / cpu_info_shared_t 的命名 (per-hart vs
+    shared 是另一维度的划分; 不属本协议四类)

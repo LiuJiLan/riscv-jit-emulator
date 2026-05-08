@@ -67,22 +67,30 @@ typedef struct cpu_s cpu_t;
 // 因为 fast path 只在 cpu_t 前 128 B (regs[32]), trap_csrs_t 在后, 不冲突。
 // ----------------------------------------------------------------------------
 typedef struct {
-    // 第四类: 按 priv 索引数组 (mepc/sepc, mtval/stval, mcause/scause, mtvec/stvec)
+    // 第四类: 按 priv 索引数组 (mepc/sepc, mtval/stval, mcause/scause, mtvec/stvec, mscratch/sscratch)
     // index = deliver priv: PRIV_M=3 / PRIV_S=1; PRIV_U=0 / PRIV_H=2 槽位不用但保 4 对齐
     // (cpu_t.tlb_table[4] 同风格, 直接 [priv] 索引免减法)。
     // 命名 "x" 前缀对应 RV 手册 xepc 风格 (xepc[PRIV_M] = mepc, xepc[PRIV_S] = sepc 等);
     // csr 大 switch 的 mepc / sepc / ... read/write helper 映射到对应槽位。
-    // a_01_5_b v0 只写 [PRIV_M] 槽。
+    // 详见 dummy.txt §6 CSR 物理存储字段命名四类划分。
+    // a_01_5_b v0 只写 [PRIV_M] 槽; a01_9 step 4a 加 xscratch[4] (mscratch / sscratch)。
     uint32_t  xcause[4];
     uint32_t  xtval[4];
     uint32_t  xepc[4];
     uint32_t  xtvec[4];
+    uint32_t  xscratch[4];     // a01_9 step 4a 加; mscratch=xscratch[PRIV_M], sscratch=xscratch[PRIV_S]
 
-    // 第一类: RV32 物理 64 位 (mstatus + mstatush 两个 csr 入口拆访问)。
-    // sstatus 是 _mstatus 的 masked view, a_01_5_b 不实现。
-    // a_01_5_b 内 csr.c 小 helper 仍是 fprintf 占位, 暂不真读写本字段; a_01_5_c csr.c
-    // 改造时 csr_mstatus_read / csr_mstatush_read / csr_<*>_write 才真接本字段。
+    // 第一类: RV32 物理 64 位, csr 入口拆 32 位访问 (dummy.txt §6)。
+    // _mstatus: csr 入口 mstatus + mstatush 拆访问低/高半边 (RV32 ABI)。sstatus 是
+    //   _mstatus 的 masked view (SSTATUS_MASK)。
+    // _medeleg / _mideleg: RV32 单 csr 入口 (无 medelegh/midelegh), 但物理 64 位为 RV64
+    //   future-proof; 字段类型统一 uint64_t 跟 _mstatus 一致 (写 helper 截低 32 位)。
+    //   a01_9 step 4a 字段就位, 但 trap_set_state 不读 — deliver_priv 仍 hard-coded
+    //   PRIV_M; step 4b 改 deliver_priv 真按 _medeleg.bit(cause) 派发。
+    //   _mideleg 进一步推后 (跟 mip/mie 中断机制一起 a_03 真做)。
     uint64_t  _mstatus;
+    uint64_t  _medeleg;        // a01_9 step 4a 加; csr 入口 medeleg (0x302)
+    uint64_t  _mideleg;        // a01_9 step 4a 加; csr 入口 mideleg (0x303); a_03 中断真做时启用
 
     // host trap 流程状态: 嵌套 trap 计数器 (0 / 1 / 2 / 3+)。
     //   0 = 正常 execution

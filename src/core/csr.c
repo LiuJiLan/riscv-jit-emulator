@@ -12,6 +12,9 @@
 //             未实现 csr → cause 2)
 //   a_01_8:   加 satp 入口 (csr_satp_read/write + 大 switch case); satp_write WARL ASID 截断
 //             到 ASID_MASK 位 — dummy.txt §3 satp 合法性契约的"生产者"职责
+//             Step 6 末段加 sstatus/sepc (sret 必带最小集) + 临时 tohost (CSR 0x800, csrw
+//             流式输出) + privrd (CSR 0xCC0 RO, csrr 流式 priv 字符)
+//   a01_9:    csr 函数位置整理 (step 1 段头规范化 + 加组织哲学 doc 段; 不动函数本身)
 //
 // csr 编号 → 字段映射 (a_01_8 起 satp 不在 trap_csrs_t 里, 改名"字段映射"):
 //   mstatus  (0x300) → trap._mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
@@ -23,6 +26,32 @@
 //   mtval    (0x343) → trap.xtval[PRIV_M]
 //   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
 //                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
+//   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
+//   sepc     (0x141) → trap.xepc[PRIV_S];  WARL 截 IALIGN 对齐位 (跟 mepc 同)
+//   tohost   (0x800) → 不存字段; write 直接 fprintf 流式输出 (a_01_8 临时)
+//   privrd   (0xCC0) → 不存字段; read 直接 fprintf "[priv] X" + return hart->priv (a_01_8 临时 RO)
+//
+// 组织哲学 (a_01_session_012 D11 / step 1 拍):
+//   类 1 — 扩展 CSR (F/V/Debug 等): 字段 + 函数都在 isa/<扩展>.{c,h}; csr.c 不放, 仅 csr_op
+//          大 switch case dispatch 到对应模块 extern 接口。项目当前没实现, 占位说明。
+//   类 2 — 跨模块 CSR (satp): 字段在 cpu_t; 函数留 csr.c (csr 入口集中)。sfence 跟 satp
+//          写是运行期协议 (dummy.txt §3), 不是代码组织耦合。
+//   类 3 — 核心 CSR (_mstatus, xtvec/xepc/xcause/xtval, sstatus/sepc): 字段在 trap_csrs_t,
+//          函数留 csr.c。哲学: data 归 cpu_t, 动作分散在 isa/ + core/ (Linux struct
+//          task_struct 风格); cpu.c 只放 lifecycle (cpu_create / 字段初值)。
+//   类 4 — 出场信息 RO CSR — 拆 per-hart 私有 + 多 hart 共享 两类:
+//      4a per-hart 私有 (mhartid + misa): cpu_info_per_hart_t struct 嵌入 cpu_t (不指针;
+//          per-hart 私有就跟 cpu_t 走)。异构 SMP (1×MU + 4×MSU) 时不同 hart 的 misa 字段
+//          不同 (例如 MU hart 不带 S-mode 扩展位), mhartid 也不同 (0/1/2/...) — 必须 per-hart
+//          独立, 不能共享。cpu_create 入参 misa + mhartid 直接写入 hart->per_hart_info。
+//          csr.c csr_mhartid/misa_read 读 hart->per_hart_info.xxx。
+//      4b 多 hart 共享 (mvendorid + marchid + mimpid): cpu_info_shared_t struct + cpu_t 内
+//          const cpu_info_shared_t *shared_info 指针; cpu.c static const cpu_info_shared_default
+//          一份, 所有 hart shared_info 指向它。这些是机器整体属性, 不区分 hart。
+//          csr.c csr_mvendorid/marchid/mimpid_read 读 hart->shared_info->xxx 解引用。
+//   类 5 — 临时调试 CSR (tohost / privrd, a_01_8 临时): 字段不存 cpu_t; csr.c 内 read/write
+//          直接 fprintf 流式输出。uart 实装后删除整段 (csr.c 内 5 个 helper + csr_op 内
+//          2 个 case + riscv.h 2 个宏)。
 //
 
 #include "csr.h"
@@ -38,9 +67,10 @@
 
 
 // ============================================================================
-// 小 r/w helper —— 每个 csr 一对, file-static, csr_op 大 switch 调用
+// M-mode Trap-Related CSR (类 3)
 //
-// a_01_5_c 真接 hart->trap 字段。
+// 含 mstatus/mstatush + mtvec/mepc/mcause/mtval 共 6 个 csr; 每个 csr 一对 file-static
+// r/w helper, csr_op 大 switch 调用。a_01_5_c 起真接 hart->trap 字段。
 // 命名规则 (与 trap.h 一致):
 //   - mstatus / mstatush 操作 _mstatus (uint64_t) 的低/高 半边
 //   - mtvec / mepc / mcause / mtval 操作 xxx[PRIV_M] (priv-indexed, x 前缀)
@@ -80,6 +110,11 @@ static void csr_mstatus_write(cpu_t *hart, uint32_t v) {
         }
     }
 
+    // SD bit (mstatus[31]) WARL — SD 是 RO summary (= FS|XS dirty 的或); 项目当前无 F/V,
+    // FS=XS=00, SD 永远 0。截 SD 防 csrw 设假状态 (写 1 后读回 1, 但实际 FS/XS=00 SD 应 0)。
+    // 未来加 F/V 时 SD 仍不允许 csrw 直接写, 由 FS/XS 写时硬件联动设。
+    v &= ~MSTATUS_SD_RV32;
+
     hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                         | (uint64_t)v;
 }
@@ -89,10 +124,11 @@ static uint32_t csr_mstatush_read(cpu_t *hart) {
 }
 
 static void csr_mstatush_write(cpu_t *hart, uint32_t v) {
-    // 高 32 位换成 v, 低 32 位保留。
-    // mstatush 字段 (SBE / MBE 等) a_01 全部 0, 不真触发 endian 切换。
-    hart->trap._mstatus = (hart->trap._mstatus & 0x00000000FFFFFFFFULL)
-                        | ((uint64_t)v << 32);
+    // 高 32 位 WARL 强制 0 — mstatush 字段 (SBE bit 4 / MBE bit 5 / GVA / MPV / 其余 WPRI)
+    // 项目当前都不实现 (无大端切换 / 无 H 扩展); 任何写入被忽略, 读回保持 0。
+    // 未来真做 H 扩展或大端时改这里 (按合法字段加 mask)。
+    (void)v;
+    hart->trap._mstatus = hart->trap._mstatus & 0x00000000FFFFFFFFULL;
 }
 
 // ---- mtvec / mepc / mcause / mtval (映射到 hart->trap.{xtvec,xepc,xcause,xtval}[PRIV_M]) ----
@@ -151,6 +187,60 @@ static void csr_mtval_write(cpu_t *hart, uint32_t v) {
     hart->trap.xtval[PRIV_M] = v;
 }
 
+// ---- mscratch (a01_9 step 4a 加; xscratch[PRIV_M], 类 4) ----
+
+static uint32_t csr_mscratch_read(cpu_t *hart) {
+    return hart->trap.xscratch[PRIV_M];
+}
+
+static void csr_mscratch_write(cpu_t *hart, uint32_t v) {
+    /* RV spec §3.1.18 mscratch RW, 任意值, 无 WARL */
+    hart->trap.xscratch[PRIV_M] = v;
+}
+
+// ---- medeleg / mideleg (a01_9 step 4a 加; _medeleg / _mideleg 物理 64 位拆访问, 类 1) ----
+//
+// medeleg (0x302): M-mode 同步异常 trap delegation bitmask, per-cause bit (bit N = cause N
+//   delegate 到 S-mode); bit 11 (ecall_from_M) WARL hardwire 0 — M can't delegate to
+//   less-privileged (SiFive U74-MC 同此); 其他位项目当前接受全 32 位写。
+// mideleg (0x303): M-mode 中断 delegation; 项目当前中断机制未实现, 字段就位但
+//   trap_set_state 不读 (4a 不真生效, a_03 中断真做时启用)。
+//
+// 物理类型 uint64_t 跟 _mstatus 同 (dummy.txt §6 类 1 future-proof RV64); RV32 csr 入口
+// 拆访问低 32 位 (RV32 spec 只有 medeleg / mideleg, 没 medelegh / midelegh)。
+//
+// step 4a 字段就位; trap_set_state 不真按 _medeleg.bit(cause) 派发 deliver_priv (仍
+// hard-coded PRIV_M); step 4b 改 trap.c 让 medeleg 真生效。
+
+static uint32_t csr_medeleg_read(cpu_t *hart) {
+    return (uint32_t)(hart->trap._medeleg & 0xFFFFFFFFu);
+}
+
+static void csr_medeleg_write(cpu_t *hart, uint32_t v) {
+    /* WARL: bit 11 (ecall_from_M) hardwire 0 — M 不能 delegate ecall_from_M 给 S */
+    v &= ~(1u << CAUSE_ECALL_FROM_M);
+    /* 低 32 位换成 v, 高 32 位 (medelegh 未来占位) 保留 — 跟 _mstatus 拆访问同形态 */
+    hart->trap._medeleg = (hart->trap._medeleg & 0xFFFFFFFF00000000ULL) | (uint64_t)v;
+}
+
+static uint32_t csr_mideleg_read(cpu_t *hart) {
+    return (uint32_t)(hart->trap._mideleg & 0xFFFFFFFFu);
+}
+
+static void csr_mideleg_write(cpu_t *hart, uint32_t v) {
+    /* mideleg WARL 项目当前简化 — 接受全 32 位写 (中断机制未实现, 字段不真用)。
+     * a_03 中断真做时按 RV spec 加 mask reserved bits + per-bit WARL */
+    hart->trap._mideleg = (hart->trap._mideleg & 0xFFFFFFFF00000000ULL) | (uint64_t)v;
+}
+
+// ============================================================================
+// Address Translation CSR (类 2)
+//
+// 跨模块 CSR — 字段 hart->satp 在 cpu_t (跨 mmu / dispatcher / sfence 模块用); 函数
+// 留 csr.c 集中 (跟 RV spec "所有 CSR addr 走 csr_op dispatch" 一致); sfence 跟 satp
+// 写是运行期协议 (dummy.txt §3, 不是代码组织耦合)。
+// ============================================================================
+
 // ---- satp (a_01_8 加; dummy.txt §3 satp 合法性契约的"生产者"职责) ----
 //
 // satp 物理存储在 hart->satp (cpu_t 顶层字段, 不在 trap_csrs_t 内 — satp 不属于
@@ -189,6 +279,15 @@ static void csr_satp_write(cpu_t *hart, uint32_t v) {
 }
 
 
+// ============================================================================
+// S-mode CSR (类 3 投影)
+//
+// 含 sstatus/sepc 等 (a_01_8 Step 6 起加; 最小集为 sret 必带)。sstatus 是 mstatus 的
+// masked view (SSTATUS_MASK; 物理共用 trap._mstatus); sepc 是 trap.xepc[PRIV_S] 槽
+// (priv-indexed 数组 [PRIV_S] 项)。
+// 未来 step 4 加 medeleg + sscratch/stvec/scause/stval (a01_9 D11 拍; mideleg 推后 a_03)。
+// ============================================================================
+
 // ---- sstatus / sepc (a_01_8 Step 6 加; sret 必带的最小集) ----
 //
 // sstatus 是 _mstatus 的 masked view (SSTATUS_MASK = SIE | SPIE | SPP | SUM | MXR; 详见
@@ -219,8 +318,106 @@ static void csr_sepc_write(cpu_t *hart, uint32_t v) {
     hart->trap.xepc[PRIV_S] = v & ~IALIGN_MASK;
 }
 
+// ---- sscratch / stvec / scause / stval (a01_9 step 4a 加; xxx[PRIV_S], 类 4) ----
+//
+// 跟 mscratch / mtvec / mcause / mtval 同形态, 只是 [PRIV_S] 槽。stvec WARL 截 MODE 跟
+// mtvec 同。step 4a 字段就位; trap_set_state 不写 [PRIV_S] 槽 (deliver_priv 仍 hard-coded
+// PRIV_M); step 4b 改 trap.c 让 deliver 写 [PRIV_S] 槽。
 
-// ---- tohost (a_01_8 临时 fixture 流式输出; CSR 0x800; 等 uart 实装后删除) ----
+static uint32_t csr_sscratch_read(cpu_t *hart) {
+    return hart->trap.xscratch[PRIV_S];
+}
+
+static void csr_sscratch_write(cpu_t *hart, uint32_t v) {
+    hart->trap.xscratch[PRIV_S] = v;
+}
+
+static uint32_t csr_stvec_read(cpu_t *hart) {
+    return hart->trap.xtvec[PRIV_S];
+}
+
+static void csr_stvec_write(cpu_t *hart, uint32_t v) {
+    /* WARL 截 MODE 跟 mtvec 同 (项目不实现 Vectored, 强制 Direct) */
+    hart->trap.xtvec[PRIV_S] = v & ~0x3u;
+}
+
+static uint32_t csr_scause_read(cpu_t *hart) {
+    return hart->trap.xcause[PRIV_S];
+}
+
+static void csr_scause_write(cpu_t *hart, uint32_t v) {
+    /* RV spec §5.1.6 scause; 跟 mcause 同, 接受全 32 位 */
+    hart->trap.xcause[PRIV_S] = v;
+}
+
+static uint32_t csr_stval_read(cpu_t *hart) {
+    return hart->trap.xtval[PRIV_S];
+}
+
+static void csr_stval_write(cpu_t *hart, uint32_t v) {
+    /* RV spec §5.1.7 stval; 跟 mtval 同, 接受全 32 位 */
+    hart->trap.xtval[PRIV_S] = v;
+}
+
+
+// ============================================================================
+// M-mode RO Identity CSR (类 4; a01_9 step 3 加) — 拆 per-hart + shared 两组
+//
+// 4a per-hart 私有 (mhartid + misa): 数据在 hart->per_hart_info.{mhartid, misa} (嵌入,
+//    cpu_create 入参写入); 异构 SMP 时不同 hart 字段值不同。
+// 4b 多 hart 共享 (mvendorid + marchid + mimpid): 数据在 hart->shared_info->xxx 解引用
+//    (指针, cpu.c static const cpu_info_shared_default; 机器整体属性, 不区分 hart)。
+//
+// 写检查:
+//   mhartid/mvendorid/marchid/mimpid 的 csr addr [11:10]=11 = RO; csr_op 入口判已 reject 写
+//   (csrw 触发 cause 2 illegal); 不需要 write helper, 大 switch 写路径不加 case。
+//   misa addr 0x301 [11:10]=00 = RW; 但 RV spec §3.1.1 WARL 允许实现 hardwire 全部扩展位 →
+//   write helper noop (接受写但不真改); 大 switch 写路径加 case 调 noop helper。
+// ============================================================================
+
+// ---- 4a: mhartid + misa (per-hart 私有, 嵌入 hart->per_hart_info) ----
+
+static uint32_t csr_mhartid_read(cpu_t *hart) {
+    return hart->per_hart_info.mhartid;
+}
+
+static uint32_t csr_misa_read(cpu_t *hart) {
+    return hart->per_hart_info.misa;
+}
+
+static void csr_misa_write(cpu_t *hart, uint32_t v) {
+    /* RV spec §3.1.1 WARL: 实现可 hardwire 不支持的扩展位忽略写入。项目所有扩展位
+     * hardwire (per_hart_info.misa fixed by cpu_create 入参), 写入忽略 — read 仍返
+     * hart->per_hart_info.misa。真要按 misa 切扩展行为时改这里 (累加可写位 mask)。 */
+    (void)hart;
+    (void)v;
+}
+
+// ---- 4b: mvendorid + marchid + mimpid (多 hart 共享, hart->shared_info 解引用) ----
+
+static uint32_t csr_mvendorid_read(cpu_t *hart) {
+    return hart->shared_info->mvendorid;
+}
+
+static uint32_t csr_marchid_read(cpu_t *hart) {
+    return hart->shared_info->marchid;
+}
+
+static uint32_t csr_mimpid_read(cpu_t *hart) {
+    return hart->shared_info->mimpid;
+}
+
+
+// ============================================================================
+// 临时调试 CSR (类 5; a_01_8 临时, uart 实装后删除整段)
+//
+// 含 tohost (0x800) + privrd (0xCC0) 共 2 个 csr; 字段不存 cpu_t (csr.c 内 read/write
+// 直接 fprintf 流式输出)。
+// 删除时机: a_03+ uart + 真 trap 路径 (用 ecall + putchar) 替代后, 删本段 5 个 helper +
+// csr_op 内 2 个 case (read/write switch 各 2 处) + riscv.h 2 个宏 (CSR_TOHOST / CSR_PRIVRD)。
+// ============================================================================
+
+// ---- tohost (a_01_8 临时 fixture 流式输出; CSR 0x800) ----
 //
 // 设计意图: csrw 0x800 立即 fprintf 输出到 stderr, 不存 cpu_t 字段; fixture 用作"流式
 // 调试输出" 不污染 GPR (跟 spike tohost / qemu semihosting 风格类似但 user-level)。
@@ -314,9 +511,21 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MEPC:     read_old = csr_mepc_read    (hart); break;
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
+        case CSR_MSCRATCH: read_old = csr_mscratch_read(hart); break;   /* a01_9 step 4a */
+        case CSR_MEDELEG:  read_old = csr_medeleg_read (hart); break;   /* a01_9 step 4a */
+        case CSR_MIDELEG:  read_old = csr_mideleg_read (hart); break;   /* a01_9 step 4a */
         case CSR_SATP:     read_old = csr_satp_read    (hart); break;   /* a_01_8 */
         case CSR_SSTATUS:  read_old = csr_sstatus_read (hart); break;   /* a_01_8 Step 6 */
         case CSR_SEPC:     read_old = csr_sepc_read    (hart); break;   /* a_01_8 Step 6 */
+        case CSR_SSCRATCH: read_old = csr_sscratch_read(hart); break;   /* a01_9 step 4a */
+        case CSR_STVEC:    read_old = csr_stvec_read   (hart); break;   /* a01_9 step 4a */
+        case CSR_SCAUSE:   read_old = csr_scause_read  (hart); break;   /* a01_9 step 4a */
+        case CSR_STVAL:    read_old = csr_stval_read   (hart); break;   /* a01_9 step 4a */
+        case CSR_MHARTID:  read_old = csr_mhartid_read (hart); break;   /* a01_9 step 3, RO */
+        case CSR_MISA:     read_old = csr_misa_read    (hart); break;   /* a01_9 step 3, RW-effective-RO */
+        case CSR_MVENDORID:read_old = csr_mvendorid_read(hart); break;  /* a01_9 step 3, RO */
+        case CSR_MARCHID:  read_old = csr_marchid_read (hart); break;   /* a01_9 step 3, RO */
+        case CSR_MIMPID:   read_old = csr_mimpid_read  (hart); break;   /* a01_9 step 3, RO */
         case CSR_TOHOST:   read_old = csr_tohost_read  (hart); break;   /* a_01_8 临时, 删除时一起 */
         case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* a_01_8 临时 RO, RO 写 trap 由入口判 */
         default:
@@ -345,9 +554,17 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
             case CSR_MEPC:     csr_mepc_write    (hart, to_write); break;
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
+            case CSR_MSCRATCH: csr_mscratch_write(hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_MEDELEG:  csr_medeleg_write (hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_MIDELEG:  csr_mideleg_write (hart, to_write); break;   /* a01_9 step 4a */
             case CSR_SATP:     csr_satp_write    (hart, to_write); break;   /* a_01_8 */
             case CSR_SSTATUS:  csr_sstatus_write (hart, to_write); break;   /* a_01_8 Step 6 */
             case CSR_SEPC:     csr_sepc_write    (hart, to_write); break;   /* a_01_8 Step 6 */
+            case CSR_SSCRATCH: csr_sscratch_write(hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_STVEC:    csr_stvec_write   (hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_SCAUSE:   csr_scause_write  (hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_STVAL:    csr_stval_write   (hart, to_write); break;   /* a01_9 step 4a */
+            case CSR_MISA:     csr_misa_write    (hart, to_write); break;   /* a01_9 step 3, noop (WARL) */
             case CSR_TOHOST:   csr_tohost_write  (hart, to_write); break;   /* a_01_8 临时 */
             default:
                 // a_01_7 末: 上面 read 路径的 default 已 fprintf + trap_raise_exception

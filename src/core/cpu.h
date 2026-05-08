@@ -44,6 +44,28 @@
 // 但 trap.h 不能 #include cpu.h 形成循环)。tag 名 cpu_s 仅服务 forward decl, 没人直接用
 // "struct cpu_s" 这个写法; 项目代码全用 cpu_t typedef。零运行时成本 (struct 加 tag 不改
 // ABI / 字段布局)。
+// cpu_info_per_hart_t (a01_9 step 3 加, 类 4 per-hart 私有 RO CSR 数据)
+//
+// per-hart 私有 — 异构 SMP (e.g. 1×MU + 4×MSU) 时不同 hart 的字段值不同, 不能共享。
+// mhartid: hartid 编号; misa: 该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
+// 嵌入 cpu_t 字段 (非指针; per-hart 私有就跟着 cpu_t 走, 不需要外部 alloc)。
+typedef struct cpu_info_per_hart_s {
+    uint32_t mhartid;     // RV spec §3.1.5; per-hart 不同; csr_mhartid_read 直读
+    uint32_t misa;        // RV spec §3.1.1; bit 30 = MXL (RV32 = 1); bits[25:0] = extension flags;
+                          //   异构 SMP 时不同 hart 可不同 (例如某些 hart 不带 S-mode)
+} cpu_info_per_hart_t;
+
+// cpu_info_shared_t (a01_9 step 3 加, 类 4 多 hart 共享 RO CSR 数据)
+//
+// 制造商信息类 — 全机器统一 (mvendorid/marchid/mimpid 都是机器整体属性, 不区分 hart)。
+// 多 hart 共享一份 (cpu.c 内 static const cpu_info_shared_default); cpu_t 内持指针。
+// 只放 CSR — cache_size / tlb_size 等"硬件参数"不进这里, 进 config.h (编译期宏)。
+typedef struct cpu_info_shared_s {
+    uint32_t mvendorid;   // RV spec §3.1.2; JEDEC vendor ID; 0 = open-source / no JEDEC
+    uint32_t marchid;     // RV spec §3.1.3; architecture ID;  0 = no architecture ID
+    uint32_t mimpid;      // RV spec §3.1.4; implementation ID; 0 = no impl ID
+} cpu_info_shared_t;
+
 typedef struct cpu_s {
     // _Alignas(64) 在第一字段, 强制整个 struct 以 64B (cache line) 对齐。
     // cpu_create 用 aligned_alloc(64, sizeof(cpu_t)) 分配, 与之配套。
@@ -55,9 +77,15 @@ typedef struct cpu_s {
     uint32_t              satp;             // Sv32 satp; a_01 = 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
-    trap_csrs_t           trap;             // trap-related CSR 镜像 + host trap 流程状态
-                                            // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
-                                            // 见 trap.h 顶部 doc + dummy.txt §1
+    trap_csrs_t              trap;             // trap-related CSR 镜像 + host trap 流程状态
+                                                // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
+                                                // 见 trap.h 顶部 doc + dummy.txt §1
+    cpu_info_per_hart_t      per_hart_info;     // a01_9 step 3 加; per-hart 私有 RO CSR (mhartid +
+                                                //   misa); 嵌入 (非指针, 跟 cpu_t 走); cpu_create
+                                                //   入参 mhartid + misa 写入
+    const cpu_info_shared_t *shared_info;       // a01_9 step 3 加; 多 hart 共享 RO CSR (mvendorid +
+                                                //   marchid + mimpid); 指向 cpu.c static const
+                                                //   cpu_info_shared_default
 } cpu_t;
 // 注: a_01_8 v01 加过 tohost 字段, 后改为 csr_tohost_write 直接 fprintf 流式输出 (不存
 //     字段) — 跟 csr_privrd_read 同形态. 删字段后这两条 csr 都是"接 csr.c 入口直接 console
@@ -66,11 +94,12 @@ typedef struct cpu_s {
 // 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。
 // 失败返回 NULL, 内部已 fprintf。
 //
-// misa 参数 a_01 内部不读 —— 仅作未来 misa 驱动初始化预留。
-// 未来用例:
-//   - MU-only 不对称核 (类比 SiFive U74 M-only): tlb_table[PRIV_U] 改为别名 [PRIV_M], [PRIV_S] 不分配
-//   - F/D/V 扩展进来时按 misa.fdv 决定是否分配 fcsr / vcsr 子结构
-cpu_t *cpu_create(uint32_t misa);
+// 入参:
+//   misa    — 写入 hart->per_hart_info.misa (csr_misa_read 直读); per-hart 私有, 异构 SMP
+//             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。a_01 不真按 misa 派发
+//             cpu_t 子结构 alloc (e.g. F/D 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
+//   mhartid — 写入 hart->per_hart_info.mhartid (csr_mhartid_read 直读); per-hart 不同。
+cpu_t *cpu_create(uint32_t misa, uint32_t mhartid);
 
 // 释放 cpu_create 分配的 cpu_t 及其下所有子结构 (tlb 容器 + 共享 leaf + 已懒分配的 entries)。
 // NULL 入参 do nothing。

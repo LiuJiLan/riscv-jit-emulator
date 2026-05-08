@@ -103,6 +103,33 @@
 #define CSR_MEPC       0x341U          /* M-mode 异常 / 中断的"返回 PC" */
 #define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
 #define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
+#define CSR_MSCRATCH   0x340U          /* M-mode scratch (a01_9 step 4a; xscratch[PRIV_M]) */
+#define CSR_MEDELEG    0x302U          /* M-mode 同步异常 trap delegation; bit 11 hardwire 0 */
+#define CSR_MIDELEG    0x303U          /* M-mode 中断 delegation; 4a 字段就位, a_03 中断真做时启用 */
+
+// ----------------------------------------------------------------------------
+// Machine-level RO Identity CSRs (a01_9 step 3 加; 类 4 出场信息 RO CSR)
+//
+// 拆 per-hart 私有 + 多 hart 共享 两组:
+//   per-hart (mhartid + misa): cpu_info_per_hart_t 嵌入 cpu_t (cpu.h); cpu_create 入参写入;
+//                               异构 SMP 时不同 hart 字段值不同 (e.g. 1×MU + 4×MSU)。
+//   共享 (mvendorid + marchid + mimpid): cpu_info_shared_t struct + cpu.c static const
+//                                         cpu_info_shared_default; cpu_t 持指针; 机器整体属性。
+//
+// 编码位段:
+//   mhartid    0xF14 — RO + M ([11:10]=11 RO, [9:8]=11 PRIV_M-min); 实际只 M-mode 能读
+//   mvendorid  0xF11 — RO + M
+//   marchid    0xF12 — RO + M
+//   mimpid     0xF13 — RO + M
+//   misa       0x301 — RW + M ([11:10]=00 RW, [9:8]=11 PRIV_M-min); 但 effective RO —
+//                       csr_misa_write noop (RV spec §3.1.1 WARL 允许 "hardwire 不支持的扩展
+//                       位忽略写入"; 项目所有扩展位都 hardwire, 写不改值)。
+// ----------------------------------------------------------------------------
+#define CSR_MISA       0x301U
+#define CSR_MVENDORID  0xF11U
+#define CSR_MARCHID    0xF12U
+#define CSR_MIMPID     0xF13U
+#define CSR_MHARTID    0xF14U
 
 // Supervisor-level CSRs (a_01_8 加; SV32 walker 路径真用; csr.c 大 switch 同步加 case)
 //
@@ -138,6 +165,10 @@
 // delivery (deliver_priv 仍 hard-code PRIV_M)。
 #define CSR_SSTATUS    0x100U
 #define CSR_SEPC       0x141U
+#define CSR_SSCRATCH   0x140U          /* S-mode scratch (a01_9 step 4a; xscratch[PRIV_S]) */
+#define CSR_STVEC      0x105U          /* S-mode trap vector (a01_9 step 4a; xtvec[PRIV_S]) */
+#define CSR_SCAUSE     0x142U          /* S-mode trap cause (a01_9 step 4a; xcause[PRIV_S]) */
+#define CSR_STVAL      0x143U          /* S-mode trap value (a01_9 step 4a; xtval[PRIV_S]) */
 
 // ----------------------------------------------------------------------------
 // Unprivileged and User-Level Custom CSRs (a_01_8 临时, 等 uart 实装后删除)
