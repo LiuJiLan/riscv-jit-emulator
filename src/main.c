@@ -390,14 +390,19 @@ int main(int argc, char **argv) {
             hart->regs[14], hart->regs[15]);
 
     // a_01_5_b: trap dump (验 trap_set_state 写字段对; 候选 A 早 return 行为下,
-    // in_trap=3 时字段保留第 2 次状态作 root cause)。a_01 单 hart, 只 dump [PRIV_M] 槽
-    // (a_01_5 v0 deliver_priv hard-code M; S 槽永远 0)。
+    // in_trap=3 时字段保留第 2 次状态作 root cause)。
+    // a01_9 step 4b: 加 [PRIV_S] 槽 dump — deliver_priv 按 medeleg 决定 deliver M / S, 两槽
+    // 都可能被写; 同 dump 帮助 fixture 验 medeleg delegate 路径 (e.g. fixture a01_9/03)。
     // 未来 reset 接入时, 这里换成"halt 原因分流 + reset hart" 的逻辑。
     fprintf(stderr,
-            "[main] trap dump: in_trap=%u mcause=%u mtval=0x%08x mepc=0x%08x mtvec=0x%08x\n",
+            "[main] trap dump (M): in_trap=%u mcause=%u mtval=0x%08x mepc=0x%08x mtvec=0x%08x\n",
             hart->trap.in_trap,
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
+    fprintf(stderr,
+            "[main] trap dump (S): scause=%u stval=0x%08x sepc=0x%08x stvec=0x%08x\n",
+            hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
+            hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
     // a_01_7: state dump (验 trap_set_state / OP_MRET 真切 priv + 写 mstatus.MPP/MPIE/MIE)。
     // 只 dump _mstatus 低 32 位 (mstatus 入口); 高 32 位 (mstatush) a_01 全 0, 不 dump 节省噪声。

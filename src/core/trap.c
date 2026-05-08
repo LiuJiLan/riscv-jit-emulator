@@ -10,9 +10,13 @@
 //   a_01_5_c: trap_raise_exception 标 _Noreturn + siglongjmp 跳回 dispatcher 落点
 //   a_01_7:   trap_set_state 真切 priv (写 _mstatus 的 MPP/MPIE/MIE; 改 hart->priv = deliver_priv);
 //             OP_MRET 真切 priv 在 interpreter.c case 内做 (反操作)
+//   a01_9 step 4b: deliver_priv 按 medeleg 真生效 (U/S-mode trap + medeleg.bit(cause)=1 时
+//             deliver S, 否则 deliver M; M-mode trap 总 deliver M); mstatus/sstatus 字段写
+//             按 deliver_priv 分流 (deliver M 写 MPP/MPIE/MIE; deliver S 写 SPP/SPIE/SIE)
 //
 // 未实现 (留 a_03+):
-//   - mideleg / medeleg-driven deliver_priv (现在仍 hard-code PRIV_M)
+//   - mideleg-driven deliver_priv (中断机制未实现; mideleg 字段 a01_9 step 4a 就位但
+//     trap_set_state 不读 — 项目当前 trap 都是 sync exception, 走 medeleg 路径)
 //
 
 #include "trap.h"
@@ -40,9 +44,32 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
         return hart->trap.in_trap;
     }
 
-    // a_01_5_b v0: deliver_priv hard-code PRIV_M。
-    // 未来 (真接 OS / mideleg/medeleg 路径): 按 cause 查 mideleg/medeleg 决定 deliver 到 M 还是 S。
-    const uint8_t deliver_priv = PRIV_M;
+    // ------------------------------------------------------------------------
+    // a01_9 step 4b: deliver_priv 按 medeleg 真生效
+    //
+    // RV Privileged Spec §3.1.8 medeleg: 同步 exception 委派 bitmask, bit(cause) = 1 时
+    // 该 cause 在 U/S-mode 下触发时 deliver 给 S-mode (而不是 M-mode)。规则:
+    //   - M-mode trap (caller priv = M): 总 deliver M (M 不能 delegate 给 less-privileged)
+    //   - U/S-mode trap + medeleg.bit(cause) = 1: deliver S
+    //   - U/S-mode trap + medeleg.bit(cause) = 0: deliver M
+    //
+    // medeleg bit 11 (CAUSE_ECALL_FROM_M) 由 csr_medeleg_write 入口 WARL hardwire 0
+    // (M 不会出现 ecall_from_M trap 在 U/S-mode 下, 这条 bit 永远没意义)。
+    //
+    // 项目当前 trap 都是 sync exception (中断机制 mip/mie/mideleg 都未实现); 所以
+    // trap_set_state 只查 medeleg, 不查 mideleg。a_03 中断真做时加 mideleg 路径。
+    //
+    // cause < 64 边界检查: _medeleg uint64_t (类 1 future-proof RV64); cause >= 64 时
+    // bit shift UB; 项目当前所有 cause < 32, 边界检查防御。
+    // ------------------------------------------------------------------------
+    uint8_t deliver_priv;
+    if (hart->priv == PRIV_M) {
+        deliver_priv = PRIV_M;
+    } else if (cause < 64 && ((hart->trap._medeleg >> cause) & 1u)) {
+        deliver_priv = PRIV_S;
+    } else {
+        deliver_priv = PRIV_M;
+    }
 
     hart->trap.xcause[deliver_priv] = cause;
     hart->trap.xtval [deliver_priv] = tval;
@@ -51,37 +78,55 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
                                                               // GVA, 也是该指令 PC, 含义一致
 
     // ------------------------------------------------------------------------
-    // a_01_7: 切 priv mode + 保存 mstatus 字段
+    // 切 priv mode + 保存 mstatus / sstatus 字段 (按 deliver_priv 分流)
     //
-    // RV Privileged Spec §3.1.6.1 trap entry:
-    //   MPP  = caller priv (hart->priv at trap entry)
+    // deliver M (RV Privileged Spec §3.1.6.1 trap entry to M-mode):
+    //   MPP  = caller priv (hart->priv at trap entry; 2-bit)
     //   MPIE = MIE
     //   MIE  = 0
-    //   priv = deliver_priv
+    // deliver S (RV Privileged Spec §5.1.1 trap entry to S-mode):
+    //   SPP  = caller priv (hart->priv at trap entry; 1-bit, 0=U, 1=S; M-mode trap 不
+    //          delegate, caller 必为 U/S)
+    //   SPIE = SIE
+    //   SIE  = 0
     //
-    // 操作 _mstatus 的低 32 位 (mstatus 入口); 高 32 位 (mstatush) 不动 (RV32 spec mstatush 是
-    // SBE/MBE 等 endian 控制位, trap 不影响)。
+    // 操作 _mstatus 的低 32 位 (mstatus 入口跟 sstatus 入口共用同字段, mask 不同);
+    // 高 32 位 (mstatush) 不动。
     // ------------------------------------------------------------------------
     {
         uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 
-        /* MPP = caller priv (hart->priv 在切之前的值) */
-        mstatus_lo &= ~MSTATUS_MPP;                                     /* 清旧 MPP */
-        mstatus_lo |= ((uint32_t)hart->priv << MSTATUS_MPP_SHIFT)       /* 放新 MPP */
-                      & MSTATUS_MPP;
+        if (deliver_priv == PRIV_M) {
+            /* MPP = caller priv */
+            mstatus_lo &= ~MSTATUS_MPP;
+            mstatus_lo |= ((uint32_t)hart->priv << MSTATUS_MPP_SHIFT)
+                          & MSTATUS_MPP;
 
-        /* MPIE = MIE */
-        if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
-        else                          mstatus_lo &= ~MSTATUS_MPIE;
+            /* MPIE = MIE */
+            if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
+            else                          mstatus_lo &= ~MSTATUS_MPIE;
 
-        /* MIE = 0 (trap 入口 disable interrupt) */
-        mstatus_lo &= ~MSTATUS_MIE;
+            /* MIE = 0 (trap 入口 disable interrupt) */
+            mstatus_lo &= ~MSTATUS_MIE;
+        } else {
+            /* deliver_priv == PRIV_S */
+            /* SPP = caller priv (1-bit; PRIV_U=0, PRIV_S=1; caller 必为 U/S) */
+            if (hart->priv == PRIV_S) mstatus_lo |=  MSTATUS_SPP;
+            else                      mstatus_lo &= ~MSTATUS_SPP;
+
+            /* SPIE = SIE */
+            if (mstatus_lo & MSTATUS_SIE) mstatus_lo |=  MSTATUS_SPIE;
+            else                          mstatus_lo &= ~MSTATUS_SPIE;
+
+            /* SIE = 0 */
+            mstatus_lo &= ~MSTATUS_SIE;
+        }
 
         hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                             | (uint64_t)mstatus_lo;
     }
 
-    hart->priv    = deliver_priv;                            /* 切到 deliver priv (a_01 = M) */
+    hart->priv    = deliver_priv;                            /* 切到 deliver priv */
     hart->regs[0] = hart->trap.xtvec[deliver_priv];          /* 跳 trap vector (handler 起点) */
 
     return hart->trap.in_trap;

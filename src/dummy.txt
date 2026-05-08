@@ -727,6 +727,17 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
           return (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu);
       }
 
+    [为什么单独提取出 (1) 类]
+    (1) 类的本质特征 (内部字段长度 ≠ 外部 csr 入口长度) 跟 RV 寄存器长度 (xlen=32 / 64)
+    解耦 — 同一个 _mstatus 字段在 RV32 下是 mstatus + mstatush 两入口拆访问 (各 32 位匹
+    配 xlen=32), 切到 RV64 下是 mstatus 单入口整体访问 (64 位匹配 xlen=64), 字段类型
+    uint64_t 全程不变。
+
+    提取 (1) 类做 future-proof: RV32 → RV64 切换时只需改 csr 入口形态 (拆访问 → 整体访问,
+    csr.c read/write helper 重写), 不需要改字段类型 + 不需要重新 layout cpu_t / trap_csrs_t。
+    这也是为什么 _mstatus / _medeleg / _mideleg 当前都用 uint64_t 而不是 uint32_t — 哪怕
+    a_01 RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
+
 (2) 第二类 — 副本类 (一个物理字段被多个访问通道共享)
     命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)
     分两种子情况:
