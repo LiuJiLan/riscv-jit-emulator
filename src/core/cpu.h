@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/28.
-// a01_2 cpu 模块对外接口。
+// cpu 模块对外接口。
 //
 // cpu_t = 单 hart 的 guest CPU 状态镜像 (per-hart, 无并发, 普通读写)。
 //
@@ -22,7 +22,7 @@
 // tlb_table[4] 4 槽语义见 tlb.h 顶部注释 (v3 对称设计下元素类型统一为 tlb_t **,
 //   ASID 数组容器, 直接索引 [asid] 拿 tlb_t *, 不需要 cast)。
 //
-// 未来扩展 (a01_2 不含):
+// 未来扩展:
 //   - isa/fpu 进来时加 fcsr 指针 (POD 外挂, 不嵌入主结构)
 //   - monitor / 调试需要时加 perf_counters 指针
 //   - csr 状态 (mip / mie / mideleg / medeleg ...) 真接 OS / S-mode 时加
@@ -37,14 +37,14 @@
 #include <stdint.h>
 
 #include "tlb.h"   // tlb_t * 类型 (tlb_table 元素是 tlb_t **)
-#include "trap.h"  // trap_csrs_t 内嵌字段类型 (a_01_5_b 加; trap.h forward decl cpu_t,
+#include "trap.h"  // trap_csrs_t 内嵌字段类型 (trap.h forward decl cpu_t,
                    // 单向链 trap.h ← cpu.h, 不循环)
 
 // struct tag "cpu_s" 是为了让 trap.h 能 forward typedef cpu_t (trap.h helper 签名要 cpu_t*,
 // 但 trap.h 不能 #include cpu.h 形成循环)。tag 名 cpu_s 仅服务 forward decl, 没人直接用
 // "struct cpu_s" 这个写法; 项目代码全用 cpu_t typedef。零运行时成本 (struct 加 tag 不改
 // ABI / 字段布局)。
-// cpu_info_per_hart_t (a01_9 step 3 加, 类 4 per-hart 私有 RO CSR 数据)
+// cpu_info_per_hart_t (类 4: per-hart 私有 RO CSR 数据; 见 dummy.txt §6)
 //
 // per-hart 私有 — 异构 SMP (e.g. 1×MU + 4×MSU) 时不同 hart 的字段值不同, 不能共享。
 // mhartid: hartid 编号; misa: 该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
@@ -55,7 +55,7 @@ typedef struct cpu_info_per_hart_s {
                           //   异构 SMP 时不同 hart 可不同 (例如某些 hart 不带 S-mode)
 } cpu_info_per_hart_t;
 
-// cpu_info_shared_t (a01_9 step 3 加, 类 4 多 hart 共享 RO CSR 数据)
+// cpu_info_shared_t (类 4: 多 hart 共享 RO CSR 数据; 见 dummy.txt §6)
 //
 // 制造商信息类 — 全机器统一 (mvendorid/marchid/mimpid 都是机器整体属性, 不区分 hart)。
 // 多 hart 共享一份 (cpu.c 内 static const cpu_info_shared_default); cpu_t 内持指针。
@@ -73,30 +73,27 @@ typedef struct cpu_s {
     // regs[0] 实际是 pc (物理占 x0 位置, x0 走特殊路径不碰 regs[0])
     // regs[1..31] = x1..x31, offset(reg N) = N * 4
     _Alignas(64) uint32_t regs[32];
-    uint8_t               priv;             // RV privilege encoding (riscv.h PRIV_*); a_01 = PRIV_M
-    uint32_t              satp;             // Sv32 satp; a_01 = 0 (bare; MODE=0, ASID=0, PPN=0)
+    uint8_t               priv;             // RV privilege encoding (riscv.h PRIV_*); 当前启动 PRIV_M
+    uint32_t              satp;             // Sv32 satp; 当前 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
     trap_csrs_t              trap;             // trap-related CSR 镜像 + host trap 流程状态
                                                 // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
                                                 // 见 trap.h 顶部 doc + dummy.txt §1
-    cpu_info_per_hart_t      per_hart_info;     // a01_9 step 3 加; per-hart 私有 RO CSR (mhartid +
-                                                //   misa); 嵌入 (非指针, 跟 cpu_t 走); cpu_create
+    cpu_info_per_hart_t      per_hart_info;     // per-hart 私有 RO CSR (mhartid + misa);
+                                                //   嵌入 (非指针, 跟 cpu_t 走); cpu_create
                                                 //   入参 mhartid + misa 写入
-    const cpu_info_shared_t *shared_info;       // a01_9 step 3 加; 多 hart 共享 RO CSR (mvendorid +
-                                                //   marchid + mimpid); 指向 cpu.c static const
+    const cpu_info_shared_t *shared_info;       // 多 hart 共享 RO CSR (mvendorid + marchid +
+                                                //   mimpid); 指向 cpu.c static const
                                                 //   cpu_info_shared_default
 } cpu_t;
-// 注: a_01_8 v01 加过 tohost 字段, 后改为 csr_tohost_write 直接 fprintf 流式输出 (不存
-//     字段) — 跟 csr_privrd_read 同形态. 删字段后这两条 csr 都是"接 csr.c 入口直接 console
-//     输出, 不污染 cpu_t / GPR / main.c dump"。等 uart 实装后两条 csr 一起删。
 
 // 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。
 // 失败返回 NULL, 内部已 fprintf。
 //
 // 入参:
 //   misa    — 写入 hart->per_hart_info.misa (csr_misa_read 直读); per-hart 私有, 异构 SMP
-//             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。a_01 不真按 misa 派发
+//             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。当前不按 misa 派发
 //             cpu_t 子结构 alloc (e.g. F/D 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
 //   mhartid — 写入 hart->per_hart_info.mhartid (csr_mhartid_read 直读); per-hart 不同。
 cpu_t *cpu_create(uint32_t misa, uint32_t mhartid);

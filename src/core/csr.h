@@ -1,8 +1,8 @@
 //
 // Created by liujilan on 2026/5/4.
-// a_01_5_a csr 模块对外接口 (Zicsr 6 个指令变体的统一入口 + 大 switch decode 分发)。
+// csr 模块对外接口 (Zicsr 6 个指令变体的统一入口 + 大 switch decode 分发)。
 //
-// 职责 (plan §1.6 + file_plan §A.csr):
+// 职责 (plan §1.6):
 //   1. csr_op 是 6 csr 指令变体 (CSRRW/RS/RC + 3 I 变体) 的统一入口, interpreter / 未来
 //      JIT translator 共用; 内部完成 decode + 权限检查 + 分发到具体小 r/w helper +
 //      按 op 算 read_old + write_back, 返回 read_old 给 caller 写 rd。
@@ -11,8 +11,7 @@
 //   3. csr 编号自带权限位段 (riscv.h CSR_ADDR_PRIV_* / CSR_ADDR_RO_*), 入口直接判:
 //        - priv < 要求 → trap_raise_exception(hart, 2 /*illegal*/, raw_inst); 不返回
 //        - 写 RO csr   → trap_raise_exception(hart, 2 /*illegal*/, raw_inst); 不返回
-//      a_01_7 真激活 (替换 a_01_5_a 注释占位); 入口判失败走 _Noreturn longjmp 跳回 dispatcher
-//      sigsetjmp 落点。
+//      入口判失败走 _Noreturn longjmp 跳回 dispatcher sigsetjmp 落点。
 //
 // "I 变体" (RWI / RSI / RCI) 与"普通变体" (RW / RS / RC) 在 csr 侧无差别:
 //   - csr_op 不感知 op 是不是 I 变体, 它只看 (op_kind, new_val); caller 在 RWI/RSI/RCI
@@ -63,7 +62,7 @@
 // "纯读不写"判定 (RV spec §2.1.2):
 //   CSRRS / CSRRC / CSRRSI / CSRRCI + new_val == 0 时, 视为不写 (副作用不发生; 写 RO csr
 //   不 trap)。CSRRW / CSRRWI 总是写 (rs1=x0 / zimm=0 时也写, 用 0 覆盖)。
-//   csr_op 入口的 RO 写 trap 检查由这条规则裁剪 (a_01_7 真激活)。
+//   csr_op 入口的 RO 写 trap 检查由这条规则裁剪。
 typedef enum {
     CSR_OP_RW,      /* CSRRW  / CSRRWI */
     CSR_OP_RS,      /* CSRRS  / CSRRSI */
@@ -81,7 +80,7 @@ typedef enum {
 //
 // 返回值: read_old —— csr 旧值, caller 写 rd (rd=x0 时由 WRITE_REG 宏丢)
 //
-// trap 路径 (a_01_7 全部真激活):
+// trap 路径:
 //   - priv < csr 要求   → trap_raise_exception(hart, 2, raw_inst), 不返回 (入口判)
 //   - 写 RO csr         → trap_raise_exception(hart, 2, raw_inst), 不返回 (入口判)
 //   - 不存在的 csr addr → fprintf 提示 + trap_raise_exception(hart, 2, raw_inst), 不返回

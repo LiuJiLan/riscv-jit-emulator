@@ -1,22 +1,21 @@
 //
 // Created by liujilan on 2026/5/4.
-// a_01_5_b trap 模块对外接口: trap_csrs_t 物理存储 + 两层 raise 接口
-//   (trap_set_state 不长跳, trap_raise_exception 含长跳; a_01_5_b 后者还不接 longjmp,
-//    a_01_5_c 才标 _Noreturn + siglongjmp)。
+// trap 模块对外接口: trap_csrs_t 物理存储 + 两层 raise 接口 (trap_set_state 不长跳,
+// trap_raise_exception 含长跳)。
 //
 // 跨文件协议见 src/dummy.txt §1; 本模块涉及该协议的两处:
-//   - 机制 (2a) interpreter helper 经 trap_raise_exception 长跳 (a_01_5_c 真激活)
+//   - 机制 (2a) interpreter helper 经 trap_raise_exception 长跳
 //   - 机制 (2b) dispatcher fetch 路径 (mmu_translate_pc) 直调 trap_set_state, 不长跳
 //
-// trap_csrs_t 字段分类 (按 dummy.txt §1 用户拆出的四类 CSR 镜像):
-//   - 第四类 (按 priv 索引数组): xcause / xtval / xepc / xtvec, 4 槽 (PRIV_M / PRIV_S /
-//     PRIV_VS-slot / PRIV_U), a_01_5_b v0 只用 [PRIV_M]
-//   - 第一类 (RV32 物理 64 位, csr 入口拆访问): _mstatus, csr.c 通过 mstatus / mstatush
-//     两个 csr 入口分别访问低/高 32 位 (sstatus 是 _mstatus 的 masked view, a_01_5_b
-//     不实现, 等 S-mode 时加)
-//   - host 状态 (非 RV CSR): in_trap, double fault detection 计数器, mret 复位为 0
+// trap_csrs_t 字段分类 (按 dummy.txt §6 CSR 物理存储字段命名四类划分):
+//   - 第四类 (按 priv 索引数组): xcause / xtval / xepc / xtvec / xscratch, 4 槽
+//     (PRIV_M / PRIV_S / PRIV_VS-slot / PRIV_U)
+//   - 第一类 (RV32 物理 64 位, csr 入口拆访问): _mstatus / _medeleg / _mideleg
+//     (csr.c 通过对应 csr 入口分别访问)
+//   - host 状态 (非 RV CSR): in_trap, 嵌套 trap 计数器 + 内部停机位段 (位段编码见
+//     dispatcher.c 末尾 in_trap 位段编码段); mret 路径只清 bit 0-1
 //
-// 命名约定 (与 RV 手册 + dummy.txt §1 用户拍板一致):
+// 命名约定 (与 RV 手册 + dummy.txt §6 一致):
 //   - "x" 前缀: priv 索引数组 (xcause / xtval / xepc / xtvec); 跟 RV 手册风格一致 (手册
 //     用 xepc 同时指代 mepc 和 sepc, 由 deliver priv 决定具体哪个)。csr 大 switch 的
 //     read/write helper 把 mepc/sepc 这些 csr 名映射到 xepc[PRIV_M]/xepc[PRIV_S]。
@@ -31,7 +30,7 @@
 //     in_trap++ 后返回。返回 in_trap 当前值, 给 mmu_translate_pc 那种 caller 用作 0/非0
 //     状态传给 dispatcher (省一次读 hart->trap.in_trap)。
 //
-//   trap_raise_exception(hart, cause, tval) -> _Noreturn (a_01_5_c 起)
+//   trap_raise_exception(hart, cause, tval) -> _Noreturn
 //     内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
 //     一次性 sigsetjmp 落点。caller (interpreter) 内 goto out 变 unreachable 但保留无害
 //     (GCC -Wunreachable-code 默认 disabled, 不警告)。
@@ -73,32 +72,36 @@ typedef struct {
     // 命名 "x" 前缀对应 RV 手册 xepc 风格 (xepc[PRIV_M] = mepc, xepc[PRIV_S] = sepc 等);
     // csr 大 switch 的 mepc / sepc / ... read/write helper 映射到对应槽位。
     // 详见 dummy.txt §6 CSR 物理存储字段命名四类划分。
-    // a_01_5_b v0 只写 [PRIV_M] 槽; a01_9 step 4a 加 xscratch[4] (mscratch / sscratch)。
     uint32_t  xcause[4];
     uint32_t  xtval[4];
     uint32_t  xepc[4];
     uint32_t  xtvec[4];
-    uint32_t  xscratch[4];     // a01_9 step 4a 加; mscratch=xscratch[PRIV_M], sscratch=xscratch[PRIV_S]
+    uint32_t  xscratch[4];     // mscratch=xscratch[PRIV_M], sscratch=xscratch[PRIV_S]
 
     // 第一类: RV32 物理 64 位, csr 入口拆 32 位访问 (dummy.txt §6)。
     // _mstatus: csr 入口 mstatus + mstatush 拆访问低/高半边 (RV32 ABI)。sstatus 是
     //   _mstatus 的 masked view (SSTATUS_MASK)。
     // _medeleg / _mideleg: RV32 单 csr 入口 (无 medelegh/midelegh), 但物理 64 位为 RV64
     //   future-proof; 字段类型统一 uint64_t 跟 _mstatus 一致 (写 helper 截低 32 位)。
-    //   a01_9 step 4a 字段就位, 但 trap_set_state 不读 — deliver_priv 仍 hard-coded
-    //   PRIV_M; step 4b 改 deliver_priv 真按 _medeleg.bit(cause) 派发。
-    //   _mideleg 进一步推后 (跟 mip/mie 中断机制一起 a_03 真做)。
+    //   _medeleg: trap_set_state 按 _medeleg.bit(cause) 派发 deliver_priv
+    //             (U/S-mode trap + bit=1 → deliver S, 否则 deliver M; M-mode trap 总 M)。
+    //   _mideleg: 跟 mip/mie 中断机制一起未来真做; 字段就位, trap_set_state 当前不读。
     uint64_t  _mstatus;
-    uint64_t  _medeleg;        // a01_9 step 4a 加; csr 入口 medeleg (0x302)
-    uint64_t  _mideleg;        // a01_9 step 4a 加; csr 入口 mideleg (0x303); a_03 中断真做时启用
+    uint64_t  _medeleg;        // csr 入口 medeleg (0x302)
+    uint64_t  _mideleg;        // csr 入口 mideleg (0x303); 中断机制真做时启用
 
-    // host trap 流程状态: 嵌套 trap 计数器 (0 / 1 / 2 / 3+)。
-    //   0 = 正常 execution
-    //   1 = 第一次 trap (handler 跑)
-    //   2 = handler 内再 trap (double, 项目仍尝试 deliver)
-    //   3+ = handler 又 trap (triple, 候选 A 早 return 不 deliver, dispatcher 看 while
-    //        条件 in_trap < 3 失败退出)
-    // mret 路径复位为 0 (a_01_5_c 加 OP_MRET 时实现)。
+    // host trap 流程状态: 嵌套 trap 计数器 + 内部停机位段 (位段编码详见 dispatcher.c
+    // 末尾 in_trap 位段编码段)。
+    //   bit 0-1: 嵌套深度
+    //     0 = 正常 execution
+    //     1 = 第一次 trap (handler 跑)
+    //     2 = handler 内再 trap (double, 项目仍尝试 deliver)
+    //     3 = handler 又 trap (triple, 候选 A 早 return 不 deliver, dispatcher 看 while
+    //         条件 in_trap < 3 失败退出)
+    //   bit 3+ : 内部异常 / 内部正常停机 (host 端协议, 由 dispatcher 自己设, 解释器 / JIT
+    //           不碰)
+    // mret 路径只清 bit 0-1 (高位停机标记由 reset 流程决定是否清; 当前在 OP_MRET case 内
+    // 实现复位)。
     //
     // 注意: 这是项目自定义协议, 跟 RV Smdbltrp 扩展定义的 double trap 不同:
     //   - RV Smdbltrp (Machine Double-Trap, riscv.h CAUSE_DOUBLE_TRAP=16): 标准扩展, trap
@@ -125,11 +128,13 @@ typedef struct {
 //       /* 候选 A: 早 return, 不写 xcause/xtval/xepc, 不跳 xtvec; 字段保留第二次状态 */
 //       return in_trap;
 //   }
-//   deliver_priv = PRIV_M  /* a_01_5_b v0: hard-code; 未来 mideleg/medeleg-driven */
+//   deliver_priv = (caller == M) ? M : (medeleg.bit(cause) ? S : M)
 //   xcause[deliver_priv] = cause;
 //   xtval[deliver_priv]  = tval;
 //   xepc[deliver_priv]   = hart->regs[0];
-//   /* TODO a_01_5_c: 切 priv mode (写 _mstatus.MPP 等) */
+//   /* 切 priv mode (deliver M: MPP=caller, MPIE=MIE, MIE=0;
+//                    deliver S: SPP=caller(1bit), SPIE=SIE, SIE=0) */
+//   hart->priv    = deliver_priv;
 //   hart->regs[0] = xtvec[deliver_priv];
 //   return in_trap;
 //
@@ -140,16 +145,14 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval);
 
 
 // ----------------------------------------------------------------------------
-// trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口 (a_01_5_c 起 _Noreturn)
+// trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口 (_Noreturn)
 //
 // 调用方: interpreter case (OP_UNSUPPORTED / WRITE_PC_OR_TRAP 内 misalign / csr 权限失败
 // 等), 未来 JIT translator emit 出来的 host code 同样接本 helper。
 //
-// a_01_5_c 形态: _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回
-//                dispatcher 入口的一次性 sigsetjmp 落点。caller 内 goto out 变 unreachable
-//                但保留无害 (GCC -Wunreachable-code 默认 disabled, 不警告)。
-//
-// 接口形态稳定, caller 不动。
+// 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口的一次性
+// sigsetjmp 落点。caller 内 goto out 变 unreachable 但保留无害 (GCC -Wunreachable-code
+// 默认 disabled, 不警告)。
 _Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval);
 
 #endif //CORE_TRAP_H

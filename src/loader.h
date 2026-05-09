@@ -1,11 +1,12 @@
 //
 // Created by liujilan on 2026/4/28.
-// a_01 loader 模块对外接口。
+// loader 模块对外接口。
 //
 // 三个函数:
 //   guest_load_bin   把 .bin 文件内容拷到 guest GPA = dst 处
 //   guest_load_elf   把 ELF 所有 PT_LOAD 段加载到各自 p_paddr 处
 //   guest_is_elf     探测文件是否 ELF
+// 未来加: guest_load_hex (Intel HEX 格式) + main.c 后缀分发加分支。
 //
 // 报错风格见 src/dummy.txt §5。
 //

@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/5/7.
-// a_01_8 isa/sfence —— RV32 SFENCE.VMA 指令实现 (TLB 失效)。
+// isa/sfence —— RV32 SFENCE.VMA 指令实现 (TLB 失效)。
 //
 // 不对称设计 (跟 isa/lsu.{c,h} 风格一致):
 //   - load_helper:  static inline 在 lsu.h, fast path
@@ -8,10 +8,10 @@
 //   - sfence_vma_helper: extern 在本文件 sfence.c — slow path (改 TLB 状态, 块边界,
 //                          频次低 OS 级 us 量级, 不需 inline)
 //
-// trap 协议 (sfence.vma 在 a_01_8 不抛 trap):
+// trap 协议 (sfence.vma 当前不抛 trap):
 //   未来 mstatus.TVM=1 + S-mode csrw satp / sfence.vma → trap cause 2; 真做 OS 隔离时
 //   在本 helper 入口 (或 csr_op / interpreter case 入口) 加检查, 直接调 trap_raise_exception
-//   长跳 — 不改 helper 签名。a_01_8 fixture 不构造 TVM=1, 不实现该检查。
+//   长跳 — 不改 helper 签名。当前不实现该检查。
 //
 
 #ifndef ISA_SFENCE_H
@@ -24,7 +24,7 @@
 
 // ----------------------------------------------------------------------------
 // sfence_vma_helper —— 实现 RV spec sfence.vma 的简化方案 4.a
-//   (a_01_session_011 D11 拍, sfence 不是 hot path 不亏过度刷新)
+//   (sfence 不是 hot path, 过度刷新不亏)
 //
 // RV spec 四组合 (RV Privileged Spec Vol II §10.6.1) vs 简化方案对照:
 //   (a) rs1=x0, rs2=x0   → 全清所有 ASID 全所有 vaddr   [简化方案: 全清 ✓ 精确等同]
@@ -43,13 +43,14 @@
 // just slower); sfence 不是 hot path (OS 级操作 us 量级, < 1us); 实现成本最低不亏。
 // 未来真上 OS 实测发现过度刷新是瓶颈再细化; 不入 plan §2 改进列表 (本模块自描述)。
 //
-// 涉及哪些 tlb_table[] 槽 (a_01_session_011 D13):
-//   [0] U   = alias [1] S, 不重复清 (避免 double clear 同一份)
+// 涉及哪些 tlb_table[] 槽:
+//   [0] U   = 副本于 [1] S, 不重复清 (避免 double clear 同一份)
 //   [1] S   = sfence 主目标
-//   [2] H/VS = a_01_8 永远 NULL, 留循环框架方便未来 H 扩展激活 (tlb_clear(NULL) no-op)
-//   [3] M   = D23 路线永远 NULL, RV spec sfence.vma 也不影响 M-mode TLB, 不动
+//   [2] H/VS = 当前永远 NULL, 留循环框架方便未来 H 扩展激活 (tlb_clear(NULL) no-op)
+//   [3] M   = 永远 NULL (Trust regime bypass TLB), RV spec sfence.vma 也不影响 M-mode
+//             TLB, 不动
 //
-// 入参分两组, 语义独立, **不能互相推导** (a_01_session_011 user 拍 — 方案 B):
+// 入参分两组, 语义独立, **不能互相推导**:
 //
 //   ----- 组 1: 寄存器值 (32-bit, READ_REG 处理 x0 编码后的真值) -----
 //   vaddr_val  - = READ_REG(rs1); 真要清的 vaddr 数值。4.a 简化下 helper 不读 (b/d 都
@@ -73,7 +74,7 @@
 //
 //   hart       - 调用 hart
 //
-// trap 协议: a_01_8 不抛 trap (TVM 检查未实现, 见文件顶部); 接口签名不预留 trap 出参。
+// trap 协议: 当前不抛 trap (TVM 检查未实现, 见文件顶部); 接口签名不预留 trap 出参。
 // ----------------------------------------------------------------------------
 void sfence_vma_helper(cpu_t *hart,
                        uint32_t vaddr_val, uint32_t asid_val,

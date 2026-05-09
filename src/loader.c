@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/28.
-// a_01 loader 实现。
+// loader 实现。
 //
 
 #include "loader.h"
@@ -125,9 +125,9 @@ int guest_load_elf(const char *path) {
         return -1;
     }
 
-    // 1b. class —— a_01: 当前模拟器写死 RV32, 只接 ELFCLASS32。
+    // 1b. class — 当前模拟器写死 RV32, 只接 ELFCLASS32。
     //     未来上 RV64 后, 这里要变成"按当前模拟器配置选 32 / 64"。
-    //     配置传递机制(宏 / 运行时变量)留到那时定, 不预先抽象。
+    //     配置传递机制 (宏 / 运行时变量) 留到那时定, 不预先抽象。
     if (ehdr.e_ident[EI_CLASS] == ELFCLASS64) {
         fprintf(stderr,
                 "guest_load_elf: %s: ELFCLASS64 not supported in current build (RV32 only)\n",
@@ -160,7 +160,7 @@ int guest_load_elf(const char *path) {
         return -1;
     }
 
-    // 1e. type —— 只接 ET_EXEC; ET_DYN(PIE)需要 relocation, a_01 不做。
+    // 1e. type — 只接 ET_EXEC; ET_DYN (PIE) 需要 relocation, 当前不做。
     if (ehdr.e_type != ET_EXEC) {
         fprintf(stderr,
                 "guest_load_elf: %s: e_type=%u; only ET_EXEC supported "

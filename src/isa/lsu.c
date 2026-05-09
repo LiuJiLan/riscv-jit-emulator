@@ -1,20 +1,19 @@
 //
 // Created by liujilan on 2026/5/5.
-// a_01_6 isa/lsu —— store_helper 实现 (extern, slow path)。
+// isa/lsu —— store_helper 实现 (extern, slow path)。
 //
 // 顶部接口 doc + 不对称设计背景 + trap 协议见 lsu.h。跨文件协议见 src/dummy.txt §1 末段。
 //
 // load_helper 在 lsu.h 是 static inline (fast path, 调用方内联进 case); store_helper 在本文件
-// 是 extern 函数 (slow path, helper call)。两者签名风格对齐, 实现风格不对称, 跟 file_plan
-// §8.interpreter D 区设计一致。
+// 是 extern 函数 (slow path, helper call)。两者签名风格对齐, 实现风格不对称。
 //
-// 当前 a_01_6 形态:
+// 当前形态:
 //   - misalign → trap_raise(6)
 //   - BARE 路径: identity + RAM 检查 + host store
 //     - 不在 RAM → fprintf "MMIO bus_dispatch not implemented" + trap_raise(7)
-//   - SV32 路径占位: priv 恒 PRIV_M, current_tlb 永远 NULL, 不可达; fprintf + trap_raise(15)
-//   - reservation 清除 注释占位 (LR/SC 真做时填; a_03+ A 扩展)
-//   - SMC page_dirty 检测 注释占位 (jit/smc.c 真做时填; B 阶段 JIT)
+//   - SV32 路径: TLB lookup fast path + miss/D=0 fall back walker_helper_store
+//   - reservation 清除 注释占位 (LR/SC 真做时填; A 扩展)
+//   - SMC page_dirty 检测 注释占位 (jit/smc.c 真做时填; JIT 阶段)
 //
 
 #include "lsu.h"
@@ -23,8 +22,8 @@
 #include <stdio.h>      // fprintf
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
-#include "config.h"          // TLB_NUM_ENTRIES (a_01_8 Step 7 SV32 fast path 用)
-#include "core/mmu.h"        // mmu_walker_helper_store (a_01_8 Step 7 SV32 fall back)
+#include "config.h"          // TLB_NUM_ENTRIES (SV32 fast path 用)
+#include "core/mmu.h"        // mmu_walker_helper_store (SV32 miss / D=0 / perm 不齐 fall back)
 
 
 void store_helper(cpu_t *hart, tlb_t *current_tlb,
@@ -39,11 +38,11 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
         uint32_t pa = gva;  // identity
         // RAM 区检查 (无符号下溢比较)。
         if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-            // PA 不在 RAM 区。a_01_6 bus_dispatch 未实现, fprintf 提示 + trap access fault。
-            // 未来 a_01_7+ 加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO store 走 bus +
-            // 也要看是不是 ROM, 写 ROM 是 access fault); 现在一律 cause 7 (Store/AMO Access Fault)。
+            // PA 不在 RAM 区。bus_dispatch 未实现, fprintf 提示 + trap access fault。
+            // 未来加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO store 走 bus + 也要
+            // 看是不是 ROM, 写 ROM 是 access fault); 当前一律 cause 7 (Store/AMO Access Fault)。
             fprintf(stderr,
-                    "[lsu] store: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented in a_01_6)\n",
+                    "[lsu] store: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
                     pa);
             trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
         }
@@ -57,19 +56,19 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
         // reservation 清除 (LR/SC 语义) —— 占位
         //
         // RV A 扩展: 任何 store (普通 SW 或 AMO) 都可能让某 hart 的 LR-reserved 地址失效。
-        // a_03+ 真做 isa/amo.c 时:
+        // 真做 isa/amo.c 时:
         //   - 清当前 hart 的 reservation (如果存在)
         //   - SMP 时 (本项目预留, 不实现): 跨 hart 同步 reservation table (atomic 字段)
-        // 现在 a_01 没有 LR/SC, reservation_t struct 也未定; 占位等真做。
+        // 当前没有 LR/SC, reservation_t struct 也未定; 占位等真做。
         // ----------------------------------------------------------------------
 
         // ----------------------------------------------------------------------
         // SMC 检测 (page_dirty bitmap) —— 占位
         //
-        // B 阶段 JIT 接入后: store 写到含 JIT 翻译过的 page 时, 配合 jit/smc.c 的 page_dirty
-        // bitmap 检测, 让 dispatcher 在下次进 block 前 invalidate 该 page 上所有 jit_cache
-        // 条目 (整页失效 — 不是精细; plan §1.17 + §3 #13 决策)。
-        // 当前 a_01 没 JIT 也没 jit_cache, 占位等真做。
+        // JIT 接入后: store 写到含 JIT 翻译过的 page 时, 配合 jit/smc.c 的 page_dirty bitmap
+        // 检测, 让 dispatcher 在下次进 block 前 invalidate 该 page 上所有 jit_cache 条目
+        // (整页失效 — 不是精细; plan §1.17 + §3 #13 决策)。
+        // 当前没 JIT 也没 jit_cache, 占位等真做。
         //
         // 历史路径备注: 替代设计是 "SIGSEGV write-protect → handler 设 dirty"; 但 store_helper
         // 内主动设 dirty 也是合法路径 (handler 仅服务真正 inline 的 store fast path; helper 路径
@@ -87,16 +86,15 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
     // static inline 形态跟 load_helper / mmu_translate_pc 共用一份。命名澄清见 dummy.txt §1
     // F1 段 (store_helper inline 化 ≠ store 变 fast path)。
     //
-    // 命中条件 (a01_10 (6) SUM 议程修): V + tag + D + check_perm(MMU_PERM_W)
+    // 命中条件: V + tag + D + check_perm(MMU_PERM_W)
     //   D 位必查 — load 路径 walker 不 set D, store 时 D=0 必 fall back walker 重 set
-    //   (hw-managed D 关键路径; D18 设计点 5 时序场景 step 3-4: walker 第一次 set D 写回
-    //   PT + 重 fill TLB; 之后 fast path 直接 host store)
+    //   (hw-managed D 关键路径时序场景: walker 第一次 set D 写回 PT + 重 fill TLB; 之后
+    //   fast path 直接 host store)
     //   check_perm 内查 priv/PTE_U/SUM + W 位; W=1+R=0 reserved 不查 (跟 spike 同)
     //
-    // a_01_8 旧形态 (V + tag + W + D 简化命中) 错放过 corner case (S+PTE.U=1+SUM=0):
-    //   旧 fast path 看 W=1 + D=1 就 host store 通过, 但 S 模式访问 user page 没 SUM 时
-    //   spec 规定应 store page fault。提 check_perm inline 后命中段跟 walker 对齐, 不再错
-    //   放过。
+    // 简化命中 (V + tag + W + D) 不够 — corner case (S+PTE.U=1+SUM=0): S 模式访问 user
+    //   page 没 SUM 时, 看 W=1 + D=1 就 host store 通过, 但 spec 规定应 store page fault。
+    //   check_perm inline 形式让命中段跟 walker 同源, 不漏 corner case。
     //
     // 不命中 (miss / V=0 / D=0 / perm 不齐) → fall back mmu_walker_helper_store —
     // walker 内重做 walk + check_perm + set A+D 写回 PT + fill TLB; 失败 trap_raise
@@ -117,7 +115,7 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
             memcpy(host_ptr, &value, size);
 
             /* reservation 清除 (LR/SC) + SMC page_dirty 占位 — 跟 BARE 路径同形态;
-             * a_01 没接 LR/SC, jit/smc.c 还没接, 占位等 a_03+ A 扩展 / B 阶段 JIT 真做。 */
+             * 当前未接 LR/SC, jit/smc.c 也未接, 占位等 A 扩展 / JIT 真做。 */
             return;
         }
     }

@@ -10,14 +10,19 @@
 //
 // 增量原则: 不一次到位; 每条按"哪个模块第一次需要"加进来, 配 1-2 行 spec 引文。
 //
-// 当前 (a01_2) 收纳:
-//   - PRIV_U / PRIV_S / PRIV_M (cpu.c / dispatcher / tlb.h 都要用)
+// 当前已收纳:
+//   - PRIV_U / PRIV_S / PRIV_M (+ PRIV_H 占位, 见下)
+//   - PTE_V / R / W / X / U / G / A / D (Sv32 walker 用)
+//   - CSR 编号: trap setup 7 (mstatus / mstatush / mtvec / mepc / mcause / mtval / mscratch)
+//             + delegation 2 (medeleg / mideleg) + RO Identity 5 (mhartid / misa /
+//             mvendorid / marchid / mimpid) + S-mode 7 (sstatus / sepc / sscratch / stvec /
+//             scause / stval) + satp + 临时 2 (tohost / privrd)
+//   - mstatus 字段位段: MIE / MPIE / MPP + SIE / SPIE / SPP / SUM / MXR + SSTATUS_MASK +
+//                        future-proof SD / UXL / SXL
+//   - Exception Code (CAUSE_*) trap_raise_exception / mcause 字段值 完整集
 //
-// 后续按需增量加 (示意, 真到那一步再加):
-//   - SATP_MODE_BARE / SATP_MODE_SV32 + SATP_MODE_SHIFT (csr.c 读写 satp.MODE 时)
-//   - MSTATUS_MPP / SSTATUS_SPP / MIE / SIE / 中断使能位 (csr.c)
-//   - PTE_V / PTE_R / PTE_W / PTE_X / PTE_U / PTE_G / PTE_A / PTE_D (mmu walker)
-//   - CSR 编号 (csr.c 大 switch 时增量加 — a_01_5_a 加 trap 5 个; OS / S-mode 时再加 sstatus / sepc / sscratch / scause / stval / stvec / sip / sie 等)
+// 未来增量: 中断字段 (mip / mie / sip / sie) 真做中断机制时加; SATP_MODE_* / FS / VS / XS /
+//   TVM / TSR 等真用时再加。
 //
 
 #ifndef RISCV_H
@@ -44,10 +49,11 @@
                         //   - H 扩展通过 V 位 + S 级别 (V=1, priv=PRIV_S) 表达 VS-mode,
                         //     不在 priv 字段直接放 2
                         //
-                        // 当前 a_01: cpu->priv 只取 PRIV_M, PRIV_H 不会真被赋值给 priv。
-                        //           真上 H 扩展时, 这个宏要么换为基于 V 位的派发逻辑,
-                        //           要么改名为 PRIV_VS_SLOT 之类来强调 "槽位索引" 而非
-                        //           "priv 编码值" 语义。
+                        // 当前 cpu->priv 取 PRIV_U / PRIV_S / PRIV_M 三态 (PRIV_H 不被赋值
+                        //           给 priv, 仅作 tlb_table[2] 槽位 + 占位)。真上 H 扩展时,
+                        //           这个宏要么换为基于 V 位的派发逻辑, 要么改名为
+                        //           PRIV_VS_SLOT 之类来强调 "槽位索引" 而非 "priv 编码值"
+                        //           语义。
 #define PRIV_M  3U
 
 // ----------------------------------------------------------------------------
@@ -56,11 +62,11 @@
 // PTE bit:  9 8 7 6 5 4 3 2 1 0
 //          [RSW][D][A][G][U][X][W][R][V]
 //
-// 增量加 (按"真用到一个加一个"原则):
-//   a_01_2:  V (TLB entry 有效位) + R/W/X (取指/读/写权限位; M/bare TLB fill 合成全权限)
-//   a_01_8:  U (User-mode 访问标记, walker check_perm 用) + G (Global, 项目 G-agnostic 不读
-//             但暴露宏让 fixture 可设) + A (Accessed, hw-managed walker 顺手 set) + D (Dirty,
-//             hw-managed W 访问时 set, fast path 检查决定 fall back)
+// 当前已暴露:
+//   V (TLB entry 有效位) + R/W/X (取指/读/写权限位; M/bare TLB fill 合成全权限)
+//   U (User-mode 访问标记, walker check_perm 用) + G (Global, 项目 G-agnostic 不读但暴露
+//   宏让 fixture 可设) + A (Accessed, hw-managed walker 顺手 set) + D (Dirty, hw-managed
+//   W 访问时 set, fast path 检查决定 fall back)
 // RSW (bits 9:8) 是 sw 保留, 不暴露宏 (fixture 真用到时再加)。
 // ----------------------------------------------------------------------------
 #define PTE_V  (1U << 0)
@@ -75,8 +81,7 @@
 // ----------------------------------------------------------------------------
 // CSR 编号 (Privileged Spec Vol II, table of Machine-Level CSRs / §2.2)
 //
-// 增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。a_01_5_a 加 trap 路径用的
-// 5 个 csr (mstatus 物理 64 位 = mstatus + mstatush 双 csr 入口)。
+// 增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。
 //
 // 12-bit csr 地址位段 (RV Privileged Spec §2.1):
 //   bits [11:10] = 访问性质: 00/01/10 = RW, 11 = RO  (csr.c 入口判 RO 写 → trap)
@@ -91,24 +96,24 @@
 #define CSR_ADDR_RO_MASK     0x3U          /* (addr >> 10) & 3 == 0b11 时为 RO */
 #define CSR_ADDR_RO_VALUE    0x3U          /* (addr >> 10) & 3 == 0x3 → 只读 */
 
-// Machine-level trap setup / handling CSRs (a_01_5_a 加; trap 路径必备)
+// Machine-level trap setup / handling CSRs (trap 路径必备)
 //
 // 注: mstatus 在 RV32 物理 64 位, RV 规范拆 mstatus (低 32) + mstatush (高 32) 两个 csr
 //     入口访问。本项目 cpu_t 内只存一份 _mstatus (uint64_t), csr.c 的 mstatus / mstatush
-//     read/write 都映射到同一个物理字段的不同半边 (dummy.txt §1 第一类). sstatus = 0x100
-//     是 mstatus 的 masked view, a_01_5_a 不实现, 等真做 S-mode 时加。
+//     read/write 都映射到同一个物理字段的不同半边 (dummy.txt §6 第一类)。sstatus = 0x100
+//     是 mstatus 的 masked view (见下方 S-mode CSR 段)。
 #define CSR_MSTATUS    0x300U          /* mstatus 低 32 位 (MIE/MPIE/MPP/SUM/MXR/...) */
 #define CSR_MTVEC      0x305U          /* M-mode trap vector base (+ MODE 低 2 位) */
 #define CSR_MSTATUSH   0x310U          /* mstatus 高 32 位 (RV32 only; SBE/MBE 等大端控制) */
 #define CSR_MEPC       0x341U          /* M-mode 异常 / 中断的"返回 PC" */
 #define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
 #define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
-#define CSR_MSCRATCH   0x340U          /* M-mode scratch (a01_9 step 4a; xscratch[PRIV_M]) */
+#define CSR_MSCRATCH   0x340U          /* M-mode scratch (xscratch[PRIV_M]) */
 #define CSR_MEDELEG    0x302U          /* M-mode 同步异常 trap delegation; bit 11 hardwire 0 */
-#define CSR_MIDELEG    0x303U          /* M-mode 中断 delegation; 4a 字段就位, a_03 中断真做时启用 */
+#define CSR_MIDELEG    0x303U          /* M-mode 中断 delegation; 字段就位, 中断机制真做时启用 */
 
 // ----------------------------------------------------------------------------
-// Machine-level RO Identity CSRs (a01_9 step 3 加; 类 4 出场信息 RO CSR)
+// Machine-level RO Identity CSRs (类 4 出场信息 RO CSR)
 //
 // 拆 per-hart 私有 + 多 hart 共享 两组:
 //   per-hart (mhartid + misa): cpu_info_per_hart_t 嵌入 cpu_t (cpu.h); cpu_create 入参写入;
@@ -131,7 +136,7 @@
 #define CSR_MIMPID     0xF13U
 #define CSR_MHARTID    0xF14U
 
-// Supervisor-level CSRs (a_01_8 加; SV32 walker 路径真用; csr.c 大 switch 同步加 case)
+// Supervisor-level CSRs (SV32 walker 路径真用; csr.c 大 switch 同步加 case)
 //
 // satp 字段布局 (Sv32; RV Privileged Spec Vol II §4.1.11 fig 4.11):
 //   bit  31     = MODE  (0 = Bare 恒等映射, 1 = Sv32; 项目仅支持这两值, csr 写 helper
@@ -149,29 +154,29 @@
 //   M=3 > S=1)。
 #define CSR_SATP       0x180U
 
-// Supervisor-level CSRs (a_01_8 Step 6 加; sret 必带的最小集 — sstatus + sepc)
+// Supervisor-level CSRs (sret + S-mode trap delivery 路径用)
 //
 // sstatus (0x100): mstatus 的 masked view; 物理存储 = trap._mstatus 的同一份, sstatus
 // 入口只能访问 SSTATUS_MASK 内的字段位 (SIE/SPIE/SPP/SUM/MXR + 未来 FS/VS/XS/SD/UBE)。
 // csr_sstatus_read = _mstatus & SSTATUS_MASK; csr_sstatus_write = (_mstatus & ~MASK) |
 // (v & MASK) — 不影响 mstatus M-mode-only 字段 (MIE/MPIE/MPP)。
 //
-// sepc (0x141): S-mode 异常 / 中断的"返回 PC"; 物理存储 = trap.xepc[PRIV_S] (按 priv 索引
-// 数组的 [PRIV_S] 槽, 跟 mepc=xepc[PRIV_M] 同形态)。WARL: 同 mepc 截 IALIGN 对齐位。
-// a_01_8 deliver_priv hard-code PRIV_M, trap_set_state 不写 sepc; sepc 由 fixture (sret
-// 路径) 通过 csrw sepc 显式设。
+// sepc / sscratch / stvec / scause / stval (0x141/140/105/142/143): 物理存储 =
+// trap.{xepc/xscratch/xtvec/xcause/xtval}[PRIV_S] (按 priv 索引数组的 [PRIV_S] 槽,
+// 跟 mxxx=xxxx[PRIV_M] 同形态)。WARL: sepc 同 mepc 截 IALIGN 对齐位; stvec 同 mtvec 截
+// MODE 低 2 位 (Vectored 不实现强制 Direct)。
 //
-// 不做 (留下个 session): stvec/scause/stval/sscratch (其余 S-mode CSR), medeleg, S-handler
-// delivery (deliver_priv 仍 hard-code PRIV_M)。
+// trap_set_state 按 medeleg.bit(cause) 派发 deliver_priv = S 时写 [PRIV_S] 槽; sret 路径
+// 跟 mret 反操作同形态 (priv=SPP, SIE=SPIE, SPIE=1, SPP=PRIV_U, pc=sepc, in_trap=0)。
 #define CSR_SSTATUS    0x100U
 #define CSR_SEPC       0x141U
-#define CSR_SSCRATCH   0x140U          /* S-mode scratch (a01_9 step 4a; xscratch[PRIV_S]) */
-#define CSR_STVEC      0x105U          /* S-mode trap vector (a01_9 step 4a; xtvec[PRIV_S]) */
-#define CSR_SCAUSE     0x142U          /* S-mode trap cause (a01_9 step 4a; xcause[PRIV_S]) */
-#define CSR_STVAL      0x143U          /* S-mode trap value (a01_9 step 4a; xtval[PRIV_S]) */
+#define CSR_SSCRATCH   0x140U          /* S-mode scratch (xscratch[PRIV_S]) */
+#define CSR_STVEC      0x105U          /* S-mode trap vector (xtvec[PRIV_S]) */
+#define CSR_SCAUSE     0x142U          /* S-mode trap cause (xcause[PRIV_S]) */
+#define CSR_STVAL      0x143U          /* S-mode trap value (xtval[PRIV_S]) */
 
 // ----------------------------------------------------------------------------
-// Unprivileged and User-Level Custom CSRs (a_01_8 临时, 等 uart 实装后删除)
+// Unprivileged and User-Level Custom CSRs (临时, 等 uart 实装后删除)
 //
 // 0x800-0x8FF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "Unprivileged and
 // User-Level Custom Read/Write" CSRs:
@@ -183,13 +188,13 @@
 // csr_tohost_write 内直接 fprintf, 不缓存 cpu_t 字段; 跟 CSR_PRIVRD 同形态 "csrw 即输出")。
 // 不污染 guest GPR (避免 fixture 用 x10/x11 标记跟 fixture 内部计算冲突)。
 //
-// 删除时机: a_03+ uart 实装 + ROM-based putchar 接入后, fixture 用 putchar 输出, 这条
+// 删除时机: uart 实装 + ROM-based putchar 接入后, fixture 用 putchar 输出, 这条
 // CSR + csr.c csr_tohost_* helper 一起删。
 // ----------------------------------------------------------------------------
 #define CSR_TOHOST     0x800U
 
 // ----------------------------------------------------------------------------
-// CSR_PRIVRD (a_01_8 临时, 等 uart 实装后删除) —— "作弊" 寄存器, 读当前 priv
+// CSR_PRIVRD (临时, 等 uart 实装后删除) —— "作弊" 寄存器, 读当前 priv
 //
 // 0xCC0-0xCFF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "User-level Custom
 // Read-Only" CSRs:
@@ -205,8 +210,8 @@
 // RV spec 不允许 User-mode 知道当前 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换
 // 正确性 — 控制台直接看到 priv 字符比构造 ecall+trap+handler 路径验更直接。
 //
-// 删除时机: 跟 CSR_TOHOST 一起 (a_03+ uart 实装后, fixture 用 putchar + 真 trap 路径
-// 验 priv 状态, 不需要这个 backdoor)。
+// 删除时机: 跟 CSR_TOHOST 一起 (uart 实装后, fixture 用 putchar + 真 trap 路径验 priv
+// 状态, 不需要这个 backdoor)。
 // ----------------------------------------------------------------------------
 #define CSR_PRIVRD     0xCC0U
 
@@ -265,11 +270,13 @@
 //
 // ----------------------------------------------------------------------------
 // 字段宏增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。
-//   - a_01_5_a 加: trap 路径必备 5 csr 编号 (CSR_MSTATUS / CSR_MTVEC / ... 见上方)
-//   - a_01_7   加: MIE / MPIE / MPP    (trap_set_state + OP_MRET 真切 priv 用)
-//   - a_01_8   加: SIE / SPIE / SPP / SUM / MXR    (SV32 walker / fixture 切 S 用)
-//   - a_01_8   future-proof 加: SD (RV32 真启用 + RV64 #if 0); UXL/SXL (RV64 #if 0)
-//   其余 (UBE / MPRV / TVM / TW / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP/MDT 等) 真用时再加。
+// 当前已暴露:
+//   - MIE / MPIE / MPP                (trap_set_state + OP_MRET 切 priv 用)
+//   - SIE / SPIE / SPP / SUM / MXR    (SV32 walker / OP_SRET 切 priv 用)
+//   - SSTATUS_MASK                    (sstatus = mstatus 的 masked view)
+//   - SD (RV32 真启用 + RV64 #if 0)   (future-proof; FS/XS 真做时联动)
+//   - UXL/SXL (RV64 #if 0)            (future-proof; 切 RV64 时启用)
+// 其余 (UBE / MPRV / TVM / TW / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP/MDT 等) 真用时再加。
 //
 // 命名风格:
 //   单 bit 字段: <field>_SHIFT + <field>            (single-bit mask)
@@ -286,16 +293,14 @@
 #define MSTATUS_MPP_MASK    0x3U                              /* 2-bit field */
 #define MSTATUS_MPP         (MSTATUS_MPP_MASK << MSTATUS_MPP_SHIFT)  /* = 0x00001800 */
 
-// a_01_8 增量 (SV32 walker / sret / fixture 切 S 路径真用; 命名风格跟 MIE/MPIE/MPP 一致):
-//   SIE  (bit  1): S-mode global interrupt enable。a_01_8 中断不真做 (留 a_03+); 字段先暴露,
-//                   让 fixture csrw mstatus, x.. 设值时不被 WARL 误截断丢。
-//   SPIE (bit  5): saved SIE on S-mode trap entry (sret 时恢复 SIE = SPIE)。a_01_8 不接 sret,
-//                   字段先暴露。
-//   SPP  (bit  8): saved priv on S-mode trap entry (1-bit; sret 时 priv = SPP)。a_01_8 fixture
-//                   走 mret 切 S (mstatus.MPP = PRIV_S), 不走 sret, 但字段暴露不亏。
+// S-mode 字段 (SV32 walker / sret 路径真用; 命名风格跟 MIE/MPIE/MPP 一致):
+//   SIE  (bit  1): S-mode global interrupt enable。中断不真做; 字段暴露让 fixture csrw
+//                   mstatus, x.. 设值时不被 WARL 误截断丢。
+//   SPIE (bit  5): saved SIE on S-mode trap entry (sret 时恢复 SIE = SPIE)。
+//   SPP  (bit  8): saved priv on S-mode trap entry (1-bit; sret 时 priv = SPP)。
 //   SUM  (bit 18): permit Supervisor User Memory access。SV32 walker 在 S 模式访问 PTE.U=1
 //                   page 时按本位决定: SUM=0 → 不放过 (cause 13/15 page fault); SUM=1 → 放过
-//                   (S 模式可读写 U-page)。默认 SUM=0 (跟 fixture "S 不该碰 U-page" 直觉一致)。
+//                   (S 模式可读写 U-page)。默认 SUM=0 (跟 "S 不该碰 U-page" 直觉一致)。
 //   MXR  (bit 19): make eXecutable Readable。SV32 walker load 路径按本位决定:
 //                   MXR=0 → 严格按 PTE.R 位 (X=1 R=0 page 不可读, 触发 cause 13);
 //                   MXR=1 → PTE.X=1 page 也算可读 (X 兼任 R)。默认 MXR=0。
@@ -315,29 +320,29 @@
 #define MSTATUS_MXR         (1U << MSTATUS_MXR_SHIFT)        /* = 0x00080000 */
 
 // ----------------------------------------------------------------------------
-// SSTATUS_MASK (a_01_8 Step 6 加) —— sstatus 是 mstatus 的 masked view
+// SSTATUS_MASK —— sstatus 是 mstatus 的 masked view
 //
 // sstatus 入口可访问 _mstatus 的字段位; mstatus M-mode-only 字段 (MIE/MPIE/MPP/TVM/TW/TSR
 // 等) 不在 sstatus 视图内, 写入忽略读出 0。
 //
-// 项目当前真用的 S-mode 字段: SIE / SPIE / SPP / SUM / MXR (Step 1 已暴露宏); 跟 a_01_8
-// fixture (a) sret 切 priv + walker SUM/MXR 配套。其他 S-mode 字段 (UBE bit 6, VS bits 10:9,
-// FS bits 14:13, XS bits 16:15, SD bit 31) 项目不实现 F/D/V/XS, mask 暂不覆盖 — 跟"真用到
-// 一个加一个" 原则一致; 未来真做 F/D/V 扩展时把对应位加进 mask。
+// 项目当前真用的 S-mode 字段: SIE / SPIE / SPP / SUM / MXR; 跟 sret 切 priv + walker
+// SUM/MXR 配套。其他 S-mode 字段 (UBE bit 6, VS bits 10:9, FS bits 14:13, XS bits 16:15,
+// SD bit 31) 项目不实现 F/D/V/XS, mask 暂不覆盖 — 跟 "真用到一个加一个" 原则一致;
+// 未来真做 F/D/V 扩展时把对应位加进 mask。
 //
 // 注: SD 是 read-only derived from FS/VS/XS dirty 状态 (RV spec); 严格说 sstatus 应能 read
 // 到 SD 但 write 时 ignore — 项目不实现 FS/VS/XS, SD 永远 0, 不进 mask 也不影响行为。
 #define SSTATUS_MASK   (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR)
 
 // ----------------------------------------------------------------------------
-// future-proof 字段宏 (a_01_8 加; user 主导拍, 见 a_01_session_011 — RV64 切换时启用)
+// future-proof 字段宏 (RV64 切换 / F/D 扩展接入时启用)
 //
 // 原则: _mstatus 物理 64 位, 但当前 RV32 ABI 拆 mstatus + mstatush 入口暴露; 字段位号
-// 在 RV32 / RV64 视角下不一样的, 同时给出两版宏 (RV64 版用 #if 0 包占位)。a_01_8 真用的
-// 5 个字段 (SIE/SPIE/SPP/SUM/MXR) 在 RV32 / RV64 位置一致, 已在上方加宏, 不需要双版本。
+// 在 RV32 / RV64 视角下不一样的, 同时给出两版宏 (RV64 版用 #if 0 包占位)。S-mode 5 个
+// 字段 (SIE/SPIE/SPP/SUM/MXR) 在 RV32 / RV64 位置一致, 已在上方加宏, 不需要双版本。
 //
-// 当前 a_01_8 不真激活 SD / UXL / SXL (fixture 不构造 FS/VS dirty, 也不切 RV64);
-// 字段宏先暴露便于未来切 RV64 / 接 F/D 扩展时一处启用, 不需要回头加。
+// 当前不真激活 SD / UXL / SXL (fixture 不构造 FS/VS dirty, 也不切 RV64); 字段宏先暴露
+// 便于未来切 RV64 / 接 F/D 扩展时一处启用, 不需要回头加。
 // ----------------------------------------------------------------------------
 
 // SD (Status Dirty): RV32 在 mstatus[31], RV64 在 mstatus[63]。

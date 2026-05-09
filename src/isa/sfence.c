@@ -1,13 +1,13 @@
 //
 // Created by liujilan on 2026/5/7.
-// a_01_8 isa/sfence —— sfence_vma_helper 实现 (extern, slow path)。
+// isa/sfence —— sfence_vma_helper 实现 (extern, slow path)。
 //
 // 顶部接口 doc + RV spec 四组合 vs 简化方案 4.a 对照 + 涉及哪些 tlb_table[] 槽 见 sfence.h。
 //
 
 #include "sfence.h"
 
-#include <stddef.h>          // NULL (a_01_8 v01 加; sfence.c 内 if (tlb_table[priv] != NULL) 用)
+#include <stddef.h>          // NULL (容器空指针 check 用)
 #include <stdint.h>
 
 #include "config.h"          // ASID_MAX, ASID_MASK
@@ -37,12 +37,11 @@ void sfence_vma_helper(cpu_t *hart,
     int single_asid_mode = (rs1 == 0u) && (rs2 != 0u);
 
     /* tlb_table[priv] 是 ASID 容器指针; 容器自身可能 NULL (该 priv 没 eager-allocate 容器).
-     * a_01_8 现状:
+     * 当前现状:
      *   [PRIV_S] 容器 eager 分配 (cpu_create), 永远非 NULL
-     *   [PRIV_H] 容器 a_01_8 不分配, 永远 NULL (留 H 扩展激活时分配)
-     *   [PRIV_M] / [PRIV_U] 见 D13 (此处不动)
-     * 索引 tlb_table[priv][asid] 前必须 check 容器非 NULL — 否则 NULL[asid] 是 host 段错
-     * (a_01_8 v01 fixture (g) 跑 sfence.vma 时 ASan 抓到本 bug). */
+     *   [PRIV_H] 容器当前不分配, 永远 NULL (留 H 扩展激活时分配)
+     *   [PRIV_M] 永远 NULL (Trust regime bypass TLB); [PRIV_U] 副本于 [PRIV_S]
+     * 索引 tlb_table[priv][asid] 前必须 check 容器非 NULL — 否则 NULL[asid] 是 host 段错。 */
 
     if (single_asid_mode) {
         /* (c) 单 ASID 清: WARL 截 asid 到 ASID_MASK 位 (跟 csr_satp_write 同, host 内存安全) */
@@ -51,7 +50,7 @@ void sfence_vma_helper(cpu_t *hart,
             tlb_clear(hart->tlb_table[PRIV_S][asid]);     /* 主目标 */
         }
         if (hart->tlb_table[PRIV_H] != NULL) {
-            tlb_clear(hart->tlb_table[PRIV_H][asid]);     /* a_01_8 不到这, H 扩展时激活 */
+            tlb_clear(hart->tlb_table[PRIV_H][asid]);     /* 当前不到这, H 扩展时激活 */
         }
     } else {
         /* (a)/(b)/(d) 全清: 遍历所有 ASID 槽位调 tlb_clear (tlb_clear(NULL) no-op) */

@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/28.
-// a01_3 interpreter 模块实现 (算术 / 逻辑 / 立即数子集)。
+// interpreter 模块实现 (decode → switch → 执行; pure case + may-trap helper + boundary)。
 //
 // 顶部模块文档见 interpreter.h。fast/slow path 协议见 dummy.txt §1; x0 编码见 §2;
 // TLB 派发见 §4。
@@ -10,25 +10,24 @@
 
 #include "config.h"     // BLOCK_INST_LIMIT, IALIGN_MASK
 #include "cpu.h"
-#include "csr.h"        // csr_op + csr_op_t (a_01_5_a 6 csr case)
+#include "csr.h"        // csr_op + csr_op_t
 #include "decode.h"
-#include "isa/lsu.h"    // load_helper (static inline) + store_helper (extern), a_01_6 5 load + 3 store
-#include "isa/sfence.h" // sfence_vma_helper (extern), a_01_8 OP_SFENCE_VMA case
-#include "riscv.h"      // PRIV_M (a_01_5_c MRET 读 hart->trap.xepc[PRIV_M])
+#include "isa/lsu.h"    // load_helper (static inline) + store_helper (extern)
+#include "isa/sfence.h" // sfence_vma_helper (extern)
+#include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M])
 #include "tlb.h"
-#include "trap.h"       // trap_raise_exception 真 helper (a_01_5_b; 替换 a_01_4 的 file-static 占位)
+#include "trap.h"       // trap_raise_exception (_Noreturn longjmp)
 
 #include <stdint.h>
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint32_t *count_out) {
-    // a_01_6: current_tlb 透传给 load_helper / store_helper (BARE: NULL; SV32: 非 NULL)。
-    // 不再 (void)current_tlb 抑制 unused — 真用了。
+    // current_tlb 透传给 load_helper / store_helper (BARE: NULL; SV32: 非 NULL)。
 
     // dummy.txt §2 局部垃圾桶变量: 写 x0 的 dead store 落点。
     // 编译器 DCE 会把这个 store 干掉, 等于 NO-OP; 保留是为统一 "所有写都通过同一个宏" 风格,
-    // 让未来 IR / 后端不感知 x0 特殊性 (a01_3 体现不到, 但统一)。
+    // 让未来 IR / 后端不感知 x0 特殊性。
     uint32_t x0_garbage = 0;
     (void)x0_garbage;            // 防 -Wunused-variable; 真有 WRITE_REG(0,...) 时编译器会用
 
@@ -60,7 +59,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //                                       not-taken → 不写 pc, 让 fetch loop 末段 +=
     //                                       d.pc_step 自动推进)。
     //
-    // a_01_10 (7) step 2 修 (user D9 主导): branch 是 control flow 特例 —
+    // branch 是 control flow 特例:
     //   - taken: case 自写 pc (跳到 imm 目标), 必须 goto out 跳过 fetch loop 末段, 否则
     //            末段 += d.pc_step 会破坏 pc (= taken_target + 2/4); count++ + SYNC_COUNT
     //            在 goto out 之前显式做 (跟 fetch loop 末段一致语义)
@@ -69,17 +68,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //                 pc + 2 (RVC) 或 pc + 4 (32-bit); 然后 boundary check goto out
     //                 (branch is hard boundary)
     //
-    // d.pc_step 含 (decode_rvc CB / 32-bit B-type):
+    // d.pc_step 透传 (decode_rvc CB / 32-bit B-type):
     //   - 32-bit branch: PC_STEP_RV = 4
     //   - RVC C.BEQZ/C.BNEZ: PC_STEP_RVC = 2
     //   两条路径都通过 d.pc_step 在 not-taken 端自动适配, BRANCH_IF 不需要再判断 raw_inst
-    //   位段 (decode 阶段已知信息透传到 d.pc_step)。
-    //
-    // 历史 bug (a_01_4 起步): branch d.pc_step 设 PC_STEP_NONE = 0 — 当时只考虑 taken 路径
-    //   (case 自写 pc + fetch loop 末段 += 0 NOP), 忘了 not-taken 是顺序推进 (需 += 2 或 4)。
-    //   bug 导致 not-taken 路径 pc 不动, dispatcher 重派发还从 branch PC 取指, 死循环。
-    //   a_01_4 fixture 实际 PASS 是因为 BRANCH_IF 当时 hardcoded `pc + 4u` 帮 case 写 pc,
-    //   绕开 d.pc_step. 现在修复 — d.pc_step 透传指令长度, BRANCH_IF 走 fetch loop 末段。
+    //   位段 (decode 阶段已知信息透传到 d.pc_step; 详见 decode.h pc_step doc 设计哲学)。
     //
     // pc + 2 / pc + 4 都一定 IALIGN-aligned (pc 自身已对齐, +2/+4 不破坏对齐), 不需 check,
     // fetch loop 末段直接 += 即可。taken 路径仍走 WRITE_PC_OR_TRAP 做 misalign check (branch
@@ -96,7 +89,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         /* not-taken: 不写 pc, fetch loop 末段 += d.pc_step + boundary out */ \
     } while (0)
 
-    // SYNC_COUNT —— 把当前 count 同步到 dispatcher 的 count_out 指针 (a_01_10 (7) step 1 加)。
+    // SYNC_COUNT —— 把当前 count 同步到 dispatcher 的 count_out 指针。
     //
     // 使用场景 (跟 JIT prologue/epilogue 哲学一致, dummy.txt §1):
     //   在"可能 trap / 回 dispatcher" 的边界同步 count, 让 longjmp 路径下 dispatcher 收到
@@ -129,10 +122,21 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
 
     uint32_t count = 0;
 
+    // 跨页软边界状态: 块入口 page 起点 (host_ram_base 4K 对齐 — ram.c mmap(NULL,...) 内核
+    // 分配地址必然 page-aligned; gpa_to_hva_offset 也 4K 对齐 → invariant: (hva_pc & 0xFFF)
+    // == (gva_pc & 0xFFF), 解释器在 hva 上判跨页等价于在 gva 上判, 不需单独保留 gva)。
+    const uintptr_t page_mask  = ~(uintptr_t)0xFFFu;
+    const uintptr_t entry_page = (uintptr_t)hva_pc & page_mask;
+
     while (count < BLOCK_INST_LIMIT) {
-        // 取指: hva_pc 指向当前指令字节起点。a01_3 假设块内不跨 4K page, 不需要每次重做
-        // mmu_translate_pc。memcpy 防 strict-aliasing / unaligned 风险 (RV32 指令必 4 字节
-        // 对齐, 实际 hva_pc 也对齐, 但 memcpy 表达更通用; 编译器会优化为单 mov)。
+        // 取指: hva_pc 指向当前指令字节起点。块内每条指令完整在同一 4K page 内 (推进后
+        // 跨页时退出 block, 见 fetch loop 末段)。memcpy 防 strict-aliasing / unaligned 风险
+        // (RV32 指令必 4 字节对齐, 实际 hva_pc 也对齐, 但 memcpy 表达更通用; 编译器会优化
+        // 为单 mov)。
+        // 注: page 末 RVC (hva_pc & 0xFFF == 0xFFE) 时 memcpy 4 字节会 over-read 2 字节进
+        // 下一 page。BARE / SV32 下 mmap 连续 128MB, over-read 物理无 segfault; decode_rvc
+        // 只读低 16 位, over-read 字节不参与解码, 逻辑无害。RAM 末尾 4 字节是唯一例外
+        // (fixture 不写到那)。
         uint32_t inst;
         memcpy(&inst, hva_pc, 4);
 
@@ -146,7 +150,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         const uint32_t shamt_i = (uint32_t)d.imm & 0x1Fu;
 
         // ====================================================================
-        // count_out 同步协议 (a_01_10 (7) step 1 加; SYNC_COUNT 宏 doc 见上方)
+        // count_out 同步协议 (SYNC_COUNT 宏 doc 见上方)
         // ====================================================================
         //
         // count 跨 longjmp 跳走时, dispatcher 必须收到"trap 触发指令前已成功执行" 的
@@ -248,7 +252,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 WRITE_REG(d.rd, READ_REG(d.rs1) & READ_REG(d.rs2));
                 break;
 
-            // ---- B-type BRANCH (a_01_4) ----
+            // ---- B-type BRANCH ----
             // 比较 rs1 / rs2 (按 funct3 决定有/无符号 + 比较方向); taken 走 pc + imm
             // (经 WRITE_PC_OR_TRAP 含对齐检查), not-taken 走 pc + 4 (固定 32-bit 分支)。
             case OP_BEQ:  BRANCH_IF(READ_REG(d.rs1)            == READ_REG(d.rs2));            break;
@@ -258,21 +262,21 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             case OP_BLTU: BRANCH_IF(READ_REG(d.rs1)            <  READ_REG(d.rs2));            break;
             case OP_BGEU: BRANCH_IF(READ_REG(d.rs1)            >= READ_REG(d.rs2));            break;
 
-            // ---- J-type JAL (a_01_4) ----
-            // rd = pc + 4 (返回地址, 调用约定: rd=x1 是 ra, rd=x0 是无返回纯跳转); pc =
-            // pc + imm (经 WRITE_PC_OR_TRAP 含对齐检查)。
-            // 写 rd 在写 pc 之前: 即使后者 trap 也要先把 rd 写好? 不, 反过来想 — 如果 trap
-            // 触发, 整条指令视为未执行 (precise trap), rd 也不该被写。所以 WRITE_REG 应该
-            // 在对齐检查通过之后。但 WRITE_PC_OR_TRAP 的对齐检查在写 hart->regs[0] 之前,
-            // 而 WRITE_REG 写的是 rd != 0; pc-misalign 在 IALIGN=16 + jal/branch imm[0]=0
-            // 编码下永远不命中, 顺序问题在本项目不构成实际正确性 bug; 但为了"语义严格",
-            // 之后 (a_01_5 真接 trap) 可以重构成 "先算 target → 检查对齐 → 写 rd → 写 pc"。
-            // 当前先按"写 rd 再 WRITE_PC_OR_TRAP"形态走, 简洁 + 与现状语义一致。
-            // a_01_10 (7) step 3 修 (跟 BRANCH_IF taken 同形态): JAL/JALR 是 "总跳" control
-            // flow, case 自写 pc 后必须 goto out 跳过 fetch loop 末段 (避免 += d.pc_step 破坏
-            // case 写的 jump target). ra = pc + d.pc_step (替代 hardcoded pc+4u; RV=4 / RVC=2,
-            // 兼容 RVC C.JAL / C.JALR ra=pc+2 spec). count++ + SYNC_COUNT 在 goto out 之前
-            // 显式做。
+            // ---- J-type JAL ----
+            // rd = pc + d.pc_step (返回地址; 调用约定 rd=x1 是 ra, rd=x0 是无返回纯跳转;
+            // d.pc_step = RV=4 / RVC=2 兼容 C.JAL ra=pc+2 spec); pc = pc + imm (经
+            // WRITE_PC_OR_TRAP 含对齐检查)。
+            //
+            // 跟 BRANCH_IF taken 同形态: JAL/JALR 是 "总跳" control flow, case 自写 pc 后
+            // 必须 goto out 跳过 fetch loop 末段 (避免 += d.pc_step 破坏 case 写的 jump
+            // target); count++ + SYNC_COUNT 在 goto out 之前显式做 (跟 fetch loop 末段
+            // 一致语义)。
+            //
+            // 写 rd / 写 pc 顺序 (precise trap 语义): 严格按 RV precise trap 应该 "算 target
+            // → 检查对齐 → 写 rd → 写 pc"。当前 IALIGN=16 + jal/branch imm[0]=0 编码下
+            // pc-misalign 永远不命中 (是 dead code), 写 rd / 写 pc 顺序在本项目不构成实际
+            // 正确性 bug。简洁起见保持"写 rd 再 WRITE_PC_OR_TRAP"形态, 真做 IALIGN=32 时
+            // 重构成严格顺序。
             case OP_JAL:
                 WRITE_REG(d.rd, pc + d.pc_step);
                 WRITE_PC_OR_TRAP(pc + (uint32_t)d.imm);
@@ -280,7 +284,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 SYNC_COUNT();
                 goto out;
 
-            // ---- I-type JALR (a_01_4) ----
+            // ---- I-type JALR ----
             // 同 JAL, 区别: 目标 = (rs1 + imm) & ~1u (RV spec 强制 mask LSB; mask 后 bit[0]
             // 永远 0, 即 IALIGN=16 永远过)。
             case OP_JALR:
@@ -290,13 +294,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 SYNC_COUNT();
                 goto out;
 
-            // ---- I-type SYSTEM CSR 6 变体 (a_01_5_a) ----
+            // ---- I-type SYSTEM CSR 6 变体 ----
             // 6 个 op_kind 在 csr 侧映射到 3 个内核操作 (csr_op_t) + new_val 来源:
             //   RW/RS/RC:    new_val = READ_REG(d.rs1)             /* rs1 是寄存器号 */
             //   RWI/RSI/RCI: new_val = (uint32_t)d.rs1             /* rs1 字段当 5-bit zimm */
             // csr_op 返回 read_old, WRITE_REG(d.rd, old) 写 rd (rd=x0 走 dummy.txt §2 dead store
             // 路径, 自然丢弃)。case 末 break (不 goto out), fetch loop 末 count++ 后
-            // is_block_boundary_inst (Step 2 已 return 1) 让 fetch loop 退出, dispatcher
+            // is_block_boundary_inst → 1 让 fetch loop 退出, dispatcher
             // 重派发 pc + 4 进下一块。
             //
             // d.imm 是 12-bit csr addr (decode 已无符号扩展放低 12 位, 高 20 位 0); 这里
@@ -304,7 +308,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // cast 等价于 d.imm & 0xFFF, 但语义清晰)。
             //
             // d.raw_inst 是 32-bit 原始指令编码 (decode 顶部已填), 给 csr_op 内 trap 路径
-            // 填 mtval 用 (a_01_5_b 真接 trap.c 后激活)。
+            // 填 mtval 用。
             case OP_CSRRW:
                 SYNC_COUNT();
                 WRITE_REG(d.rd, csr_op(hart, (uint32_t)d.imm, READ_REG(d.rs1),
@@ -336,20 +340,19 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                                        CSR_OP_RC, d.raw_inst));
                 break;
 
-            // ---- I-type SYSTEM (ECALL / EBREAK / MRET) ---- a_01_5_c
+            // ---- I-type SYSTEM (ECALL / EBREAK / MRET) ----
             //
             // ECALL: 触发 environment-call trap, cause 按 priv 分流 (RV spec table 3.6):
             //          priv U → cause 8, priv S → cause 9, priv M → cause 11
             //          有意写成 (8 + hart->priv) 公式 — RV 编码巧合: PRIV_U=0, PRIV_S=1,
-            //          PRIV_M=3 与 cause 8/9/11 差 8。a_01 hart->priv 永远 PRIV_M (= 3),
-            //          所以实际值 = 11。Spike/QEMU 同做法。
+            //          PRIV_M=3 与 cause 8/9/11 差 8。Spike/QEMU 同做法。
             //          tval = 0 (RV spec §3.1.17: ECALL/EBREAK 的 mtval write 0)。
             //
             // EBREAK: cause 3 (breakpoint, RV spec); 不分 priv。tval 一般 = 0
             //          (实现 debug 子集时可填触发 PC, 项目当前 = 0)。
             //
             // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径 + trap_set_state
-            //          的反操作 (a_01_7 真激活, 替换 a_01_5_c 简化版):
+            //          的反操作:
             //          - hart->priv = mstatus.MPP                 (从 MPP 恢复 caller priv)
             //          - mstatus.MIE  = mstatus.MPIE              (恢复 interrupt-enable)
             //          - mstatus.MPIE = 1                          (RV spec 要求)
@@ -361,11 +364,10 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
             //          boundary) → goto out 退出 fetch loop, dispatcher 重派发 from xepc。
             //
-            //          权限要求: MRET 仅在 priv >= M 时合法 (M-mode CSR 入口); a_01_7 csr_op 入口判
-            //          激活后, 由 csrw mepc / csrr mepc 这条 csr 入口判把关; 但 MRET 本身不是 csr
-            //          指令, 是 system 指令, 没走 csr_op。当前 fixture 只在 M-mode 跑 MRET; 真做
-            //          U/S-mode 时, MRET 在 U/S 触发 cause=2 (illegal instruction) 是 spec 要求,
-            //          a_01_7 暂不接 (本次 fixture 不构造 U-mode mret, 留 a_01_8+)。
+            //          权限要求: MRET 仅在 priv >= M 时合法 (M-mode CSR 入口); MRET 本身不是
+            //          csr 指令而是 system 指令, 没走 csr_op 入口判。U/S-mode 触发 MRET 应
+            //          cause=2 (illegal instruction) — 当前 case 入口未做 priv 检查, 真做 OS
+            //          隔离时在 case 入口加 priv 判 (跟 SRET 同形态)。
             case OP_ECALL:
                 /* RV 编码巧合: PRIV_U=0/S=1/M=3 ↔ cause 8/9/11 (= CAUSE_ECALL_FROM_U + priv).
                  * Spike / QEMU 同写法; PRIV_H=2 在没 H 扩展下不会触发 (hart->priv ∉ {2}). */
@@ -401,7 +403,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
-            // ---- a_01_8 Step 6 SRET (跟 OP_MRET 同形态; S-mode 字段段 + sepc) ----
+            // ---- I-type SYSTEM SRET (跟 OP_MRET 同形态; S-mode 字段段 + sepc) ----
             //
             // RV Privileged Spec Vol II §3.3.2:
             //   priv = SPP (1-bit; 0=U, 1=S)
@@ -411,11 +413,10 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //   pc   = sepc (= trap.xepc[PRIV_S])
             //   in_trap = 0 (项目复位嵌套链, 跟 MRET 同)
             //
-            // 权限要求 (a_01_8 暂不接, 跟 a_01_7 OP_MRET 风格一致):
+            // 权限要求 (跟 OP_MRET 同形态, 当前未实现):
             //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction.
-            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2). 当前 fixture (a) M→S→U→M
-            //   只在 S-mode 跑 SRET (S→U), 不构造 U-mode SRET / TSR=1; 真做 priv 检查留 a_03+
-            //   时跟 MRET 一起补 (interpreter case 入口或 csr_op 风格的 priv 检查段)。
+            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2). 真做 OS 隔离时跟 MRET
+            //   一起补 (interpreter case 入口或 csr_op 风格的 priv 检查段)。
             case OP_SRET: {
                 uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 
@@ -440,11 +441,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
-            // ---- I-type LOAD (5 op, a_01_6) ----
+            // ---- I-type LOAD (5 op) ----
             //
-            // 不对称设计 (file_plan §8.interpreter D 区, dummy.txt §1 末段): load 走
-            // static inline load_helper (isa/lsu.h, fast path); BARE 路径直接 host load,
-            // SV32 路径 a_01_7+ 加 TLB lookup + walker_helper_load miss。
+            // 不对称设计 (dummy.txt §1 末段): load 走 static inline load_helper (isa/lsu.h,
+            // fast path); BARE 路径直接 host load, SV32 路径 TLB lookup + walker_helper_load
+            // miss。
             //
             // 方案 A (helper 不知 signed): load_helper 返回低 size 字节有效 + 高位 0 的 uint32_t,
             // case 自做 sext (LB int8_t / LH int16_t cast → int32_t 再 cast 回 uint32_t) 或
@@ -452,12 +453,12 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //
             // ea 算成 uint32_t (RV32 wraparound 算术; gva = rs1 + imm 自然 wrap)。imm 是
             // int32_t (decode 已 sign-ext), 加到 uint32_t 上要先 cast (避免 -Wsign-conversion;
-            // 跟 a_01_4 BRANCH_IF / WRITE_PC_OR_TRAP 路径同模式)。
+            // 跟 BRANCH_IF / WRITE_PC_OR_TRAP 路径同模式)。
             //
             // 错误路径 (load_helper 内部 trap_raise_exception _Noreturn longjmp):
             //   misalign (gva & (size-1)) != 0    → cause 4
-            //   PA 不在 RAM (a_01_6 BARE)         → cause 5 + fprintf "MMIO not implemented"
-            //   SV32 路径 (a_01_6 不可达)         → cause 13 + fprintf "SV32 not implemented"
+            //   BARE 路径 PA 不在 RAM             → cause 5 + fprintf "MMIO not implemented"
+            //   SV32 路径 walker fault            → cause 13 (page fault) / 5 (access fault)
             // 长跳走 dispatcher 落点; 这里 break 后的 fetch loop 末尾 += pc_step / count++ /
             // boundary 检查不会执行。
             case OP_LB: {
@@ -491,18 +492,17 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
-            // ---- S-type STORE (3 op, a_01_6) ----
+            // ---- S-type STORE (3 op) ----
             //
             // 不对称设计: store 走 extern store_helper (isa/lsu.c, slow path)。helper 内部
             // 处理 misalign / RAM 检查 / host store / reservation 清除占位 / 未来 SMC 检测;
-            // 解释器 case 不感知。a_01_5_c 跟 a_01_5_b 比 case 数量增加, 但 store path 形态
-            // 跟 csr_op 入口风格一致 (caller 简洁, helper 内做事)。
+            // 解释器 case 不感知 (caller 简洁, helper 内做事; 跟 csr_op 入口风格一致)。
             //
             // SB/SH/SW 写多少字节由 size 决定; value = READ_REG(d.rs2) 整 32 位传给 helper,
             // helper 内部 memcpy size 字节 (SB 写低 8 位, SH 写低 16 位, SW 写全 32 位)。
             //
             // 错误路径 (store_helper 内部 trap_raise_exception _Noreturn longjmp):
-            //   misalign → cause 6; 不在 RAM → cause 7 + fprintf; SV32 占位 → cause 15。
+            //   misalign → cause 6; BARE 不在 RAM → cause 7 + fprintf; SV32 walker fault → 15/7。
             case OP_SB: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
@@ -522,10 +522,10 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
-            // ---- a_01_8 SFENCE.VMA ----
+            // ---- I-type SYSTEM SFENCE.VMA ----
             //
-            // 接口方案 B (a_01_session_011 user 拍): helper 接 4 个独立信息, 分两组 — 寄存器
-            // **值** (vaddr_val/asid_val, 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
+            // 接口设计: helper 接 4 个独立信息, 分两组 — 寄存器**值** (vaddr_val/asid_val,
+            // 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
             // (rs1/rs2, 0..31)。两组语义独立不可互相推导:
             //   - 值: 真做事用 (helper 4.a 简化下只用 asid_val; vaddr_val 是 (b)/(d) 精确实现
             //          的预留, 当前 (void) 抑制 unused)
@@ -551,13 +551,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                                   d.rs1,           d.rs2);
                 break;
 
-            // ---- 兜底 ---- (a_01_5_b 接 trap_raise_exception 真路径)
+            // ---- 兜底 ----
             case OP_UNSUPPORTED:
                 // RV cause 2 = illegal instruction; tval = raw_inst (RV spec §3.1.16)。
-                // a_01_5_b: helper 内部调 trap_set_state (写 xcause/xtval/xepc, regs[0]=xtvec),
-                //           普通 return; 这里 goto out 退出 fetch loop, dispatcher 通过
-                //           while(in_trap < 3) 接管 (in_trap=3 时退出 dispatcher)。
-                // a_01_5_c: helper 标 _Noreturn longjmp, goto out 变 unreachable 但保留无害。
+                // helper 标 _Noreturn longjmp 跳回 dispatcher sigsetjmp 落点,
+                // goto out 变 unreachable 但保留无害 (GCC -Wunreachable-code 默认 disabled)。
                 SYNC_COUNT();
                 trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, /*tval*/d.raw_inst);
                 goto out;
@@ -574,7 +572,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         hva_pc        += d.pc_step;
         count++;
 
-        // 硬边界判定 (a_01_4 接入): branch/jal/jalr 类 op 已在上方 case 内写好新 pc, 此处
+        // 跨页软边界: 推进后 hva_pc 进新 page → 退出 block, 让 dispatcher 重 mmu_translate_pc
+        // 拿新 page 的 hva (SV32 下 walker 重做权限检查)。跟 BLOCK_INST_LIMIT 同性质 (软
+        // 边界), 块入口指令必跑一次 (即使 hva_pc & 0xFFF 在 page 末) — entry_page 由块入口
+        // 算出, 第一次进 fetch loop 时必命中本 page。
+        if (((uintptr_t)hva_pc & page_mask) != entry_page) goto out;
+
+        // 硬边界判定: branch/jal/jalr 类 op 已在上方 case 内写好新 pc, 此处
         // 退出 fetch loop, 让 dispatcher 重新 mmu_translate_pc 拿新入口的 hva 进下一块。
         // boundary 那条指令计入 count (precise: 已成功执行); trap 路径走 WRITE_PC_OR_TRAP
         // 内 goto out, 不到此处, count 不含 trap 那条。

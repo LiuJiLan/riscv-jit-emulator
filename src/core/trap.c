@@ -1,22 +1,13 @@
 //
 // Created by liujilan on 2026/5/4.
-// a_01_5_c → a_01_7 trap 模块实现 (架构语义层 + 双 raise 入口接通 sigsetjmp 协议 +
-//           a_01_7 起真切 priv mode + 写 mstatus.MPP/MPIE/MIE)。
+// trap 模块实现 (架构语义层 + 双 raise 入口接通 sigsetjmp 协议 + 真切 priv mode + 写
+// mstatus/sstatus 按 deliver_priv 分流)。
 //
 // 顶部接口 doc 见 trap.h; 跨文件协议见 src/dummy.txt §1。
 //
-// 阶段演进:
-//   a_01_5_b: trap_set_state 候选 A 早 return; trap_raise_exception 普通 return (不 longjmp)
-//   a_01_5_c: trap_raise_exception 标 _Noreturn + siglongjmp 跳回 dispatcher 落点
-//   a_01_7:   trap_set_state 真切 priv (写 _mstatus 的 MPP/MPIE/MIE; 改 hart->priv = deliver_priv);
-//             OP_MRET 真切 priv 在 interpreter.c case 内做 (反操作)
-//   a01_9 step 4b: deliver_priv 按 medeleg 真生效 (U/S-mode trap + medeleg.bit(cause)=1 时
-//             deliver S, 否则 deliver M; M-mode trap 总 deliver M); mstatus/sstatus 字段写
-//             按 deliver_priv 分流 (deliver M 写 MPP/MPIE/MIE; deliver S 写 SPP/SPIE/SIE)
-//
-// 未实现 (留 a_03+):
-//   - mideleg-driven deliver_priv (中断机制未实现; mideleg 字段 a01_9 step 4a 就位但
-//     trap_set_state 不读 — 项目当前 trap 都是 sync exception, 走 medeleg 路径)
+// 未实现:
+//   - mideleg-driven deliver_priv (中断机制未做; _mideleg 字段就位但 trap_set_state 不读
+//     — 项目当前 trap 都是 sync exception, 走 medeleg 路径)
 //
 
 #include "trap.h"
@@ -24,7 +15,7 @@
 #include "cpu.h"        // cpu_t 完整定义 (trap.h 只 forward, 这里要访问字段)
 #include "riscv.h"      // PRIV_M
 
-#include <setjmp.h>     // siglongjmp (a_01_5_c)
+#include <setjmp.h>     // siglongjmp
 #include <stdint.h>
 
 
@@ -45,7 +36,7 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
     }
 
     // ------------------------------------------------------------------------
-    // a01_9 step 4b: deliver_priv 按 medeleg 真生效
+    // deliver_priv 按 medeleg 真生效
     //
     // RV Privileged Spec §3.1.8 medeleg: 同步 exception 委派 bitmask, bit(cause) = 1 时
     // 该 cause 在 U/S-mode 下触发时 deliver 给 S-mode (而不是 M-mode)。规则:
@@ -57,7 +48,7 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
     // (M 不会出现 ecall_from_M trap 在 U/S-mode 下, 这条 bit 永远没意义)。
     //
     // 项目当前 trap 都是 sync exception (中断机制 mip/mie/mideleg 都未实现); 所以
-    // trap_set_state 只查 medeleg, 不查 mideleg。a_03 中断真做时加 mideleg 路径。
+    // trap_set_state 只查 medeleg, 不查 mideleg。中断机制真做时加 mideleg 路径。
     //
     // cause < 64 边界检查: _medeleg uint64_t (类 1 future-proof RV64); cause >= 64 时
     // bit shift UB; 项目当前所有 cause < 32, 边界检查防御。
@@ -136,9 +127,8 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
 // ----------------------------------------------------------------------------
 // trap_raise_exception —— interpreter / JIT block 内 helper 长跳入口; 详见 trap.h doc
 //
-// a_01_5_c 形态: _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回
-//                dispatcher 入口的一次性 sigsetjmp 落点。caller (interpreter) 内 goto out
-//                变 unreachable 但保留无害。
+// _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
+// 的一次性 sigsetjmp 落点。caller (interpreter) 内 goto out 变 unreachable 但保留无害。
 // ----------------------------------------------------------------------------
 _Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval) {
     (void)trap_set_state(hart, cause, tval);

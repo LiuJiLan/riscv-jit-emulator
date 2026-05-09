@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/29.
-// a01_2 tlb 模块对外接口。
+// tlb 模块对外接口。
 //
 // ============================================================================
 // tlb_table[4] 语义约定 (cpu_t 持有, 见 cpu.h)
@@ -8,34 +8,38 @@
 //
 // cpu_t 内的 `tlb_t **tlb_table[4]` 是 4 槽派发数组, index 按 RV privilege encoding:
 //
-//   [0] = U  : ASID 数组容器 (tlb_t **). MSU 默认下别名 [1] (U 共享 S 的 ASID 命名空间);
-//              MU-only 不对称核 (类比 SiFive U74 M-only) 下应别名 [3]。由 cpu_create
-//              按 misa 派发, 由 mstatus / hstatus 写 helper 在 xstatus 变动时维护切换。
+//   [0] = U  : 始终是副本语义 (副本于 [1] S 或 [3] M, 取决于 misa)。副本分配两路:
+//                - 初始化: cpu_create 按 misa 派发 (MSU 副本 [1]; MU-only 副本 [3])
+//                - 运行时: H 扩展 (VS / VU 切换) 由对应 csr_helper 维护 mirror
+//              当前默认 MSU, 副本 [1] (U 与 S 共享 ASID 命名空间)。
 //
-//   [1] = S  : ASID 数组容器 (tlb_t **), entries 由 dispatcher 在首次访问该 ASID 时
-//              懒分配 (调 tlb_alloc 写回)。
+//   [1] = S  : ASID 数组容器 (tlb_t **)。容器由 cpu_create eager 分配, entries 由 walker
+//              在首次访问该 ASID 时懒分配 (调 tlb_alloc 写回)。
 //
 //   [2] = VS : 初版 NULL (无 H 扩展); 未来 H 扩展激活时同 [1] 形态。
 //
-//   [3] = M  : ASID 数组容器 (tlb_t **), 16 槽全部别名同一份共享 leaf (M 模式无 ASID
-//              概念, 用 16 路别名让 dispatcher 用统一的 [select][asid] 索引)。
+//   [3] = M  : 永远 NULL。Trust regime (M-mode 或任何 priv 带 bare satp) 直接走 identity
+//              + IS_GPA_RAM 检查, 不需要 TLB; real CPU bare 下也 bypass MMU/TLB, 我们对齐。
 //
-// 物理元素类型在 cpu_t 中是 tlb_t **(v3 完全对称设计后, 4 槽都是 ASID 数组容器,
-// 类型统一)。早期版本曾因"M 槽是单 leaf, S/V 是 ASID 数组"的类型不对称用 void *
-// 存储, v3 收敛后不再需要 cast。
+// 物理元素类型在 cpu_t 中是 tlb_t ** (4 槽对称, 类型统一; 不需要 cast)。S 实际指向 ASID
+// 容器, U 副本同样指针; M 永远 NULL (Trust regime 不查 TLB); V 当前 NULL, 是 H 扩展接口
+// (激活时同 [1] S 形态)。
 //
-// dispatcher 派发逻辑 (未来; a_01 仍 #if 0):
+// dispatcher 派发逻辑 (见 dispatcher.c block 1):
 //
-//   if (xatp.mode == bare)  select = PRIV_M;   /* M 槽 (16 路别名同一 leaf); 实际位运算 */
-//   else                    select = priv;
-//   leaf = cpu->tlb_table[select][xatp.ASID];
-//   if (leaf == NULL) {                  /* 仅 S/V 槽会发生 */
-//       leaf = tlb_alloc();
-//       cpu->tlb_table[select][xatp.ASID] = leaf;
+//   if (priv == M || xatp.mode == bare) {
+//       regime = REGIME_BARE;  current_tlb = NULL;        // Trust 不查 TLB
+//   } else {
+//       regime = REGIME_SV32;
+//       current_tlb = cpu->tlb_table[priv][xatp.ASID];
+//       if (current_tlb == NULL) {                        // 仅 S/V 槽会发生
+//           current_tlb = tlb_alloc();
+//           cpu->tlb_table[priv][xatp.ASID] = current_tlb;
+//       }
 //   }
-//   /* 把 leaf 通过固定 host 寄存器 (JIT) / 函数参数 (interpreter) 传给 block */
+//   /* 把 current_tlb 通过固定 host 寄存器 (JIT) / 函数参数 (interpreter) 传给 block */
 //
-// M 槽永不 NULL (cpu_create eager 分配 + 16 路别名), 懒分配只在 S/V 的 ASID entries 上发生。
+// 懒分配只在 S/V 的 ASID entries 上发生。
 //
 // 详见 dummy.txt §4 (TLB 作为 block 入口的统一分发机制) + dummy.txt §3 (satp ASID 合法性契约)。
 //
@@ -65,7 +69,7 @@
 //                 可直接用 free 释放
 //             (b) free(NULL) 是 no-op (C 标准保证), 未懒分配的槽位天然无操作
 //             因此 tlb_free 与 free() 等价, 不带额外语义, 不另立。
-//             a_01 唯一调用点是 cpu_destroy (释放 ASID 数组容器中各 entries 时);
+//             当前唯一调用点是 cpu_destroy (释放 ASID 数组容器中各 entries 时);
 //             运行时 TLB 失效走 tlb_clear (memset 保留分配), 不走 free。
 //
 
@@ -100,15 +104,15 @@ typedef struct {
 // 失败返回 NULL (内部已 fprintf), 调用方按 dummy.txt §5 错误风格处理。
 //
 // 调用方:
-//   - cpu_create:   eager 分配 M 槽 [3] 的共享 leaf
-//   - dispatcher:   懒分配 S/V 槽 [priv][asid] entries (a_01 仍 #if 0)
+//   - dispatcher:   懒分配 S 槽 [priv][asid] entries (Sv32 路径首次访问该 ASID 时)
+//   - 未来 H 扩展激活时, [VS] 槽走同样的懒分配路径
 tlb_t *tlb_alloc(void);
 
 // 清空一套叶 TLB (memset 全 0, 保留分配)。
 // NULL 入参 do nothing —— 简化 sfence helper, 不需写 if (tlb_table[PRIV_S][i]) ...
 //
 // 调用方:
-//   - sfence.vma helper (未来): 清 [1][asid] 的 entries, 见 file_plan.md §2.tlb E 区
+//   - sfence.vma helper: 清 [1][asid] 的 entries (具体 ASID 选择见 sfence.c 4 组合分流)
 void tlb_clear(tlb_t *tlb);
 
 #endif //CORE_TLB_H

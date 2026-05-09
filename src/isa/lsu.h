@@ -1,24 +1,24 @@
 //
 // Created by liujilan on 2026/5/5.
-// a_01_6 isa/lsu —— RV32 load/store ISA helpers (Spike `riscv/insns/{load,store}.h` 概念对应)。
+// isa/lsu —— RV32 load/store ISA helpers (Spike `riscv/insns/{load,store}.h` 概念对应)。
 //
-// 不对称设计 (file_plan §8.interpreter D 区, dummy.txt §1 末段):
+// 不对称设计 (dummy.txt §1 末段):
 //   - load_helper:  static inline 在本头文件, caller (interpreter / 未来 translator emit-equiv)
 //                    内联进 fast path。BARE 路径直接 host load; SV32 + TLB hit 也是 inline
-//                    命中, 只有 miss 才走 walker_helper_load slow path (a_01_7+ 加)。
+//                    命中, 只有 miss 才走 walker_helper_load slow path。
 //   - store_helper: extern 函数在 lsu.c, 总是走 helper call (slow path)。
 //                    理由: LR/SC reservation 清除 / 未来 SMC 检测 / 未来副作用扩展, 都需 helper
-//                    介入; store_helper 整体仍是 slow path, 只是初版用 extern 函数 call 形态。
-//                    file_plan §F1 待办: 把 store_helper 改成 static inline (放 lsu.h),
-//                    消除函数 call 开销; helper 内部 misalign / TLB lookup / walker / reservation
-//                    / SMC 仍全是 slow path 操作 (命名"fast path inline 化"有误导性, 实际是
-//                    "helper 链接形态从 extern 变 inline", 见 dummy.txt §1 F1)。
+//                    介入; store_helper 整体仍是 slow path, 只是当前用 extern 函数 call 形态。
+//                    未来改进: 把 store_helper 改成 static inline (放 lsu.h), 消除函数 call
+//                    开销; helper 内部 misalign / TLB lookup / walker / reservation / SMC 仍
+//                    全是 slow path 操作 (命名"fast path inline 化"有误导性, 实际是 "helper
+//                    链接形态从 extern 变 inline", 见 dummy.txt §1 F1)。
 //   interpreter 与 (未来) translator 都遵守这条不对称, 完整背景见 dummy.txt §1 末段。
 //
 // trap 协议 (dummy.txt §1 路径 2a, helper 长跳):
 //   - misalign:    trap_raise_exception(hart, 4 load misalign / 6 store misalign, gva)
 //   - access fault: trap_raise_exception(hart, 5 load access  / 7 store access, gva)
-//   - SV32 page fault (a_01_7+): trap_raise_exception(hart, 13 load page / 15 store page, gva)
+//   - SV32 page fault: trap_raise_exception(hart, 13 load page / 15 store page, gva)
 //   helper 内 trap_raise_exception 是 _Noreturn longjmp, 不返回 caller; caller 不需要 goto out
 //   (但保留无害, 跟 OP_UNSUPPORTED case 同形态)。
 //
@@ -27,11 +27,11 @@
 //   项目选 (b) trap 路径, 实现简单不需要拆字节; LR/SC + AMO 强制对齐本来就是这条路径。
 //   QEMU 默认 (a) split, Spike 默认 (b) trap, 我们跟 Spike。
 //
-// 跨页 (a_01_6 BARE):
+// 跨页:
 //   BARE 路径下 RAM 是 mmap 连续区域, 跨 4K 边界本身 OK; 跨 RAM 边界 (RAM 末端 vs 后续地址不
 //   在 RAM 区) 走 access fault (cause 5/7), 不拆字节。
-//   a_01_7 SV32 加进来时, 跨 PTE 边界化简为 trap (具体 cause 等真做时拍, 主流模拟器都允许
-//   这种简化; RV spec 也不强制要求支持跨页)。
+//   SV32 路径跨 PTE 边界化简为 trap (具体 cause 真细化时拍, 主流模拟器都允许这种简化;
+//   RV spec 也不强制要求支持跨页)。
 //
 
 #ifndef ISA_LSU_H
@@ -43,7 +43,7 @@
 
 #include "config.h"          // GUEST_RAM_START / GUEST_RAM_SIZE / TLB_NUM_ENTRIES
 #include "core/cpu.h"        // cpu_t
-#include "core/mmu.h"        // mmu_walker_helper_load (a_01_8 Step 7 SV32 fall back)
+#include "core/mmu.h"        // mmu_walker_helper_load (SV32 miss / perm 不齐 fall back)
 #include "core/tlb.h"        // tlb_t (current_tlb 参数类型)
 #include "core/trap.h"       // trap_raise_exception (_Noreturn longjmp)
 #include "platform/ram.h"    // gpa_to_hva_offset (BARE host load 解地址)
@@ -58,12 +58,12 @@
 // 参数:
 //   hart        — 调用 hart
 //   current_tlb — NULL = REGIME_BARE (Trust 不走 TLB);
-//                 非 NULL = REGIME_SV32, dispatcher 选定的叶 TLB (a_01_7+ 真用)
+//                 非 NULL = REGIME_SV32, dispatcher 选定的叶 TLB
 //   gva         — guest 虚拟地址 = ea (READ_REG(rs1) + imm)
 //   size        — 1 / 2 / 4 (LB/LBU = 1, LH/LHU = 2, LW = 4)
 //
 // 返回: 32 位 host load 结果, 低 size 字节有效, 高位 0 (memcpy 到预初始化 0 的 buffer)。
-//        sext/zext 由 caller 自做 (方案 A, helper 不知 signed):
+//        sext/zext 由 caller 自做 (helper 不知 signed):
 //   case OP_LB:  WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t)  load_helper(hart, ct, ea, 1));
 //   case OP_LH:  WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t) load_helper(hart, ct, ea, 2));
 //   case OP_LW:  WRITE_REG(d.rd,                              load_helper(hart, ct, ea, 4));
@@ -72,8 +72,8 @@
 //
 // 错误 (longjmp 走 trap_raise_exception, 不返回 caller):
 //   - misalign  → trap_raise(4, gva)
-//   - 不在 RAM (a_01_6 没接 bus_dispatch) → fprintf + trap_raise(5, gva)
-//   - SV32 占位 (a_01_6 不可达, 因 priv 恒 M; 形式上保接口对齐) → fprintf + trap_raise(13, gva)
+//   - BARE PA 不在 RAM (未接 bus_dispatch) → fprintf + trap_raise(5, gva)
+//   - SV32 walker fault → fall back walker_helper_load 内 trap_raise(13/5, gva)
 // ----------------------------------------------------------------------------
 static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
                                    uint32_t gva, uint32_t size) {
@@ -87,11 +87,11 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
         uint32_t pa = gva;  // identity
         // RAM 区检查 (无符号下溢比较, 跟 mmu.c pa_to_fetch_hva 一致)。
         if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-            // PA 不在 RAM 区。a_01_6 bus_dispatch 未实现, fprintf 提示 + trap access fault。
-            // 未来 a_01_7+ 加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO load 走 bus);
-            // 现在一律 cause 5 (Load Access Fault)。
+            // PA 不在 RAM 区。bus_dispatch 未实现, fprintf 提示 + trap access fault。
+            // 未来加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO load 走 bus);
+            // 当前一律 cause 5 (Load Access Fault)。
             fprintf(stderr,
-                    "[lsu] load: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented in a_01_6)\n",
+                    "[lsu] load: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
                     pa);
             trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
         }
@@ -104,18 +104,17 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
 
     // Step 3: REGIME_SV32 (current_tlb 非 NULL) — TLB lookup fast path + miss/perm 错 fall back
     //
-    // fast path 命中条件 (a01_10 (6) SUM 议程修):
-    //   V + tag + check_perm(MMU_PERM_R) — check_perm 是 mmu.h 的 static inline, 跟 walker
-    //   同源, 完整查 priv/PTE_U/SUM/MXR + R-or-(MXR&&X)。inline 展开后 fast path 多 ~8 条
-    //   ALU 指令 (mstatus load 1 次 cache 友好 + SUM/MXR mask + priv 分支 + R/MXR 检查),
-    //   现代 OoO CPU 跟 host load 并行 dispatch, 实际 cycle 增加 ~1-2 / load。
+    // fast path 命中条件: V + tag + check_perm(MMU_PERM_R) — check_perm 是 mmu.h 的 static
+    //   inline, 跟 walker 同源, 完整查 priv/PTE_U/SUM/MXR + R-or-(MXR&&X)。inline 展开后
+    //   fast path 多 ~8 条 ALU 指令 (mstatus load 1 次 cache 友好 + SUM/MXR mask + priv 分支
+    //   + R/MXR 检查), 现代 OoO CPU 跟 host load 并行 dispatch, 实际 cycle 增加 ~1-2 / load。
     //
-    // a_01_8 旧形态 (V + tag + R 简化命中) 错放过 corner case (S+PTE.U=1+SUM=0):
-    //   S 模式访问 PTE.U=1 page 没 SUM 时, 旧 fast path 看 R=1 就 host load 通过, 但 spec
-    //   规定应 page fault。提 check_perm inline 后 fast path 跟 walker 对齐, 不再错放过。
+    // 简化命中 (V + tag + R) 不够 — corner case (S+PTE.U=1+SUM=0): S 模式访问 PTE.U=1 page
+    //   没 SUM 时, 看 R=1 就 host load 通过, 但 spec 规定应 page fault。check_perm inline
+    //   形式让 fast path 跟 walker 同源, 不漏 corner case。
     //
-    // D18 设计点 5 (A 位永远 set, 不查): walker 进 TLB 时永远 set A=1, fast path / check_perm
-    // 都不查 A 位; D 位 load 路径不查 (load 时 walker 不 set D, store fast path 才必查)。
+    // A 位永远 set, 不查: walker 进 TLB 时永远 set A=1, fast path / check_perm 都不查 A 位;
+    // D 位 load 路径不查 (load 时 walker 不 set D, store fast path 才必查)。
     //
     // 不命中 (miss / V=0 / perm 不齐 / 任何不齐) → fall back mmu_walker_helper_load —
     // walker 内重做 walk + check_perm + 必要时 set A 写回 PT + fill TLB; 失败时 walker_helper
@@ -146,7 +145,7 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
 //
 // 详细 doc 见 lsu.c。signature:
 //   hart        — 调用 hart
-//   current_tlb — NULL = REGIME_BARE; 非 NULL = REGIME_SV32 (a_01_7+ 真用)
+//   current_tlb — NULL = REGIME_BARE; 非 NULL = REGIME_SV32
 //   gva         — guest 虚拟地址 = ea (READ_REG(rs1) + imm)
 //   value       — 要 store 的值 (32 位); SB 写 value 低 8 位, SH 写低 16 位, SW 写全部 32 位,
 //                  由 size 决定写多少字节 (helper 内部 memcpy size 字节)
@@ -154,8 +153,8 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
 //
 // 错误 (longjmp 走 trap_raise_exception, 不返回 caller):
 //   - misalign  → trap_raise(6 store misalign, gva)
-//   - 不在 RAM → fprintf + trap_raise(7 store access, gva)
-//   - SV32 占位 → fprintf + trap_raise(15 store page fault, gva)
+//   - BARE 不在 RAM → fprintf + trap_raise(7 store access, gva)
+//   - SV32 walker fault → fall back walker_helper_store 内 trap_raise(15/7, gva)
 // ----------------------------------------------------------------------------
 void store_helper(cpu_t *hart, tlb_t *current_tlb,
                   uint32_t gva, uint32_t value, uint32_t size);

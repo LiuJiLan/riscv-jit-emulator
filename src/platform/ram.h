@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/29.
-// a_01 ram 模块对外接口。
+// ram 模块对外接口。
 //
 // 由 ram_init 初始化的全局清单(声明在本头,定义在 ram.c):
 //   host_ram_base

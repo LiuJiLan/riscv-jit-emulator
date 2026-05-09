@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/29.
-// a01_2 tlb 模块实现 (tlb_alloc / tlb_clear)。
+// tlb 模块实现 (tlb_alloc / tlb_clear)。
 // 顶部模块文档见 tlb.h。报错风格见 src/dummy.txt §5。
 //
 

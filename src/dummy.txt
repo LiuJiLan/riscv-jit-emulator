@@ -260,7 +260,7 @@ store/restore。否决理由:
          (reservation 清除 / 真正 fall back walker 的路径)上
      这等于自动消化了"统一保护"在 store 路径上的成本,但 store_helper 仍是
      slow path —— 只是这条 slow path 的边界从"函数边界"挪到"代码块边界"。
-     完整设计见 file_plan.md 待办(对齐时一并修正命名误导)。
+     完整设计留作未来改进 (对齐时一并修正历史命名误导)。
 
 (F2) 性能 profile 后,如果某个低频 pure helper 意外成为热点,可以单独
      为它加 "no_save" 标注。这是局部优化,不破坏架构。
@@ -280,7 +280,7 @@ store/restore。否决理由:
   - **store**:**全部走 store_helper**(初版无 inline fast path)。
     JIT 和解释器都这样做。
 
-store_helper 内部翻译形态(2026-05-05 拍方案 1, a_01_6 起步前对齐):
+store_helper 内部翻译形态:
 
   接口: store_helper(cpu_t *hart, tlb_t *current_tlb, uint32_t gva,
                      uint32_t value, uint32_t size);
@@ -291,11 +291,11 @@ store_helper 内部翻译形态(2026-05-05 拍方案 1, a_01_6 起步前对齐):
     (b) GVA → host_ptr 翻译, 跟 load inline 路径概念对称, 但在 helper 内做:
         - BARE(current_tlb=NULL): identity + IS_GPA_RAM 检查;
           失败 → trap_raise_exception(cause 7 store/AMO access fault, tval = gva)
-        - SV32(a_01_7+): TLB lookup; 命中 host_ptr; miss → walker_helper_store
+        - SV32: TLB lookup; 命中 host_ptr; miss → walker_helper_store
           → fill TLB → host_ptr; 权限错 → trap_raise_exception(cause 15
           store/AMO page fault, tval = gva)
     (c) host store:*(uint?_t *)host_ptr = value
-    (d) reservation 清除(a_01 注释占位; future LR/SC 真接时清当前 hart 的
+    (d) reservation 清除(注释占位; future LR/SC 真接时清当前 hart 的
         reservation;SMP 时需跨 hart 同步 reservation table)
     (e) future SMC 检测:配合 page_dirty 位图(替代 SIGSEGV 机制)
 
@@ -316,19 +316,17 @@ store_helper 内部翻译形态(2026-05-05 拍方案 1, a_01_6 起步前对齐):
     检查的逻辑放在 store_helper 内部。
   - 未来 SMC 检测优化:可能让 store 路径配合 page_dirty 检查(替代 SIGSEGV
     机制)。
-  - 即使初版 reservation "暂时不清除"(LiuJiLan 的初版决定),接口形态
-    保持 store_helper,以便未来加 reservation 清除只改 helper 内部,
-    不改调用方。
+  - 即使初版 reservation "暂时不清除"(初版简化决定),接口形态保持
+    store_helper,以便未来加 reservation 清除只改 helper 内部,不改调用方。
 
 性能影响:
   - 解释器:每个 store case 走 helper(几条 mov + call),~10-20 cycle。
     解释器本来就慢路径,代价占比小。
   - JIT:每个 store emit 一个 helper call 而非 inline。**这正是 dummy.txt
     §1 "统一保护"所付的代价**(每次 store 都付寄存器 store/restore)。
-  - 未来 store_helper inline 化(file_plan.md 待办;命名澄清见本文 F1)
-    会同时消除 JIT 和(可选)解释器的 store 函数 call 开销。注意
-    inline 化后 store_helper 内部仍全是 slow path 操作,只是边界从
-    函数边界挪到代码块边界。
+  - 未来 store_helper inline 化(命名澄清见本文 F1)会同时消除 JIT 和
+    (可选)解释器的 store 函数 call 开销。注意 inline 化后 store_helper
+    内部仍全是 slow path 操作,只是边界从函数边界挪到代码块边界。
 
 → 这个不对称在 §2.tlb / §3.mmu / §8.interpreter 各自的 D 区都有体现,
   此处只是把它和 longjmp 协议的关系说清楚。
@@ -593,9 +591,8 @@ M 态 / S 态的 bare 模式下,gva == pa(恒等映射)。一种朴素实现可�
   - 本机制不覆盖 block 内 load/store 的 TLB 路径,但相关协议见
     本文 §1(sigsetjmp / 寄存器保护)和 dummy.txt 整体的 fast/slow
     path 哲学
-  - 本机制不强制 a_01 完整实现 TLB 装载;a_01 范围内 dispatcher 的
-    block 2(fetch 路径)是注释占位,真实装载等 a_01_4(tlb/mmu) +
-    a_01_5(interpreter/dispatcher 端到端)完工
+  - 本机制不规定 TLB 实现的具体阶段时序(各 milestone 实现到哪一步由
+    file 自身决定; 本协议描述的是稳定状态)
 
 
 ================================================================================
@@ -629,7 +626,7 @@ M 态 / S 态的 bare 模式下,gva == pa(恒等映射)。一种朴素实现可�
     示例:
       fprintf(stderr, "ram_init: mmap failed: %s\n", strerror(errno));
       fprintf(stderr, "loader_load_bin: open(%s) failed: %s\n", path, strerror(errno));
-      fprintf(stderr, "loader_load_elf: not implemented in a_01\n");
+      fprintf(stderr, "loader_load_elf: not implemented\n");
 
 (2) 该帧之上(包括模块入口、main),不再二次 fprintf "why",只 propagate
     错误码(return -1 或 return NULL)。
@@ -693,7 +690,7 @@ stderr vs stdout
   - 本协议不规定信息的人类可读语言(中英文皆可,但同一模块内一致)。
   - 本协议不覆盖"helper 通过 longjmp 跳走"的路径(那是 §1 的范畴,
     不走这套 fprintf)。
-  - 本协议不规定日志级别 / 日志文件 / syslog;a_01 全部走 stderr 即可。
+  - 本协议不规定日志级别 / 日志文件 / syslog;项目当前全部走 stderr 即可。
 
 
 ================================================================================
@@ -753,7 +750,7 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
     提取 (1) 类做 future-proof: RV32 → RV64 切换时只需改 csr 入口形态 (拆访问 → 整体访问,
     csr.c read/write helper 重写), 不需要改字段类型 + 不需要重新 layout cpu_t / trap_csrs_t。
     这也是为什么 _mstatus / _medeleg / _mideleg 当前都用 uint64_t 而不是 uint32_t — 哪怕
-    a_01 RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
+    项目当前 RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
 
 (2) 第二类 — 副本类 (一个物理字段被多个 csr 入口看, 入口之间不存在派生关系, 各看不同 mask)
     命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)

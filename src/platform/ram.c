@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/29.
-// a_01 ram 实现。
+// ram 实现。
 //
 
 #define _GNU_SOURCE  // for MADV_NOHUGEPAGE on Linux
@@ -30,8 +30,8 @@ int ram_init(void) {
         return -1;
     }
 
-    // 显式排除 transparent huge page,保证 SMC 检测的 4KB 颗粒度。
-    // 相关协议见 dummy.txt §1 / 后续 jit/smc.c 设计。
+    // 显式排除 transparent huge page, 保 4KB 颗粒度服务 SMC 检测 (smc.c 的
+    // page_dirty 位图按 4KB 索引; THP 把页合到 2MB 会让位图粒度失准)。
     if (madvise(p, GUEST_RAM_SIZE, MADV_NOHUGEPAGE) != 0) {
         fprintf(stderr, "ram_init: madvise(MADV_NOHUGEPAGE) failed: %s\n",
                 strerror(errno));

@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/4/28.
-// a01_3 decode 模块实现 (纯函数; 不读 / 不写 cpu_t)。
+// decode 模块实现 (纯函数; 不读 / 不写 cpu_t)。
 //
 // 顶部模块文档见 decode.h。
 //
@@ -18,12 +18,6 @@
 
 // ----------------------------------------------------------------------------
 // decode_rvc —— 16-bit C 扩展 (compressed) 指令的 decode 路径
-//
-// 演进:
-//   a_01_3 起步: 只翻译 C.LI + C.ADDI 两个 RVC 算术 case (用户拍 viii)
-//   a_01_10 (7) step 1: 加完整 RVC 算术 + sp 设置 case (~16 case 含展开 SUB/XOR/OR/AND);
-//                       控制流 (C.JAL/J/JR/JALR/BEQZ/BNEZ/EBREAK) 留 step 2-3, load/store
-//                       (C.LW/SW/LWSP/SWSP) 留 step 4
 //
 // 所有 RVC 复用现有 RV32I op_kind, 不为 RVC 单立 op_kind enum — RVC 是"指令长度变化",
 // 不是"语义变化", 与 RV32I 同源 (decoded_inst_t.pc_step = PC_STEP_RVC = 2 区分 fetch
@@ -64,7 +58,7 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
     const uint32_t funct3 = (inst >> 13) & 0x7u;    // 类别
 
     // ========================================================================
-    // C0 quadrant (op = 00) —— C.ADDI4SPN / (C.LW step 4) / (C.SW step 4)
+    // C0 quadrant (op = 00) —— C.ADDI4SPN / C.LW / C.SW
     // ========================================================================
     if (op == 0x0) {
         // C.ADDI4SPN (funct3=000, CIW-format): addi rd', x2, nzuimm10
@@ -124,7 +118,7 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
     }
 
     // ========================================================================
-    // C1 quadrant (op = 01) —— 算术 + sp + 控制流 (控制流 step 2/3 加)
+    // C1 quadrant (op = 01) —— 算术 + sp + 控制流 (branch / jump)
     // ========================================================================
     if (op == 0x1) {
         const uint32_t rd_full = (inst >> 7) & 0x1Fu;
@@ -310,18 +304,18 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             d.rs1     = rs1_p;
             d.rs2     = 0;                       // x0 (BEQZ/BNEZ 跟 0 比)
             d.imm     = offset;
-            d.pc_step = PC_STEP_RVC;             // a_01_10 (7) step 2 修: branch d.pc_step =
-                                                 // 实际长度 (跟 32-bit branch 同, BRANCH_IF
-                                                 // 宏 taken goto out / not-taken 走末段)
+            d.pc_step = PC_STEP_RVC;             // 实际指令长度 (跟 32-bit branch 同形态;
+                                                 // BRANCH_IF 宏 taken goto out / not-taken
+                                                 // 走 fetch loop 末段 += d.pc_step)
             return d;
         }
 
-        // 其他 C1 子类: C.JAL (001) / C.J (101) — step 3 (jump)
+        // 其他 C1 子段未覆盖: 留 OP_UNSUPPORTED
         return d;
     }
 
     // ========================================================================
-    // C2 quadrant (op = 10) —— C.SLLI / 控制流 + 算术 / load/store (后两段后续 step 加)
+    // C2 quadrant (op = 10) —— C.SLLI / 控制流 + 算术 / load/store
     // ========================================================================
     if (op == 0x2) {
         const uint32_t rd_full  = (inst >> 7) & 0x1Fu;
@@ -346,10 +340,10 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
 
         // C.MV / C.ADD (funct3=100, CR-format): 共用 funct3 跟 C.JR/JALR/EBREAK
         //   inst[12] + rs2 区分:
-        //     [12]=0 + rs2=0: C.JR        (step 3)
+        //     [12]=0 + rs2=0: C.JR
         //     [12]=0 + rs2!=0: C.MV       → ADD rd, x0, rs2 (rd!=0; rd=0 reserved)
-        //     [12]=1 + rs1=rs2=0: C.EBREAK (step 3)
-        //     [12]=1 + rs1!=0 + rs2=0: C.JALR (step 3)
+        //     [12]=1 + rs1=rs2=0: C.EBREAK
+        //     [12]=1 + rs1!=0 + rs2=0: C.JALR
         //     [12]=1 + rs2!=0: C.ADD     → ADD rd, rd, rs2 (rd!=0; rd=0 reserved)
         if (funct3 == 0x4) {
             const uint32_t bit12 = (inst >> 12) & 0x1u;
@@ -371,7 +365,7 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
                 d.rs2  = rs2_full;
                 return d;
             }
-            // bit12 + rs2=0 子段: C.JR / C.JALR / C.EBREAK (a_01_10 (7) step 3 加)
+            // bit12 + rs2=0 子段: C.JR / C.JALR / C.EBREAK
             //   [12]=0 + rs1!=0:        C.JR    → OP_JALR rd=x0, rs1, imm=0
             //   [12]=1 + rs1=0:         C.EBREAK → OP_EBREAK
             //   [12]=1 + rs1!=0:        C.JALR  → OP_JALR rd=x1, rs1, imm=0
@@ -453,7 +447,7 @@ decoded_inst_t decode(uint32_t inst) {
         return decode_rvc((uint16_t)inst);
     }
 
-    // 32-bit 普通 RV 路径 (a_01_3 现有)
+    // 32-bit 普通 RV 路径
     decoded_inst_t d;
     d.raw_inst = inst;
     d.kind     = OP_UNSUPPORTED;     // 默认; 各 case 命中再覆盖
@@ -529,7 +523,7 @@ decoded_inst_t decode(uint32_t inst) {
             }
             break;
 
-        // ---- B-type BRANCH ---- a_01_4
+        // ---- B-type BRANCH ----
         case 0x63: {
             // B-type 13 位有符号立即数 (multiple of 2, imm[0]=0 编码强制), 4 段位拼接 (RV
             // spec Vol I, Conditional Branches 段; J-type 同型, 后面也 4 段):
@@ -549,11 +543,10 @@ decoded_inst_t decode(uint32_t inst) {
                 | (int32_t)(((inst >> 8)  & 0xFu)  << 1)               /* bits 4:1 */
                 | (int32_t)(((inst >> 7)  & 0x1u)  << 11);             /* bit 11 */
             d.imm     = imm;
-            /* a_01_10 (7) step 2 修 (user D9 主导): branch 是 control flow 中的特例 — taken
-             * case 自写 pc, not-taken 顺序推进 (= pc + 指令长度)。a_01_4 起步设 PC_STEP_NONE
-             * 是 bug: 只考虑 taken set pc 路径, 忘了 not-taken 顺序推进。修复 — 设实际指令长度
-             * (RV=4 / RVC=2 in decode_rvc), BRANCH_IF 宏 taken case goto out 跳过 fetch loop
-             * 末段, not-taken 走末段 += d.pc_step 自动推进. */
+            /* branch 是 control flow 中的特例 — taken case 自写 pc, not-taken 顺序推进
+             * (= pc + 指令长度)。设实际指令长度 (RV=4 / RVC=2 in decode_rvc), BRANCH_IF
+             * 宏 taken case goto out 跳过 fetch loop 末段, not-taken 走末段 += d.pc_step
+             * 自动推进. */
             d.pc_step = PC_STEP_RV;
             switch (funct3) {
                 case 0: d.kind = OP_BEQ;  break;
@@ -565,15 +558,15 @@ decoded_inst_t decode(uint32_t inst) {
                 default:
                     // funct3 = 010 / 011 reserved by RV spec; 归 OP_UNSUPPORTED。
                     // 此时 pc_step 已被设为 PC_STEP_NONE, 但 OP_UNSUPPORTED 走 interpreter
-                    // goto out 路径不依赖 pc_step (a_01_5 trap.c 接入后 pc_step 字段对 unsupp
-                    // 也无意义), 不需要 reset。
+                    // goto out 路径不依赖 pc_step (trap_raise(2) 长跳, pc_step 字段对
+                    // unsupp 也无意义), 不需要 reset。
                     d.kind = OP_UNSUPPORTED;
                     break;
             }
             break;
         }
 
-        // ---- J-type JAL ---- a_01_4
+        // ---- J-type JAL ----
         case 0x6F: {
             // J-type 21 位有符号立即数 (multiple of 2, imm[0]=0 编码强制), 4 段位拼接:
             //   imm[20]    = inst[31]                (sign bit)
@@ -591,32 +584,31 @@ decoded_inst_t decode(uint32_t inst) {
                 | (int32_t)(inst & 0xFF000u);                          /* bits 19:12, 在原位 */
             d.kind    = OP_JAL;
             d.imm     = imm;
-            /* a_01_10 (7) step 3 修: JAL d.pc_step = 实际长度 (跟 branch 修复同形态) — 让
-             * interpreter case 内 ra = pc + d.pc_step (RV=4 / RVC=2 future C.JAL); case 末 goto
-             * out 跳过 fetch loop 末段 += d.pc_step (避免破坏 case 写的 jump target). 同时也是
-             * 修复历史 bug — JAL ra hardcoded `pc + 4u` 不兼容未来 RVC C.JAL (ra 应 = pc + 2)。 */
+            /* JAL d.pc_step = 实际指令长度 (跟 branch 同形态), interpreter case 内 ra =
+             * pc + d.pc_step (RV=4 / RVC=2 for C.JAL); case 末 goto out 跳过 fetch loop
+             * 末段 += d.pc_step (避免破坏 case 写的 jump target)。 */
             d.pc_step = PC_STEP_RV;
             break;
         }
 
-        // ---- I-type JALR ---- a_01_4
+        // ---- I-type JALR ----
         case 0x67:
             // funct3 != 0 reserved by RV spec; 归 OP_UNSUPPORTED。
             if (funct3 != 0) break;       // d.kind 默认 OP_UNSUPPORTED
             // 立即数 12 位有符号 (与 OP-IMM 同型), 同样用 ((int32_t)inst) >> 20 算术右移做
             // sign-ext。目标地址的 & ~1u mask 不在 decode 做 (decode 是纯函数, 不知 rs1 值);
-            // 由 interpreter / translator 在 case 内做 (Step 3 WRITE_PC_OR_TRAP 的事)。
+            // 由 interpreter / translator 在 case 内做 (WRITE_PC_OR_TRAP 的事)。
             d.kind    = OP_JALR;
             d.imm     = ((int32_t)inst) >> 20;
-            /* a_01_10 (7) step 3 修: 同 JAL — d.pc_step = 实际长度, 兼容 RVC C.JR/C.JALR */
+            /* 同 JAL: d.pc_step = 实际指令长度, 兼容 RVC C.JR / C.JALR (pc_step=PC_STEP_RVC) */
             d.pc_step = PC_STEP_RV;
             break;
 
-        // ---- I-type SYSTEM ---- a_01_5_a 加 csr 6 变体
+        // ---- I-type SYSTEM (csr 6 变体 + ECALL/EBREAK/MRET/SRET + SFENCE.VMA) ----
         case 0x73: {
             // SYSTEM opcode 含两类指令:
             //   funct3 = 000: ECALL / EBREAK / MRET / SRET / WFI / SFENCE.VMA / ...
-            //                 由 imm[11:0] 进一步区分 (a_01_5_c 加; 现在归 OP_UNSUPPORTED)
+            //                 由 imm[11:0] (或 funct7) 进一步区分
             //   funct3 ∈ {001, 010, 011, 101, 110, 111}: csr 6 变体
             //
             // csr 字段约定 (decode.h enum 段已 doc):
@@ -626,8 +618,8 @@ decoded_inst_t decode(uint32_t inst) {
             //             RWI/RSI/RCI: 5-bit zimm (interpreter 不查 regs, 直接用数值)
             //   d.rd / d.pc_step: 走默认 (rd 顶部已提取; pc_step = PC_STEP_RV)
             //
-            // csr 是硬边界 (decode.h is_block_boundary_inst Step 2 改 return 1, fetch loop
-            // 末退出 → dispatcher 重派发 pc + 4 进下一块)。
+            // csr 是硬边界 (decode.h is_block_boundary_inst → 1, fetch loop 末退出
+            // → dispatcher 重派发 pc + 4 进下一块)。
             d.imm = (int32_t)((inst >> 20) & 0xFFFu);     /* 无符号 12 位放 imm */
             switch (funct3) {
                 case 1: d.kind = OP_CSRRW;  break;
@@ -638,17 +630,16 @@ decoded_inst_t decode(uint32_t inst) {
                 case 7: d.kind = OP_CSRRCI; break;
                 case 0:
                     // funct3=000 system 类: 两层区分:
-                    //   funct7 = 0x09 (= 0b0001001) → SFENCE.VMA  (rs1=vaddr, rs2=asid; a_01_8)
+                    //   funct7 = 0x09 (= 0b0001001) → SFENCE.VMA  (rs1=vaddr, rs2=asid)
                     //   funct7 = 0x00 / 0x18       → 由 imm[11:0] 区分 ECALL/EBREAK/MRET
                     //
                     // 为什么 sfence.vma 不能用 imm[11:0] switch 识别: imm[4:0] = rs2 是变量
                     // (寄存器号 0..31), imm[11:0] 不固定值, 32 种变种。所以先看 funct7。
                     //
-                    // 其他 funct7 + funct3=0 的指令 (SRET=imm 0x102, WFI=imm 0x105 等):
-                    // 走 imm switch 末 default → OP_UNSUPPORTED。a_01 不做 (S-mode / 中断 真做
-                    // 时再加 op_kind + case)。
+                    // 其他 funct7 + funct3=0 的指令 (WFI=imm 0x105 / FENCE.I 等):
+                    // 走 imm switch 末 default → OP_UNSUPPORTED, 真做时再加 op_kind + case。
                     if (funct7 == 0x09u) {
-                        // SFENCE.VMA rs1, rs2 (a_01_8)
+                        // SFENCE.VMA rs1, rs2
                         // d.rs1, d.rs2 已由 decode 顶部统一提取 (rs1=vaddr 寄存器, rs2=asid 寄存器);
                         // d.rd, d.imm 不用 (RV spec 要求 rd=0; imm 字段被 funct7|rs2 复用, 但 case
                         // 不读, 仅供 raw_inst trap 路径备查)。
@@ -671,7 +662,7 @@ decoded_inst_t decode(uint32_t inst) {
                             d.pc_step = PC_STEP_NONE;   /* MRET 写 pc=xepc, 不让 fetch loop +4 */
                             break;
                         case 0x102:
-                            d.kind    = OP_SRET;        /* a_01_8 Step 6; 跟 MRET 同形态 */
+                            d.kind    = OP_SRET;        /* 跟 MRET 同形态, 走 _mstatus 的 S 段 */
                             d.pc_step = PC_STEP_NONE;
                             break;
                         default:
@@ -688,7 +679,7 @@ decoded_inst_t decode(uint32_t inst) {
             break;
         }
 
-        // ---- I-type LOAD ---- a_01_6
+        // ---- I-type LOAD ----
         case 0x03: {
             // I-type 12 位有符号立即数 (与 OP-IMM 同型, 复用 ((int32_t)inst) >> 20 算术右移)。
             // 字段 rd / rs1 已由 decode 顶部统一提取; rs2 是 garbage = imm 低 5 位 (顶部提取)。
@@ -710,7 +701,7 @@ decoded_inst_t decode(uint32_t inst) {
             break;
         }
 
-        // ---- S-type STORE ---- a_01_6
+        // ---- S-type STORE ----
         case 0x23: {
             // S-type 12 位有符号立即数, 由 inst 中两段拼接:
             //   imm[11:5] = inst[31:25]    (高 7 位)
