@@ -22,7 +22,7 @@
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
-                         uint8_t *hva_pc, uint32_t *count_out) {
+                         uint8_t *hva_pc, uint64_t *count_out) {
     // current_tlb 透传给 load_helper / store_helper (BARE: NULL; SV32: 非 NULL)。
 
     // dummy.txt §2 局部垃圾桶变量: 写 x0 的 dead store 落点。
@@ -120,7 +120,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     // 隐式捕获: count (interpret_one_block 内局部变量), count_out (函数参数指针)。
     #define SYNC_COUNT() do { *count_out = count; } while (0)
 
-    uint32_t count = 0;
+    uint64_t count = 0;
 
     // 跨页软边界状态: 块入口 page 起点 (host_ram_base 4K 对齐 — ram.c mmap(NULL,...) 内核
     // 分配地址必然 page-aligned; gpa_to_hva_offset 也 4K 对齐 → invariant: (hva_pc & 0xFFF)

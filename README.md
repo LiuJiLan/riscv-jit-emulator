@@ -233,7 +233,7 @@ graph TB
     end
 
     U -.->|MSU 默认 副本| S
-    U -.->|MU-only 副本<br/>(未来 misa 派发)| M
+    U -.->|"MU-only 副本<br/>(未来 misa 派发)"| M
 ```
 
 - **[0] U** 始终是副本语义(副本于 [1] S 或 [3] M,取决于 misa)。即使 MU-only CPU 中

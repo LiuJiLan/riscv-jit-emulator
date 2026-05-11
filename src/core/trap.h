@@ -10,8 +10,9 @@
 // trap_csrs_t 字段分类 (按 dummy.txt §6 CSR 物理存储字段命名四类划分):
 //   - 第四类 (按 priv 索引数组): xcause / xtval / xepc / xtvec / xscratch, 4 槽
 //     (PRIV_M / PRIV_S / PRIV_VS-slot / PRIV_U)
-//   - 第一类 (RV32 物理 64 位, csr 入口拆访问): _mstatus / _medeleg / _mideleg
+//   - 第一类 (RV32 物理 64 位, csr 入口拆访问): _mstatus / _medeleg
 //     (csr.c 通过对应 csr 入口分别访问)
+//   - 第三类 (单字段, 单 csr 入口, 不带前缀): mideleg (MXLEN=32, spec 无 midelegh)
 //   - host 状态 (非 RV CSR): in_trap, 嵌套 trap 计数器 + 内部停机位段 (位段编码见
 //     dispatcher.c 末尾 in_trap 位段编码段); mret 路径只清 bit 0-1
 //
@@ -81,14 +82,18 @@ typedef struct {
     // 第一类: RV32 物理 64 位, csr 入口拆 32 位访问 (dummy.txt §6)。
     // _mstatus: csr 入口 mstatus + mstatush 拆访问低/高半边 (RV32 ABI)。sstatus 是
     //   _mstatus 的 masked view (SSTATUS_MASK)。
-    // _medeleg / _mideleg: RV32 单 csr 入口 (无 medelegh/midelegh), 但物理 64 位为 RV64
-    //   future-proof; 字段类型统一 uint64_t 跟 _mstatus 一致 (写 helper 截低 32 位)。
-    //   _medeleg: trap_set_state 按 _medeleg.bit(cause) 派发 deliver_priv
-    //             (U/S-mode trap + bit=1 → deliver S, 否则 deliver M; M-mode trap 总 M)。
-    //   _mideleg: 跟 mip/mie 中断机制一起未来真做; 字段就位, trap_set_state 当前不读。
+    // _medeleg: priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位入口, 物理 64 位
+    //   存 cause bitmap (RV64 单入口整体访问)。项目当前只实装 medeleg 低 32 位入口
+    //   (medelegh 未实装, 跟 mstatush 平行 future), 字段类型 uint64_t 已 RV64-ready。
+    //   trap_set_state 按 _medeleg.bit(cause) 派发 deliver_priv (U/S-mode trap + bit=1
+    //   → deliver S, 否则 deliver M; M-mode trap 总 M)。
     uint64_t  _mstatus;
-    uint64_t  _medeleg;        // csr 入口 medeleg (0x302)
-    uint64_t  _mideleg;        // csr 入口 mideleg (0x303); 中断机制真做时启用
+    uint64_t  _medeleg;        // csr 入口 medeleg (0x302); medelegh (0x312) 未实装
+
+    // 第三类: 单字段, 单 csr 入口, 不带前缀 (dummy.txt §6)。
+    // mideleg: MXLEN-bit (RV32 = 32 位; spec 未定义 midelegh, 中断 cause 不会超 32 位)。
+    //   跟 mip/mie 中断机制一起未来真做; 字段就位, trap_set_state 当前不读。
+    uint32_t  mideleg;         // csr 入口 mideleg (0x303); 中断机制真做时启用
 
     // host trap 流程状态: 嵌套 trap 计数器 + 内部停机位段 (位段编码详见 dispatcher.c
     // 末尾 in_trap 位段编码段)。

@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "cpu.h"
+#include "debug.h"      // DEBUG_REFETCH (块边界 / 跨页 / longjmp 回 sigsetjmp 落点都触发)
 #include "interpreter.h"
 #include "mmu.h"
 #include "tlb.h"
@@ -94,8 +95,14 @@ void dispatcher(cpu_t *hart) {
     // total_count + local_count: 跨 longjmp 累加 / 持久, volatile 强制放栈 (dummy.txt §1
     // 末段)。两个变量都必须在 sigsetjmp 之前声明 + 初始化, 否则 longjmp 跳回时重新执行初始化,
     // local_count 丢失上一轮 SYNC_COUNT 写好的值, total_count 累加丢失。
-    volatile uint32_t total_count = 0;
-    volatile uint32_t local_count = 0;
+    // total_count / local_count 类型统一 uint64_t: T1 方案 A 时直接拿 total_count 暴露
+    // 给 csrr time / clint mtime 入口 (RV spec mtime/time 是 64 位无符号; 32 位 ~4G 指令
+    // 在 1GHz host 下几秒就溢出)。local_count 也 64 bit, 跟 interpret_one_block 的
+    // count_out 签名 + 内部 count 类型一致 — "count 一律 64 bit"心智, 跟未来
+    // perf_counters / cycle / instret 等 64-bit 字段铺路。x86-64 host 上 32/64 ALU 单
+    // cycle 等价, .text +REX prefix 几字节可忽略 (性能差 ≈ 0)。
+    volatile uint64_t total_count = 0;
+    volatile uint64_t local_count = 0;
 
     // 一次性 sigsetjmp 建立永久落点; 返回值不分流 (dummy.txt §1 机制 (3) "dispatcher 视角"段)。
     sigsetjmp(*hart->jmp_buf_ptr, 1);
@@ -115,6 +122,10 @@ void dispatcher(cpu_t *hart) {
     // ========================================================================
     total_count += local_count;
     local_count = 0;
+
+    // 每轮 while 体进入 = 一次"重新派发取指" (块边界自然推进 / 跨页退块重派 / helper
+    // longjmp 跳回 sigsetjmp 落点都走这里)。fixture 跨页 / 中断密度人工观察 (debug.h)。
+    DEBUG_REFETCH();
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb)
@@ -221,7 +232,7 @@ void dispatcher(cpu_t *hart) {
      * 处理 (block 1 之前); 这里只做 interpret_one_block 调用本身。(uint32_t *) cast 因
      * interpret_one_block 接口非 volatile 指针; 调用期间 volatile 语义不影响 (helper 内部
      * 本地操作), 调用前后 dispatcher 端 volatile 读写仍生效。 */
-    interpret_one_block(hart, current_tlb, hva, (uint32_t *)&local_count);
+    interpret_one_block(hart, current_tlb, hva, (uint64_t *)&local_count);
     // perf_advance(hart, local_count);  // 占位, dispatcher 不消费; 真做时也搬迭代头
 
     }  /* while (in_trap < 3) */
@@ -230,8 +241,13 @@ void dispatcher(cpu_t *hart) {
     // (迭代头扫尾负责的是"上一轮", 最后一轮没下一轮迭代头来扫)。
     total_count += local_count;
 
+    // DEBUG trace 流尾部换行: dispatcher 在 while 体内通过 DEBUG_XXX 宏写入单字符流 (无
+    // 换行); 退出前打一次 \n 把 trace 字符跟下面的 halted dump + main.c 的 trap/state
+    // dump 分开。debug_cnt 不另外打印 (字符流自身可数, 后续需要数值再加)。
+    fputc('\n', stderr);
+
     fprintf(stderr,
-            "[dispatcher] halted: in_trap=%u total_count=%u pc=0x%08" PRIx32 "\n",
+            "[dispatcher] halted: in_trap=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "\n",
             hart->trap.in_trap, total_count, hart->regs[0]);
 
     // ========================================================================

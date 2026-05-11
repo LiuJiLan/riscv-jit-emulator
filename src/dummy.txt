@@ -730,8 +730,11 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
                   三个入口都是 _mstatus 字段的访问通道, sstatus 不是"mstatus 的派生",
                   跟 mstatus / mstatush 同级 (实现上 csr.c 三个 read/write helper 各自
                   对 _mstatus 字段做 mask/shift, 互相不调)。
-      _medeleg  — RV32 单 csr 入口 (无 medelegh), 但物理 64 位为 RV64 future-proof
-      _mideleg  — 同 _medeleg
+      _medeleg  — priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位入口, 物理 64
+                  位存 cause bitmap (RV64 单入口整体访问)。项目当前只实装 medeleg 低
+                  32 位入口 (medelegh 未实装), 字段类型 uint64_t 已 RV64-ready。
+                  注: mideleg (M-mode 中断 delegation) 是 MXLEN-bit (RV32 = 32 位, spec
+                  未定义 midelegh), 属类 3 不带前缀, 不属本类。
 
     csr.c read/write helper 模式:
       static uint32_t csr_mstatus_read (cpu_t *hart) {
@@ -749,8 +752,8 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 
     提取 (1) 类做 future-proof: RV32 → RV64 切换时只需改 csr 入口形态 (拆访问 → 整体访问,
     csr.c read/write helper 重写), 不需要改字段类型 + 不需要重新 layout cpu_t / trap_csrs_t。
-    这也是为什么 _mstatus / _medeleg / _mideleg 当前都用 uint64_t 而不是 uint32_t — 哪怕
-    项目当前 RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
+    这也是为什么 _mstatus / _medeleg 当前都用 uint64_t 而不是 uint32_t — 哪怕项目当前
+    RV32 实际只用低 32 位, 物理类型已经 RV64-ready。
 
 (2) 第二类 — 副本类 (一个物理字段被多个 csr 入口看, 入口之间不存在派生关系, 各看不同 mask)
     命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)
@@ -785,8 +788,12 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 
 (3) 第三类 — priv 无关独立寄存器 (单字段, 单 csr 入口, 无 sub-view / 无副本)
     命名前缀: 不带前缀 (普通字段名)
-    示例: 项目当前没遇到真字段; 未来:
-      - RV Unprivileged Vector CSRs 中的独立部分:
+    示例:
+      mideleg — M-mode 中断 delegation bitmask, MXLEN-bit (RV32 = 32 位; spec 未定义
+                midelegh, 中断 cause 不会超 32 位)。单字段单 csr 入口 (0x303), 字段类型
+                uint32_t, csr.c read/write helper 直读 (无 mask/shift)。项目当前中断
+                机制未实现, 字段就位但 trap_set_state 不读, 中断真做时启用。
+      (未来) RV Unprivileged Vector CSRs 中的独立部分:
           vstart  — 单字段 (vector start position)
           vtype   — 单字段 (vector type, RW with WARL)
           vl      — 单字段 (vector length, RO from M-mode 写视角; vsetvl 指令写)
@@ -814,8 +821,8 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 本协议适用于所有 csr 字段, 不限 trap_csrs_t:
 
   - trap_csrs_t (cpu.h 内嵌, trap.h 定义)
-      _mstatus / _medeleg / _mideleg / xtvec[4] / xepc[4] / xcause[4] / xtval[4] /
-      xscratch[4] 等
+      _mstatus / _medeleg (类 1) / mideleg (类 3) / xtvec[4] / xepc[4] / xcause[4] /
+      xtval[4] / xscratch[4] 等
 
   - cpu_info_per_hart_t (cpu.h)
       per-hart 私有 RO csr (mhartid / misa); 严格说不属于上面四类 cover 范畴 (本协议
@@ -849,8 +856,8 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
       手册用 xepc 同时指代 mepc / sepc; 项目代码 xepc[4] 直接对应
 
   (3) future-proof RV64
-      _mstatus / _medeleg / _mideleg 等 64 位字段在 RV32 拆 csr 入口访问, RV64 时
-      直接 64 位整体访问; 字段类型不变 (uint64_t), 改的只是 csr 入口形态
+      _mstatus / _medeleg 等 64 位字段在 RV32 拆 csr 入口访问, RV64 时直接 64 位整体
+      访问; 字段类型不变 (uint64_t), 改的只是 csr 入口形态
 
 
 --------------------------------------------------------------------------------
@@ -861,3 +868,81 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
   - 本协议不规定 RO/RW/WARL 行为 (那是 csr.c 各 helper 自己的事)
   - 本协议不规定 cpu_info_per_hart_t / cpu_info_shared_t 的命名 (per-hart vs
     shared 是另一维度的划分; 不属本协议四类)
+
+
+================================================================================
+## §7. 多线程 vs 多 HART 术语
+================================================================================
+
+涉及文件:
+  - src/debug.h           (镜像本节内容; 两边都看, 内容一致)
+  - src/core/cpu.h        (cpu_t / cpu_info_per_hart_t / cpu_info_shared_t 拆分体现)
+  - src/platform/clint.h  (未来 — clint.mtime / clint.mtimecmps[N] shared 字段示例)
+  - src/jit/smc.h         (未来 — page_dirty bitmap shared 字段示例)
+  - src/jit/jit_cache.h   (未来 — jit_cache 表头 shared 示例)
+  - 任何引入 host pthread 的模块 (timer / monitor / hart 线程本体)
+
+
+--------------------------------------------------------------------------------
+背景与目的
+--------------------------------------------------------------------------------
+
+从 a_02 起项目开始涉及辅助线程 (timer / 未来 monitor); "hart 数" 跟 "host thread
+数" 不再 1:1 对齐, 之前 single-hart-single-thread 时代隐含的"hart = thread"约定
+要正式拆开。本节固定术语, 后续模块 doc / 注释 / commit message 引用同一组词。
+
+
+--------------------------------------------------------------------------------
+术语定义
+--------------------------------------------------------------------------------
+
+hart        — RV guest hart (architectural concept)。一个 hart 对应一份 cpu_t,
+              SMP 真做时对应一个 host pthread; 跑 guest 指令的"线程实例"。
+              hart 数由 guest 视角 (misa / mhartid / RV 配置) 决定, 不由 host
+              pthread 数决定。
+
+host thread — OS 级 pthread, 包括两类:
+              (a) hart 线程: 每 hart 一个, 持 cpu_t, 跑 dispatcher
+              (b) 辅助线程: 不持 cpu_t, 不跑 guest, 只动 shared 数据
+                            例 timer 线程 (写 clint.mtime); 未来 monitor 线程
+                            (读 perf shm / 暴露调试接口)
+
+数据归属:
+  per-hart    : cpu_t (regs / trap_csrs / tlb_table / satp / per_hart_info 等)。
+                只本 hart 线程读写, 不需 atomic。
+  shared      : clint.mtime / clint.mtimecmps[N] / page_dirty bitmap /
+                jit_cache 表头 / 未来 LR/SC reservation table 等。多 hart 线程
+                + 辅助线程都可能读写, 用 C11 atomic (memory_order_relaxed 起步,
+                fence 按需加)。
+  thread-local: debug.c::debug_cnt 等 host trace 状态。当前 hart 线程独占
+                (单 hart); SMP 多 hart 时按"全局密度"还是"per-hart 密度"再拍
+                (T5 时确认), 前者改 atomic, 后者改 per-hart 字段。
+
+
+--------------------------------------------------------------------------------
+关键约束
+--------------------------------------------------------------------------------
+
+(1) "多 hart" ≠ "多线程"。timer / monitor 等辅助线程数不算 hart 数; 它们不持
+    cpu_t, 不影响 misa / mhartid 等 hart-counting 属性。
+    例: 单 hart + 1 timer 辅助线程 = 1 hart + 2 host threads。
+
+(2) 辅助线程只动 shared 数据, 永远不直接读写任何 cpu_t 字段 (包括 trap_csrs_t /
+    tlb / satp / regs)。要拿 guest 状态必须走 hart 线程主动 (例: hart 线程
+    自己读 atomic mtime → 跟 mtimecmp 比 → set mip.MTIP bit)。
+
+(3) cpu_t 任何字段保持非 atomic (fast path 性能要求); shared 字段一律 atomic
+    (跨线程读写的 host 内存安全要求)。这条契约一旦违反 → C11 data race UB,
+    debug 路径不可达。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不规定 host pthread 怎么创建 / join / cancel (那是 main.c / 各模块
+    init 的事)
+  - 本协议不规定 atomic 的具体 memory_order (各 shared 字段 sheet 自定; 默认
+    起步 relaxed)
+  - 本协议不规定"per-hart"还是"shared"的具体边界 (这是各字段 sheet 的事;
+    边界改动要写明)

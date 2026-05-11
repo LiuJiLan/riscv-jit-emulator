@@ -14,7 +14,7 @@
 //   mtval    (0x343) → trap.xtval[PRIV_M]
 //   mscratch (0x340) → trap.xscratch[PRIV_M]
 //   medeleg  (0x302) → trap._medeleg 低 32 位
-//   mideleg  (0x303) → trap._mideleg 低 32 位 (字段就位; trap_set_state 当前不读, 中断真做时启用)
+//   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_state 当前不读, 中断真做时启用)
 //   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
 //                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
 //   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
@@ -36,7 +36,7 @@
 //          大 switch case dispatch 到对应模块 extern 接口。项目当前没实现, 占位说明。
 //   类 2 — 跨模块 CSR (satp): 字段在 cpu_t; 函数留 csr.c (csr 入口集中)。sfence 跟 satp
 //          写是运行期协议 (dummy.txt §3), 不是代码组织耦合。
-//   类 3 — 核心 CSR (_mstatus, xtvec/xepc/xcause/xtval/xscratch, _medeleg/_mideleg, sstatus/
+//   类 3 — 核心 CSR (_mstatus, xtvec/xepc/xcause/xtval/xscratch, _medeleg, mideleg, sstatus/
 //          sepc/sscratch/stvec/scause/stval): 字段在 trap_csrs_t, 函数留 csr.c。哲学: data
 //          归 cpu_t, 动作分散在 isa/ + core/ (Linux struct task_struct 风格); cpu.c 只放
 //          lifecycle (cpu_create / 字段初值)。
@@ -75,7 +75,8 @@
 // 命名规则 (与 trap.h 一致):
 //   - mstatus / mstatush 操作 _mstatus (uint64_t) 的低/高 半边
 //   - mtvec / mepc / mcause / mtval / mscratch 操作 xxx[PRIV_M] (priv-indexed, x 前缀)
-//   - medeleg / mideleg 操作 _xxx (uint64_t) 的低 32 位 (RV32 csr 入口拆访问)
+//   - medeleg 操作 _medeleg (uint64_t) 的低 32 位 (RV32 csr 入口拆访问; medelegh 未实装)
+//   - mideleg 操作 mideleg (uint32_t, 类 3 MXLEN-bit 单字段; spec 无 midelegh)
 // ============================================================================
 
 // ---- mstatus 半边 (mstatus 物理 64 位, mstatus = 低 32, mstatush = 高 32) ----
@@ -199,17 +200,17 @@ static void csr_mscratch_write(cpu_t *hart, uint32_t v) {
     hart->trap.xscratch[PRIV_M] = v;
 }
 
-// ---- medeleg / mideleg (_medeleg / _mideleg 物理 64 位拆访问, 类 3) ----
+// ---- medeleg / mideleg (medeleg 拆访问类 1, mideleg 单字段类 3) ----
 //
-// medeleg (0x302): M-mode 同步异常 trap delegation bitmask, per-cause bit (bit N = cause N
-//   delegate 到 S-mode); bit 11 (ecall_from_M) WARL hardwire 0 — M can't delegate to
-//   less-privileged (SiFive U74-MC 同此); 其他位项目当前接受全 32 位写。
+// medeleg (0x302): 类 1 (_medeleg uint64_t 拆访问)。M-mode 同步异常 trap delegation
+//   bitmask, per-cause bit (bit N = cause N delegate 到 S-mode); bit 11 (ecall_from_M)
+//   WARL hardwire 0 — M can't delegate to less-privileged (SiFive U74-MC 同此); 其他
+//   位项目当前接受全 32 位写。priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位
+//   入口 (项目当前未实装, 跟 mstatush 平行 future); 字段类型 uint64_t 已 RV64-ready。
 //   trap_set_state 按 _medeleg.bit(cause) 真生效 (U/S-mode trap + bit=1 → deliver S)。
-// mideleg (0x303): M-mode 中断 delegation; 项目当前中断机制未实现, 字段就位但
-//   trap_set_state 不读, 中断真做时启用。
-//
-// 物理类型 uint64_t 跟 _mstatus 同 (dummy.txt §6 类 1 future-proof RV64); RV32 csr 入口
-// 拆访问低 32 位 (RV32 spec 只有 medeleg / mideleg, 没 medelegh / midelegh)。
+// mideleg (0x303): 类 3 (mideleg uint32_t 单字段)。M-mode 中断 delegation, MXLEN-bit
+//   (spec 未定义 midelegh, 中断 cause 不会超 32 位)。项目当前中断机制未实现, 字段
+//   就位但 trap_set_state 不读, 中断真做时启用。
 
 static uint32_t csr_medeleg_read(cpu_t *hart) {
     return (uint32_t)(hart->trap._medeleg & 0xFFFFFFFFu);
@@ -223,13 +224,13 @@ static void csr_medeleg_write(cpu_t *hart, uint32_t v) {
 }
 
 static uint32_t csr_mideleg_read(cpu_t *hart) {
-    return (uint32_t)(hart->trap._mideleg & 0xFFFFFFFFu);
+    return hart->trap.mideleg;
 }
 
 static void csr_mideleg_write(cpu_t *hart, uint32_t v) {
     /* mideleg WARL 项目当前简化 — 接受全 32 位写 (中断机制未实现, 字段不真用)。
      * 中断机制真做时按 RV spec 加 mask reserved bits + per-bit WARL */
-    hart->trap._mideleg = (hart->trap._mideleg & 0xFFFFFFFF00000000ULL) | (uint64_t)v;
+    hart->trap.mideleg = v;
 }
 
 // ============================================================================

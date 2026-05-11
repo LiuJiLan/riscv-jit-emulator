@@ -57,6 +57,6 @@
 #include "tlb.h"
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
-                         uint8_t *hva_pc, uint32_t *count_out);
+                         uint8_t *hva_pc, uint64_t *count_out);
 
 #endif //CORE_INTERPRETER_H
