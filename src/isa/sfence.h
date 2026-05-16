@@ -2,9 +2,9 @@
 // Created by liujilan on 2026/5/7.
 // isa/sfence —— RV32 SFENCE.VMA 指令实现 (TLB 失效)。
 //
-// 不对称设计 (跟 isa/lsu.{c,h} 风格一致):
-//   - load_helper:  static inline 在 lsu.h, fast path
-//   - store_helper: extern 在 lsu.c, slow path (LR/SC reservation 等副作用)
+// helper 风格 (跟 isa/lsu.{c,h} P3 后形态一致):
+//   - lsu_load_helper / lsu_store_helper: inline 顶层在 lsu.h (BARE/SV32 分流)
+//   - store_helper: extern 在 lsu.c (HVA-based, RAM 写 + LR/SC + SMC 副作用入口)
 //   - sfence_vma_helper: extern 在本文件 sfence.c — slow path (改 TLB 状态, 块边界,
 //                          频次低 OS 级 us 量级, 不需 inline)
 //

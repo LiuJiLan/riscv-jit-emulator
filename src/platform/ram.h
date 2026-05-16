@@ -18,8 +18,27 @@
 
 #include <stdint.h>
 
+#include "config.h"   // GUEST_RAM_START / GUEST_RAM_SIZE (IS_GPA_RAM 宏用)
+
 extern void *host_ram_base;
 extern uint8_t *gpa_to_hva_offset;
+
+// ----------------------------------------------------------------------------
+// IS_GPA_RAM(pa) — guest 物理地址是否落在 RAM 区
+// ----------------------------------------------------------------------------
+//
+// 实现: 无符号下溢比较 (一次 sub + 一次 cmp, 不需要两个比较)。
+//   pa < GUEST_RAM_START 时 (pa - GUEST_RAM_START) 在 uint32_t 下下溢成很大的值,
+//   自然 >= GUEST_RAM_SIZE, 比较失败。
+//   pa >= GUEST_RAM_START 时 (pa - GUEST_RAM_START) 是正常 offset, 跟 SIZE 比较。
+//
+// 调用方 (lsu / mmu walker / mmu_translate_pc): 决定 RAM 直通 (gpa_to_hva_offset
+//   + pa → host_ptr memcpy) 还是 bus_dispatch (MMIO 派发); 跟 dummy.txt §8 三层
+//   模型层 (3) 内存访问层的 "RAM-like 直通 vs 纯 MMIO 派发" 对齐。
+//
+// 未来 ROM 接入: 加一个 IS_GPA_ROM 平行宏, callsite 自己决定查哪个; 不要把 ROM
+// 塞进 IS_GPA_RAM (RAM/ROM 写语义不同 — 写 RAM OK / 写 ROM = access fault)。
+#define IS_GPA_RAM(pa)  ((uint32_t)((pa) - GUEST_RAM_START) < GUEST_RAM_SIZE)
 
 // 成功返回 0,失败返回 -1
 //      内部通过 fprintf 具体原因。

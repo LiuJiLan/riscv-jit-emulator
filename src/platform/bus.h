@@ -3,7 +3,7 @@
 // bus 模块对外接口 — MMIO 注册 + PA 派发。
 //
 // 职责: 持一份 (PA range → device read/write fn) 注册表; lsu / mmu 在 PA 落
-// 非 RAM 时调 bus_dispatch_read/write 派发到对应 device。
+// 非 RAM 时调 mmio_read_helper/write 派发到对应 device。
 //
 // 三层职责分工 (mmu / pmp / 内存) 见 src/dummy.txt §8。bus 属"内存访问层"
 // 的 MMIO 分支, 跟 RAM 直通路径平行 (lsu 在 IS_GPA_RAM 不命中时落 bus)。
@@ -58,7 +58,7 @@
 
 #include <stdint.h>
 
-#include "core/cpu.h"     // cpu_t (bus_dispatch_* 失败路径调 trap_raise_exception)
+#include "core/cpu.h"     // cpu_t (mmio_*_helper 失败路径调 trap_raise_exception)
 
 typedef struct {
     uint32_t gpa_start;
@@ -94,8 +94,8 @@ int bus_register_mmio(const mmio_dev_t *dev);
 //           取指落 MMIO 直接 access fault, 见 mmu.h "PA 落 MMIO 时的行为差异"段。
 //
 // 失败语义见 dummy.txt §9 ("0=成功" 接口约定 + cause 0 产生路径)。
-uint32_t bus_dispatch_read (cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size);
-void     bus_dispatch_write(cpu_t *hart, uint32_t pa, uint32_t gva,
+uint32_t mmio_read_helper (cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size);
+void     mmio_write_helper(cpu_t *hart, uint32_t pa, uint32_t gva,
                             uint32_t value, uint32_t size);
 
 #endif //PLATFORM_BUS_H

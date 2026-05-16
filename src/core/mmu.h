@@ -2,11 +2,42 @@
 // Created by liujilan on 2026/4/29.
 // mmu 模块对外接口。
 //
-// 职责: GVA → 终结点的整体翻译层。包括:
+// 职责 (a_02 session_004 P3 重构后, 回归 dummy.txt §8 三层模型):
 //   - 走页表 (GVA → GPA / PA) (Sv32 模式; bare 模式恒等)
 //   - 检查权限 (PTE 权限位 / PMP / PMA)
-//   - 判断 RAM / ROM / MMIO
-//   - LSA (load/store/AMO) 路径还要"真做访问" (RAM 用 host_ptr / MMIO 调 bus_dispatch)
+//   - 在 PA 落 RAM 还是 MMIO 之间分流, 但**只决定下一步去哪**, 不亲自做"真访问":
+//     - RAM 路径: walker fill TLB + 调 RAM 直接 *hva (load) / 调 store_helper (store)
+//     - MMIO 路径: 直接调 mmio_read/write_helper (不入 TLB; 走 bus 派发)
+//
+// 关键变化 (P3 前 vs P3 后): mmu 不再"亲自 host_ptr memcpy / 内嵌 RAM 写", 而是
+// 调出 lsu 层的 store_helper / 调出 bus 层的 mmio_*_helper, 跟 §8 三层模型一致。
+// 详 src/isa/lsu.h 顶段"调用拓扑"图。
+//
+// ============================================================================
+// mmu_walker_helper_* 系列 = JIT 颗粒度 by design (insight 2, 不可压缩)
+// ============================================================================
+//
+// mmu_walker_helper_load / store (现) + mmu_walker_helper_amo_lr / amo_sc / amo_*
+// (未来) 这一族函数, **不只是 TLB miss 时的 fallback**, 而是 by design 给 **JIT
+// 块出口** 准备的"不同颗粒度的助手函数":
+//
+//   1. JIT 翻译块内每条访问指令 emit `call mmu_walker_helper_xxx` = 块边界 + longjmp
+//      出口 (一条 RV 访问指令对应一个 helper 入口, 颗粒度 = 单条指令)
+//   2. 不能合并成"统一 mmu_walker_helper(op_kind, ...)" 大入口 — JIT 翻译时每条
+//      指令 helper 函数地址要静态绑定到 emit 出来的 call 指令; 大 helper 入口要在
+//      helper 内 switch on op_kind, 多一层间接 + JIT 翻译产物里无法静态绑各种
+//      inline 特化
+//   3. → 未来 LR/SC + 9 个 AMO 各需要自己的 mmu_walker_helper_amo_xxx, 不能图省
+//      事合并
+//
+// ============================================================================
+// misalign check 隐式契约 (P3 后)
+// ============================================================================
+//
+// misalign (gva & (size-1) != 0) 由 caller (interpreter case 入口
+// LOAD/STORE_MISALIGN_CHECK 宏 / 未来 JIT translator emit 段) 已查; 本文件所有
+// helper (mmu_walker_helper_load/store) 都信任 caller 已查, 不重复。详 src/isa/lsu.h
+// 顶段。
 //
 // ============================================================================
 // 执行 regime —— 项目内部的"两套硬件逻辑"分类
@@ -181,13 +212,14 @@ typedef enum {
 // ----------------------------------------------------------------------------
 // check_perm —— priv + SUM/MXR + PTE.U/R/W/X 权限检查 (static inline, 三处共用)
 //
-// 三处调用方:
+// 三处调用方 (P3 后):
 //   1. mmu_translate_pc (mmu.c) — TLB hit 后调 check_perm(MMU_PERM_X);
 //      per-block 1 次 slow path, inline 与否性能差别小, 调用形态 OK
-//   2. load_helper (lsu.h, fast path inline) — 真 fast path, 命中条件内联展开
+//   2. lsu_load_helper (lsu.h, inline 顶层) — SV32 TLB hit fast path 命中条件内联调
 //      check_perm(MMU_PERM_R); inline 形态消除函数 call 开销 (每条 lw/lh/lb 都跑)
-//   3. store_helper (lsu.c, slow path helper) — 整体 slow path, 内部命中段调
-//      check_perm(MMU_PERM_W); store_helper 已是 helper call, inline 与否差别小
+//   3. lsu_store_helper (lsu.h, inline 顶层) — SV32 TLB hit fast path 命中条件内联调
+//      check_perm(MMU_PERM_W); inline 形态消除函数 call 开销 (跟 load 对称)
+//   附: mmu_walk 内 walker 自身也调 check_perm(PERM) (mmu_walker_helper_* 复用 walker)
 //
 // 三处共用一份 check_perm 实现 → 跟 walker (mmu_walk) 内的 perm 检查同源, 不会两份
 // 维护偏离。
@@ -208,11 +240,11 @@ typedef enum {
 // 注意: PTE.A/PTE.D 检查不在此函数里 — 项目 hw-managed 风格, walker 内 mmu_walk 顺手
 // set A/D 写回 PT (见 mmu.c 实现); 不像 Svade 风格那样把 A=0/D=0 当 fault。
 //
-// fast path 调用形态 (lsu.h load_helper):
+// fast path 调用形态 (lsu.h lsu_load_helper SV32 TLB hit 段):
 //   if ((entry->pte_flags & PTE_V)
 //       && entry->gva_tag == vpn
-//       && check_perm(hart, entry->pte_flags, MMU_PERM_R)) { /* host load */ }
-//   else { /* fall back walker_helper_load */ }
+//       && check_perm(hart, entry->pte_flags, MMU_PERM_R)) { /* return *hva 直接 */ }
+//   else { /* fall back mmu_walker_helper_load */ }
 //
 // SMP / 立即生效说明:
 //   check_perm 每次都读 hart->trap._mstatus 当前值 (SUM/MXR), 不缓存; 配合 csr 写
@@ -316,31 +348,34 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
 // SV32 walker —— mmu_walk + mmu_walker_helper_load / store
 // ============================================================================
 //
-// 整体设计:
+// 整体设计 (P3 后, 跟 dummy.txt §8 三层 + lsu.h 顶段调用拓扑一致):
 //
-//   load_helper (lsu.h, fast path inline)        store_helper (lsu.c, slow path)
+//   lsu_load_helper (lsu.h, inline 顶层)         lsu_store_helper (lsu.h, inline 顶层)
 //             │                                            │
-//             ├─ TLB lookup inline (hit + 权限齐 → host load 完成)
+//             ├─ BARE: IS_GPA_RAM ? *hva : mmio_*_helper
 //             │                                            │
-//             └─ TLB miss / 权限不齐 → fall back ──────────┤ 同 (TLB lookup + miss
-//                                          │               │  / D=0 → fall back)
+//             ├─ SV32 TLB hit + check_perm:                │
+//             │   load 直接 return *hva                    store 调 store_helper(hva,...)
+//             │                                            │
+//             └─ SV32 miss/D=0/perm → fall back ───────────┤
 //                                          ↓               ↓
 //                            mmu_walker_helper_load    mmu_walker_helper_store
 //                            (mmu.c, slow path)        (mmu.c, slow path)
 //                                          │               │
 //                                          ├─ mmu_walk → (pa, pte_flags, fault)
-//                                          ├─ ram check (PA in RAM 区)
-//                                          ├─ fill TLB entry (lazy refresh)
-//                                          └─ host load / host store + return
+//                                          ├─ MMIO (!IS_GPA_RAM):
+//                                          │   mmio_read_helper       mmio_write_helper
+//                                          │   (不 fill TLB, 直接派发)
+//                                          └─ RAM:
+//                                              fill TLB +              fill TLB +
+//                                              直接 *hva               store_helper(hva,...)
 //
-// 注意 fast/slow 不对称 (dummy.txt §1 末段):
-//   - load 路径: fast = TLB-hit inline, slow = mmu_walker_helper_load
-//   - store 路径: store_helper 整体 slow path (extern 函数 call), 但内部仍有
-//                  "TLB lookup 短路径"避免每次 walk PT; "fall back" 在 store 路径意思
-//                  store_helper 内 inline 查 → mmu_walker_helper_store 函数 (helper 之间分层)
-//   - 未来改进: store_helper inline 化 (extern → static inline; 命名澄清见 dummy.txt §1
-//                  F1 段, 不是"store 变 fast path", store_helper 内部仍全 slow path),
-//                  消除 store 每次付的函数 call 开销; load fast path inline 性质不变
+// fast/slow 不对称的真机理 (insight 1, 不可压缩; 见 lsu.h 顶段):
+//   - load 路径: TLB 缓存 hva + MMIO 不进 TLB → 命中路径**结构上**不带 RAM/MMIO 分支
+//                → 直接 return *hva (没有"store_helper 那样的副作用 helper")
+//   - store 路径: 命中也走 store_helper (HVA-based) — 因 LR/SC reservation + 未来
+//                SMC 副作用强制经 helper, 跟 RAM/MMIO 分流无关
+//   → 不是"性能 vs 副作用" 二分。详 src/isa/lsu.h 顶段 "load / store 不对称的真机理"。
 //
 // ----------------------------------------------------------------------------
 // hw-managed A/D 设计 (RV Privileged Spec Vol II §4.3.1, 非 Svade 路径)
@@ -467,20 +502,24 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
 // mmu_walker_helper_load —— SV32 load 路径完整流程; helper 长跳风格 (路径 2a)
 // ============================================================================
 //
-// 调用方: lsu.h load_helper SV32 路径; TLB miss / 权限不齐 时调用。
+// 调用方: lsu.h lsu_load_helper SV32 路径 TLB miss / 权限不齐时; 未来 JIT 翻译产物
+//          emit `call mmu_walker_helper_load` 作 JIT 块出口 (JIT 颗粒度 by design,
+//          见顶段)。
 //
-// 流程:
+// 流程 (P3 后, 跟 §8 三层模型一致):
 //   1. mmu_walk(hart, gva, MMU_PERM_R) → pa + pte_flags + fault_cause
 //      失败 → trap_raise_exception(cause, gva)  /* _Noreturn longjmp */
-//   2. PA 在 RAM 区检查 (当前不实现 bus_dispatch, 不在 RAM → access fault):
-//      失败 → fprintf + trap_raise_exception(CAUSE_LOAD_ACCESS_FAULT, gva)
-//   3. host_ptr = gpa_to_hva_offset + pa
-//   4. fill TLB entry (lazy refresh, 在 host load 之前, 副作用要在成功路径才发生):
-//        entry = current_tlb->e[(gva >> 12) & (TLB_NUM_ENTRIES-1)]
-//        entry.gva_tag  = gva >> 12
-//        entry.pte_flags = pte_flags  (含 walker set 的 A=1)
-//        entry.host_ptr = host_ptr - (gva & 0xFFF)   /* page 起点 host 地址 */
-//   5. host load size 字节 + sext/zext (caller 做 — load_helper 接口对齐) → return uint32_t
+//   2. PA 落 MMIO (!IS_GPA_RAM) → mmio_read_helper(hart, pa, gva, size) 返值
+//      (不 fill TLB; bus 内部 _Noreturn-on-failure, 未命中 / device 拒绝直接长跳)
+//   3. PA 落 RAM:
+//      a. host_ptr = gpa_to_hva_offset + pa
+//      b. fill TLB entry (lazy refresh, 在 host load 之前):
+//           entry.gva_tag  = gva >> 12
+//           entry.pte_flags = pte_flags  (含 walker set 的 A=1)
+//           entry.host_ptr = host_ptr - (gva & 0xFFF)   /* page 起点 host 地址 */
+//      c. **直接 *host_ptr memcpy** (不调子 helper — 跟 lsu_load_helper SV32 命中
+//         段同形, walker 已知是 RAM, 没必要再去 lsu 走一圈; insight 1, 见 lsu.h)
+//      d. return uint32_t (低 size 字节有效, sext/zext 由 caller 做)
 //
 // 错误路径 trap_raise_exception 长跳, 不返回 caller (caller 不需要 goto out 处理失败)。
 uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
@@ -491,15 +530,24 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
 // mmu_walker_helper_store —— SV32 store 路径完整流程; helper 长跳风格
 // ============================================================================
 //
-// 调用方: lsu.c store_helper SV32 路径; store_helper 内 TLB miss / 权限不齐 / D=0 时调用。
+// 调用方: lsu.h lsu_store_helper SV32 路径 TLB miss / 权限不齐 / D=0 时; 未来 JIT
+//          翻译产物 emit `call mmu_walker_helper_store` 作 JIT 块出口。
 //
-// 流程跟 mmu_walker_helper_load 对称, perm = MMU_PERM_W:
+// 流程跟 mmu_walker_helper_load 对称 (P3 后), perm = MMU_PERM_W:
 //   1. mmu_walk(hart, gva, MMU_PERM_W) → walker 内 set A+D 写回 PT
-//   2. PA 在 RAM 区检查 (失败 → CAUSE_STORE_ACCESS_FAULT)
-//   3. host_ptr = gpa_to_hva_offset + pa
-//   4. fill TLB entry (pte_flags 含 D=1)
-//   5. host store size 字节 (memcpy)
-//   6. reservation 清除占位 (LR/SC 未做; 跟 store_helper BARE 路径同形态注释)
+//      失败 → trap_raise_exception(15/7, gva)
+//   2. PA 落 MMIO → mmio_write_helper(hart, pa, gva, value, size) 直接派发
+//      (不 fill TLB; 不调 store_helper, 跳过 LR/SC + SMC 副作用 — 因 MMIO 不参与
+//      reservation 也非可执行不参与 SMC; 跟 lsu_store_helper BARE MMIO 路径同形)
+//   3. PA 落 RAM:
+//      a. host_ptr = gpa_to_hva_offset + pa
+//      b. fill TLB entry (pte_flags 含 walker set 的 D=1)
+//      c. **store_helper(hart, host_ptr, gva, value, size)** — 委托 lsu 层做
+//         RAM 写 + LR/SC reservation 清除占位 + SMC 占位 (insight 1, 跟 lsu.h 顶段
+//         同形; store_helper 是 P3 后唯一统一的 "RAM 写 + 副作用" 入口, 三处
+//         caller 共用)
+//
+// 错误路径 trap_raise_exception 长跳, 不返回 caller。
 void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
                              uint32_t gva, uint32_t value, uint32_t size);
 

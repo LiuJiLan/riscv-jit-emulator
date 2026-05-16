@@ -6,13 +6,15 @@
 // 顶部模块文档见 mmu.h (含 regime 二分 / 错误模型 / trap_raise 职责 / MMIO 行为差异 +
 // SV32 walker 设计 / hw-managed A/D / TLB fall back / G-agnostic / 立即生效)。
 // 报错风格见 src/dummy.txt §5 (mmu_translate_pc 不 fprintf, 错误码就是 RV cause);
-// walker_helper_* 在 PA 不在 RAM 时走 bus_dispatch_* (MMIO 派发, 见 dummy.txt §8 / §9)。
+// walker_helper_* 在 PA 不在 RAM 时走 mmio_*_helper (MMIO 派发, 见 dummy.txt §8 / §9);
+// RAM 时直接 *hva (load) / 调 store_helper(hva,...) (store), 跟 §8 三层模型一致。
 //
 
 #include "mmu.h"
 
 #include "config.h"
-#include "platform/bus.h"   // bus_dispatch_read/write (MMIO 派发, _Noreturn-on-failure)
+#include "isa/lsu.h"        // store_helper (HVA-based, RAM 写 + LR/SC + SMC 副作用)
+#include "platform/bus.h"   // mmio_read/write_helper (MMIO 派发, _Noreturn-on-failure)
 #include "platform/ram.h"
 #include "riscv.h"
 #include "tlb.h"
@@ -23,8 +25,9 @@
 #include <stdio.h>    // fprintf (PT 物理地址越界 占位提示)
 #include <string.h>   // memcpy (walker 读写 PT, walker_helper_* host load/store)
 
-// check_perm 是 mmu.h 的 static inline 函数 (三处共用: mmu_translate_pc / load_helper /
-// store_helper); 详见 mmu.h check_perm 段 doc。本文件直接调用, 不另起 forward decl。
+// check_perm 是 mmu.h 的 static inline 函数 (三处共用: mmu_translate_pc /
+// lsu_load_helper / lsu_store_helper, P3 后命名); 详见 mmu.h check_perm 段 doc。
+// 本文件直接调用, 不另起 forward decl。
 
 
 // ----------------------------------------------------------------------------
@@ -43,8 +46,8 @@
 // 所以三个 helper 分别命名 + 各自实现, 不强求统一。
 // ----------------------------------------------------------------------------
 static int pa_to_fetch_hva(uint32_t pa, uint8_t **hva_out) {
-    // RAM 区: 利用无符号下溢比较 (gpa < GUEST_RAM_START 时差值变成很大的 u32, 自然 >= GUEST_RAM_SIZE)
-    if ((uint32_t)(pa - GUEST_RAM_START) < GUEST_RAM_SIZE) {
+    // RAM 区检查 (IS_GPA_RAM 见 ram.h)
+    if (IS_GPA_RAM(pa)) {
         *hva_out = gpa_to_hva_offset + pa;
         return 0;
     }
@@ -225,7 +228,7 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
 
     // ---- level=1 walk ----
     const uint32_t pte1_pa = root_pa + (vpn1 << 2);      /* 4 字节每 PTE */
-    if ((uint32_t)(pte1_pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
+    if (!IS_GPA_RAM(pte1_pa)) {
         /* PT 物理地址不在 RAM (当前不实现 PMP, 用 RAM 区检查代替) → access fault.
          * 未来 PMP 接入: 这里改成 PMP allow 检查 + cause 不变。 */
         *fault_cause_out = af_cause;
@@ -245,7 +248,7 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
         const uint32_t pte1_full_pa  = pte1_full_ppn << 12;
 
         const uint32_t pte0_pa = pte1_full_pa + (vpn0 << 2);
-        if ((uint32_t)(pte0_pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
+        if (!IS_GPA_RAM(pte0_pa)) {
             *fault_cause_out = af_cause;
             return -1;
         }
@@ -327,10 +330,10 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
     }
 
     // PA 不在 RAM 区 → MMIO 派发 (不入 TLB, plan §1.4 + dummy.txt §8)
-    // bus_dispatch_read 内部 _Noreturn-on-failure (未命中 / device 拒绝都 longjmp,
+    // mmio_read_helper 内部 _Noreturn-on-failure (未命中 / device 拒绝都 longjmp,
     // 不返回 caller; 见 dummy.txt §9 "0=成功" + cause 0 路径)。
-    if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-        return bus_dispatch_read(hart, pa, gva, size);
+    if (!IS_GPA_RAM(pa)) {
+        return mmio_read_helper(hart, pa, gva, size);
     }
 
     uint8_t *host_ptr       = gpa_to_hva_offset + pa;
@@ -364,8 +367,8 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
     }
 
     // PA 不在 RAM 区 → MMIO 派发 (不入 TLB; plan §1.4 + dummy.txt §8 / §9)
-    if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-        bus_dispatch_write(hart, pa, gva, value, size);  // _Noreturn-on-failure
+    if (!IS_GPA_RAM(pa)) {
+        mmio_write_helper(hart, pa, gva, value, size);  // _Noreturn-on-failure
         return;
     }
 
@@ -380,10 +383,9 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
     entry->pte_flags = (uint16_t)pte_flags;
     entry->host_ptr  = page_host_base;
 
-    // host store size 字节
-    memcpy(host_ptr, &value, size);
-
-    // reservation 清除 (LR/SC) 占位 — 跟 store_helper BARE 路径同形态
-    // 当前未接 LR/SC, reservation_t struct 也未定; 占位等 A 扩展真做。
-    // SMC page_dirty 检测占位同 store_helper BARE 路径。
+    // RAM 写 + LR/SC reservation 清除 + SMC 占位 — 全部委托 store_helper (HVA-based)。
+    // store_helper 是 P3 后唯一统一的 "RAM 写 + 副作用" 入口, lsu_store_helper BARE/
+    // SV32 hit / 本 walker_helper RAM 路径三处共用一份逻辑 (insight 1, 见 lsu.h 顶段)。
+    // MMIO 路径不调 store_helper, 已在上面分流直走 mmio_write_helper。
+    store_helper(hart, host_ptr, /*gva for tval*/gva, value, size);
 }

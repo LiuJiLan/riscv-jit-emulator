@@ -12,7 +12,7 @@
 #include "cpu.h"
 #include "csr.h"        // csr_op + csr_op_t
 #include "decode.h"
-#include "isa/lsu.h"    // load_helper (static inline) + store_helper (extern)
+#include "isa/lsu.h"    // lsu_load_helper / lsu_store_helper (inline 顶层) + store_helper (extern, HVA-based)
 #include "isa/sfence.h" // sfence_vma_helper (extern)
 #include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M])
 #include "tlb.h"
@@ -23,7 +23,8 @@
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint64_t *count_out) {
-    // current_tlb 透传给 load_helper / store_helper (BARE: NULL; SV32: 非 NULL)。
+    // current_tlb 透传给 lsu_load_helper / lsu_store_helper (BARE: NULL; SV32: 非 NULL);
+    // interpreter 自感知 priv (NULL/非NULL 编码 BARE/SV32, lsu 内部分流; a_02 session_004 P3)。
 
     // dummy.txt §2 局部垃圾桶变量: 写 x0 的 dead store 落点。
     // 编译器 DCE 会把这个 store 干掉, 等于 NO-OP; 保留是为统一 "所有写都通过同一个宏" 风格,
@@ -99,8 +100,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     // 同哲学); 只在已知 may-trap 位置插入。具体位置:
     //   - WRITE_PC_OR_TRAP 内 trap_raise 之前 (misalign target; branch/jal/jalr 共用此宏)
     //   - case OP_ECALL / OP_EBREAK / OP_UNSUPPORTED — trap_raise_exception 之前
-    //   - case OP_LB/LH/LW/LBU/LHU — load_helper 调用之前 (helper 内可能 trap_raise)
-    //   - case OP_SB/SH/SW         — store_helper 调用之前
+    //   - case OP_LB/LH/LW/LBU/LHU — lsu_load_helper 调用之前 (helper 内可能 trap_raise)
+    //   - case OP_SB/SH/SW         — lsu_store_helper 调用之前
     //   - CSR 6 case (CSRRW/RS/RC/WI/SI/CI) — csr_op 调用之前 (csr_op 内可能 trap_raise
     //     illegal csr / privilege violation)
     //
@@ -119,6 +120,26 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //
     // 隐式捕获: count (interpret_one_block 内局部变量), count_out (函数参数指针)。
     #define SYNC_COUNT() do { *count_out = count; } while (0)
+
+    // LOAD_MISALIGN_CHECK / STORE_MISALIGN_CHECK —— gva 级 misalign 检查 (a_02
+    // session_004 P3 后契约): caller (interpreter case 入口) 一处做, helper
+    // (lsu_*_helper / mmu_walker_helper_* / store_helper) 都信任 caller 已查。
+    //
+    // size=1 时 mask=0, LB/LBU/SB 永远过 (但形式保留, 跟 LH/LW/SH/SW 一致, 同形宏)。
+    //
+    // SYNC_COUNT 在 misalign 触发前已调 (case 入口顺序: ea 算 → SYNC_COUNT() →
+    // MISALIGN_CHECK → helper); trap 触发那条不算入 count_out, 跟 RV precise trap
+    // 一致。
+    //
+    // 隐式捕获: hart (调 trap_raise_exception)。
+    #define LOAD_MISALIGN_CHECK(ea, size)                                       \
+        do { if (((ea) & ((size) - 1u)) != 0u)                                  \
+                trap_raise_exception(hart, CAUSE_LOAD_ADDR_MISALIGNED, (ea));   \
+        } while (0)
+    #define STORE_MISALIGN_CHECK(ea, size)                                      \
+        do { if (((ea) & ((size) - 1u)) != 0u)                                  \
+                trap_raise_exception(hart, CAUSE_STORE_ADDR_MISALIGNED, (ea));  \
+        } while (0)
 
     uint64_t count = 0;
 
@@ -443,82 +464,100 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
 
             // ---- I-type LOAD (5 op) ----
             //
-            // 不对称设计 (dummy.txt §1 末段): load 走 static inline load_helper (isa/lsu.h,
-            // fast path); BARE 路径直接 host load, SV32 路径 TLB lookup + walker_helper_load
-            // miss。
+            // 不对称设计 (a_02 session_004 P3 后): load 走 inline 顶层 lsu_load_helper
+            // (isa/lsu.h); BARE 内联 RAM/MMIO 分流, SV32 TLB hit 直接 *hva (不调子 helper,
+            // 因 TLB 缓存 hva + MMIO 不进 TLB → 命中路径结构不带分支, insight 1),
+            // miss 调 mmu_walker_helper_load。
             //
-            // 方案 A (helper 不知 signed): load_helper 返回低 size 字节有效 + 高位 0 的 uint32_t,
-            // case 自做 sext (LB int8_t / LH int16_t cast → int32_t 再 cast 回 uint32_t) 或
-            // zext (LBU/LHU 直接传, 高位已是 0)。LW size=4 直传整 32 位。
+            // 方案 A (helper 不知 signed): lsu_load_helper 返回低 size 字节有效 + 高位 0
+            // 的 uint32_t, case 自做 sext (LB int8_t / LH int16_t cast → int32_t 再 cast
+            // 回 uint32_t) 或 zext (LBU/LHU 直接传, 高位已是 0)。LW size=4 直传整 32 位。
             //
             // ea 算成 uint32_t (RV32 wraparound 算术; gva = rs1 + imm 自然 wrap)。imm 是
             // int32_t (decode 已 sign-ext), 加到 uint32_t 上要先 cast (避免 -Wsign-conversion;
             // 跟 BRANCH_IF / WRITE_PC_OR_TRAP 路径同模式)。
             //
-            // 错误路径 (load_helper 内部 trap_raise_exception _Noreturn longjmp):
-            //   misalign (gva & (size-1)) != 0    → cause 4
-            //   BARE 路径 PA 不在 RAM             → cause 5 + fprintf "MMIO not implemented"
-            //   SV32 路径 walker fault            → cause 13 (page fault) / 5 (access fault)
+            // misalign (gva & (size-1)) check 由 case 入口 LOAD_MISALIGN_CHECK 宏完成
+            // (P3 后契约: lsu_load_helper / mmu_walker_helper_load 都信任 caller 已查);
+            // 触发时 trap_raise_exception(cause 4, gva) 长跳。
+            //
+            // 其他错误路径 (lsu_load_helper / mmu_walker_helper_load / mmio_read_helper
+            // 内部 trap_raise_exception _Noreturn longjmp):
+            //   BARE PA 不在 RAM, MMIO 未命中 / device 拒绝 → cause 5 (access fault) / cause
+            //   SV32 walker fault                          → cause 13 (page fault) / 5 (access fault)
             // 长跳走 dispatcher 落点; 这里 break 后的 fetch loop 末尾 += pc_step / count++ /
             // boundary 检查不会执行。
             case OP_LB: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t) load_helper(hart, current_tlb, ea, 1u));
+                LOAD_MISALIGN_CHECK(ea, 1u);
+                WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t) lsu_load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LH: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t)load_helper(hart, current_tlb, ea, 2u));
+                LOAD_MISALIGN_CHECK(ea, 2u);
+                WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t)lsu_load_helper(hart, current_tlb, ea, 2u));
                 break;
             }
             case OP_LW: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 4u));
+                LOAD_MISALIGN_CHECK(ea, 4u);
+                WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 4u));
                 break;
             }
             case OP_LBU: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 1u));
+                LOAD_MISALIGN_CHECK(ea, 1u);
+                WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LHU: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                WRITE_REG(d.rd,                              load_helper(hart, current_tlb, ea, 2u));
+                LOAD_MISALIGN_CHECK(ea, 2u);
+                WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 2u));
                 break;
             }
 
             // ---- S-type STORE (3 op) ----
             //
-            // 不对称设计: store 走 extern store_helper (isa/lsu.c, slow path)。helper 内部
-            // 处理 misalign / RAM 检查 / host store / reservation 清除占位 / 未来 SMC 检测;
-            // 解释器 case 不感知 (caller 简洁, helper 内做事; 跟 csr_op 入口风格一致)。
+            // 不对称设计 (a_02 session_004 P3 后): store 走 inline 顶层 lsu_store_helper
+            // (isa/lsu.h); BARE 内联 RAM/MMIO 分流, SV32 TLB hit 调 store_helper(hva,...)
+            // (RAM 写 + LR/SC + SMC 副作用, insight 1), miss 调 mmu_walker_helper_store。
             //
             // SB/SH/SW 写多少字节由 size 决定; value = READ_REG(d.rs2) 整 32 位传给 helper,
-            // helper 内部 memcpy size 字节 (SB 写低 8 位, SH 写低 16 位, SW 写全 32 位)。
+            // 最终 memcpy size 字节 (SB 写低 8 位, SH 写低 16 位, SW 写全 32 位)。
             //
-            // 错误路径 (store_helper 内部 trap_raise_exception _Noreturn longjmp):
-            //   misalign → cause 6; BARE 不在 RAM → cause 7 + fprintf; SV32 walker fault → 15/7。
+            // misalign 由 case 入口 STORE_MISALIGN_CHECK 宏完成 (P3 后契约同 load);
+            // 触发 trap_raise_exception(cause 6, gva) 长跳。
+            //
+            // 其他错误路径 (lsu_store_helper / mmu_walker_helper_store / mmio_write_helper
+            // 内部 trap_raise_exception _Noreturn longjmp):
+            //   BARE PA 不在 RAM, MMIO 未命中 / device 拒绝 → cause 7 (access fault) / cause
+            //   SV32 walker fault                          → cause 15 (page fault) / 7 (access fault)
             case OP_SB: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 1u);
+                STORE_MISALIGN_CHECK(ea, 1u);
+                lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 1u);
                 break;
             }
             case OP_SH: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 2u);
+                STORE_MISALIGN_CHECK(ea, 2u);
+                lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 2u);
                 break;
             }
             case OP_SW: {
                 uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
-                store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
+                STORE_MISALIGN_CHECK(ea, 4u);
+                lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
                 break;
             }
 
@@ -595,4 +634,6 @@ out:
     #undef WRITE_PC_OR_TRAP
     #undef BRANCH_IF
     #undef SYNC_COUNT
+    #undef LOAD_MISALIGN_CHECK
+    #undef STORE_MISALIGN_CHECK
 }

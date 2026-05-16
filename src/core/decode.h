@@ -185,10 +185,10 @@ typedef enum {
     //   d.pc_step  = PC_STEP_RV (普通 +4)
     //
     // load 不是块边界 (is_block_boundary_inst → 0); 内存访问不改控制流, 块内可连续多条。
-    // 实际访问 case 内调 load_helper (isa/lsu.h, static inline; BARE 路径直接 host load,
-    // SV32 路径 TLB lookup + walker_helper_load miss); sext/zext 由 case 各自做
-    // (LB: int8_t cast → int32_t; LH: int16_t cast; LBU/LHU: 直接 zero-ext; LW: 直传)。
-    // dummy.txt §1 末段 "load inline / store helper" 不对称设计。
+    // 实际访问 case 内调 lsu_load_helper (isa/lsu.h, inline 顶层; P3 后 a_02 session_004:
+    // BARE 内联 RAM/MMIO 分流 / SV32 TLB hit 直接 *hva / miss 调 mmu_walker_helper_load);
+    // sext/zext 由 case 各自做 (LB: int8_t cast → int32_t; LH: int16_t cast; LBU/LHU:
+    // 直接 zero-ext; LW: 直传)。不对称真机理见 src/isa/lsu.h 顶段 (insight 1)。
     OP_LB,
     OP_LH,
     OP_LW,
@@ -216,9 +216,11 @@ typedef enum {
     //   d.pc_step = PC_STEP_RV
     //
     // store 不是块边界 (is_block_boundary_inst → 0)。
-    // 实际访问 case 内调 store_helper (isa/lsu.c extern; BARE 路径直接 host store, SV32 路径
-    // TLB lookup + walker_helper_store miss); reservation 清除 + SMC 检测 + 未来 bus_dispatch
-    // 都在 helper 内, 解释器 case 不感知。dummy.txt §1 末段不对称设计。
+    // 实际访问 case 内调 lsu_store_helper (isa/lsu.h, inline 顶层; P3 后 a_02 session_004:
+    // BARE 内联 RAM/MMIO 分流 / SV32 TLB hit 调 store_helper(hva,..) / miss 调
+    // mmu_walker_helper_store); reservation 清除 + SMC 检测 集中在 lsu.c store_helper
+    // (HVA-based, RAM 写 + 副作用 入口); MMIO 不经 store_helper, 直接 mmio_write_helper。
+    // 不对称真机理见 src/isa/lsu.h 顶段 (insight 1)。
     OP_SB,
     OP_SH,
     OP_SW,

@@ -4,7 +4,8 @@
 //
 // dispatcher 是 hart 主循环: sigsetjmp 一次性建立永久落点 + while(in_trap<3) 多块循环 +
 // 每轮迭代头做扫尾 (count 累加 / 未来 mtime 推进 / 中断检查 / perf_advance)。helper 端
-// 的 longjmp (mmu walker / store_helper / trap_raise_exception 等) 都跳回这个入口落点;
+// 的 longjmp (mmu_walker_helper_* / mmio_*_helper / trap_raise_exception 等) 都跳回这
+// 个入口落点;
 // main 调一次 dispatcher 返回时 hart 已 halt (halt 状态由 hart->trap.in_trap 表达,
 // 位段编码见 dispatcher.c 末尾)。
 //

@@ -55,7 +55,7 @@ int bus_register_mmio(const mmio_dev_t *dev) {
     return 0;
 }
 
-uint32_t bus_dispatch_read(cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size) {
+uint32_t mmio_read_helper(cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size) {
     for (uint32_t i = 0; i < bus_table_n; i++) {
         if (pa >= bus_table[i].gpa_start && pa < bus_table[i].gpa_end) {
             uint32_t value = 0;
@@ -71,7 +71,7 @@ uint32_t bus_dispatch_read(cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size
     trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, gva);  // _Noreturn longjmp
 }
 
-void bus_dispatch_write(cpu_t *hart, uint32_t pa, uint32_t gva,
+void mmio_write_helper(cpu_t *hart, uint32_t pa, uint32_t gva,
                         uint32_t value, uint32_t size) {
     for (uint32_t i = 0; i < bus_table_n; i++) {
         if (pa >= bus_table[i].gpa_start && pa < bus_table[i].gpa_end) {
