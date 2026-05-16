@@ -4,14 +4,14 @@
 //
 // 顶部接口 doc + 调用拓扑 + 不对称真机理 + misalign 隐式契约 见 lsu.h。
 //
-// a_02 session_004 P3 重构后, store_helper 形态变化:
-//   - 接口从 GVA-based + 内部 BARE/SV32 分流 + 内部 IS_GPA_RAM 分流
-//     变成 HVA-based 不分流, 只做 RAM 写 + 副作用 (LR/SC + SMC 占位)
+// store_helper 形态:
+//   - HVA-based 接口, 不做 BARE/SV32 / IS_GPA_RAM 分流; 只做 RAM 写 + 副作用
+//     (LR/SC + SMC 占位)
 //   - 调用方 (lsu_store_helper BARE/SV32 hit / mmu_walker_helper_store RAM) 已确认
 //     PA 落 RAM, 算好 hva 传入
 //   - MMIO 路径 caller 直接调 mmio_write_helper, 不经 store_helper (跳过 LR/SC +
-//     SMC 副作用; 跟 §8 三层模型 + insight 1 一致, 因 MMIO 不参与 reservation
-//     也非可执行不参与 SMC)
+//     SMC 副作用; 跟 §8 三层模型一致, 因 MMIO 不参与 reservation 也非可执行
+//     不参与 SMC)
 //
 
 #include "lsu.h"

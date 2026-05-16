@@ -3,7 +3,7 @@
 // isa/lsu —— RV32 load/store ISA helpers (Spike `riscv/insns/{load,store}.h` 概念对应)。
 //
 // ============================================================================
-// 调用拓扑 (a_02 session_004 P3 重构后, 回归 dummy.txt §8 三层模型)
+// 调用拓扑 (跟 dummy.txt §8 三层模型一致)
 // ============================================================================
 //
 //   interpreter LOAD case (5 个 LB/LH/LW/LBU/LHU)
@@ -27,7 +27,7 @@
 //               mmu_walker_helper_store(...)  [extern; mmu.c]
 //
 // ============================================================================
-// load / store 不对称的真机理 (不可压缩, session_004 insight 1)
+// load / store 不对称的真机理 (跨文件协议见 dummy.txt §1 末段)
 // ============================================================================
 //
 // 旧叙事 "load 性能敏感所以 inline / store 副作用所以 extern" 不准确。真机理:
@@ -46,7 +46,7 @@
 // "省 TLB 空间 / MMIO 命中率低"。
 //
 // ============================================================================
-// misalign check 隐式契约 (P3 后)
+// misalign check 隐式契约
 // ============================================================================
 //
 // misalign check (gva & (size-1) != 0) 由 caller 在 case 入口完成
@@ -161,7 +161,7 @@ static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
     //   walker 同源, 完整查 priv/PTE_U/SUM/MXR + R-or-(MXR&&X)。
     //
     // 命中后**直接 return *hva, 不调子 helper** — 因为 TLB 缓存的是 hva 且 MMIO
-    //   不进 TLB → 命中路径结构上不可能是 MMIO, 不需要 IS_GPA_RAM 分支 (insight 1,
+    //   不进 TLB → 命中路径结构上不可能是 MMIO, 不需要 IS_GPA_RAM 分支 (见顶段
     //   见顶段 doc)。
     //
     // 不命中 (miss / V=0 / perm 不齐) → fall back mmu_walker_helper_load — walker 内
@@ -192,7 +192,7 @@ static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
 //
 // 跟 lsu_load_helper 同形态, 但 SV32 TLB 命中时**仍调 store_helper** (extern), 不
 // 像 load 命中直接 *hva — 因为 store 有 LR/SC reservation 清除 + 未来 SMC 副作用,
-// 强制经 helper (insight 1, 见顶段 doc)。
+// 强制经 helper (见顶段 doc 不对称真机理)。
 //
 // 调用方: interpreter.c 3 store case (SB/SH/SW)。
 //
@@ -236,7 +236,7 @@ static inline void lsu_store_helper(cpu_t *hart, tlb_t *current_tlb,
     //   之后 fast path 直接调 store_helper)
     //
     // 命中后调 store_helper(hva, ...) — 不像 load 命中直接 *hva, 因 store 副作用
-    // (LR/SC reservation 清除 + 未来 SMC) 强制经 helper (insight 1)。store_helper
+    // (LR/SC reservation 清除 + 未来 SMC) 强制经 helper。store_helper
     // HVA-based, caller 已确认 RAM (TLB 命中 → RAM), 不需重复 IS_GPA_RAM。
     //
     // 不命中 (miss / V=0 / D=0 / perm 不齐) → fall back mmu_walker_helper_store。

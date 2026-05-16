@@ -272,69 +272,45 @@ store/restore。否决理由:
 
 
 --------------------------------------------------------------------------------
-附:load 和 store 在初版的 fast path 不对称
+附: load / store 不对称的真机理
 --------------------------------------------------------------------------------
 
-虽然本协议主要讲 sigsetjmp/siglongjmp,但 load/store 路径上有一个相关
-的不对称设计,值得在此明确(因为它影响"哪些 helper 真的会 longjmp"):
+虽然本协议主体讲 sigsetjmp/siglongjmp, 但 load/store 路径上有一个相关
+的不对称, 直接影响"哪些 helper 真的会 longjmp"。
 
-  - **load**:可以 inline TLB fast path(命中 + 权限对 → 直接 host load,
-    不调 helper);只在 TLB miss / 权限错时调 walker_helper_load。
-    JIT 和解释器都这样做。
+不对称的因果链 (5 条):
 
-  - **store**:**全部走 store_helper**(初版无 inline fast path)。
-    JIT 和解释器都这样做。
+  1. TLB 缓存的是 hva (tlb_e_t.host_ptr, 见 tlb.h), 不是 pa
+  2. MMIO 不进 TLB (§4 单分发表 + §8 三层模型)
+  3. → TLB 命中路径**结构上**不带 RAM/MMIO 分支 — entry 内根本不可能是
+     MMIO, 命中路径不需要 IS_GPA_RAM check
+  4. → load 命中可以**直接 return *hva**, 不需要任何子 helper
+  5. store 命中仍然必须走 store_helper — 不是因为"store 慢点也无所谓",
+     而是 LR/SC reservation 清除 / 未来 SMC 副作用强制经 helper, 跟
+     RAM/MMIO 分流无关
 
-store_helper 内部翻译形态:
+也就是: load / store 不对称 = "副作用强制经 helper vs 没副作用可走 TLB
+直接 *hva", **不是** "性能 vs 副作用" 二分。
 
-  接口: store_helper(cpu_t *hart, tlb_t *current_tlb, uint32_t gva,
-                     uint32_t value, uint32_t size);
+"MMIO 不进 TLB" 的真意 = "让 TLB 命中路径结构上不带分支", 不是单纯"省
+TLB 空间 / MMIO 命中率低"。
 
-  helper 内部:
-    (a) misalign 检查(size > 1 时低位非 0)→ trap_raise_exception
-        (cause 6 store/AMO address misaligned, tval = gva)
-    (b) GVA → host_ptr 翻译, 跟 load inline 路径概念对称, 但在 helper 内做:
-        - BARE(current_tlb=NULL): identity + IS_GPA_RAM 检查;
-          失败 → trap_raise_exception(cause 7 store/AMO access fault, tval = gva)
-        - SV32: TLB lookup; 命中 host_ptr; miss → walker_helper_store
-          → fill TLB → host_ptr; 权限错 → trap_raise_exception(cause 15
-          store/AMO page fault, tval = gva)
-    (c) host store:*(uint?_t *)host_ptr = value
-    (d) reservation 清除(注释占位; future LR/SC 真接时清当前 hart 的
-        reservation;SMP 时需跨 hart 同步 reservation table)
-    (e) future SMC 检测:配合 page_dirty 位图(替代 SIGSEGV 机制)
-
-  对称性:
-    - load inline 路径:caller 在 case 内 inline TLB lookup, 命中 bypass helper
-    - store helper 路径:caller 调 store_helper, helper 内做 TLB lookup
-      (而不是 caller 自己查后传 host_ptr)
-    两条路径 TLB lookup 用同一份逻辑, 区别在于 caller 是否 bypass helper。
-    load bypass 是性能优化(fast path 完全 inline);
-    store 必须经 helper 因为 reservation / SMC / 未来扩展副作用。
-
-  current_tlb 由 caller 透传:dispatcher 在 block 1 算好 current_tlb 一路传到
-    interpret_one_block / JIT block, 再传到 store_helper(跟 mmu_translate_pc
-    接口同模式, 不需要 helper 内重新算)。
+完整调用拓扑 + 接口签名见 src/isa/lsu.h 顶段; mmu 端见 src/core/mmu.h 顶段。
 
 为什么 store 不能简单 inline:
-  - LR/SC 语义:任何 store 都可能让某个 reservation 失效。reservation
-    检查的逻辑放在 store_helper 内部。
-  - 未来 SMC 检测优化:可能让 store 路径配合 page_dirty 检查(替代 SIGSEGV
-    机制)。
-  - 即使初版 reservation "暂时不清除"(初版简化决定),接口形态保持
-    store_helper,以便未来加 reservation 清除只改 helper 内部,不改调用方。
+  - LR/SC 语义: 任何 store 都可能让某 reservation 失效; reservation 检查
+    放在 store_helper 内部
+  - 未来 SMC 检测: 可能让 store 路径配合 page_dirty 位图 (替代 SIGSEGV)
+  - 接口稳定: reservation 暂未真做, 接口仍保 store_helper 形态, 未来加
+    副作用只改 helper 内部, 不改调用方
 
-性能影响:
-  - 解释器:每个 store case 走 helper(几条 mov + call),~10-20 cycle。
-    解释器本来就慢路径,代价占比小。
-  - JIT:每个 store emit 一个 helper call 而非 inline。**这正是 dummy.txt
-    §1 "统一保护"所付的代价**(每次 store 都付寄存器 store/restore)。
-  - 未来 store_helper inline 化(命名澄清见本文 F1)会同时消除 JIT 和
-    (可选)解释器的 store 函数 call 开销。注意 inline 化后 store_helper
-    内部仍全是 slow path 操作,只是边界从函数边界挪到代码块边界。
+性能影响 (统一保护策略下):
+  - 解释器: 每个 store case 走 helper (~10-20 cycle), 占比小
+  - JIT: 每个 store emit 一个 helper call, 每次付寄存器 store/restore
+    (这正是本节 "统一保护" 所付的代价)
 
-→ 这个不对称在 §2.tlb / §3.mmu / §8.interpreter 各自的 D 区都有体现,
-  此处只是把它和 longjmp 协议的关系说清楚。
+→ 这个不对称在 §4 (TLB) / §8 (三层模型) 各自有体现, 此处把它和 longjmp
+  协议的关系说清楚。
 
 
 --------------------------------------------------------------------------------
@@ -1009,36 +985,47 @@ guest OS 通过 PMP 配的物理权限策略。
     输出: load 返回值 / store 副作用 / 无 device → access fault
     实现:
       - IS_GPA_RAM(pa)  → gpa_to_hva_offset + pa, 直通 host_ptr memcpy
-      - 否则 → bus_dispatch_read/write(pa, ...) → device 自处理
-      - bus 未命中 → 返回非 0, caller (lsu) 转 access fault
-    不知道: GVA; priv; PMP 状态
+                          (load 直接 *hva 返回; store 走 store_helper, HVA-based,
+                          含 LR/SC + 未来 SMC 副作用入口)
+      - 否则 → mmio_read_helper / mmio_write_helper(hart, pa, gva, ...)
+              → bus 线性扫表 + device read/write fn
+      - bus 未命中 → bus 自产 CAUSE_LOAD/STORE_ACCESS_FAULT (5/7) +
+                     trap_raise_exception (_Noreturn-on-failure)
+    不知道: GVA (作 tval 透传, 不参与派发); priv; PMP 状态
 
 
 --------------------------------------------------------------------------------
 组合形态 (load 路径示例; store / fetch 同形态, perm 不同)
 --------------------------------------------------------------------------------
 
-guest 一条 lw 指令的完整翻译路径:
+guest 一条 lw 指令的完整翻译路径 (抽象层; 完整调用拓扑见 src/isa/lsu.h 顶段):
 
-  load_helper (lsu):
+  interpreter LOAD case
     │
-    ├─ (1) mmu: GVA → PA  (TLB 命中 + check_perm R / miss → walker)
-    │        失败 → page fault (cause 13)
+    ├─ misalign check (LOAD_MISALIGN_CHECK 宏, case 入口 gva 级)
+    │      失败 → trap_raise(cause 4 load addr misaligned, tval=gva)
     │
-    ├─ (2) pmp_check(pa, MMU_PERM_R)  [v1 跳过; 真做时插一行]
-    │        失败 → access fault (cause 5)
-    │
-    └─ (3) memory:
-           IS_GPA_RAM(pa)  → host_ptr memcpy → return value
-           else            → bus_dispatch_read(pa, &value, size)
-                              0    → return value
-                              非 0 → access fault (cause 5)
+    └─ lsu_load_helper [inline 顶层]
+         ├─ BARE: IS_GPA_RAM(gva) ? *hva inline : mmio_read_helper(...)
+         ├─ SV32 TLB hit: return *(entry->host_ptr + offset)
+         └─ SV32 miss: mmu_walker_helper_load
+                       ├─ (1) mmu_walk → PA + pte_wb 建议 set A
+                       │      失败 → trap_raise(13 page fault)
+                       ├─ (2) pmp_check  [v1 跳过]
+                       └─ (3) memory:
+                              IS_GPA_RAM(pa) ? 写回 PT + fill TLB + *hva
+                                             : mmio_read_helper (不写回 PT,
+                                                                 不 fill TLB)
 
 fetch 路径 (mmu_translate_pc) 对称: perm = X, 失败 cause = 12 / 1; 当前没有
-"可 fetch 范围表", 故 (3) 阶段就是 IS_GPA_RAM 直通 + 否则 access fault (取指
-不进 bus_dispatch — bus 派发到 device 取指无意义, 见 mmu.h "PA 落 MMIO 时的
+"可 fetch 范围表", 故 (3) 阶段是 IS_GPA_RAM 直通 + 否则 access fault (取指
+不进 mmio_*_helper — bus 派发到 device 取指无意义, 见 mmu.h "PA 落 MMIO 时的
 行为差异" 段)。未来若真做 ROM / flash, 在 (3) 阶段加"可 fetch 范围表"查询,
 不动 mmu / pmp / device 接口。
+
+store 路径 perm = W, 跟 load 形态对称但 SV32 TLB hit 也必走 store_helper
+(LR/SC + 未来 SMC 副作用强制经 helper, 见 §1 末段 "load / store 不对称")。
+mmu_walker_helper_* 一族的颗粒度设计见 §10。
 
 
 --------------------------------------------------------------------------------
@@ -1139,9 +1126,9 @@ cause 0 的两条产生路径
   - mmio_dev_t.read / write fn → int
       0    = 成功
       非 0 = cause (RV spec exception code; 例 4/5/6/7)
-      device 内部决定 cause 细分; bus_dispatch_* 透传给 trap_raise_exception。
+      device 内部决定 cause 细分; mmio_*_helper 透传给 trap_raise_exception。
 
-  - bus_dispatch_read / write 本身是 _Noreturn-on-failure (失败 longjmp),
+  - mmio_read_helper / mmio_write_helper 本身是 _Noreturn-on-failure (失败 longjmp),
     不返回 cause 给调用方 —— 因为调用方 (lsu / mmu walker) 已经在 helper
     深处, 直接 longjmp 比 propagate cause 简洁。
 
@@ -1163,7 +1150,7 @@ trap_set_state vs trap_raise_exception 的选择依据:
   - 已进入解释器 / JIT block (控制流深处)  →  trap_raise_exception (_Noreturn
     longjmp) 跳回 dispatcher 的 sigsetjmp 落点。栈帧深, longjmp 跳过中间帧。
     例: interpreter op_kind case 内 trap_raise (§1 路径 2a); load_helper /
-        store_helper / mmu_walker_helper_* / bus_dispatch_* 内 trap_raise。
+        store_helper / mmu_walker_helper_* / mmio_*_helper 内 trap_raise。
 
 跟 §1 (sigsetjmp 协议) 是同一件事的两个角度: §1 描述机制 (sigsetjmp 一次性
 + 两条 raise 路径), §9 描述选择依据 (基于"已进 block 没"决定用哪条)。
@@ -1178,7 +1165,111 @@ trap_set_state vs trap_raise_exception 的选择依据:
     tval = pc 自身; 都是同一个值)。
   - 本协议不延伸到其他 cause 跟 "0=成功" 的关系 —— cause 1..15 都 ≠ 0,
     跟 "0=成功" 天然不冲突。
-  - 本协议不规定 bus_dispatch_* 内 "device 拒绝" vs "未命中" 的 cause 区分
+  - 本协议不规定 mmio_*_helper 内 "device 拒绝" vs "未命中" 的 cause 区分
     —— device 自决 cause (拒绝时); 未命中由 bus 自产 CAUSE_LOAD/STORE_ACCESS_FAULT
     (5/7), 在 bus.c 实装时定。
+
+
+================================================================================
+## §10. JIT helper 颗粒度 + may-longjmp 边界 + 寄存器保存协议
+================================================================================
+
+涉及文件:
+  - src/core/mmu.{c,h}      (mmu_walker_helper_load/store + 未来 amo_lr/sc 一族)
+  - src/isa/lsu.{c,h}       (lsu_load_helper / lsu_store_helper / store_helper)
+  - src/core/interpreter.c  (PRIV_CHECK_OR_TRAP / SYNC_COUNT / LOAD_MISALIGN_CHECK
+                             等 file-local 宏)
+  - src/core/csr.{c,h}      (csr_op 入口判 priv/RO; may-longjmp 边界)
+  - src/platform/bus.{c,h}  (mmio_read/write_helper _Noreturn-on-failure)
+  - 未来 src/isa/amo.{c,h}  (LR/SC + 9 个 AMO 各自的 helper 入口)
+  - 未来 src/jit/translator.c (emit 时遵守同协议)
+
+
+--------------------------------------------------------------------------------
+(A) helper 颗粒度 by design — 每条 RV 访问指令对应一个 helper 入口
+--------------------------------------------------------------------------------
+
+mmu_walker_helper_load / store (现有) + mmu_walker_helper_amo_lr / amo_sc /
+amo_* (未来) 这一族函数, **不只是 TLB miss 时的 fallback**, 而是 by design
+给 **JIT 块出口** 准备的"不同颗粒度的助手函数":
+
+  1. JIT 翻译块内每条访问指令 emit `call mmu_walker_helper_xxx` = 块边界 +
+     longjmp 出口 —— **颗粒度 = 单条指令**, 函数地址静态绑定到 emit 出来的
+     call 指令
+  2. 不能合并成"统一 mmu_walker_helper(op_kind, ...)" 大入口 —— 大 helper
+     需要在 helper 内 switch on op_kind, 多一层间接 + JIT 翻译产物里无法
+     静态绑各种 inline 特化 + 调用约定也得跨 op_kind 一致 (限制 helper
+     实现的灵活性)
+  3. → 未来 LR/SC + 9 个 AMO 各需要自己的 mmu_walker_helper_amo_xxx, 不能
+     图省事合并; 这条决定 isa/amo.{c,h} 接口设计 + JIT translator emit 路径表
+
+同样原则也应用到 lsu 层: lsu_load_helper / lsu_store_helper (顶层 inline)
++ 未来 amo_lr_helper / amo_sc_helper / amo_xxx_helper 各自入口, 不合并。
+
+
+--------------------------------------------------------------------------------
+(B) may-longjmp 边界列表
+--------------------------------------------------------------------------------
+
+"may-longjmp 边界" = 调用后可能不返回 caller (内部 trap_raise_exception
+_Noreturn longjmp) 的位置。本项目当前 may-longjmp 边界:
+
+  解释器 / JIT 控制流深处 (§1 路径 2a):
+    - lsu_load_helper / lsu_store_helper        (顶层 inline; SV32 miss 调
+                                                 walker; BARE MMIO 调 bus)
+    - mmu_walker_helper_load / store            (SV32 miss 走 mmu_walk + 调
+                                                 lsu / bus)
+    - store_helper                              (HVA-based, RAM 写 + LR/SC +
+                                                 SMC 副作用; 不直接 longjmp,
+                                                 但调链可能)
+    - mmio_read_helper / mmio_write_helper      (bus _Noreturn-on-failure)
+    - csr_op                                    (入口判 priv / RO 写违法 →
+                                                 trap_raise)
+    - trap_raise_exception                      (本身就是 _Noreturn 长跳入口)
+    - PRIV_CHECK_OR_TRAP (file-local 宏)        (MRET / SRET / SFENCE.VMA 等
+                                                 priv 不够 → trap_raise)
+    - LOAD_MISALIGN_CHECK / STORE_MISALIGN_CHECK (case 入口 gva 级查 → trap_raise)
+    - 未来 amo_*_helper / amo_walker_helper_*   (同 lsu 形态)
+
+  dispatcher 主帧内 (§1 路径 2b, **不长跳**):
+    - mmu_translate_pc                          (fetch 失败 trap_set_state +
+                                                 return; 不长跳)
+    - dispatcher 循环顶 pc IALIGN 兜底           (trap_set_state + continue;
+                                                 §9 (b))
+
+
+--------------------------------------------------------------------------------
+(C) 寄存器保存协议 (JIT translator 配合)
+--------------------------------------------------------------------------------
+
+§1 中段已规定 "Translator 配合机制 (寄存器保护)": **emit 每个 may-longjmp
+helper call 之前, store 所有映射 host 寄存器到 cpu_t**。本节是具体应用清单。
+
+(B) 列出的每个 may-longjmp 边界, JIT translator 都要在 emit call 之前插
+寄存器保存序列 (跟 csr_op / lsu_*_helper / mmu_walker_helper_* 同处理)。
+没有例外, 没有"这个 helper 不会 longjmp 所以省了"的标注 — 见 §1 "统一保护
+vs 标注式" 的策略选择。
+
+→ 解释器视角与 JIT 视角的对偶:
+
+  解释器:  SYNC_COUNT() 宏在 may-longjmp 调用前同步 count_out
+           (RV precise trap 要求"触发指令不算入" — failing 那条不能被
+            cumulative count 累上, 否则 dispatcher 用旧 count 算错)
+
+  JIT:     emit "store 所有映射 host 寄存器" 序列在 may-longjmp call 前
+           (寄存器值要在 longjmp 跳走前固化到 cpu_t, 否则 sigsetjmp 落点
+            读到的是旧值)
+
+两者是同一哲学的两个版本: "may-longjmp 边界前, 把瞬态状态固化到 cpu_t"。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不规定 helper 内部具体 trap cause 细分 (cause 集见 §1 + 各 helper
+    自身 doc)
+  - 本协议不规定 JIT 寄存器映射策略 (是 translator / backend 内部决定)
+  - 本协议不延伸到 IRQ 中断分发 (T3+ 真做中断时, "中断走长跳还是返回机制"
+    再扩 §9 + 本节)
 
