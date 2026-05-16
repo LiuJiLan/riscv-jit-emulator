@@ -77,7 +77,9 @@ add_executable(riscv_jit_emulator
         src/isa/sfence.c
         src/isa/sfence.h
         src/debug.c
-        src/debug.h)
+        src/debug.h
+        src/platform/bus.c
+        src/platform/bus.h)
 
 # Test
 enable_testing()

@@ -946,3 +946,125 @@ host thread — OS 级 pthread, 包括两类:
     起步 relaxed)
   - 本协议不规定"per-hart"还是"shared"的具体边界 (这是各字段 sheet 的事;
     边界改动要写明)
+
+
+================================================================================
+## §8. PMP / MMU / 内存 (RAM + MMIO) 三层关系
+================================================================================
+
+涉及文件:
+  - src/core/mmu.{c,h}        (地址翻译层, GVA → PA + SV32 PTE 权限)
+  - src/platform/ram.{c,h}    (RAM 直通层, PA → host_ptr 偏移)
+  - src/platform/bus.{c,h}    (MMIO 派发层, PA → device read/write)
+  - src/isa/lsu.{c,h}         (load/store 调度层, 把上面三层串起来)
+  - 未来 src/platform/pmp.{c,h} (PA 物理权限层, R/W/X 过滤; v1 不实装, 长期
+                                  也不打算实装)
+
+
+--------------------------------------------------------------------------------
+背景
+--------------------------------------------------------------------------------
+
+项目早期 (a_02 起步讨论中) 曾把"设备能否被取指 / 读 / 写"这一组语义误归到
+device 接口里 — 想象 device struct 持 read_fn / write_fn / execute_fn 三个槽,
+NULL 表示不支持。讨论澄清后发现这是把三个独立维度搅在了一起: 一个 device
+被允许 R / W / X 这件事既不是 device 自身的属性, 也不是 bus 的职责, 而是
+guest OS 通过 PMP 配的物理权限策略。
+
+本节固定 mmu / pmp / 内存 三层的职责边界, 让后续模块设计不再回到这个误解。
+顺带记录: 把维度拆清后, PMP 在本项目里既不阻塞 v1, 也不阻塞 v2+, 估计长期
+不会实装 — 主流 guest OS 不依赖 PMP 才能起来。
+
+
+--------------------------------------------------------------------------------
+三层职责
+--------------------------------------------------------------------------------
+
+(1) 地址翻译层 = mmu (含 TLB / walker)
+    职责: GVA → PA + 页级权限检查 (SV32 PTE.R/W/X/U + mstatus.SUM/MXR)
+    输入: GVA, perm (R/W/X), priv
+    输出: PA (成功) 或 page fault (cause 12/13/15)
+    实现: SV32 走 TLB + walker; BARE 是 identity 短路, 不查 PTE
+    不知道: PA 落 RAM 还是 MMIO; device 信息; PMP 状态
+
+(2) PA 物理权限层 = pmp (未来; 项目长期不实装)
+    职责: 对已翻译 PA 做物理层 R/W/X 过滤 — 跟 device 类型无关, 跟 OS 配的
+          PMP CSR 状态直接对应
+    输入: PA, perm
+    输出: OK 或 access fault (cause 1/5/7)
+    实现: 查 PMP CSR (pmpcfg0..15 + pmpaddr0..63) 线性匹配 R/W/X
+    不知道: device 信息; PTE 信息; mmu 状态
+    项目状态: v1 + 长期不实装 — 主流 guest OS (Linux / FreeRTOS / OpenSBI)
+              不依赖 PMP 起 boot; 真接 PMP 是 plan §2 范围以外的优化项
+
+(3) 内存访问层 = ram + bus
+    职责: 已通过 (1) 和 (2) 后, 把 PA 真正解到 host 端读写 (RAM 直通 host_ptr
+          或 MMIO 派发 device read/write)
+    输入: PA, perm, value/buf, size
+    输出: load 返回值 / store 副作用 / 无 device → access fault
+    实现:
+      - IS_GPA_RAM(pa)  → gpa_to_hva_offset + pa, 直通 host_ptr memcpy
+      - 否则 → bus_dispatch_read/write(pa, ...) → device 自处理
+      - bus 未命中 → 返回非 0, caller (lsu) 转 access fault
+    不知道: GVA; priv; PMP 状态
+
+
+--------------------------------------------------------------------------------
+组合形态 (load 路径示例; store / fetch 同形态, perm 不同)
+--------------------------------------------------------------------------------
+
+guest 一条 lw 指令的完整翻译路径:
+
+  load_helper (lsu):
+    │
+    ├─ (1) mmu: GVA → PA  (TLB 命中 + check_perm R / miss → walker)
+    │        失败 → page fault (cause 13)
+    │
+    ├─ (2) pmp_check(pa, MMU_PERM_R)  [v1 跳过; 真做时插一行]
+    │        失败 → access fault (cause 5)
+    │
+    └─ (3) memory:
+           IS_GPA_RAM(pa)  → host_ptr memcpy → return value
+           else            → bus_dispatch_read(pa, &value, size)
+                              0    → return value
+                              非 0 → access fault (cause 5)
+
+fetch 路径 (mmu_translate_pc) 对称: perm = X, 失败 cause = 12 / 1; 当前没有
+"可 fetch 范围表", 故 (3) 阶段就是 IS_GPA_RAM 直通 + 否则 access fault (取指
+不进 bus_dispatch — bus 派发到 device 取指无意义, 见 mmu.h "PA 落 MMIO 时的
+行为差异" 段)。未来若真做 ROM / flash, 在 (3) 阶段加"可 fetch 范围表"查询,
+不动 mmu / pmp / device 接口。
+
+
+--------------------------------------------------------------------------------
+为什么 device 接口里不放 R / W / X / execute 字段
+--------------------------------------------------------------------------------
+
+历史误解: 把"该 device 是否允许被读 / 写 / fetch"当成 device 自身能力, struct
+持 read_fn / write_fn / execute_fn 三个槽, NULL 表示不支持。
+
+实际形态: 上述三件其实分属三个独立维度, 不在同一层:
+
+  - "该 PA 是否允许 R/W/X" = 权限维度 → 层 (2) PMP, 由 OS 配 PMP CSR 决定;
+    跟该 PA 上是 CLINT / UART / RAM 完全无关 (PMP 只看 PA, 不看 device 类型)
+  - "该 PA 是否有 host_ptr 可让解释器顺序读字节 (执行)" = 物理可 fetch 维度
+    → 层 (3) memory 内部细分 (RAM-like 直通 vs 纯 MMIO 派发); 跟 OS 无关,
+    跟 device 类型有关 (CLINT 没 host_ptr, RAM 有), 但不在 device struct 字段
+    里, 而在 IS_GPA_RAM 宏 / 未来"可 fetch 范围表"里
+  - "该 device 收到 read/write 后做什么副作用" = device 语义维度 → 在 device
+    自己的 read_fn / write_fn 实现里, 跟权限无关
+
+device struct (mmio_dev_t in bus.h) 只承担第三件, 是 bus 接口最小化设计 —
+read_fn / write_fn 表达"收到访问做什么副作用", 不表达"是否允许被访问"。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不规定 PMP 的具体 region 数 / cfg 编码 (真做时按 RV spec §3.7;
+    项目当前没这个计划)
+  - 本协议不规定"可 fetch 范围表"的具体形态 (bus 模块未来扩展时定; 当前
+    bus.h 注释占位)
+  - 本协议不延伸到 IOMMU / PASID 等高级 IO 翻译 (不在 v1 / 长期范围)
+
