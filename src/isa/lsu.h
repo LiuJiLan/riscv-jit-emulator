@@ -38,7 +38,6 @@
 #define ISA_LSU_H
 
 #include <stdint.h>
-#include <stdio.h>      // fprintf (BARE access fault / SV32 占位 提示)
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
 #include "config.h"          // GUEST_RAM_START / GUEST_RAM_SIZE / TLB_NUM_ENTRIES
@@ -46,6 +45,7 @@
 #include "core/mmu.h"        // mmu_walker_helper_load (SV32 miss / perm 不齐 fall back)
 #include "core/tlb.h"        // tlb_t (current_tlb 参数类型)
 #include "core/trap.h"       // trap_raise_exception (_Noreturn longjmp)
+#include "platform/bus.h"    // bus_dispatch_read (BARE MMIO 派发, _Noreturn-on-failure)
 #include "platform/ram.h"    // gpa_to_hva_offset (BARE host load 解地址)
 #include "riscv.h"           // CAUSE_LOAD_* (Exception Code 宏) + PTE_* 位
 
@@ -72,7 +72,8 @@
 //
 // 错误 (longjmp 走 trap_raise_exception, 不返回 caller):
 //   - misalign  → trap_raise(4, gva)
-//   - BARE PA 不在 RAM (未接 bus_dispatch) → fprintf + trap_raise(5, gva)
+//   - BARE PA 不在 RAM → bus_dispatch_read (_Noreturn-on-failure; 未命中 / device
+//                        拒绝在 bus 内部 trap_raise, 不返回 caller)
 //   - SV32 walker fault → fall back walker_helper_load 内 trap_raise(13/5, gva)
 // ----------------------------------------------------------------------------
 static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
@@ -87,13 +88,10 @@ static inline uint32_t load_helper(cpu_t *hart, tlb_t *current_tlb,
         uint32_t pa = gva;  // identity
         // RAM 区检查 (无符号下溢比较, 跟 mmu.c pa_to_fetch_hva 一致)。
         if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-            // PA 不在 RAM 区。bus_dispatch 未实现, fprintf 提示 + trap access fault。
-            // 未来加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO load 走 bus);
-            // 当前一律 cause 5 (Load Access Fault)。
-            fprintf(stderr,
-                    "[lsu] load: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
-                    pa);
-            trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
+            // PA 不在 RAM 区 → MMIO 派发 (不入 TLB; plan §1.4 + dummy.txt §8 / §9)。
+            // bus_dispatch_read 内部 _Noreturn-on-failure (未命中 / device 拒绝
+            // 都 longjmp, 不返回 caller)。
+            return bus_dispatch_read(hart, pa, /*gva for tval*/gva, size);
         }
 
         uint8_t *host_ptr = gpa_to_hva_offset + pa;

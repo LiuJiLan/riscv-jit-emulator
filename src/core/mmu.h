@@ -63,6 +63,9 @@
 //       1  = Instruction Access Fault   (PA 落在不可执行物理区域: MMIO / 不存在内存 / PMP 拒绝)
 //       12 = Instruction Page Fault     (Sv32 walker 翻译失败: PTE 无效 / X 位 / U 位等)
 //     tval = 触发 fault 的 GVA = hart->regs[0] (mmu 自己填, dispatcher 不再填)。
+//     注: 返回值 0 = 成功跟 RV cause 0 (CAUSE_INST_ADDR_MISALIGNED) 不冲突 —
+//         cause 0 由 dispatcher 循环顶 + 转跳指令自检产生, 不经 mmu 接口的 return
+//         code。详 dummy.txt §9 ("0=成功" 接口约定)。
 //
 // (2) mmu_walker_load/store/amo (JIT block / interpreter 调; dummy.txt §1 路径 2a):
 //     失败时调 **trap_raise_exception** (含长跳); helper 内部 trap_set_state + siglongjmp 到

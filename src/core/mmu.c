@@ -5,13 +5,14 @@
 //
 // 顶部模块文档见 mmu.h (含 regime 二分 / 错误模型 / trap_raise 职责 / MMIO 行为差异 +
 // SV32 walker 设计 / hw-managed A/D / TLB fall back / G-agnostic / 立即生效)。
-// 报错风格见 src/dummy.txt §5 (mmu_translate_pc 不 fprintf, 错误码就是 RV cause;
-// walker_helper_* 在 PA 不在 RAM 时 fprintf 占位提示, 跟 lsu.c 同形态)。
+// 报错风格见 src/dummy.txt §5 (mmu_translate_pc 不 fprintf, 错误码就是 RV cause);
+// walker_helper_* 在 PA 不在 RAM 时走 bus_dispatch_* (MMIO 派发, 见 dummy.txt §8 / §9)。
 //
 
 #include "mmu.h"
 
 #include "config.h"
+#include "platform/bus.h"   // bus_dispatch_read/write (MMIO 派发, _Noreturn-on-failure)
 #include "platform/ram.h"
 #include "riscv.h"
 #include "tlb.h"
@@ -19,7 +20,7 @@
 
 #include <stddef.h>   // NULL (current_tlb == NULL 编码 REGIME_BARE)
 #include <stdint.h>
-#include <stdio.h>    // fprintf (walker_helper_* PA 不在 RAM 占位提示)
+#include <stdio.h>    // fprintf (PT 物理地址越界 占位提示)
 #include <string.h>   // memcpy (walker 读写 PT, walker_helper_* host load/store)
 
 // check_perm 是 mmu.h 的 static inline 函数 (三处共用: mmu_translate_pc / load_helper /
@@ -325,12 +326,11 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
         trap_raise_exception(hart, fault_cause, /*tval*/gva);   /* _Noreturn longjmp */
     }
 
-    // PA 在 RAM 区检查 (当前不接 bus_dispatch; PA 不在 RAM 一律 access fault)
+    // PA 不在 RAM 区 → MMIO 派发 (不入 TLB, plan §1.4 + dummy.txt §8)
+    // bus_dispatch_read 内部 _Noreturn-on-failure (未命中 / device 拒绝都 longjmp,
+    // 不返回 caller; 见 dummy.txt §9 "0=成功" + cause 0 路径)。
     if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-        fprintf(stderr,
-                "[mmu_walker_helper_load] PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
-                pa);
-        trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, /*tval*/gva);
+        return bus_dispatch_read(hart, pa, gva, size);
     }
 
     uint8_t *host_ptr       = gpa_to_hva_offset + pa;
@@ -363,11 +363,10 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
         trap_raise_exception(hart, fault_cause, /*tval*/gva);
     }
 
+    // PA 不在 RAM 区 → MMIO 派发 (不入 TLB; plan §1.4 + dummy.txt §8 / §9)
     if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-        fprintf(stderr,
-                "[mmu_walker_helper_store] PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
-                pa);
-        trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);
+        bus_dispatch_write(hart, pa, gva, value, size);  // _Noreturn-on-failure
+        return;
     }
 
     uint8_t *host_ptr       = gpa_to_hva_offset + pa;

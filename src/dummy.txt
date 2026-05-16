@@ -95,12 +95,17 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
          b. siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 的落点
        trap_raise_exception 标 _Noreturn, 不返回 caller。
 
-    (2b) dispatcher fetch 路径 —— 直接调 trap_set_state, 不长跳
-       mmu_translate_pc 内部检测到取指 fault 时, 已经在 dispatcher 主循环帧
-       内, 直接走普通 control flow (return rc) 比 longjmp 简洁。它直接调
-       trap_set_state, 后者只设架构状态(写字段, 不长跳), 然后通过 mmu_
-       translate_pc 的返回值告诉 dispatcher "已 deliver, continue 这一轮"。
-       dispatcher 看 rc != 0 直接 continue, 让 while 条件接管。
+    (2b) dispatcher 主帧内 —— 直接调 trap_set_state, 不长跳 (两条子路径)
+       已经在 dispatcher 主循环帧内, 控制流回到主循环不需要长跳, 直接调
+       trap_set_state(写字段, 不长跳) + return / continue 即可:
+
+       - mmu_translate_pc 取指 fault: 通过返回值告诉 dispatcher "已 deliver,
+         continue 这一轮"。dispatcher 看 rc != 0 直接 continue。
+       - dispatcher 循环顶 pc IALIGN 兜底 (block 1 之前): 检测 pc 未对齐时
+         直接 trap_set_state(CAUSE_INST_ADDR_MISALIGNED, pc) + continue。
+
+       本质规则 (长跳 vs 返回机制的分界) + cause 0 (CAUSE_INST_ADDR_MISALIGNED)
+       产生路径细化见 §9。
 
     两种路径共用同一个 trap_set_state 内核(写字段 + 计数 + 决定不 deliver
     when in_trap >= 3); 区别只是"控制流如何回到 dispatcher 主循环顶":
@@ -1067,4 +1072,113 @@ read_fn / write_fn 表达"收到访问做什么副作用", 不表达"是否允�
   - 本协议不规定"可 fetch 范围表"的具体形态 (bus 模块未来扩展时定; 当前
     bus.h 注释占位)
   - 本协议不延伸到 IOMMU / PASID 等高级 IO 翻译 (不在 v1 / 长期范围)
+
+
+================================================================================
+## §9. CAUSE_INST_ADDR_MISALIGNED 产生路径 + "0=成功" 接口约定
+================================================================================
+
+涉及文件:
+  - src/core/dispatcher.c   (循环顶兜底 pc IALIGN 检查 — single source)
+  - src/core/interpreter.c  (jal/jalr/branch + mret/sret 自检占位; 实际 dead code)
+  - src/core/mmu.{c,h}      (mmu_translate_pc 接口 "0=成功")
+  - src/core/trap.c         (trap_set_state 服务的三条 exception 路径)
+  - src/platform/bus.{c,h}  (device 接口约定 "0=成功"; bus 自己 _Noreturn)
+  - src/platform/clint.c + 未来其他 device  (read/write fn 返回 cause)
+
+
+--------------------------------------------------------------------------------
+背景
+--------------------------------------------------------------------------------
+
+CAUSE_INST_ADDR_MISALIGNED = 0 (RV spec exception code 0) 跟项目内 "返回 0 =
+成功" 的约定在数值上看似冲突 —— 但实际 cause 0 只在两条专用路径产生, 永远
+不经 bus / device / mmu 接口的 return code, 所以 "0=成功" 无歧义。
+
+
+--------------------------------------------------------------------------------
+cause 0 的两条产生路径
+--------------------------------------------------------------------------------
+
+(a) 转跳指令自检 (interpreter / 未来 JIT 翻译产物)
+    jal / jalr / branch / mret / sret 等写 pc 的指令, 在写之前检查目标地址
+    IALIGN 对齐。项目 IALIGN=16 + jal/branch encoding 强制 imm[0]=0 + jalr
+    内 & ~1u mask LSB, 实际是 dead code; 保留占位让 IALIGN=32 切换时只改宏
+    不改逻辑。
+
+(b) dispatcher 循环顶兜底 (block 1 之前, single source)
+    无论 pc 怎么来 —— cpu_create 初始化 / 上一轮 block 出口 / sigsetjmp 跳回
+    后的 xtvec / 未来 reset_vector / mret/sret 写的 mepc/sepc 等 —— fetch
+    之前在 dispatcher 主循环顶兜底:
+
+        if ((hart->regs[0] & IALIGN_MASK) != 0) {
+            trap_set_state(hart, CAUSE_INST_ADDR_MISALIGNED,
+                           /*tval*/hart->regs[0]);
+            continue;
+        }
+
+    位置: 迭代头扫尾 + DEBUG_REFETCH 之后, block 1 之前 —— pc 不对齐时
+    regime / TLB / mmu_translate_pc 都没必要算。
+
+    这条是 single source: 任何写 pc 的路径出错都在这里捕。
+
+(a) 是规范层"指令自检"占位 (dead code, 不依赖); (b) 是 host emulator 安全
+兜底 (真正捕异常 pc 的路径)。
+
+
+--------------------------------------------------------------------------------
+"0=成功" 接口约定
+--------------------------------------------------------------------------------
+
+跟 mmu_translate_pc 同形态, 项目内多个接口共用 "0=成功 / 非0=cause" 编码:
+
+  - mmu_translate_pc(hart, current_tlb, ...) → int
+      0    = 成功 (pa_out / hva_out 已填)
+      非 0 = in_trap 当前值 (trap 已 deliver, 见 §1 路径 2b)
+
+  - mmio_dev_t.read / write fn → int
+      0    = 成功
+      非 0 = cause (RV spec exception code; 例 4/5/6/7)
+      device 内部决定 cause 细分; bus_dispatch_* 透传给 trap_raise_exception。
+
+  - bus_dispatch_read / write 本身是 _Noreturn-on-failure (失败 longjmp),
+    不返回 cause 给调用方 —— 因为调用方 (lsu / mmu walker) 已经在 helper
+    深处, 直接 longjmp 比 propagate cause 简洁。
+
+cause 0 (CAUSE_INST_ADDR_MISALIGNED) 不会作为 return code 出现 —— 它只走
+上面 (a)(b) 两条路径直达 trap, 不经任何返回值通道。
+
+
+--------------------------------------------------------------------------------
+本质规则: 长跳 vs 返回机制的分界
+--------------------------------------------------------------------------------
+
+trap_set_state vs trap_raise_exception 的选择依据:
+
+  - 在 dispatcher 主帧内, 还未进解释器 / JIT  →  trap_set_state (返回机制)
+    + 上层 continue 让 while(in_trap < 3) 接管。栈帧浅, longjmp 是多余副作用。
+    例: mmu_translate_pc fetch fault (§1 路径 2b); dispatcher 循环顶 pc
+        IALIGN 兜底。
+
+  - 已进入解释器 / JIT block (控制流深处)  →  trap_raise_exception (_Noreturn
+    longjmp) 跳回 dispatcher 的 sigsetjmp 落点。栈帧深, longjmp 跳过中间帧。
+    例: interpreter op_kind case 内 trap_raise (§1 路径 2a); load_helper /
+        store_helper / mmu_walker_helper_* / bus_dispatch_* 内 trap_raise。
+
+跟 §1 (sigsetjmp 协议) 是同一件事的两个角度: §1 描述机制 (sigsetjmp 一次性
++ 两条 raise 路径), §9 描述选择依据 (基于"已进 block 没"决定用哪条)。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不规定 cause 0 的 tval 内容 (项目沿 RV spec, tval = 触发 fault 的
+    GVA = pc 当前值; 转跳指令自检时 tval = 跳转目标; dispatcher 兜底时
+    tval = pc 自身; 都是同一个值)。
+  - 本协议不延伸到其他 cause 跟 "0=成功" 的关系 —— cause 1..15 都 ≠ 0,
+    跟 "0=成功" 天然不冲突。
+  - 本协议不规定 bus_dispatch_* 内 "device 拒绝" vs "未命中" 的 cause 区分
+    —— device 自决 cause (拒绝时); 未命中由 bus 自产 CAUSE_LOAD/STORE_ACCESS_FAULT
+    (5/7), 在 bus.c 实装时定。
 

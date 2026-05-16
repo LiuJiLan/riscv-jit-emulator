@@ -12,6 +12,7 @@
 #include "interpreter.h"
 #include "mmu.h"
 #include "tlb.h"
+#include "trap.h"       // trap_set_state (循环顶 pc IALIGN 兜底; dummy.txt §9)
 #include "riscv.h"
 
 #include <inttypes.h>
@@ -126,6 +127,23 @@ void dispatcher(cpu_t *hart) {
     // 每轮 while 体进入 = 一次"重新派发取指" (块边界自然推进 / 跨页退块重派 / helper
     // longjmp 跳回 sigsetjmp 落点都走这里)。fixture 跨页 / 中断密度人工观察 (debug.h)。
     DEBUG_REFETCH();
+
+    // ========================================================================
+    // pc IALIGN 兜底 (single source; 详 dummy.txt §9)
+    //
+    // 不管 pc 怎么来 (cpu_create / 上轮 block 出口 / sigsetjmp 跳回后的 xtvec /
+    // 未来 reset_vector / mret/sret 写的 mepc/sepc), fetch 前统一兜底。pc 不对齐时
+    // regime / TLB / mmu_translate_pc 都没必要算 — 直接 trap_set_state + continue
+    // 让 while 条件接管。dispatcher 主帧内, 走返回机制不长跳 (§1 路径 2b)。
+    //
+    // tval = pc 自身 (跟 mmu_translate_pc fetch fault 写 tval = gva = pc 同形态)。
+    // 转跳指令 (jal/jalr/branch/mret/sret) 内的 IALIGN 自检占位实际是 dead code
+    // (IALIGN=16 + encoding/mask 强制对齐), 这里是 single source。
+    // ========================================================================
+    if ((hart->regs[0] & IALIGN_MASK) != 0u) {
+        trap_set_state(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/hart->regs[0]);
+        continue;
+    }
 
     // ========================================================================
     // block 1: 算派发包 (regime, current_tlb)

@@ -306,7 +306,9 @@ int main(int argc, char **argv) {
     // hart 字段初始化 (启动协议; 必须在 dispatcher 外, 因为 hart 热插拔 = 寄存器
     // 初始化 + 开始运行)。regs[0] 在 cpu_t 内物理占 x0 位置, 但实际存 pc (见 cpu.h)。
     // 启动状态参考 https://docs.kernel.org/arch/riscv/boot.html
-    hart->regs[0] = GUEST_RAM_START;       // pc; 程序起点; 未来热插拔核时由外部参数设置
+    hart->regs[0] = GUEST_RAM_START | 1u;  // TEMP: 临时测试 dispatcher pc IALIGN 兜底
+                                            // (dummy.txt §9 BUG fix 一次性佐证, commit 后撤回 |1u)
+    // hart->regs[0] = GUEST_RAM_START;     // pc; 程序起点; 未来热插拔核时由外部参数设置
     hart->satp    = 0;                      // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
     hart->priv    = PRIV_M;                 // M 模式
     hart->regs[10] = hart->per_hart_info.mhartid;  // a0 = hartid (Linux RV boot; x10 = a0)

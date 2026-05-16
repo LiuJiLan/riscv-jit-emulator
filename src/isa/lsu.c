@@ -10,7 +10,7 @@
 // 当前形态:
 //   - misalign → trap_raise(6)
 //   - BARE 路径: identity + RAM 检查 + host store
-//     - 不在 RAM → fprintf "MMIO bus_dispatch not implemented" + trap_raise(7)
+//     - 不在 RAM → bus_dispatch_write (_Noreturn-on-failure, MMIO 派发; dummy.txt §8 / §9)
 //   - SV32 路径: TLB lookup fast path + miss/D=0 fall back walker_helper_store
 //   - reservation 清除 注释占位 (LR/SC 真做时填; A 扩展)
 //   - SMC page_dirty 检测 注释占位 (jit/smc.c 真做时填; JIT 阶段)
@@ -19,11 +19,11 @@
 #include "lsu.h"
 
 #include <stdint.h>
-#include <stdio.h>      // fprintf
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
 #include "config.h"          // TLB_NUM_ENTRIES (SV32 fast path 用)
 #include "core/mmu.h"        // mmu_walker_helper_store (SV32 miss / D=0 / perm 不齐 fall back)
+#include "platform/bus.h"    // bus_dispatch_write (BARE MMIO 派发, _Noreturn-on-failure)
 
 
 void store_helper(cpu_t *hart, tlb_t *current_tlb,
@@ -38,13 +38,13 @@ void store_helper(cpu_t *hart, tlb_t *current_tlb,
         uint32_t pa = gva;  // identity
         // RAM 区检查 (无符号下溢比较)。
         if ((uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE) {
-            // PA 不在 RAM 区。bus_dispatch 未实现, fprintf 提示 + trap access fault。
-            // 未来加 platform/bus.c 后, 这里改为 bus_dispatch 路径 (MMIO store 走 bus + 也要
-            // 看是不是 ROM, 写 ROM 是 access fault); 当前一律 cause 7 (Store/AMO Access Fault)。
-            fprintf(stderr,
-                    "[lsu] store: PA 0x%08x not in RAM (MMIO bus_dispatch not implemented)\n",
-                    pa);
-            trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);  // _Noreturn longjmp
+            // PA 不在 RAM 区 → MMIO 派发 (不入 TLB; plan §1.4 + dummy.txt §8 / §9)。
+            // bus_dispatch_write 内部 _Noreturn-on-failure (未命中 / device 拒绝
+            // 都 longjmp, 不返回 caller)。
+            // 注: 未来 ROM 真接时, "写 ROM = access fault" 由 ROM device write_fn
+            // 返非 0 cause 表达, bus 透传给 trap_raise — 仍走这条路径。
+            bus_dispatch_write(hart, pa, /*gva for tval*/gva, value, size);
+            return;
         }
 
         uint8_t *host_ptr = gpa_to_hva_offset + pa;

@@ -24,11 +24,19 @@
 // trap_set_state —— 架构语义层, 不长跳; 详见 trap.h doc
 // ----------------------------------------------------------------------------
 uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
-    // DEBUG trace: 'E' 打印。当前 trap_set_state 只服务 sync exception 一种语义 (两条
-    // 路径都是 exception: trap_raise_exception 内部长跳 + mmu_translate_pc fetch fault
-    // 非长跳); 中断机制未接, 中断不过此函数。
+    // DEBUG trace: 'E' 打印。当前 trap_set_state 只服务 sync exception 一种语义, 三条
+    // 路径都是 exception:
+    //   (a) trap_raise_exception 内部长跳 (interpreter / helper 走 dummy.txt §1 路径
+    //       2a, _Noreturn longjmp)
+    //   (b) mmu_translate_pc fetch fault 非长跳 (dispatcher 主帧内, 路径 2b)
+    //   (c) dispatcher 循环顶 pc IALIGN 兜底非长跳 (cause 0, 跟 (b) 同形态; 见 §9)
     //
-    // T5 接 trap_raise_interrupt 时按形态拍位置 (落 a_02 时按场内分支密度决定):
+    // 本质: (b)(c) 共有特征 — 都在 dispatcher 主帧内, 还未进解释器 / JIT, 控制流回到
+    // dispatcher 主循环用 return + continue 即可, 不长跳 (栈帧浅, longjmp 是多余副作
+    // 用)。(a) 走长跳因为 helper 已在 block 控制流深处。详 dummy.txt §1 + §9。
+    //
+    // 中断机制未接, 中断不过此函数。T5 接 trap_raise_interrupt 时按形态拍位置 (落
+    // a_02 时按场内分支密度决定):
     //   (a) 若 T5 拆 trap_set_exception_state / trap_set_interrupt_state 两个辅助函数,
     //       'E' 留这边, 't'/'s'/'e' 进对偶函数, DEBUG 调用各自独立
     //   (b) 若 T5 共用 trap_set_state + 按 cause 高位 (interrupt bit) 分流, 这条

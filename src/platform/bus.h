@@ -22,9 +22,13 @@
 //     off        相对 gpa_start 的字节偏移 (bus 已减好, device 内直接用)
 //     buf, size  数据缓冲 + 字节数 (size = 1/2/4; future 8 留 64-bit MMIO)
 //     返回 0    成功 (含设备内部决定的"合法忽略"也算成功)
-//     返回 非0  设备拒绝 (size / offset / alignment 不合法; device 自己 fprintf
-//               "why", 见报错风格 dummy.txt §5) — bus 透传给 caller, lsu 转
-//               access fault
+//     返回 非0  cause 数值 (RV spec exception code) — bus 透传给 trap_raise_exception
+//               常见 cause: 4=LOAD_ADDR_MISALIGNED / 5=LOAD_ACCESS_FAULT /
+//                          6=STORE_ADDR_MISALIGNED / 7=STORE_ACCESS_FAULT
+//               cause 0 (CAUSE_INST_ADDR_MISALIGNED) 不在此接口出现 — 它只由
+//               dispatcher 循环顶 + 转跳指令自检产生, 见 dummy.txt §9。
+//               device 内部决定 cause 细分; 跟 mmu_translate_pc 返回形态同源
+//               ("0=成功 / 非0=cause" 接口约定; 见 §9)。
 //   name         调试 / 错误信息用 (string literal; bus 持指针不拷字符串)
 //
 // ----------------------------------------------------------------------------
@@ -54,6 +58,8 @@
 
 #include <stdint.h>
 
+#include "core/cpu.h"     // cpu_t (bus_dispatch_* 失败路径调 trap_raise_exception)
+
 typedef struct {
     uint32_t gpa_start;
     uint32_t gpa_end;
@@ -71,13 +77,25 @@ typedef struct {
 //   3. range 跟已注册 device 重叠
 int bus_register_mmio(const mmio_dev_t *dev);
 
-// 派发 MMIO 读 / 写。
-// 返回:
-//   0    = 命中某 device + device 处理成功
-//   非 0 = 无 device 命中此 PA / 命中但 device 拒绝
-//          caller (通常 lsu load/store_helper) 应 raise access fault
-// 调用时机: lsu 在 IS_GPA_RAM 不命中后, 把 PA / value / size 透传过来。
-int bus_dispatch_read (uint32_t pa, void *buf, uint32_t size);
-int bus_dispatch_write(uint32_t pa, const void *buf, uint32_t size);
+// 派发 MMIO 读 / 写 (_Noreturn-on-failure):
+//   - 命中 device + device 返 0 → return value (read) / void return (write)
+//   - 命中 device 但 device 返非 0 (cause) → trap_raise_exception(hart, cause, gva)
+//   - 未命中任何 device → trap_raise_exception(hart, CAUSE_*_ACCESS_FAULT, gva)
+//                          (load 路径 cause 5; store 路径 cause 7)
+//
+// 参数:
+//   hart   - 调用 hart (trap_raise_exception 用; longjmp 跳回 dispatcher 落点)
+//   pa     - 物理地址 (BARE 时 = GVA; SV32 时 = walker 翻译产物)
+//   gva    - 触发访问的 guest 虚拟地址, 作 trap 的 tval (RV spec stval/mtval)
+//   buf/value/size - 数据 + 字节数 (size = 1/2/4; future 8 留 64-bit MMIO)
+//
+// 调用时机: lsu BARE 路径 IS_GPA_RAM 不命中 / mmu_walker_helper_* SV32 路径
+//           IS_GPA_RAM 不命中。fetch 路径 (mmu_translate_pc) 不走 bus —
+//           取指落 MMIO 直接 access fault, 见 mmu.h "PA 落 MMIO 时的行为差异"段。
+//
+// 失败语义见 dummy.txt §9 ("0=成功" 接口约定 + cause 0 产生路径)。
+uint32_t bus_dispatch_read (cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size);
+void     bus_dispatch_write(cpu_t *hart, uint32_t pa, uint32_t gva,
+                            uint32_t value, uint32_t size);
 
 #endif //PLATFORM_BUS_H
