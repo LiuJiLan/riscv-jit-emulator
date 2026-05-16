@@ -91,11 +91,14 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     //
     // 流程:
     //   1. 试图命中 current_tlb (TLB hit fast path; check_perm 复用 walker 逻辑)
-    //   2. miss → mmu_walk(MMU_PERM_X) → pa + pte_flags
+    //   2. miss → mmu_walk(MMU_PERM_X) → pa + pte_flags + pte_wb_pa + pte_wb_new
+    //      (P2 后 walker 不写回 PT; 出参回 caller)
     //      - walk 失败 → trap_set_state(fault_cause, gva); fault_cause 是 walker 选的
     //        (page fault 12 / access fault 1)
     //   3. PA 在 RAM 区检查 (用 pa_to_fetch_hva, 跟 BARE 路径同; 取指不能从 MMIO 拿, 不
     //      在 RAM → access fault cause 1; 未来 ROM 接入时 pa_to_fetch_hva 内加 ROM 分支)
+    //   3.5 RAM 路径写回 PTE.A (P2 后; MMIO 取指上面已 access fault, 不到此点 — 跟
+    //       Spike "fail 不 set" 一致)
     //   4. fill TLB (lazy refresh: 在 ram check 后, 即将"成功"前 fill)
     //   5. 返回 PA + HVA
     //
@@ -131,7 +134,9 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     // Step 2: miss → mmu_walk
     {
         uint32_t pa, pte_flags, fault_cause;
-        if (mmu_walk(hart, gva, MMU_PERM_X, &pa, &pte_flags, &fault_cause) != 0) {
+        uint32_t pte_wb_pa, pte_wb_new;
+        if (mmu_walk(hart, gva, MMU_PERM_X, &pa, &pte_flags, &fault_cause,
+                     &pte_wb_pa, &pte_wb_new) != 0) {
             /* walker 失败 cause: X 路径 page fault 12 (V=0 / perm 错 / superpage misaligned),
              * 或 access fault 1 (PT 不在 RAM, 未来 PMP 路径) */
             return (int)trap_set_state(hart, fault_cause, /*tval*/gva);
@@ -140,7 +145,17 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
         // Step 3: PA 在 RAM 区检查 (取指不能从 MMIO 拿; 用 pa_to_fetch_hva 跟 BARE 路径同)
         uint8_t *hva;
         if (pa_to_fetch_hva(pa, &hva) != 0) {
+            /* P2 后: pa_to_fetch_hva 失败时 PTE.A 还没 set (mmu_walk 不写回), 直接 trap;
+             * 跟 Spike "fetch MMIO fail 不 set PTE.A" 一致 */
             return (int)trap_set_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
+        }
+
+        // Step 3.5 (P2 后): RAM 路径已通过 (pa_to_fetch_hva), 现在 set PTE.A 写回 PT
+        // (跟 walker_helper_load/store RAM 路径写回点同形态; MMIO 取指上面已 access
+        // fault 走掉, 不会到这里, 所以这里写回安全)
+        if (pte_wb_pa != 0) {
+            // SMP: 改 atomic_fetch_or 跨 hart 同步 (PTE 位 set 必须 atomic)
+            memcpy(gpa_to_hva_offset + pte_wb_pa, &pte_wb_new, 4);
         }
 
         // Step 4: fill TLB (lazy refresh; 在 ram check 后, return 0 之前 — 副作用要在
@@ -202,17 +217,24 @@ static uint32_t af_cause_for(mmu_perm_t perm) {
 //
 // 三级 (实际 2 级) walk: level=1 → leaf (4MB superpage) 或 next-level → level=0 → leaf
 // (4KB)。失败 return -1 + 填 fault_cause_out (page fault / access fault); 成功 return 0
-// + 填 pa_out + pte_flags_out (含 walker set 后的 A/D)。
+// + 填 pa_out + pte_flags_out + pte_wb_pa_out + pte_wb_new_out (P2 后新增最后两个)。
 //
-// hw-managed A/D (RV Spec 非 Svade): walker 内顺手 set A=1 (任何访问) 和 D=1 (W 访问),
-// 写回 PT。已 set 不重写 (避免无用写, SMP 时减原子开销)。
+// hw-managed A/D (RV Spec 非 Svade; P2 后): walker 内只**算** set A/D 后的 new_pte,
+// **不真写回 PT** —— 通过 pte_wb_pa_out + pte_wb_new_out 把"写回任务"返给 caller;
+// caller 在 RAM 路径 (IS_GPA_RAM 通过) 才 memcpy 写回, MMIO 路径不写回 (跟 Spike
+// "fail 不 set" 一致简化版)。已 set 的 PTE 不重报 (pte_wb_pa_out = 0)。
 //
-// SMP atomic 占位: 当前单 hart 用 memcpy 写回 PT; SMP 时改 atomic_fetch_or 跨 hart 同步
-// (PTE 位 set 必须 atomic; 多 hart 并发 walk 同 PTE 时不丢 set)。
+// SMP atomic 占位: 当前 caller 单 hart 用 memcpy 写回 PT; SMP 时改 atomic_fetch_or
+// 跨 hart 同步 (PTE 位 set 必须 atomic; 多 hart 并发 walk 同 PTE 时不丢 set)。
 
 int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
              uint32_t *pa_out, uint32_t *pte_flags_out,
-             uint32_t *fault_cause_out) {
+             uint32_t *fault_cause_out,
+             uint32_t *pte_wb_pa_out, uint32_t *pte_wb_new_out) {
+    /* P2 后默认无 writeback; level=0/level=1 leaf 分支按需覆盖 */
+    *pte_wb_pa_out  = 0;
+    *pte_wb_new_out = 0;
+
     const uint32_t pf_cause = pf_cause_for(perm);
     const uint32_t af_cause = af_cause_for(perm);
 
@@ -270,14 +292,16 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
             return -1;
         }
 
-        // hw-managed A/D set + 写回 PT
+        // hw-managed A/D 建议 set (P2 后只算, 不写回 PT; caller RAM 路径才写)
         uint32_t new_pte0 = pte0 | PTE_A;
         if (perm == MMU_PERM_W) new_pte0 |= PTE_D;
         if (new_pte0 != pte0) {
-            // SMP: 改用 atomic_fetch_or(&pte_in_pt, PTE_A | (W ? PTE_D : 0)) 跨 hart 同步
-            memcpy(gpa_to_hva_offset + pte0_pa, &new_pte0, 4);
-            pte0 = new_pte0;
+            /* PTE.A 或 PTE.D 需要 set; 把"写回任务"返给 caller */
+            *pte_wb_pa_out  = pte0_pa;
+            *pte_wb_new_out = new_pte0;
+            pte0 = new_pte0;   /* 本地更新让 pte_flags_out 反映建议 set 后状态 */
         }
+        /* else: PTE.A/D 已 set, pte_wb_pa_out 保留入口默认值 0 (不需要 writeback) */
 
         // 算 PA: leaf PPN<<12 | offset
         const uint32_t leaf_ppn = (pte0 >> 10);          /* 22 位 PPN */
@@ -301,14 +325,15 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
         return -1;
     }
 
-    // hw-managed A/D set + 写回 PT
+    // hw-managed A/D 建议 set (P2 后只算, 不写回 PT; caller RAM 路径才写)
     uint32_t new_pte1 = pte1 | PTE_A;
     if (perm == MMU_PERM_W) new_pte1 |= PTE_D;
     if (new_pte1 != pte1) {
-        // SMP: atomic_fetch_or
-        memcpy(gpa_to_hva_offset + pte1_pa, &new_pte1, 4);
+        *pte_wb_pa_out  = pte1_pa;
+        *pte_wb_new_out = new_pte1;
         pte1 = new_pte1;
     }
+    /* else: PTE.A/D 已 set, pte_wb_pa_out 保留入口默认值 0 */
 
     // 算 4MB superpage PA: PTE.PPN[1] (12 位) | VPN[0] (来自 vaddr) | offset (12 位)
     const uint32_t pte1_ppn1 = (pte1 >> 20) & 0xFFFu;    /* PTE bits[31:20] = PPN[1] 12 位 */
@@ -325,19 +350,31 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
 uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
                                 uint32_t gva, uint32_t size) {
     uint32_t pa, pte_flags, fault_cause;
-    if (mmu_walk(hart, gva, MMU_PERM_R, &pa, &pte_flags, &fault_cause) != 0) {
+    uint32_t pte_wb_pa, pte_wb_new;
+    if (mmu_walk(hart, gva, MMU_PERM_R, &pa, &pte_flags, &fault_cause,
+                 &pte_wb_pa, &pte_wb_new) != 0) {
         trap_raise_exception(hart, fault_cause, /*tval*/gva);   /* _Noreturn longjmp */
     }
 
     // PA 不在 RAM 区 → MMIO 派发 (不入 TLB, plan §1.4 + dummy.txt §8)
     // mmio_read_helper 内部 _Noreturn-on-failure (未命中 / device 拒绝都 longjmp,
     // 不返回 caller; 见 dummy.txt §9 "0=成功" + cause 0 路径)。
+    //
+    // P2 后: MMIO 路径**不写回 PTE.A** — 跟 Spike "fail 不 set" 一致简化版 (MMIO
+    // 成功访问也不 set, 因 MMIO PTE 不缓存到 TLB, 每次重 walk 时按 PT 原值,
+    // 行为正确; 见 mmu.h hw-managed A/D 段)。
     if (!IS_GPA_RAM(pa)) {
         return mmio_read_helper(hart, pa, gva, size);
     }
 
     uint8_t *host_ptr       = gpa_to_hva_offset + pa;
     uint8_t *page_host_base = host_ptr - (gva & 0xFFFu);  /* page 起点 host 地址 */
+
+    // P2 后: RAM 路径才写回 PTE.A (建议 set, walker 算好 pte_wb_new)
+    if (pte_wb_pa != 0) {
+        // SMP: 改 atomic_fetch_or 跨 hart 同步
+        memcpy(gpa_to_hva_offset + pte_wb_pa, &pte_wb_new, 4);
+    }
 
     // Fill TLB entry (lazy refresh: 在 ram check 后, host load 之前; 副作用要在
     // 即将成功访问时才发生, 避免没成功污染 TLB)
@@ -362,11 +399,16 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
 void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
                              uint32_t gva, uint32_t value, uint32_t size) {
     uint32_t pa, pte_flags, fault_cause;
-    if (mmu_walk(hart, gva, MMU_PERM_W, &pa, &pte_flags, &fault_cause) != 0) {
+    uint32_t pte_wb_pa, pte_wb_new;
+    if (mmu_walk(hart, gva, MMU_PERM_W, &pa, &pte_flags, &fault_cause,
+                 &pte_wb_pa, &pte_wb_new) != 0) {
         trap_raise_exception(hart, fault_cause, /*tval*/gva);
     }
 
     // PA 不在 RAM 区 → MMIO 派发 (不入 TLB; plan §1.4 + dummy.txt §8 / §9)
+    //
+    // P2 后: MMIO 路径**不写回 PTE.A/D** — 跟 load 路径同形态简化 (MMIO 失败
+    // trap_raise 时 PTE.A/D 不会已 set; 见 mmu.h hw-managed A/D 段)。
     if (!IS_GPA_RAM(pa)) {
         mmio_write_helper(hart, pa, gva, value, size);  // _Noreturn-on-failure
         return;
@@ -375,7 +417,13 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
     uint8_t *host_ptr       = gpa_to_hva_offset + pa;
     uint8_t *page_host_base = host_ptr - (gva & 0xFFFu);
 
-    // Fill TLB entry (含 walker set 的 D=1, 跟 load 路径同形态)
+    // P2 后: RAM 路径才写回 PTE.A+D (建议 set, walker 算好 pte_wb_new)
+    if (pte_wb_pa != 0) {
+        // SMP: 改 atomic_fetch_or 跨 hart 同步
+        memcpy(gpa_to_hva_offset + pte_wb_pa, &pte_wb_new, 4);
+    }
+
+    // Fill TLB entry (含建议 set 的 D=1, 跟 load 路径同形态)
     const uint32_t vpn   = gva >> 12;
     const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
     tlb_e_t *entry = &current_tlb->e[index];

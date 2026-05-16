@@ -104,11 +104,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //   - case OP_SB/SH/SW         — lsu_store_helper 调用之前
     //   - CSR 6 case (CSRRW/RS/RC/WI/SI/CI) — csr_op 调用之前 (csr_op 内可能 trap_raise
     //     illegal csr / privilege violation)
+    //   - OP_MRET / OP_SRET / OP_SFENCE_VMA — PRIV_CHECK_OR_TRAP 调用之前 (a_02
+    //     session_005 P5: priv check 补全后, 三条从原"不 may-trap"列表移入 may-trap)
     //
     // 不需要插入的位置:
     //   - 算术 / 逻辑 / 移位 / NOP / LUI / AUIPC: pure case, 不可能 trap
-    //   - OP_MRET / OP_SRET: csr 路径 + trap_set_state (dummy.txt §1 path 2b 不长跳)
-    //   - OP_SFENCE_VMA: sfence_vma_helper 4.a 简化方案不 trap
     //   - branch / jal / jalr 自身: 通过 WRITE_PC_OR_TRAP 间接覆盖 (target misalign 才 trap)
     //
     // 漏标检测: 漏写 SYNC_COUNT 的 may-trap case → fixture 跑后 total_count 偏小 (缺该
@@ -140,6 +140,32 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         do { if (((ea) & ((size) - 1u)) != 0u)                                  \
                 trap_raise_exception(hart, CAUSE_STORE_ADDR_MISALIGNED, (ea));  \
         } while (0)
+
+    // PRIV_CHECK_OR_TRAP —— priv-required SYSTEM 指令在 case 入口检查; priv 不足时
+    // trap (cause 2 illegal instruction, tval = raw_inst, RV spec §3.1.16)。
+    //
+    // 适用范围 (SYSTEM opcode 0x73 中 priv-required 子集; a_02 session_005 P5 audit):
+    //   - OP_MRET       (priv >= M; M-only)
+    //   - OP_SRET       (priv >= S; M 调 SRET 是 RV spec 允许的)
+    //   - OP_SFENCE_VMA (priv >= S; mstatus.TVM=1 下 S-mode 也 trap to M, 长期 TODO)
+    //   不适用 (任何 priv OK / 由其他机制判):
+    //   - ECALL / EBREAK (任何 priv OK; ECALL 按 priv 分流 cause 8/9/11)
+    //   - CSR 6 case CSRRW/RS/RC/WI/SI/CI (csr_op 入口判 priv: csr_addr[9:8] vs hart->priv)
+    //   - WFI 未实装 (实装时按 priv >= S + mstatus.TW 控制位; 补宏调用)
+    //
+    // may-trap 边界 (跟 LOAD/STORE_MISALIGN_CHECK 同形态): 调用前必须 SYNC_COUNT(),
+    // 否则 dispatcher 收到旧 count_out, 违反 RV precise trap "触发指令本身不算入" 语义。
+    //
+    // JIT 视角 (未来 translator emit 等价 priv check 时):
+    //   priv check 是 may-longjmp 边界, 跟 csr_op / lsu_*_helper 同处理 — emit 前
+    //   store 所有映射 host 寄存器回 cpu_t (dummy.txt §1 "统一保护")。SYNC_COUNT 在
+    //   解释器是 count_out 同步, JIT 中对应"寄存器保存"; 同一哲学的两个版本。
+    //
+    // 隐式捕获: hart (读 hart->priv + 调 trap_raise_exception), d (取 d.raw_inst 填 tval)。
+    #define PRIV_CHECK_OR_TRAP(required) do {                                   \
+        if (hart->priv < (required))                                            \
+            trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, d.raw_inst);  \
+    } while (0)
 
     uint64_t count = 0;
 
@@ -385,10 +411,10 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
             //          boundary) → goto out 退出 fetch loop, dispatcher 重派发 from xepc。
             //
-            //          权限要求: MRET 仅在 priv >= M 时合法 (M-mode CSR 入口); MRET 本身不是
-            //          csr 指令而是 system 指令, 没走 csr_op 入口判。U/S-mode 触发 MRET 应
-            //          cause=2 (illegal instruction) — 当前 case 入口未做 priv 检查, 真做 OS
-            //          隔离时在 case 入口加 priv 判 (跟 SRET 同形态)。
+            //          权限要求 (a_02 session_005 P5 补): MRET 仅在 priv >= M 时合法
+            //          (M-mode CSR 入口); MRET 本身不是 csr 指令而是 system 指令, 没走
+            //          csr_op 入口判, case 入口 PRIV_CHECK_OR_TRAP(PRIV_M) 显式判。
+            //          U/S-mode 触发 MRET → cause=2 (illegal instruction), tval=raw_inst。
             case OP_ECALL:
                 /* RV 编码巧合: PRIV_U=0/S=1/M=3 ↔ cause 8/9/11 (= CAUSE_ECALL_FROM_U + priv).
                  * Spike / QEMU 同写法; PRIV_H=2 在没 H 扩展下不会触发 (hart->priv ∉ {2}). */
@@ -400,6 +426,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 trap_raise_exception(hart, CAUSE_BREAKPOINT, /*tval*/0u);
                 goto out;
             case OP_MRET: {
+                SYNC_COUNT();
+                PRIV_CHECK_OR_TRAP(PRIV_M);
                 uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 
                 /* hart->priv = MPP (从 mstatus 恢复 caller priv) */
@@ -434,11 +462,14 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //   pc   = sepc (= trap.xepc[PRIV_S])
             //   in_trap = 0 (项目复位嵌套链, 跟 MRET 同)
             //
-            // 权限要求 (跟 OP_MRET 同形态, 当前未实现):
-            //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction.
-            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2). 真做 OS 隔离时跟 MRET
-            //   一起补 (interpreter case 入口或 csr_op 风格的 priv 检查段)。
+            // 权限要求 (跟 OP_MRET 同形态, a_02 session_005 P5 补):
+            //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction,
+            //   tval=raw_inst。case 入口 PRIV_CHECK_OR_TRAP(PRIV_S) 显式判。
+            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2)。TSR 控制位长期 TODO
+            //   (需要 trap_csrs_t.xxxx 字段同步 + helper 内组合判, 不在 P5 范围)。
             case OP_SRET: {
+                SYNC_COUNT();
+                PRIV_CHECK_OR_TRAP(PRIV_S);
                 uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 
                 /* hart->priv = SPP (1-bit; 0=U, 1=S) */
@@ -563,6 +594,12 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
 
             // ---- I-type SYSTEM SFENCE.VMA ----
             //
+            // 权限要求 (跟 OP_MRET/OP_SRET 同形态, a_02 session_005 P5 补):
+            //   SFENCE.VMA 仅在 hart->priv >= S 时合法; U-mode → cause=2 illegal instruction,
+            //   tval=raw_inst。case 入口 PRIV_CHECK_OR_TRAP(PRIV_S) 显式判。
+            //   mstatus.TVM=1 时 S-mode SFENCE.VMA 也 trap to M (cause=2)。TVM 控制位长期
+            //   TODO (跟 SRET 的 TSR 同形态, 不在 P5 范围)。
+            //
             // 接口设计: helper 接 4 个独立信息, 分两组 — 寄存器**值** (vaddr_val/asid_val,
             // 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
             // (rs1/rs2, 0..31)。两组语义独立不可互相推导:
@@ -585,6 +622,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // is_block_boundary_inst → 1) → goto out 退出 fetch loop, dispatcher 重派发
             // 时 block 1 重新算 (regime, current_tlb), 因为 TLB 状态已变。
             case OP_SFENCE_VMA:
+                SYNC_COUNT();
+                PRIV_CHECK_OR_TRAP(PRIV_S);
                 sfence_vma_helper(hart,
                                   READ_REG(d.rs1), READ_REG(d.rs2),
                                   d.rs1,           d.rs2);
@@ -636,4 +675,5 @@ out:
     #undef SYNC_COUNT
     #undef LOAD_MISALIGN_CHECK
     #undef STORE_MISALIGN_CHECK
+    #undef PRIV_CHECK_OR_TRAP
 }

@@ -3,6 +3,33 @@
 # set A=1 + D=1 写回 PT。fixture 04 是 PTE.A=1+D=1 直接走 fast path; 05 让起步是 0,
 # 强制 walker fall back 路径 + 验 PT 真被改。设计点 D18 #5 (hw-managed A/D) 单测。
 #
+# ============================================================================
+# ⚠ Milestone-tracked 实现演进 (期望值不变, 但实现细节有变)
+# ============================================================================
+# 本 fixture 期望 (x15 = 0x200800C7) 在 a_02_002 ~ a_02_003 之间**保持不变** (RAM
+# 路径行为兼容), 但 mmu A/D 写回点经过演进:
+#
+#   a_02_002 ~ a_02_002 末 (P2 修前):
+#     mmu_walk 内部直接 memcpy 写回 PT (set A+D 后); 单点写回, walker 完成所有工作
+#
+#   a_02_003 起 (P2 修后, session_005):
+#     mmu_walk 只**算**建议 set 后的 new_pte, 不真写回; 通过新 out 参数
+#     (pte_wb_pa_out, pte_wb_new_out) 把"写回任务"返给 caller; 三个 caller
+#     (mmu_translate_pc / mmu_walker_helper_load / store) 在 RAM 路径才 memcpy 写回。
+#     本 fixture 走 RAM 路径 (leaf_pt[1] PPN=0x20080 → 0x80080000 RAM 区), 所以
+#     caller 仍会写回, 期望 x15 = 0x200800C7 不变 — fixture **行为兼容**。
+#
+#   对偶 fixture: a_02_2/09 (leaf MMIO 版) 在 P2 后期望变 (MMIO 路径不写回, PTE
+#     保留起步值, 跟 Spike fail-不-set 一致简化版); 本 fixture (RAM 版) 仍是
+#     正向"set+写回"形态。两个 fixture 共同验 walker_helper IS_GPA_RAM 分流正确解
+#     耦 RAM/MMIO 写回路径。
+#
+# 以下 doc 中提到"walker 内 set A+D 写回 PT" / "walker 真在 PT 上 set" 等描述,
+# a_02_003 起精确说应是"walker 算 + caller (mmu_walker_helper_store) 在 RAM 路径
+# 写回"。本 doc 为兼容 a_02_002 前的注释风格保持原措辞, 实现细节见 src/core/mmu.h
+# "hw-managed A/D 设计" 段。
+# ============================================================================
+#
 # 跟 fixture 04 同模板 (.S+.c, 4KB 页路径, 同 PT 位置 + 同 vaddr 数据段); 区别两处:
 #   1. main.c setup_pt(): leaf_pt[1] PTE 起步 = 0x20080007 (V|R|W, A=0 D=0)
 #   2. stub.S handler 段加 lw 验 PT @ leaf_pt[1] 已被 walker set 到 0x200800C7
