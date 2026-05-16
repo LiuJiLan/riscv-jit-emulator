@@ -19,6 +19,7 @@
 #include "core/decode.h"
 #include "core/dispatcher.h"
 #include "loader.h"
+#include "platform/clint.h"
 #include "platform/ram.h"
 #include "riscv.h"
 
@@ -273,6 +274,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // CLINT 注册到 bus (ram_init 之后, dispatcher 启动之前; 多线程 timer 真接
+    // 在 T5, 现在只走 MMIO 读写路径)。详 platform/clint.h。
+    if (clint_init() != 0) {
+        fprintf(stderr, "clint_init failed\n");
+        return 1;
+    }
+
     // 文件后缀分发 (.bin / .elf / 猜): ELF 路径全部 stub 返回 -1 (内部 fprintf
     // "not implemented"), guess_is_elf stub 静默返回 0, 实际只走 .bin。
     int err = 0;
@@ -306,9 +314,7 @@ int main(int argc, char **argv) {
     // hart 字段初始化 (启动协议; 必须在 dispatcher 外, 因为 hart 热插拔 = 寄存器
     // 初始化 + 开始运行)。regs[0] 在 cpu_t 内物理占 x0 位置, 但实际存 pc (见 cpu.h)。
     // 启动状态参考 https://docs.kernel.org/arch/riscv/boot.html
-    hart->regs[0] = GUEST_RAM_START | 1u;  // TEMP: 临时测试 dispatcher pc IALIGN 兜底
-                                            // (dummy.txt §9 BUG fix 一次性佐证, commit 后撤回 |1u)
-    // hart->regs[0] = GUEST_RAM_START;     // pc; 程序起点; 未来热插拔核时由外部参数设置
+    hart->regs[0] = GUEST_RAM_START;       // pc; 程序起点; 未来热插拔核时由外部参数设置
     hart->satp    = 0;                      // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
     hart->priv    = PRIV_M;                 // M 模式
     hart->regs[10] = hart->per_hart_info.mhartid;  // a0 = hartid (Linux RV boot; x10 = a0)

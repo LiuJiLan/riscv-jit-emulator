@@ -66,4 +66,28 @@
 // is_block_boundary_inst 处理), 这两条是另两个独立的 block 截断条件。
 #define BLOCK_INST_LIMIT  64U
 
+// ----------------------------------------------------------------------------
+// hart 数量
+// ----------------------------------------------------------------------------
+//
+// v1 单 hart; T5 真接 SMP 时改这个宏, clint.msip[] / mtimecmps[] 等数组自动跟随。
+// 不放运行期变量 (跟 GUEST_RAM_* 同性质 — 编译期已知, 数组形态稳定)。
+#define MAX_HARTS         1U
+
+// ----------------------------------------------------------------------------
+// CLINT (Core-Local Interruptor) MMIO 地址布局
+// ----------------------------------------------------------------------------
+//
+// 跟 QEMU virt machine + SiFive E31/U54 Core Complex Manual 一致 (不跟 ACLINT spec)。
+// 详 notes/bus_decision.md §2.7 §2.8。
+//
+//   +0x0000   msip[hart]      4 byte/hart   M-mode software interrupt (仅低 1 位有效)
+//   +0x4000   mtimecmp[hart]  8 byte/hart   per-hart timer compare value
+//   +0xBFF8   mtime           8 byte global timer counter
+#define CLINT_BASE          0x02000000UL
+#define CLINT_SIZE          0x00010000UL
+#define CLINT_MSIP_OFF      0x0000UL
+#define CLINT_MTIMECMP_OFF  0x4000UL
+#define CLINT_MTIME_OFF     0xBFF8UL
+
 #endif //CONFIG_H
