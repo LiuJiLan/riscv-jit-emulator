@@ -15,6 +15,9 @@
 //   mscratch (0x340) → trap.xscratch[PRIV_M]
 //   medeleg  (0x302) → trap._medeleg 低 32 位
 //   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_state 当前不读, 中断真做时启用)
+//   mie      (0x304) → trap._mie (类 (2a) 副本基本字段, sie 是 mask view; WARL 截 MIE_VALID_MASK)
+//   mip      (0x344) → 合成读: trap._mip_sw (类 (5) 软件可写子集) OR clint_msip_pending OR
+//                       clint_timer_pending OR (未来) PLIC; csrw 只动 _mip_sw, RO 位忽略
 //   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
 //                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
 //   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
@@ -23,6 +26,9 @@
 //   stvec    (0x105) → trap.xtvec[PRIV_S];  WARL 截 MODE (跟 mtvec 同)
 //   scause   (0x142) → trap.xcause[PRIV_S]
 //   stval    (0x143) → trap.xtval[PRIV_S]
+//   sie      (0x104) → trap._mie & SIE_MASK (mask view; 写时只动 SIE_MASK 子集)
+//   sip      (0x144) → csr_mip_read(hart) & SIP_MASK (合成的 mask view); 写仅 SSIP
+//                       (SIP_WRITABLE_MASK = 1<<IRQ_S_SOFT; STIP/SEIP RO in sip)
 //   mhartid  (0xF14) → hart->per_hart_info.mhartid (RO)
 //   misa     (0x301) → hart->per_hart_info.misa (RW-effective-RO; write WARL noop)
 //   mvendorid(0xF11) → hart->shared_info->mvendorid (RO)
@@ -57,10 +63,11 @@
 
 #include "csr.h"
 
-#include "config.h"     // IALIGN_MASK
+#include "config.h"            // IALIGN_MASK
 #include "cpu.h"
+#include "platform/clint.h"    // clint_msip_pending / clint_timer_pending (mip 合成读)
 #include "riscv.h"
-#include "trap.h"       // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
+#include "trap.h"              // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
 
 #include <inttypes.h>
 #include <stdint.h>
@@ -233,6 +240,57 @@ static void csr_mideleg_write(cpu_t *hart, uint32_t v) {
     hart->trap.mideleg = v;
 }
 
+// ---- mie (类 (2a), trap._mie 物理字段; sie 是其 mask view, 见下方 S-mode 段) ----
+//
+// mie 入口物理字段直接读写; WARL 截 MIE_VALID_MASK 强制 reserved bits 为 0
+// (跟 mstatus_write WARL 风格一致). 项目 mie 6 有效位 (IRQ_S/M × SOFT/TIMER/EXT,
+// bit 1/3/5/7/9/11), 其他位 reserved 永远 0.
+
+static uint32_t csr_mie_read(cpu_t *hart) {
+    return hart->trap._mie;
+}
+
+static void csr_mie_write(cpu_t *hart, uint32_t v) {
+    /* WARL: 截 reserved bits (高 20 位 + 偶数低位永远 0) */
+    hart->trap._mie = v & MIE_VALID_MASK;
+}
+
+// ---- mip (类 (5), 软件可写子集 _mip_sw + 异步源 OR 合成读) ----
+//
+// csr_mip_read 合成 6 bit (跟 dummy.txt §6 第 5 类 helper 模式示例段一致):
+//   bit 1/5/9 (SSIP/STIP/SEIP_sw) ← trap._mip_sw 软件 inject 字段
+//   bit 3     MSIP ← CLINT.msip[hartid] 异步源 (clint_msip_pending)
+//   bit 7     MTIP ← (mtime ≥ mtimecmp[hartid]) 派生 (clint_timer_pending)
+//   bit 9     SEIP_hw ← PLIC s_pending OR _mip_sw bit 9 (未来; v1 hw_seip 永远 0)
+//   bit 11    MEIP ← PLIC m_pending (未来; v1 永远 0)
+//
+// csr_mip_write 只动 _mip_sw 的 MIP_SW_WRITABLE_MASK 对应位 (SSIP/STIP/SEIP_sw);
+// 其他位 (MSIP/MTIP/MEIP/reserved) 写忽略 (RO from M-mode csrw 视角).
+
+static uint32_t csr_mip_read(cpu_t *hart) {
+    uint32_t mip_view = hart->trap._mip_sw;
+    uint32_t hartid   = hart->per_hart_info.mhartid;
+
+    if (clint_msip_pending(hartid))
+        mip_view |= (1U << IRQ_M_SOFT);
+    if (clint_timer_pending(hartid))
+        mip_view |= (1U << IRQ_M_TIMER);
+
+    /* (未来) PLIC s_pending → IRQ_S_EXT 位 OR (跟 _mip_sw 已经 OR 的 sw_seip 合成);
+     * (未来) PLIC m_pending → IRQ_M_EXT 位 OR.
+     * v1 PLIC 未实装, 两位都 0, 占位不影响合成结果. */
+
+    return mip_view;
+}
+
+static void csr_mip_write(cpu_t *hart, uint32_t v) {
+    /* 只动 _mip_sw 软件可写位 (SSIP/STIP/SEIP_sw); RO 位 (MSIP/MTIP/MEIP) 忽略.
+     * read-modify-write 单 hart 单线程 (本字段不跨 hart 写, 见 trap.h _mip_sw
+     * 顶段并发注释). */
+    hart->trap._mip_sw = (hart->trap._mip_sw & ~MIP_SW_WRITABLE_MASK)
+                       | (v & MIP_SW_WRITABLE_MASK);
+}
+
 // ============================================================================
 // Address Translation CSR (类 2)
 //
@@ -355,6 +413,34 @@ static uint32_t csr_stval_read(cpu_t *hart) {
 static void csr_stval_write(cpu_t *hart, uint32_t v) {
     /* RV spec §5.1.7 stval; 跟 mtval 同, 接受全 32 位 */
     hart->trap.xtval[PRIV_S] = v;
+}
+
+// ---- sie / sip (mie/mip readout 的 mask view; 类 (2a) + 类 (5) 各自) ----
+//
+// sie 是 _mie 的 mask view (类 (2a), 跟 sstatus 是 _mstatus 的 mask view 同形态);
+// sip 是 csr_mip_read 合成的 mask view + S 写位收紧 (类 (5) 的 S-mode 投影).
+// sip RW 位仅 SSIP (SIP_WRITABLE_MASK = 1 << IRQ_S_SOFT); STIP / SEIP RO in sip
+// (RV spec §5.1.4 + §3.1.9 强制 — S-mode 不直接清 STIP/SEIP, 清靠 PLIC complete
+// 或 M-mode csrw mip).
+
+static uint32_t csr_sie_read(cpu_t *hart) {
+    return hart->trap._mie & SIE_MASK;
+}
+
+static void csr_sie_write(cpu_t *hart, uint32_t v) {
+    /* 只动 SIE_MASK 子集; 保留 M-mode 中断使能位 */
+    hart->trap._mie = (hart->trap._mie & ~SIE_MASK) | (v & SIE_MASK);
+}
+
+static uint32_t csr_sip_read(cpu_t *hart) {
+    /* mip readout 的 mask view (合成走 csr_mip_read) */
+    return csr_mip_read(hart) & SIP_MASK;
+}
+
+static void csr_sip_write(cpu_t *hart, uint32_t v) {
+    /* S-mode 只可写 SSIP; STIP / SEIP RO in sip */
+    hart->trap._mip_sw = (hart->trap._mip_sw & ~SIP_WRITABLE_MASK)
+                       | (v & SIP_WRITABLE_MASK);
 }
 
 
@@ -505,7 +591,21 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
         case CSR_MEPC:     read_old = csr_mepc_read    (hart); break;
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
-        case CSR_MSCRATCH: read_old = csr_mscratch_read(hart); break;        case CSR_MEDELEG:  read_old = csr_medeleg_read (hart); break;        case CSR_MIDELEG:  read_old = csr_mideleg_read (hart); break;        case CSR_SATP:     read_old = csr_satp_read    (hart); break;        case CSR_SSTATUS:  read_old = csr_sstatus_read (hart); break;        case CSR_SEPC:     read_old = csr_sepc_read    (hart); break;        case CSR_SSCRATCH: read_old = csr_sscratch_read(hart); break;        case CSR_STVEC:    read_old = csr_stvec_read   (hart); break;        case CSR_SCAUSE:   read_old = csr_scause_read  (hart); break;        case CSR_STVAL:    read_old = csr_stval_read   (hart); break;        case CSR_MHARTID:  read_old = csr_mhartid_read (hart); break;   /* RO */
+        case CSR_MSCRATCH: read_old = csr_mscratch_read(hart); break;
+        case CSR_MEDELEG:  read_old = csr_medeleg_read (hart); break;
+        case CSR_MIDELEG:  read_old = csr_mideleg_read (hart); break;
+        case CSR_MIE:      read_old = csr_mie_read     (hart); break;
+        case CSR_MIP:      read_old = csr_mip_read     (hart); break;
+        case CSR_SATP:     read_old = csr_satp_read    (hart); break;
+        case CSR_SSTATUS:  read_old = csr_sstatus_read (hart); break;
+        case CSR_SEPC:     read_old = csr_sepc_read    (hart); break;
+        case CSR_SSCRATCH: read_old = csr_sscratch_read(hart); break;
+        case CSR_STVEC:    read_old = csr_stvec_read   (hart); break;
+        case CSR_SCAUSE:   read_old = csr_scause_read  (hart); break;
+        case CSR_STVAL:    read_old = csr_stval_read   (hart); break;
+        case CSR_SIE:      read_old = csr_sie_read     (hart); break;
+        case CSR_SIP:      read_old = csr_sip_read     (hart); break;
+        case CSR_MHARTID:  read_old = csr_mhartid_read (hart); break;   /* RO */
         case CSR_MISA:     read_old = csr_misa_read    (hart); break;   /* RW-effective-RO */
         case CSR_MVENDORID:read_old = csr_mvendorid_read(hart); break;  /* RO */
         case CSR_MARCHID:  read_old = csr_marchid_read (hart); break;   /* RO */
@@ -538,7 +638,21 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
             case CSR_MEPC:     csr_mepc_write    (hart, to_write); break;
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
-            case CSR_MSCRATCH: csr_mscratch_write(hart, to_write); break;            case CSR_MEDELEG:  csr_medeleg_write (hart, to_write); break;            case CSR_MIDELEG:  csr_mideleg_write (hart, to_write); break;            case CSR_SATP:     csr_satp_write    (hart, to_write); break;            case CSR_SSTATUS:  csr_sstatus_write (hart, to_write); break;            case CSR_SEPC:     csr_sepc_write    (hart, to_write); break;            case CSR_SSCRATCH: csr_sscratch_write(hart, to_write); break;            case CSR_STVEC:    csr_stvec_write   (hart, to_write); break;            case CSR_SCAUSE:   csr_scause_write  (hart, to_write); break;            case CSR_STVAL:    csr_stval_write   (hart, to_write); break;            case CSR_MISA:     csr_misa_write    (hart, to_write); break;   /* noop (WARL) */
+            case CSR_MSCRATCH: csr_mscratch_write(hart, to_write); break;
+            case CSR_MEDELEG:  csr_medeleg_write (hart, to_write); break;
+            case CSR_MIDELEG:  csr_mideleg_write (hart, to_write); break;
+            case CSR_MIE:      csr_mie_write     (hart, to_write); break;
+            case CSR_MIP:      csr_mip_write     (hart, to_write); break;
+            case CSR_SATP:     csr_satp_write    (hart, to_write); break;
+            case CSR_SSTATUS:  csr_sstatus_write (hart, to_write); break;
+            case CSR_SEPC:     csr_sepc_write    (hart, to_write); break;
+            case CSR_SSCRATCH: csr_sscratch_write(hart, to_write); break;
+            case CSR_STVEC:    csr_stvec_write   (hart, to_write); break;
+            case CSR_SCAUSE:   csr_scause_write  (hart, to_write); break;
+            case CSR_STVAL:    csr_stval_write   (hart, to_write); break;
+            case CSR_SIE:      csr_sie_write     (hart, to_write); break;
+            case CSR_SIP:      csr_sip_write     (hart, to_write); break;
+            case CSR_MISA:     csr_misa_write    (hart, to_write); break;   /* noop (WARL) */
             case CSR_TOHOST:   csr_tohost_write  (hart, to_write); break;   /* 临时 */
             default:
                 // 上面 read 路径的 default 已 fprintf + trap_raise_exception

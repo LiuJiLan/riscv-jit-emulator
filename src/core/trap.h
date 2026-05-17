@@ -7,12 +7,15 @@
 //   - 机制 (2a) interpreter helper 经 trap_raise_exception 长跳
 //   - 机制 (2b) dispatcher fetch 路径 (mmu_translate_pc) 直调 trap_set_state, 不长跳
 //
-// trap_csrs_t 字段分类 (按 dummy.txt §6 CSR 物理存储字段命名四类划分):
+// trap_csrs_t 字段分类 (按 dummy.txt §6 CSR 物理存储字段命名五类划分):
 //   - 第四类 (按 priv 索引数组): xcause / xtval / xepc / xtvec / xscratch, 4 槽
 //     (PRIV_M / PRIV_S / PRIV_VS-slot / PRIV_U)
 //   - 第一类 (RV32 物理 64 位, csr 入口拆访问): _mstatus / _medeleg
 //     (csr.c 通过对应 csr 入口分别访问)
 //   - 第三类 (单字段, 单 csr 入口, 不带前缀): mideleg (MXLEN=32, spec 无 midelegh)
+//   - 第 (2a) 类 (副本基本字段, 多 csr 入口同级看 mask 子集): _mie (mie + sie 看)
+//   - 第 (5) 类 (软件可写子集 + 异步源 OR 合成读): _mip_sw (mip + sip 入口看;
+//     csrr 时跟 CLINT.msip / mtime≥mtimecmp / 未来 PLIC 合成)
 //   - host 状态 (非 RV CSR): in_trap, 嵌套 trap 计数器 + 内部停机位段 (位段编码见
 //     dispatcher.c 末尾 in_trap 位段编码段); mret 路径只清 bit 0-1
 //
@@ -94,6 +97,34 @@ typedef struct {
     // mideleg: MXLEN-bit (RV32 = 32 位; spec 未定义 midelegh, 中断 cause 不会超 32 位)。
     //   跟 mip/mie 中断机制一起未来真做; 字段就位, trap_set_state 当前不读。
     uint32_t  mideleg;         // csr 入口 mideleg (0x303); 中断机制真做时启用
+
+    // 第 (2a) 类: 副本基本字段 (mie / sie 两 csr 入口同级看不同 mask 子集, dummy.txt §6)。
+    // mie 入口看全部 32 位 (项目用 bit 1/3/5/7/9/11 = IRQ_S/M × SOFT/TIMER/EXT 六位,
+    //   见 riscv.h IRQ_* 宏); sie 入口看 32 位 ∩ SIE_MASK = IRQ_S × SOFT/TIMER/EXT
+    //   三位。两入口实现独立, 关系是"同级看不同 mask"。
+    uint32_t  _mie;            // csr 入口 mie (0x304) / sie (0x104) 同级 mask view
+
+    // 第 (5) 类: 软件可写子集 + 异步源 OR 合成读 (dummy.txt §6 第 5 类)。
+    // mip 入口的软件可写子集物理存储:
+    //   bit 1 = SSIP        (IRQ_S_SOFT;  M/S csrw 都可 inject)
+    //   bit 5 = STIP        (IRQ_S_TIMER; M csrw inject 用; 项目无 Sstc 无硬件源)
+    //   bit 9 = SEIP_sw     (IRQ_S_EXT;   M csrw inject; csrr SEIP 时跟 PLIC hw_seip OR)
+    // 其他位永远 0 (csrw 截 MIP_SW_WRITABLE_MASK, csrr mip 由 csr_mip_read 合成).
+    //
+    // csrr mip 时跟以下异步源 OR 合成完整 mip readout:
+    //   bit 3  MSIP ← CLINT.msip[hartid]          (atomic_load; 跨 hart MMIO writer)
+    //   bit 7  MTIP ← (mtime ≥ mtimecmp[hartid]) (clint_timer_pending compute)
+    //   bit 9  SEIP_hw ← PLIC s_pending           (未来; v1 永远 0)
+    //   bit 11 MEIP ← PLIC m_pending              (未来; v1 永远 0)
+    // csrw mip 只动本字段 MIP_SW_WRITABLE_MASK 对应位; 其他位 RO 写忽略。
+    //
+    // 并发: 本字段 plain uint32_t (本 hart 单线程访问 — M-mode csrw mip / S-mode
+    // csrw sip 都是本 hart guest 软件; dispatcher 读也本 hart loop 顶). 跨 hart
+    // inject SSIP 走 IPI 路径 (远 hart 写 clint.msip → 目标 hart MSIP trap →
+    // 目标 hart M-handler 自己 csrw mip 设 SSIP), 仍是本 hart 写自己 _mip_sw。
+    // SMP/H/AIA: H 扩展 (跨虚拟 hart inject) / AIA (IMSIC MSI 直接写远 hart) 会
+    // 破坏 "本 hart 单线程访问 _mip_sw" 前提, 真做时需改 _Atomic + atomic 路径。
+    uint32_t  _mip_sw;         // csr 入口 mip (0x344) / sip (0x144) 软件可写子集
 
     // host trap 流程状态: 嵌套 trap 计数器 + 内部停机位段 (位段编码详见 dispatcher.c
     // 末尾 in_trap 位段编码段)。

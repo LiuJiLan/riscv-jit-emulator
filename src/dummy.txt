@@ -675,7 +675,7 @@ stderr vs stdout
 
 
 ================================================================================
-## §6. CSR 物理存储字段命名四类划分
+## §6. CSR 物理存储字段命名五类划分
 ================================================================================
 
 涉及文件:
@@ -697,7 +697,7 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 
 
 --------------------------------------------------------------------------------
-四类划分
+五类划分
 --------------------------------------------------------------------------------
 
 (1) 第一类 — RV32 物理 64 位, csr 入口拆 32 位访问
@@ -740,16 +740,29 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
     命名前缀: 下划线 "_" (跟第一类同前缀, 因都是物理跨多入口/多视图字段)
     分两种子情况:
       (2a) 权级副本 — 同一份物理字段, 多个 csr 入口同级看不同 mask 子集
-           示例: _mstatus 字段被 mstatus / sstatus 两个 csr 入口看 (mstatush 跟 sstatus
-                 不算副本关系, 是低/高半边关系, 见 (1)+(2a) 特殊段); mstatus 入口看低 32
-                 位全部, sstatus 入口看低 32 位 ∩ SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR;
-                 两入口实现独立 (csr.c 三个 helper 不互调), 关系是"同级看不同 mask",
-                 不是"sstatus 派生于 mstatus"。
+           示例 1: _mstatus 字段被 mstatus / sstatus 两个 csr 入口看 (mstatush 跟 sstatus
+                   不算副本关系, 是低/高半边关系, 见 (1)+(2a) 特殊段); mstatus 入口看低 32
+                   位全部, sstatus 入口看低 32 位 ∩ SSTATUS_MASK = SIE|SPIE|SPP|SUM|MXR;
+                   两入口实现独立 (csr.c 三个 helper 不互调), 关系是"同级看不同 mask",
+                   不是"sstatus 派生于 mstatus"。
+           示例 2: _mie 字段 (uint32_t) 被 mie / sie 两个 csr 入口看; mie 入口看全部 32 位
+                   (项目用 bit 1/3/5/7/9/11 = IRQ_S/M × SOFT/TIMER/EXT 六位), sie 入口看
+                   32 位 ∩ SIE_MASK = IRQ_S × SOFT/TIMER/EXT 三位 (bit 1/5/9)。两入口实现
+                   独立 (csr.c 两个 helper 不互调), 关系是"同级看不同 mask"。
+                   _mie 跟 _mstatus 的区别: _mstatus 是 (1)+(2a) 特殊 (物理 64 位, csr 入口
+                   拆访问 + masked view 两个性质叠加); _mie 是单纯 (2a) (物理字段长度 ==
+                   csr 入口长度, 只有 masked view 一个性质)。"_" 前缀依据是 (2a) "物理跨
+                   多入口/多视图", 不是 (1) "长度差"。
+                   (注: mip / sip 入口对应的物理字段是 _mip_sw, 不属类 (2a) — 因 mip
+                   readout 不只是某物理字段的 mask view, 还要 OR 异步源 (CLINT.msip /
+                   PLIC) + compute (mtime≥mtimecmp). 见 (5) 类。)
       (2b) csr / MMIO 副本 — 一个物理字段同时被 csr 入口和 MMIO load/store 读写
            示例: _mtime (CLINT MMIO 0xBFF8 同时被 csrr time 读 + MMIO load 读, 两路径同源字段)
 
-    项目当前 (2a) 真字段 = _mstatus (mstatus + sstatus 两入口看); (2b) 没遇到真字段
-    (clint / plic 真做时加)。
+    项目当前 (2a) 真字段 = _mstatus (mstatus + sstatus 两入口看) / _mie (mie + sie);
+    (2b) 没遇到真字段 (clint / plic 真做时加)。mip / sip 入口的物理字段 _mip_sw 属类
+    (5) 软件可写子集 + 异步源合成读, 不属本类 — csr readout 是合成结果而不是字段的
+    mask view。
 
 (*) (1) + (2a) 特殊例子: _mstatus / _fcsr / _vcsr — 同时满足"物理一份长字段, 多 csr 入口
     同级看不同 sub-view"
@@ -794,6 +807,67 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
       static uint32_t csr_mepc_read(cpu_t *hart) { return hart->trap.xepc[PRIV_M]; }
       static uint32_t csr_sepc_read(cpu_t *hart) { return hart->trap.xepc[PRIV_S]; }
 
+(5) 第五类 — 软件可写子集 + 异步源 OR 合成读
+    命名前缀: 下划线 "_" + 后缀 "_sw" 或 "_hw" (后缀表 "字段不是完整 csr source,
+    是入口可写位的物理子集"; 跟类 (2a) 区分 — (2a) 字段是完整 csr source 被多入口
+    看 mask 子集)
+    特征:
+      - 物理字段只存 "csr 入口的软件可写位 (后缀 _sw) 或硬件 set 位 (后缀 _hw)",
+        位号 layout 跟 csr readout view 一致 (bit 编号 = RV spec 寄存器位号)
+      - 读时不直接返回字段; 字段 OR 异步源 / compute 派生 = 完整 csr readout
+      - 写时只动字段对应的部分 (_sw 字段被 csrw 写; _hw 字段不被 csrw 影响, 由
+        硬件源驱动)
+      - 跟 (2a) 区别: (2a) 无 "OR 异步源" 层, 多入口只是 mask view; (5) 物理字段
+        **不是完整 csr source**, 而是 csr 入口的子集; csr readout 要靠合成
+      - 跟 (2b) 区别: (2b) 同源字段被 csr + MMIO 两路径访问 (物理字段是完整 source);
+        (5) csr 入口的部分位由 "异步源 / compute" 提供, 字段只存 csr 入口的另一部分位
+    示例:
+      _mip_sw  — mip 入口软件可写子集 (uint32_t, bit 1 SSIP / bit 5 STIP / bit 9
+                  SEIP_sw, 其他位永远 0)。csrr mip 时 OR 以下源得完整 mip readout:
+                    bit 3  ← CLINT.msip[hartid] (异步源, atomic load; MSIP RO in mip)
+                    bit 7  ← (mtime ≥ mtimecmp[hartid]) (compute; MTIP RO in mip)
+                    bit 9  ← _mip_sw 该位 OR PLIC s_pending (未来; v1 永远 0)
+                    bit 11 ← PLIC m_pending (未来; v1 永远 0)
+                  csrw mip 只动 _mip_sw 对应位 (MIP_SW_WRITABLE_MASK = bit 1|5|9);
+                  其他位 (MSIP/MTIP/MEIP) 写忽略。
+                  sip 入口 = mip 入口 ∩ SIP_MASK 之后再合成 (mask view 套在合成
+                  之上); csrw sip 只动 _mip_sw bit 1 (SSIP RW; STIP / SEIP RO in sip
+                  按 RV spec §5.1.4 强制).
+
+    项目当前 (5) 真字段 = _mip_sw 唯一 (sw 子集形态); 未来 SEIP 真两 bit 视图实
+    装时加 _mip_seip_hw (hw 子集形态; 当前 hw_seip 路径占位返 0); H/AIA 扩展可
+    能再加.
+
+    csr.c read/write helper 模式:
+      static uint32_t csr_mip_read(cpu_t *hart) {
+          uint32_t mip_view = hart->trap._mip_sw;
+          uint32_t hartid = hart->per_hart_info.mhartid;
+          if (atomic_load_explicit(&clint.msip[hartid], memory_order_acquire))
+              mip_view |= (1u << IRQ_M_SOFT);
+          if (atomic_load_explicit(&clint.mtime, memory_order_acquire) >=
+              atomic_load_explicit(&clint.mtimecmp[hartid], memory_order_acquire))
+              mip_view |= (1u << IRQ_M_TIMER);
+          /* (未来) mip_view |= plic_m_pending(hartid) ? (1u << IRQ_M_EXT) : 0; */
+          /* (未来) mip_view |= plic_s_pending(hartid) ? (1u << IRQ_S_EXT) : 0; */
+          return mip_view;
+      }
+      static void csr_mip_write(cpu_t *hart, uint32_t v) {
+          /* 只动 _mip_sw 对应位 (M-mode csrw mip 可写 SSIP/STIP/SEIP_sw); RO 位忽略. */
+          hart->trap._mip_sw = (hart->trap._mip_sw & ~MIP_SW_WRITABLE_MASK)
+                             | (v & MIP_SW_WRITABLE_MASK);
+      }
+
+    并发: _mip_sw 是 plain uint32_t (本 hart 单线程访问 — M-mode csrw mip /
+    S-mode csrw sip 都是本 hart guest 软件, dispatcher 读也是本 hart loop 顶);
+    异步源在各自模块内自己 _Atomic (CLINT 已 atomic; 未来 PLIC). 跨 hart inject
+    SSIP 走 IPI 路径 (远 hart 写 clint.msip → 目标 hart MSIP trap → 目标 hart
+    M-handler 自己 csrw mip 设 SSIP), 仍是本 hart 写自己 _mip_sw, 不存在跨 hart
+    直接写本字段的路径。csr_mip_read 合成路径 = plain 读 _mip_sw + atomic_load
+    各异步源 + 按位 OR — 无 atomic RMW 需求。
+    SMP/H/AIA: H 扩展 (Hypervisor 跨虚拟 hart inject) / AIA 扩展 (IMSIC MSI 直接
+    写远 hart pending) 会破坏 "本 hart 单线程访问 _mip_sw" 前提, 真做时改 _Atomic
+    + atomic 路径. trap.h _mip_sw 字段定义处加 // SMP/H/AIA: 注释占位.
+
 
 --------------------------------------------------------------------------------
 适用范围
@@ -802,8 +876,8 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 本协议适用于所有 csr 字段, 不限 trap_csrs_t:
 
   - trap_csrs_t (cpu.h 内嵌, trap.h 定义)
-      _mstatus / _medeleg (类 1) / mideleg (类 3) / xtvec[4] / xepc[4] / xcause[4] /
-      xtval[4] / xscratch[4] 等
+      _mstatus / _medeleg (类 1) / mideleg (类 3) / _mie (类 (2a)) / _mip_sw (类 5) /
+      xtvec[4] / xepc[4] / xcause[4] / xtval[4] / xscratch[4] 等
 
   - cpu_info_per_hart_t (cpu.h)
       per-hart 私有 RO csr (mhartid / misa); 严格说不属于上面四类 cover 范畴 (本协议
@@ -829,9 +903,13 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
 --------------------------------------------------------------------------------
 
   (1) 看到字段名就知道访问形态
-      - _foo:   物理 64 位, csr 入口拆 32 位访问 (read/write helper 加 mask/shift)
-      - xfoo[4]: priv 索引, helper 用 [PRIV_M] / [PRIV_S] 区分 csr addr
-      - foo:    单一独立字段 (helper 直读)
+      - _foo:        物理 64 位 (类 1) 或单纯多入口看 mask 子集 (类 2a); read/write
+                      helper 用 mask/shift 操作单一物理 source
+      - xfoo[4]:     priv 索引 (类 4), helper 用 [PRIV_M] / [PRIV_S] 区分 csr addr
+      - foo:         单一独立字段 (类 3, helper 直读)
+      - _foo_sw / _foo_hw: 物理字段是 csr 入口的可写子集 (类 5; 不是完整 csr source);
+                      read 时 OR 异步源 / compute 派生 = 完整 csr readout; write 只动
+                      字段对应位 (其他位由源驱动)
 
   (2) 跟 RV 手册风格对齐
       手册用 xepc 同时指代 mepc / sepc; 项目代码 xepc[4] 直接对应

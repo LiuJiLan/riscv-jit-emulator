@@ -367,6 +367,63 @@
 #endif
 
 // ----------------------------------------------------------------------------
+// Interrupt CSRs (mie / mip / sie / sip 入口 + 位号 + cause 编码 + WARL mask)
+//
+// CSR 入口:
+//   mie  (0x304) — M-mode 中断 enable; 物理存储 trap_csrs_t._mie (类 (2a))
+//   mip  (0x344) — M-mode 中断 pending; csrr 时合成读 (类 (5), 物理存
+//                  trap_csrs_t._mip_sw 软件可写子集 OR 异步源 CLINT.msip /
+//                  (mtime≥mtimecmp) / 未来 PLIC)
+//   sie  (0x104) — S-mode 中断 enable; _mie 的 mask view (SIE_MASK)
+//   sip  (0x144) — S-mode 中断 pending; mip readout 的 mask view (SIP_MASK)
+//
+// 位号 (IRQ_*): mip / mie 共用位号 + 中断 cause 编码低位 — Linux + Spike 现代
+// 风格 (Linux arch/riscv/include/asm/csr.h L76-84 / Spike riscv/encoding.h);
+// 一份宏顶两用:
+//   (1) mip / mie 字段位号: bit = IRQ_M_TIMER 表 "MTIP/MTIE 位置"
+//   (2) 中断 cause 编号低位: mcause = CAUSE_INTERRUPT_BIT | IRQ_M_TIMER
+//
+// 字段 _mie / _mip_sw 顶段注释见 src/core/trap.h; 命名规则见 dummy.txt §6
+// (2a) + 第 5 类。csr.c 内 csr_mip_read 合成算法见 dummy.txt §6 (5) 类 helper
+// 模式示例段。
+// ----------------------------------------------------------------------------
+#define CSR_MIE     0x304U          /* M-mode 中断 enable;  trap._mie         */
+#define CSR_MIP     0x344U          /* M-mode 中断 pending; 合成读 (见 csr.c) */
+#define CSR_SIE     0x104U          /* S-mode 中断 enable;  _mie 的 mask view */
+#define CSR_SIP     0x144U          /* S-mode 中断 pending; mip 合成的 mask view */
+
+#define IRQ_S_SOFT    1U            /* SSIP / SSIE bit; 也是 S-software cause 低位 */
+#define IRQ_M_SOFT    3U            /* MSIP / MSIE bit; 也是 M-software cause 低位 */
+#define IRQ_S_TIMER   5U            /* STIP / STIE bit; 也是 S-timer    cause 低位 */
+#define IRQ_M_TIMER   7U            /* MTIP / MTIE bit; 也是 M-timer    cause 低位 */
+#define IRQ_S_EXT     9U            /* SEIP / SEIE bit; 也是 S-external cause 低位 */
+#define IRQ_M_EXT    11U            /* MEIP / MEIE bit; 也是 M-external cause 低位 */
+
+#define CAUSE_INTERRUPT_BIT  (1U << 31)  /* mcause MSB = 1 时表中断 (vs 异常) */
+
+// MIE / MIP 完整有效位 (项目用 6 位; 高 20 位 reserved/0; mie/mip 同 layout)。
+// mie WARL 截 reserved bits: csr_mie_write 用 `v & MIE_VALID_MASK`。
+#define MIE_VALID_MASK   ((1U << IRQ_S_SOFT)  | (1U << IRQ_M_SOFT)  | \
+                          (1U << IRQ_S_TIMER) | (1U << IRQ_M_TIMER) | \
+                          (1U << IRQ_S_EXT)   | (1U << IRQ_M_EXT))
+
+// SIP / SIE 可见位 (sip 是 mip readout 的 mask view; sie 是 _mie 的 mask view).
+// 两者字面值相同 (sie 跟 sip 都看 S 中断三位)。
+#define SIP_MASK    ((1U << IRQ_S_SOFT) | (1U << IRQ_S_TIMER) | (1U << IRQ_S_EXT))
+#define SIE_MASK    SIP_MASK
+
+// M-mode csrw mip 可写位 (软件 inject; 物理写入 _mip_sw 三位 SSIP/STIP/SEIP_sw).
+// 字面 = SIP_MASK 因位号巧合 = S 中断三位 = mip 入口软件可写位。
+// (RV spec §3.1.9 让 SEIP 实现复杂 "两 bit 视图"; 项目 v1 简化成单 bit, 见
+//  dummy.txt §6 第 5 类 _mip_sw 描述。)
+#define MIP_SW_WRITABLE_MASK   SIP_MASK
+
+// S-mode csrw sip 可写位 (仅 SSIP; RV spec §5.1.4 + §3.1.9: sip 入口 STIP /
+// SEIP RO — S-mode 不该直接清这两位; 清靠 PLIC claim/complete 或 M-mode csrw mip).
+#define SIP_WRITABLE_MASK      (1U << IRQ_S_SOFT)
+
+
+// ----------------------------------------------------------------------------
 // Exception Code (RV Privileged Spec Vol II, table 3.6 sync exception code)
 //
 // 用途: trap_raise_exception / trap_set_state 的 cause 参数 + mcause/scause 字段值。

@@ -139,10 +139,19 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 // ----------------------------------------------------------------------------
 
 int clint_init(void) {
+    // mtime 初值 0 (time begins from 0; RV spec OK reset state).
     atomic_store_explicit(&clint.mtime, 0, memory_order_relaxed);
+
+    // mtimecmp 初值 UINT64_MAX (= "no timer interrupt scheduled" sentinel).
+    // 跟 OpenSBI sbi_timer_init 惯例一致: RV Priv Spec §3.2.1 "MTIP pending
+    // whenever mtime ≥ mtimecmp", 若初值 0 + mtime=0 → `0 >= 0` 永远 true →
+    // MTIP spurious set 整个 T2 阶段。guest software (SBI / kernel) 显式 csrw
+    // 或 MMIO 写 mtimecmp 设有意义的值后, clint_timer_pending 才返 true。
+    //
+    // msip 初值 0 (no software interrupt pending).
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
-        atomic_store_explicit(&clint.mtimecmps[i], 0, memory_order_relaxed);
-        atomic_store_explicit(&clint.msip[i],      0, memory_order_relaxed);
+        atomic_store_explicit(&clint.mtimecmps[i], UINT64_MAX, memory_order_relaxed);
+        atomic_store_explicit(&clint.msip[i],      0,          memory_order_relaxed);
     }
 
     mmio_dev_t dev = {
@@ -158,4 +167,26 @@ int clint_init(void) {
         return -1;
     }
     return 0;
+}
+
+
+// ----------------------------------------------------------------------------
+// 中断 pending 语义查询 (csr.c csr_mip_read 合成路径用)
+//
+// 接口约定见 clint.h 顶段; hartid 越界返 0 防御; 内部 atomic_load_explicit 跨
+// hart 安全 (单 hart 时编译为 plain load, 零开销)。memory_order_acquire 跟
+// dummy.txt §7 跨线程读取异步源约定一致 (T5 timer 辅助线程 release-store
+// mtime 之后, dispatcher 这边 acquire-load 看到新值)。
+// ----------------------------------------------------------------------------
+
+int clint_msip_pending(uint32_t hartid) {
+    if (hartid >= MAX_HARTS) return 0;
+    return atomic_load_explicit(&clint.msip[hartid], memory_order_acquire) ? 1 : 0;
+}
+
+int clint_timer_pending(uint32_t hartid) {
+    if (hartid >= MAX_HARTS) return 0;
+    uint64_t now = atomic_load_explicit(&clint.mtime,             memory_order_acquire);
+    uint64_t cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
+    return (now >= cmp) ? 1 : 0;
 }
