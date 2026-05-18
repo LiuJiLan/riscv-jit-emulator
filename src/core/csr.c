@@ -16,8 +16,8 @@
 //   medeleg  (0x302) → trap._medeleg 低 32 位
 //   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_interrupt_state + trap_check_interrupt 真读)
 //   mie      (0x304) → trap._mie (类 (2a) 副本基本字段, sie 是 mask view; WARL 截 MIE_VALID_MASK)
-//   mip      (0x344) → 合成读: trap._mip_sw (类 (5) 软件可写子集) OR clint_msip_pending OR
-//                       clint_timer_pending OR (未来) PLIC; csrw 只动 _mip_sw, RO 位忽略
+//   mip      (0x344) → 合成读: trap._mip_sw (类 (5) 软件可写子集) OR is_clint_msip_pending OR
+//                       is_clint_timer_pending OR (未来) PLIC; csrw 只动 _mip_sw, RO 位忽略
 //   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
 //                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
 //   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
@@ -65,7 +65,7 @@
 
 #include "config.h"            // IALIGN_MASK
 #include "cpu.h"
-#include "platform/clint.h"    // clint_msip_pending / clint_timer_pending (mip 合成读)
+#include "platform/clint.h"    // is_clint_msip_pending / is_clint_timer_pending (mip 合成读)
 #include "riscv.h"
 #include "trap.h"              // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
 
@@ -263,8 +263,8 @@ static void csr_mie_write(cpu_t *hart, uint32_t v) {
 //
 // csr_mip_read 合成 6 bit (跟 dummy.txt §6 第 5 类 helper 模式示例段一致):
 //   bit 1/5/9 (SSIP/STIP/SEIP_sw) ← trap._mip_sw 软件 inject 字段
-//   bit 3     MSIP ← CLINT.msip[hartid] 异步源 (clint_msip_pending)
-//   bit 7     MTIP ← (mtime ≥ mtimecmp[hartid]) 派生 (clint_timer_pending)
+//   bit 3     MSIP ← CLINT.msip[hartid] 异步源 (is_clint_msip_pending)
+//   bit 7     MTIP ← (mtime ≥ mtimecmp[hartid]) 派生 (is_clint_timer_pending)
 //   bit 9     SEIP_hw ← PLIC s_pending OR _mip_sw bit 9 (未来; v1 hw_seip 永远 0)
 //   bit 11    MEIP ← PLIC m_pending (未来; v1 永远 0)
 //
@@ -277,9 +277,9 @@ uint32_t csr_mip_read(cpu_t *hart) {
     uint32_t mip_view = hart->trap._mip_sw;
     uint32_t hartid   = hart->per_hart_info.mhartid;
 
-    if (clint_msip_pending(hartid))
+    if (is_clint_msip_pending(hartid))
         mip_view |= (1U << IRQ_M_SOFT);
-    if (clint_timer_pending(hartid))
+    if (is_clint_timer_pending(hartid))
         mip_view |= (1U << IRQ_M_TIMER);
 
     /* (未来) PLIC s_pending → IRQ_S_EXT 位 OR (跟 _mip_sw 已经 OR 的 sw_seip 合成);

@@ -1001,8 +1001,10 @@ host thread — OS 级 pthread, 包括两类:
                 + 辅助线程都可能读写, 用 C11 atomic (memory_order_relaxed 起步,
                 fence 按需加)。
   thread-local: debug.c::debug_cnt 等 host trace 状态。当前 hart 线程独占
-                (单 hart); SMP 多 hart 时按"全局密度"还是"per-hart 密度"再拍
-                (T5 时确认), 前者改 atomic, 后者改 per-hart 字段。
+                (单 hart); T5 实际未触发改动 — timer 辅助线程不打 trace,
+                不动用 debug 文件 (真要 debug 是临时 fprintf 用完删)。真 SMP
+                落地时再拍是否要 per-hart 密度 vs 全局密度, 前者改 atomic,
+                后者改 per-hart 字段。
 
 
 --------------------------------------------------------------------------------
@@ -1020,6 +1022,46 @@ host thread — OS 级 pthread, 包括两类:
 (3) cpu_t 任何字段保持非 atomic (fast path 性能要求); shared 字段一律 atomic
     (跨线程读写的 host 内存安全要求)。这条契约一旦违反 → C11 data race UB,
     debug 路径不可达。
+
+
+--------------------------------------------------------------------------------
+monitor 模型 (shared 数据接口暴露规则)
+--------------------------------------------------------------------------------
+
+上文"数据归属"段决定"哪些字段 atomic"; 本段补充"shared 数据怎么对外暴露"。
+来自 Hoare/Hansen 并发 monitor 范式: 每个共享状态模块封装内部 atomic 字段 +
+同步细节, 对外只暴露 consumer / producer 接口, 调用方不感知内部 atomic /
+memory_order 选择。
+
+(注: 这里的 "monitor" 是并发理论 monitor 范式, **不是**未来 src/monitor/ 目录
+里的"监看程序" (perf counter / 外部观察接口)。两个概念中文都译"监视器"易混;
+T6 归零时统一术语。)
+
+项目内 monitor 实例:
+
+  clint = 完整 monitor (第一个)
+    内部状态: _Atomic uint64_t mtime / mtimecmps[N] / msip[N] + pthread_t
+              timer_thread (T5 加)
+    内部 actor: file-static timer_run routine (T5 加; 不算外部)
+    对外 consumer: is_clint_msip_pending / is_clint_timer_pending / clint_read
+                   (bus MMIO)
+    对外 producer: clint_write (bus MMIO)
+    lifecycle: clint_init / clint_reset / clint_destroy
+
+  runtime = degenerate monitor (单 flag 简化)
+    extern _Atomic int runtime_system_reset_signal / runtime_shutdown_signal,
+    直接读写无封装函数; 单字段无跨字段一致性问题, 不强制接口函数
+
+memory_order 配对规则:
+  producer (write): memory_order_release
+  consumer (read):  memory_order_acquire
+  建立 happens-before (类比 monitor 范式中 mutex unlock/lock 的顺序)。选择
+  封装在模块 .c 内, 模块外不感知。
+
+边界规则 (跨模块):
+  外部模块 (csr.c / dispatcher.c / bus.c 等) 不直接 atomic_* 操作 clint 内部
+  字段, 一律走 clint.h 接口 (例 is_clint_*_pending 而非裸 atomic_load(&clint.
+  msip[N]))。runtime extern flag 是 degenerate case 例外 (单字段)。
 
 
 --------------------------------------------------------------------------------
@@ -1377,4 +1419,46 @@ vs 标注式" 的策略选择。
   - 本协议不规定 JIT 寄存器映射策略 (是 translator / backend 内部决定)
   - 本协议不延伸到 IRQ 中断分发 (T3+ 真做中断时, "中断走长跳还是返回机制"
     再扩 §9 + 本节)
+
+
+================================================================================
+## §11. predicate 函数命名约定
+================================================================================
+
+涉及文件:
+  - src/platform/clint.{c,h}::is_clint_msip_pending / is_clint_timer_pending
+  - src/core/decode.h::is_block_boundary_inst (static inline; 已符合)
+  - 未来任何返 0/1 状态查询函数
+
+
+--------------------------------------------------------------------------------
+约定
+--------------------------------------------------------------------------------
+
+返 0/1 (布尔语义) 的查询函数 — 谓词 (is / has) 前置, module 嵌入 descriptor
+后段:
+
+  - is_<module>_<thing>_<state>     例: is_clint_msip_pending
+  - is_<thing>                      例: is_block_boundary_inst (本地 static inline)
+  - has_<module>_<thing>            例 (假想): has_jit_cache_hit
+
+哲学:
+  - 谓词位置高于 module prefix, 因为 predicate 是函数的语义关键词; module
+    是次要 namespace 信息。读起来 "is + 谁的 + 什么状态" 自然。
+  - CLAUDE.md 通用 schema `module_verb_object` 不覆盖 predicate 形态 — 本节
+    是补充规则, 不替代 schema。非 predicate 函数仍走 schema (例 clint_init /
+    clint_reset / clint_destroy)。
+  - 项目不用 bool, 返 int (0/1)。跟 §9 "0=成功 / 非 0=cause" 接口约定的布尔
+    语义不冲突 — 那条针对 RV exception cause 编码; 本节针对状态查询。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本节不规定 predicate 函数的副作用 / atomic 性 / longjmp 行为 (各 sheet
+    自定)
+  - 不规定参数命名 (例 hartid 等参数名各 module 沿用本身约定)
+  - 不替代 module_verb_object schema — 非 predicate 函数 (init / reset /
+    destroy / read / write / walk / ...) 仍走 schema
 

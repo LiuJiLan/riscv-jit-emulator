@@ -14,7 +14,7 @@
 #ifndef PLATFORM_CLINT_H
 #define PLATFORM_CLINT_H
 
-#include <stdint.h>     // uint32_t (clint_msip_pending / clint_timer_pending 参数)
+#include <stdint.h>     // uint32_t (is_clint_msip_pending / is_clint_timer_pending 参数)
 
 // 入口: main.c 在 ram_init 之后, dispatcher 启动之前调一次。
 // 内部: 初始化 atomic 字段 (mtime / msip 全清零; mtimecmp 初值 UINT64_MAX 表
@@ -31,13 +31,13 @@ int clint_init(void);
 //
 // 内部 atomic_load_explicit 读 clint 内部 _Atomic 字段 (跨 hart 安全); 调用方
 // 不感知 clint 内部存储形态 + 不感知 "mtime 怎么累加" (T2 阶段不真累加, T5 由
-// timer 辅助线程异步累加; clint_timer_pending 语义 RV spec §3.2.1 "mtime ≥
+// timer 辅助线程异步累加; is_clint_timer_pending 语义 RV spec §3.2.1 "mtime ≥
 // mtimecmp[hartid]" 不变)。
 //
 // hartid 越界 (>= MAX_HARTS) 返 0 (防御; 不 pending), 不 abort。
 // ----------------------------------------------------------------------------
-int clint_msip_pending (uint32_t hartid);    /* 0/1; = !!atomic_load(msip[hartid]) */
-int clint_timer_pending(uint32_t hartid);    /* 0/1; = (mtime ≥ mtimecmp[hartid]) */
+int is_clint_msip_pending (uint32_t hartid);    /* 0/1; = !!atomic_load(msip[hartid]) */
+int is_clint_timer_pending(uint32_t hartid);    /* 0/1; = (mtime ≥ mtimecmp[hartid]) */
 
 
 // ----------------------------------------------------------------------------

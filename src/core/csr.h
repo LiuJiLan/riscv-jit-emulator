@@ -95,8 +95,8 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
 //
 // 合成 6 bit (dummy.txt §6 第 5 类 _mip_sw 合成读模型):
 //   bit 1/5/9 (SSIP/STIP/SEIP_sw) ← hart->trap._mip_sw 软件 inject 字段
-//   bit 3     MSIP ← clint_msip_pending(hartid) 异步源
-//   bit 7     MTIP ← clint_timer_pending(hartid) compute
+//   bit 3     MSIP ← is_clint_msip_pending(hartid) 异步源
+//   bit 7     MTIP ← is_clint_timer_pending(hartid) compute
 //   bit 9     SEIP_hw ← PLIC s_pending OR (未来; v1 永远 0)
 //   bit 11    MEIP ← PLIC m_pending (未来; v1 永远 0)
 //

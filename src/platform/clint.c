@@ -146,7 +146,7 @@ int clint_init(void) {
     // 跟 OpenSBI sbi_timer_init 惯例一致: RV Priv Spec §3.2.1 "MTIP pending
     // whenever mtime ≥ mtimecmp", 若初值 0 + mtime=0 → `0 >= 0` 永远 true →
     // MTIP spurious set 整个 T2 阶段。guest software (SBI / kernel) 显式 csrw
-    // 或 MMIO 写 mtimecmp 设有意义的值后, clint_timer_pending 才返 true。
+    // 或 MMIO 写 mtimecmp 设有意义的值后, is_clint_timer_pending 才返 true。
     //
     // msip 初值 0 (no software interrupt pending).
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
@@ -179,12 +179,12 @@ int clint_init(void) {
 // mtime 之后, dispatcher 这边 acquire-load 看到新值)。
 // ----------------------------------------------------------------------------
 
-int clint_msip_pending(uint32_t hartid) {
+int is_clint_msip_pending(uint32_t hartid) {
     if (hartid >= MAX_HARTS) return 0;
     return atomic_load_explicit(&clint.msip[hartid], memory_order_acquire) ? 1 : 0;
 }
 
-int clint_timer_pending(uint32_t hartid) {
+int is_clint_timer_pending(uint32_t hartid) {
     if (hartid >= MAX_HARTS) return 0;
     uint64_t now = atomic_load_explicit(&clint.mtime,             memory_order_acquire);
     uint64_t cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);

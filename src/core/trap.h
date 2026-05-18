@@ -134,7 +134,7 @@ typedef struct {
     //
     // csrr mip 时跟以下异步源 OR 合成完整 mip readout:
     //   bit 3  MSIP ← CLINT.msip[hartid]          (atomic_load; 跨 hart MMIO writer)
-    //   bit 7  MTIP ← (mtime ≥ mtimecmp[hartid]) (clint_timer_pending compute)
+    //   bit 7  MTIP ← (mtime ≥ mtimecmp[hartid]) (is_clint_timer_pending compute)
     //   bit 9  SEIP_hw ← PLIC s_pending           (未来; v1 永远 0)
     //   bit 11 MEIP ← PLIC m_pending              (未来; v1 永远 0)
     // csrw mip 只动本字段 MIP_SW_WRITABLE_MASK 对应位; 其他位 RO 写忽略。
