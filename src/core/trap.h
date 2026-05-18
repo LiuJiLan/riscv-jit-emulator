@@ -1,11 +1,14 @@
 //
 // Created by liujilan on 2026/5/4.
-// trap 模块对外接口: trap_csrs_t 物理存储 + 两层 raise 接口 (trap_set_state 不长跳,
-// trap_raise_exception 含长跳)。
+// trap 模块对外接口: trap_csrs_t 物理存储 + 三层 raise 接口
+//   exception 路径: trap_set_exception_state (不长跳) + trap_raise_exception (含长跳)
+//   interrupt 路径: trap_set_interrupt_state (不长跳) + trap_check_interrupt (dispatcher 主帧 polling 入口)
 //
-// 跨文件协议见 src/dummy.txt §1; 本模块涉及该协议的两处:
-//   - 机制 (2a) interpreter helper 经 trap_raise_exception 长跳
-//   - 机制 (2b) dispatcher fetch 路径 (mmu_translate_pc) 直调 trap_set_state, 不长跳
+// 跨文件协议见 src/dummy.txt §1; 本模块涉及该协议的三处:
+//   - 路径 2a interpreter/JIT helper 经 trap_raise_exception 长跳 (深栈)
+//   - 路径 2b dispatcher fetch 路径 (mmu_translate_pc / IALIGN 兜底) 直调 trap_set_exception_state, 不长跳
+//   - 路径 2b' dispatcher loop 顶 trap_check_interrupt → trap_set_interrupt_state, 不长跳
+//     (跟 2b 同形态 dispatcher 主帧浅栈 return + continue, 详 dummy.txt §1 + §9)
 //
 // trap_csrs_t 字段分类 (按 dummy.txt §6 CSR 物理存储字段命名五类划分):
 //   - 第四类 (按 priv 索引数组): xcause / xtval / xepc / xtvec / xscratch, 4 槽
@@ -28,14 +31,30 @@
 //   - 不带前缀: 既不按 priv 索引也不拆 64 位的字段 (in_trap; host 流程状态)。
 //
 // helper 形态:
-//   trap_set_state(hart, cause, tval) -> uint8_t
-//     设架构状态 (in_trap++; 写 xcause/xtval/xepc[deliver_priv]; regs[0] = xtvec[deliver_priv]);
+//   trap_set_exception_state(hart, cause, tval) -> uint8_t
+//     设架构状态 (in_trap++; 写 xcause/xtval/xepc[deliver_priv]; regs[0] = xtvec[deliver_priv]
+//     & ~0x3 跳 base 忽略 mode; cause < 32 不含 CAUSE_INTERRUPT_BIT);
 //     候选 A 早 return: in_trap >= 3 时不 deliver (字段保留第二次状态作 root cause), 静默
 //     in_trap++ 后返回。返回 in_trap 当前值, 给 mmu_translate_pc 那种 caller 用作 0/非0
 //     状态传给 dispatcher (省一次读 hart->trap.in_trap)。
 //
+//   trap_set_interrupt_state(hart, cause_low) -> uint8_t
+//     设架构状态 (in_trap++; xcause = cause_low | CAUSE_INTERRUPT_BIT; xtval = 0;
+//     xepc = hart->regs[0]; mstatus xPIE/xIE/xPP 翻转 + 切 priv; jump-to = xtvec base
+//     (mode=0 direct) 或 base + 4*cause_low (mode=1 vectored)). cause_low ∈ [0, 32)
+//     = IRQ_* 位号. mideleg 查 deliver_priv. tval 强制 0 (RV spec §3.1.16 interrupt tval=0).
+//     候选 A 早 return 同 trap_set_exception_state.
+//
+//   trap_check_interrupt(hart) -> int
+//     dispatcher 主帧 polling 入口 (每 loop 顶调). 内部 csr_mip_read 合成读 (含 CLINT
+//     pending) → mip & mie & 按 priv 全局 IE / mideleg 算 deliver_mask → ready 非 0
+//     按 RV Priv Spec §3.1.9 优先级 (M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER)
+//     选第一非零位 → 调 trap_set_interrupt_state. 返 0 = 无 fire, dispatcher 继续 fetch;
+//     返非 0 = 已 trap_set_interrupt_state, dispatcher 应 continue. trace 互斥协议见
+//     debug.h 顶段 (ready==0 时本函数打 'c'; ready!=0 时 trap_set_interrupt_state 内打 t/s/e).
+//
 //   trap_raise_exception(hart, cause, tval) -> _Noreturn
-//     内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
+//     内部 trap_set_exception_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
 //     一次性 sigsetjmp 落点。caller (interpreter) 内 goto out 变 unreachable 但保留无害
 //     (GCC -Wunreachable-code 默认 disabled, 不警告)。
 //
@@ -88,15 +107,17 @@ typedef struct {
     // _medeleg: priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位入口, 物理 64 位
     //   存 cause bitmap (RV64 单入口整体访问)。项目当前只实装 medeleg 低 32 位入口
     //   (medelegh 未实装, 跟 mstatush 平行 future), 字段类型 uint64_t 已 RV64-ready。
-    //   trap_set_state 按 _medeleg.bit(cause) 派发 deliver_priv (U/S-mode trap + bit=1
-    //   → deliver S, 否则 deliver M; M-mode trap 总 M)。
+    //   trap_set_exception_state 按 _medeleg.bit(cause) 派发 deliver_priv (U/S-mode trap +
+    //   bit=1 → deliver S, 否则 deliver M; M-mode trap 总 M)。
     uint64_t  _mstatus;
     uint64_t  _medeleg;        // csr 入口 medeleg (0x302); medelegh (0x312) 未实装
 
     // 第三类: 单字段, 单 csr 入口, 不带前缀 (dummy.txt §6)。
     // mideleg: MXLEN-bit (RV32 = 32 位; spec 未定义 midelegh, 中断 cause 不会超 32 位)。
-    //   跟 mip/mie 中断机制一起未来真做; 字段就位, trap_set_state 当前不读。
-    uint32_t  mideleg;         // csr 入口 mideleg (0x303); 中断机制真做时启用
+    //   trap_set_interrupt_state 按 mideleg.bit(cause_low) 派发 deliver_priv
+    //   (U/S-mode 时 bit=1 → S, bit=0 → M; M-mode 总 M)。trap_check_interrupt 算
+    //   deliver_mask 时也读 mideleg 决定哪些 IRQ 在当前 priv 下接受。
+    uint32_t  mideleg;         // csr 入口 mideleg (0x303); T3+T4 中断机制真接
 
     // 第 (2a) 类: 副本基本字段 (mie / sie 两 csr 入口同级看不同 mask 子集, dummy.txt §6)。
     // mie 入口看全部 32 位 (项目用 bit 1/3/5/7/9/11 = IRQ_S/M × SOFT/TIMER/EXT 六位,
@@ -152,32 +173,81 @@ typedef struct {
 
 
 // ----------------------------------------------------------------------------
-// trap_set_state —— 架构语义层, 不长跳
+// trap_set_exception_state —— 架构语义层 (sync exception 路径), 不长跳
 //
 // 调用方:
 //   - mmu_translate_pc (dummy.txt §1 路径 2b, 直接 control flow)
+//   - dispatcher.c IALIGN 兜底 (dummy.txt §9 单一源)
 //   - trap_raise_exception 内部 (复用本 helper 的"写字段+计数")
 //
 // 行为:
 //   in_trap++;
-//   if (in_trap >= 3) {
-//       /* 候选 A: 早 return, 不写 xcause/xtval/xepc, 不跳 xtvec; 字段保留第二次状态 */
-//       return in_trap;
-//   }
-//   deliver_priv = (caller == M) ? M : (medeleg.bit(cause) ? S : M)
-//   xcause[deliver_priv] = cause;
+//   if (in_trap >= 3) return in_trap;     /* 候选 A: 早 return 不 deliver */
+//   deliver_priv = (caller == M) ? M : (_medeleg.bit(cause) ? S : M);
+//   xcause[deliver_priv] = cause;          /* cause < 32, 不含 CAUSE_INTERRUPT_BIT */
 //   xtval[deliver_priv]  = tval;
 //   xepc[deliver_priv]   = hart->regs[0];
-//   /* 切 priv mode (deliver M: MPP=caller, MPIE=MIE, MIE=0;
-//                    deliver S: SPP=caller(1bit), SPIE=SIE, SIE=0) */
+//   /* 切 priv mode + 翻 mstatus xPIE/xIE/xPP */
 //   hart->priv    = deliver_priv;
-//   hart->regs[0] = xtvec[deliver_priv];
+//   hart->regs[0] = xtvec[deliver_priv] & ~0x3u;  /* exception 永走 base, 忽略 MODE */
 //   return in_trap;
+uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uint32_t tval);
+
+
+// ----------------------------------------------------------------------------
+// trap_set_interrupt_state —— 架构语义层 (async interrupt 路径), 不长跳
 //
-// 返回值: in_trap 当前值 (++ 后)。caller 用作"trap 是否已处理"的 0/非0 信号 (机制不依赖
-// 返回值, dispatcher while 条件兜底; 但 mmu_translate_pc 等 caller 透传给 dispatcher 省
-// 一次读 hart->trap.in_trap)。
-uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval);
+// 调用方:
+//   - trap_check_interrupt 内部 (dispatcher 主帧 polling 入口, dummy.txt §1 路径 2b')
+//
+// 跟 trap_set_exception_state 的分歧 (按"对偶不教条"原则拆函数):
+//   1. cause 高位由本函数加 (caller 传 cause_low = IRQ_* 位号, 函数内 OR
+//      CAUSE_INTERRUPT_BIT 写 xcause)
+//   2. deliver_priv 查 mideleg (替 _medeleg)
+//   3. tval 强制 0 (RV spec §3.1.16; 中断 tval 永远 0)
+//   4. jump-to 处理 vectored mode (mtvec/stvec MODE=1 时 base + 4*cause_low)
+//   5. DEBUG 字符按 cause_low 分流 ('t'/'s'/'e')
+// mstatus xPIE/xIE/xPP 翻转 / in_trap 协议 / 候选 A 早 return 完全跟 exception 路径一样
+// (30 行重复 by design, 不抽 common helper; 未来 H 扩展 hstatus 增量铺路时再抽).
+//
+// 行为:
+//   in_trap++;
+//   if (in_trap >= 3) return in_trap;
+//   deliver_priv = (caller == M) ? M : (mideleg.bit(cause_low) ? S : M);
+//   xcause[deliver_priv] = cause_low | CAUSE_INTERRUPT_BIT;
+//   xtval[deliver_priv]  = 0;
+//   xepc[deliver_priv]   = hart->regs[0];
+//   /* 切 priv mode + 翻 mstatus xPIE/xIE/xPP */
+//   hart->priv    = deliver_priv;
+//   /* jump-to: mode==1 vectored 跳 base+4*cause_low; 否则 (0 direct / 2/3 reserved 落 direct) 跳 base */
+//   uint32_t tvec = xtvec[deliver_priv];
+//   hart->regs[0] = (tvec & 0x3u) == 1u ? (tvec & ~0x3u) + 4u*cause_low : (tvec & ~0x3u);
+//   return in_trap;
+uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low);
+
+
+// ----------------------------------------------------------------------------
+// trap_check_interrupt —— dispatcher 主帧 polling 入口, 不长跳
+//
+// 调用方: dispatcher.c loop 顶 (每轮 while 体进入一次).
+//
+// 返 0  = 无中断 deliver, dispatcher 继续 fetch
+// 返非 0 = 已调 trap_set_interrupt_state, dispatcher 应 continue (重派发 from xtvec)
+//
+// 内部步骤:
+//   1. mip_view = csr_mip_read(hart)                        // T2 合成读: _mip_sw | clint pending
+//   2. enabled = mip_view & hart->trap._mie
+//   3. deliver_mask = 按当前 priv + mstatus.MIE/SIE + mideleg 决定哪些 IRQ 在本 priv 接受
+//        priv=M: mstatus.MIE ? MIE_VALID_MASK : 0
+//        priv=S: (~mideleg & MIE_VALID_MASK) | (mstatus.SIE ? (mideleg & SIE_MASK) : 0)
+//        priv=U: MIE_VALID_MASK
+//   4. ready = enabled & deliver_mask;  ready == 0 → DEBUG_INT_CHECK 'c' + return 0
+//   5. RV Priv Spec §3.1.9 优先级 M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER 选第一非零位
+//   6. trap_set_interrupt_state(hart, irq);  return 非 0
+//
+// trace 互斥协议 (debug.h 顶段): ready==0 时本函数打 'c'; ready!=0 时由
+// trap_set_interrupt_state 内按 cause_low 打 't/s/e'. 每轮入口必出且仅出一个 ∈ {c,t,s,e}.
+int trap_check_interrupt(cpu_t *hart);
 
 
 // ----------------------------------------------------------------------------
@@ -186,9 +256,14 @@ uint8_t trap_set_state(cpu_t *hart, uint32_t cause, uint32_t tval);
 // 调用方: interpreter case (OP_UNSUPPORTED / WRITE_PC_OR_TRAP 内 misalign / csr 权限失败
 // 等), 未来 JIT translator emit 出来的 host code 同样接本 helper。
 //
-// 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口的一次性
-// sigsetjmp 落点。caller 内 goto out 变 unreachable 但保留无害 (GCC -Wunreachable-code
-// 默认 disabled, 不警告)。
+// 内部 trap_set_exception_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 入口
+// 的一次性 sigsetjmp 落点。caller 内 goto out 变 unreachable 但保留无害 (GCC
+// -Wunreachable-code 默认 disabled, 不警告).
+//
+// 跟 interrupt 路径形态不对偶 by design: exception 在 helper 深栈必须 longjmp 才能跳回
+// dispatcher 主帧; interrupt 在 dispatcher 主帧浅栈 return + continue 即可. 见
+// dummy.txt §1 路径 2a vs 2b'. 按"对偶不教条" 原则承认形态差异, trap_set_*_state 内
+// 核共用思想.
 _Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval);
 
 #endif //CORE_TRAP_H

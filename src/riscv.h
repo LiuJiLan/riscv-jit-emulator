@@ -163,11 +163,12 @@
 //
 // sepc / sscratch / stvec / scause / stval (0x141/140/105/142/143): 物理存储 =
 // trap.{xepc/xscratch/xtvec/xcause/xtval}[PRIV_S] (按 priv 索引数组的 [PRIV_S] 槽,
-// 跟 mxxx=xxxx[PRIV_M] 同形态)。WARL: sepc 同 mepc 截 IALIGN 对齐位; stvec 同 mtvec 截
-// MODE 低 2 位 (Vectored 不实现强制 Direct)。
+// 跟 mxxx=xxxx[PRIV_M] 同形态)。WARL: sepc 同 mepc 截 IALIGN 对齐位; stvec 同 mtvec WARL
+// MODE bit (0/1 都接受, 2/3 reserved 落 0; T3+T4 解绑后支持 Vectored)。
 //
-// trap_set_state 按 medeleg.bit(cause) 派发 deliver_priv = S 时写 [PRIV_S] 槽; sret 路径
-// 跟 mret 反操作同形态 (priv=SPP, SIE=SPIE, SPIE=1, SPP=PRIV_U, pc=sepc, in_trap=0)。
+// trap_set_exception_state 按 _medeleg.bit(cause) / trap_set_interrupt_state 按
+// mideleg.bit(cause_low) 派发 deliver_priv = S 时写 [PRIV_S] 槽; sret 路径跟 mret 反操作
+// 同形态 (priv=SPP, SIE=SPIE, SPIE=1, SPP=PRIV_U, pc=sepc, in_trap=0)。
 #define CSR_SSTATUS    0x100U
 #define CSR_SEPC       0x141U
 #define CSR_SSCRATCH   0x140U          /* S-mode scratch (xscratch[PRIV_S]) */
@@ -271,7 +272,7 @@
 // ----------------------------------------------------------------------------
 // 字段宏增量原则: 真用到一个加一个 (csr.c 大 switch 同步加 case)。
 // 当前已暴露:
-//   - MIE / MPIE / MPP                (trap_set_state + OP_MRET 切 priv 用)
+//   - MIE / MPIE / MPP                (trap_set_*_state + OP_MRET 切 priv 用)
 //   - SIE / SPIE / SPP / SUM / MXR    (SV32 walker / OP_SRET 切 priv 用)
 //   - SSTATUS_MASK                    (sstatus = mstatus 的 masked view)
 //   - SD (RV32 真启用 + RV64 #if 0)   (future-proof; FS/XS 真做时联动)
@@ -426,7 +427,7 @@
 // ----------------------------------------------------------------------------
 // Exception Code (RV Privileged Spec Vol II, table 3.6 sync exception code)
 //
-// 用途: trap_raise_exception / trap_set_state 的 cause 参数 + mcause/scause 字段值。
+// 用途: trap_raise_exception / trap_set_exception_state 的 cause 参数 + mcause/scause 字段值。
 // 命名: CAUSE_<event> (跟 Spike riscv-sim CAUSE_* 一致; 跟 mcause 字段名直接对应)。
 //
 // 部分编号 (10/14/17/20+) 是 RV spec reserved, 项目不暴露宏 (避免误用); 真用到时再加。

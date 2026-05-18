@@ -7,14 +7,14 @@
 // csr 编号 → 字段映射:
 //   mstatus  (0x300) → trap._mstatus 低 32 位 (mstatus 物理 64 位被 RV32 拆 mstatus + mstatush 两 csr)
 //   mstatush (0x310) → trap._mstatus 高 32 位 (RV32-only csr 入口)
-//   mtvec    (0x305) → trap.xtvec[PRIV_M]; write WARL mask 低 2 位 (项目不实现 Vectored, 强制 Direct)
+//   mtvec    (0x305) → trap.xtvec[PRIV_M]; write WARL MODE bit[1:0] = 0/1 都接受, 2/3 reserved → 0
 //   mepc     (0x341) → trap.xepc[PRIV_M];  write WARL mask 低 IALIGN_MASK 位 (RV spec mepc[0]=0
 //                       when IALIGN=16; mepc[1:0]=0 when IALIGN=32)
 //   mcause   (0x342) → trap.xcause[PRIV_M]
 //   mtval    (0x343) → trap.xtval[PRIV_M]
 //   mscratch (0x340) → trap.xscratch[PRIV_M]
 //   medeleg  (0x302) → trap._medeleg 低 32 位
-//   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_state 当前不读, 中断真做时启用)
+//   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_interrupt_state + trap_check_interrupt 真读)
 //   mie      (0x304) → trap._mie (类 (2a) 副本基本字段, sie 是 mask view; WARL 截 MIE_VALID_MASK)
 //   mip      (0x344) → 合成读: trap._mip_sw (类 (5) 软件可写子集) OR clint_msip_pending OR
 //                       clint_timer_pending OR (未来) PLIC; csrw 只动 _mip_sw, RO 位忽略
@@ -23,7 +23,7 @@
 //   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
 //   sepc     (0x141) → trap.xepc[PRIV_S];  WARL 截 IALIGN 对齐位 (跟 mepc 同)
 //   sscratch (0x140) → trap.xscratch[PRIV_S]
-//   stvec    (0x105) → trap.xtvec[PRIV_S];  WARL 截 MODE (跟 mtvec 同)
+//   stvec    (0x105) → trap.xtvec[PRIV_S];  WARL MODE 0/1 都接受 (跟 mtvec 同)
 //   scause   (0x142) → trap.xcause[PRIV_S]
 //   stval    (0x143) → trap.xtval[PRIV_S]
 //   sie      (0x104) → trap._mie & SIE_MASK (mask view; 写时只动 SIE_MASK 子集)
@@ -147,17 +147,21 @@ static uint32_t csr_mtvec_read(cpu_t *hart) {
 }
 
 static void csr_mtvec_write(cpu_t *hart, uint32_t v) {
-    // WARL 截断 MODE 位 (项目不实现 Vectored, 强制 Direct):
-    //   - mtvec[1:0] = MODE: 00 = Direct (全部 trap 跳 BASE; 项目支持)
-    //                         01 = Vectored (async/interrupt 跳 BASE+4*cause; 项目不支持)
-    //                         10/11 = reserved by RV spec
-    //   - mtvec[31:2] = BASE
-    // RV spec WARL 允许实现"不支持的 MODE 写入 → 落到合法值"; 我们选 mask 低 2 位为 0
-    // (即 MODE 永远存 00 = Direct), 跟 trap_set_state 内 hart->regs[0] = xtvec[deliver_priv]
-    // 直接赋值 (不算 BASE+4*cause) 一致。
-    // 未来中断机制真做时, 解开本 mask 接受 MODE; trap_set_state 按 cause 分流 (sync 跳 BASE,
-    // async 跳 BASE + 4*cause)。
-    hart->trap.xtvec[PRIV_M] = v & ~0x3u;
+    // WARL MODE 位处理 (项目支持 Direct + Vectored 两种 mode; T3+T4 解绑):
+    //   - mtvec[1:0] = MODE:
+    //       00 = Direct   (sync exception + async interrupt 都跳 BASE; 项目支持)
+    //       01 = Vectored (sync exception 跳 BASE; async interrupt 跳 BASE+4*cause; 项目支持)
+    //       10/11 = Reserved by RV Priv Spec
+    //   - mtvec[31:2] = BASE (IALIGN 对齐, IALIGN=16 时 bit 1 不强制, IALIGN=32 时 bit[1] 在 BASE 里)
+    //   RV spec §3.1.7 WARL: 实现可拒绝非法 MODE, 但必须接受 0 + 1; 我们 reserved
+    //   值落 Direct (合法值).
+    //
+    // 跟 trap_set_*_state 的分工:
+    //   trap_set_exception_state: 永走 BASE (& ~0x3u 在自己函数里 mask, 忽略 MODE)
+    //   trap_set_interrupt_state: 按 MODE 决定 BASE vs BASE+4*cause_low
+    uint32_t mode = v & 0x3u;
+    if (mode >= 2u) mode = 0u;             /* reserved → direct (legal value) */
+    hart->trap.xtvec[PRIV_M] = (v & ~0x3u) | mode;
 }
 
 static uint32_t csr_mepc_read(cpu_t *hart) {
@@ -183,7 +187,7 @@ static uint32_t csr_mcause_read(cpu_t *hart) {
 static void csr_mcause_write(cpu_t *hart, uint32_t v) {
     // mcause 字段: bit[31] = Interrupt (1) vs Exception (0); bit[30:0] = Exception/Interrupt code。
     // RV spec §3.1.16 没强制 WARL (除了 MSB; "implementations may further restrict"), 我们当前
-    // 接受全 32 位写入。fixture 一般也不直接写 mcause (handler 只读, trap_set_state 写)。
+    // 接受全 32 位写入。fixture 一般也不直接写 mcause (handler 只读, trap_set_*_state 写)。
     hart->trap.xcause[PRIV_M] = v;
 }
 
@@ -214,10 +218,10 @@ static void csr_mscratch_write(cpu_t *hart, uint32_t v) {
 //   WARL hardwire 0 — M can't delegate to less-privileged (SiFive U74-MC 同此); 其他
 //   位项目当前接受全 32 位写。priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位
 //   入口 (项目当前未实装, 跟 mstatush 平行 future); 字段类型 uint64_t 已 RV64-ready。
-//   trap_set_state 按 _medeleg.bit(cause) 真生效 (U/S-mode trap + bit=1 → deliver S)。
+//   trap_set_exception_state 按 _medeleg.bit(cause) 真生效 (U/S-mode trap + bit=1 → deliver S)。
 // mideleg (0x303): 类 3 (mideleg uint32_t 单字段)。M-mode 中断 delegation, MXLEN-bit
-//   (spec 未定义 midelegh, 中断 cause 不会超 32 位)。项目当前中断机制未实现, 字段
-//   就位但 trap_set_state 不读, 中断真做时启用。
+//   (spec 未定义 midelegh, 中断 cause 不会超 32 位)。trap_set_interrupt_state 按
+//   mideleg.bit(cause_low) 派发; trap_check_interrupt 也用 mideleg 算 deliver_mask。
 
 static uint32_t csr_medeleg_read(cpu_t *hart) {
     return (uint32_t)(hart->trap._medeleg & 0xFFFFFFFFu);
@@ -267,7 +271,9 @@ static void csr_mie_write(cpu_t *hart, uint32_t v) {
 // csr_mip_write 只动 _mip_sw 的 MIP_SW_WRITABLE_MASK 对应位 (SSIP/STIP/SEIP_sw);
 // 其他位 (MSIP/MTIP/MEIP/reserved) 写忽略 (RO from M-mode csrw 视角).
 
-static uint32_t csr_mip_read(cpu_t *hart) {
+/* csr_mip_read 非 static (跨模块 export): trap_check_interrupt 也调本函数算合成 mip view.
+ * csr.h 加声明. */
+uint32_t csr_mip_read(cpu_t *hart) {
     uint32_t mip_view = hart->trap._mip_sw;
     uint32_t hartid   = hart->per_hart_info.mhartid;
 
@@ -377,8 +383,9 @@ static void csr_sepc_write(cpu_t *hart, uint32_t v) {
 
 // ---- sscratch / stvec / scause / stval (xxx[PRIV_S], 类 3) ----
 //
-// 跟 mscratch / mtvec / mcause / mtval 同形态, 只是 [PRIV_S] 槽。stvec WARL 截 MODE 跟
-// mtvec 同。trap_set_state 按 medeleg 派发 deliver_priv = S 时写 [PRIV_S] 槽。
+// 跟 mscratch / mtvec / mcause / mtval 同形态, 只是 [PRIV_S] 槽。stvec WARL 处理 MODE 跟
+// mtvec 同 (Direct + Vectored 都支持, 2/3 → 0)。trap_set_exception_state 按 medeleg /
+// trap_set_interrupt_state 按 mideleg 派发 deliver_priv = S 时写 [PRIV_S] 槽。
 
 static uint32_t csr_sscratch_read(cpu_t *hart) {
     return hart->trap.xscratch[PRIV_S];
@@ -393,8 +400,10 @@ static uint32_t csr_stvec_read(cpu_t *hart) {
 }
 
 static void csr_stvec_write(cpu_t *hart, uint32_t v) {
-    /* WARL 截 MODE 跟 mtvec 同 (项目不实现 Vectored, 强制 Direct) */
-    hart->trap.xtvec[PRIV_S] = v & ~0x3u;
+    /* WARL MODE 处理跟 mtvec 同 (Direct + Vectored 都支持, 2/3 reserved → 0; 详 csr_mtvec_write) */
+    uint32_t mode = v & 0x3u;
+    if (mode >= 2u) mode = 0u;
+    hart->trap.xtvec[PRIV_S] = (v & ~0x3u) | mode;
 }
 
 static uint32_t csr_scause_read(cpu_t *hart) {

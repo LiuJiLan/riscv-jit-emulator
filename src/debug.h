@@ -56,15 +56,37 @@ extern uint32_t debug_cnt;
 
 // DEBUG_XXX 字符事件宏: 写单字符到 stderr + DEBUG_TICK (tick 内部判换行 → \n 跟在
 // 字符后, 即"本行末尾"位置)。
-// 字符约定:
-//   'f' — refetch (dispatcher 重派发, 即每轮 while 体进入)
-//   'E' — exception (sync trap raise)
-//   't' — timer interrupt
-//   's' — software interrupt
-//   'e' — external interrupt
-// 大小写区分: 'E' 大写 sync exception (严重) vs 't'/'s'/'e' 小写 async 中断。
-#define DEBUG_REFETCH()    do { fputc('f', stderr); DEBUG_TICK(); } while (0)
+//
+// 事件 ↔ 字符映射 (字符可视觉调整, 不影响语义; 各 fixture 注释里仍用 fetch/check 概念
+// 词描述 trace, 字符层是实现细节):
+//   fetch (历史 'f' / 现 '_')  — dispatcher refetch (每轮 while 体进入, 真 fetch 即将发生)
+//   check (历史 'c' / 现 '.')  — trap_check_interrupt 入口 ready==0 (poll 但未 fire)
+//   exception ('E')           — sync trap raise (大写表 sync exception 严重)
+//   timer ('t')               — timer interrupt fire
+//   soft ('s')                — software interrupt fire
+//   external ('e')            — external interrupt fire
+//
+// 字符选取依据 (调整时考虑视觉密度):
+//   - fetch 是真"做事" (块执行), 给粗字符 ('_') 让动作可见
+//   - check 是 poll 决定, 给细字符 ('.') 作背景, 不淹没 fire 事件
+//   - fire / exception (t/s/e/E) 是粗字符, 跟 '_' 粗细近, 在 '.' 背景上跳出明显
+//
+// 互斥协议 (dispatcher 主帧每轮 while 体):
+//   每轮 trap_check_interrupt 入口必出且仅出一个字符 (check 或 fire) —
+//     ready == 0 → 本函数内打 check 字符 ('.')
+//     ready != 0 → 不在本函数打, 由 trap_set_interrupt_state 内按 cause_low 打 t/s/e
+//   随后:
+//     check 返 0 → dispatcher 调 DEBUG_REFETCH 打 fetch 字符 ('_')
+//     check 返非 0 → dispatcher continue 跳过 DEBUG_REFETCH, 本 iter 只一个 fire 字符
+//   即每 iter 至少 1 字符 (fire 单字符) 至多 2 字符 (check + fetch).
+//
+//   trace 形态示例 (用字符):
+//     '._._._._._.t._._.' = N 轮无 fire (check+fetch 对) → 一轮 timer fire (只 't', 无后续 fetch
+//                            因 continue) → 下一轮 N+1 又 check+fetch (handler 内 MIE=0 → check
+//                            no fire).
+#define DEBUG_REFETCH()    do { fputc('_', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_EXCEPTION()  do { fputc('E', stderr); DEBUG_TICK(); } while (0)
+#define DEBUG_INT_CHECK()  do { fputc('.', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_TIME_INTR()  do { fputc('t', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_SOFT_INTR()  do { fputc('s', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_EXT_INTR()   do { fputc('e', stderr); DEBUG_TICK(); } while (0)

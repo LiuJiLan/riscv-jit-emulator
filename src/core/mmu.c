@@ -18,7 +18,7 @@
 #include "platform/ram.h"
 #include "riscv.h"
 #include "tlb.h"
-#include "trap.h"     // trap_set_state (路径 2b) + trap_raise_exception (路径 2a, walker helpers)
+#include "trap.h"     // trap_set_exception_state (路径 2b) + trap_raise_exception (路径 2a, walker helpers)
 
 #include <stddef.h>   // NULL (current_tlb == NULL 编码 REGIME_BARE)
 #include <stdint.h>
@@ -77,10 +77,10 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     if (current_tlb == NULL) {
         uint32_t pa = gva;          // identity 映射
         if (pa_to_fetch_hva(pa, hva_out) != 0) {
-            // 直调 trap_set_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
+            // 直调 trap_set_exception_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
             // cause=1 (Instruction Access Fault, RV spec §3.1.16 cause table); tval=fetch GVA。
             // 返回 in_trap 当前值给 dispatcher (0/非0 信号; dispatcher continue 让 while 兜底)。
-            return (int)trap_set_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
+            return (int)trap_set_exception_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
         }
         *pa_out = pa;
         return 0;
@@ -93,7 +93,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     //   1. 试图命中 current_tlb (TLB hit fast path; check_perm 复用 walker 逻辑)
     //   2. miss → mmu_walk(MMU_PERM_X) → pa + pte_flags + pte_wb_pa + pte_wb_new
     //      (walker 不写回 PT; 写回任务通过出参回 caller)
-    //      - walk 失败 → trap_set_state(fault_cause, gva); fault_cause 是 walker 选的
+    //      - walk 失败 → trap_set_exception_state(fault_cause, gva); fault_cause 是 walker 选的
     //        (page fault 12 / access fault 1)
     //   3. PA 在 RAM 区检查 (用 pa_to_fetch_hva, 跟 BARE 路径同; 取指不能从 MMIO 拿, 不
     //      在 RAM → access fault cause 1; 未来 ROM 接入时 pa_to_fetch_hva 内加 ROM 分支)
@@ -102,7 +102,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     //   4. fill TLB (lazy refresh: 在 ram check 后, 即将"成功"前 fill)
     //   5. 返回 PA + HVA
     //
-    // 跟 mmu_walker_helper_load/store 不同: 这里 trap 用 trap_set_state (路径 2b 不长跳),
+    // 跟 mmu_walker_helper_load/store 不同: 这里 trap 用 trap_set_exception_state (路径 2b 不长跳),
     // 因为 mmu_translate_pc 在 dispatcher 主循环帧内 return 给 dispatcher 接管即可 (跟
     // BARE 路径风格一致); walker_helper_* 在解释器深栈用 trap_raise_exception 长跳。
     // ========================================================================
@@ -120,7 +120,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
         if ((entry->pte_flags & PTE_V) && entry->gva_tag == vpn) {
             // tag + V 命中 → fetch perm 检查 (X + priv/PTE_U + SUM)
             if (!check_perm(hart, (uint32_t)entry->pte_flags, MMU_PERM_X)) {
-                return (int)trap_set_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
+                return (int)trap_set_exception_state(hart, CAUSE_INST_PAGE_FAULT, /*tval*/gva);
             }
             uint8_t *hva = entry->host_ptr + (gva & 0xFFFu);
             *hva_out = hva;
@@ -139,7 +139,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
                      &pte_wb_pa, &pte_wb_new) != 0) {
             /* walker 失败 cause: X 路径 page fault 12 (V=0 / perm 错 / superpage misaligned),
              * 或 access fault 1 (PT 不在 RAM, 未来 PMP 路径) */
-            return (int)trap_set_state(hart, fault_cause, /*tval*/gva);
+            return (int)trap_set_exception_state(hart, fault_cause, /*tval*/gva);
         }
 
         // Step 3: PA 在 RAM 区检查 (取指不能从 MMIO 拿; 用 pa_to_fetch_hva 跟 BARE 路径同)
@@ -147,7 +147,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
         if (pa_to_fetch_hva(pa, &hva) != 0) {
             /* pa_to_fetch_hva 失败时 PTE.A 还没 set (mmu_walk 不写回, 由 caller 在 RAM
              * 路径写; 这里失败走 trap 跟 Spike "fetch MMIO fail 不 set PTE.A" 一致) */
-            return (int)trap_set_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
+            return (int)trap_set_exception_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
         }
 
         // Step 3.5: RAM 路径已通过 (pa_to_fetch_hva), 现在 set PTE.A 写回 PT

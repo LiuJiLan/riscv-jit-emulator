@@ -396,8 +396,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // EBREAK: cause 3 (breakpoint, RV spec); 不分 priv。tval 一般 = 0
             //          (实现 debug 子集时可填触发 PC, 项目当前 = 0)。
             //
-            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径 + trap_set_state
-            //          的反操作:
+            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径 + trap_set_exception_state
+            //          / trap_set_interrupt_state 的反操作:
             //          - hart->priv = mstatus.MPP                 (从 MPP 恢复 caller priv)
             //          - mstatus.MIE  = mstatus.MPIE              (恢复 interrupt-enable)
             //          - mstatus.MPIE = 1                          (RV spec 要求)

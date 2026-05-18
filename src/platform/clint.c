@@ -190,3 +190,18 @@ int clint_timer_pending(uint32_t hartid) {
     uint64_t cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
     return (now >= cmp) ? 1 : 0;
 }
+
+
+// ----------------------------------------------------------------------------
+// T3 临时 mtime 步进源 (T5 timer 辅助线程上线时 grep "mtime_t3_temp" 清三点)
+//
+// 接口语义见 clint.h 顶段。注: RV Priv Spec §3.2.1 mtime 由 rtc_toggle 驱动,
+// 跟 guest 指令执行**异步**; 本 setter "1 指令 = 1 tick" 强行同步是 T3 临时桥,
+// T5 走方案 C 独立 timer 辅助线程才跟 spec 异步语义对齐.
+//
+// memory_order_relaxed 起步 (跟 clint_read/write mtime 路径同序; T5 timer 辅助
+// 线程上线时改 release-store, 让 dispatcher acquire-load 看到 happens-before).
+// ----------------------------------------------------------------------------
+void clint_set_mtime_t3_temp(uint64_t v) {
+    atomic_store_explicit(&clint.mtime, v, memory_order_relaxed);
+}

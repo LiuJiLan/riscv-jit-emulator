@@ -12,8 +12,9 @@
 #include "interpreter.h"
 #include "mmu.h"
 #include "tlb.h"
-#include "trap.h"       // trap_set_state (循环顶 pc IALIGN 兜底; dummy.txt §9)
+#include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
 #include "riscv.h"
+#include "platform/clint.h"   // clint_set_mtime_t3_temp (T3 临时 mtime 步进; T5 清理 grep)
 
 #include <inttypes.h>
 #include <setjmp.h>
@@ -40,14 +41,15 @@
 //     机制 (1) "为什么 sigsetjmp 在 while 外"段)。落点同时承接两种路径:
 //       (i)  初次进入 dispatcher (sigsetjmp 返回 0, 顺序到 while 顶判条件)
 //       (ii) helper longjmp 跳来 (siglongjmp 返回非 0, 控制流到 sigsetjmp 落点, 顺序到
-//            while 顶重新判 in_trap; trap_set_state 内已设 hart->regs[0]=xtvec, 自然
+//            while 顶重新判 in_trap; trap_set_exception_state 内已设 hart->regs[0]=xtvec, 自然
 //            从 trap handler 继续)
 //     sigsetjmp 返回值不被分流 — longjmp 不携带"trap 错误"语义, 只是无条件控制流原语。
 //
 //   - 退出条件: hart->trap.in_trap < 3 不再成立 — bit 0-1 进 triple fault (值=3) 或高位
 //     (bit 3+) 被 dispatcher 自己设 (内部异常 / 未来停机)。具体编码见本文件末尾 in_trap
-//     位段编码段。trap_set_state 内 in_trap >= 3 时早 return 不 deliver (候选 A); main
-//     端拿回控制后 dump halt 状态, 未来 reset 由 dispatcher 自己处理。
+//     位段编码段。trap_set_exception_state / trap_set_interrupt_state 内 in_trap >= 3 时早
+//     return 不 deliver (候选 A); main 端拿回控制后 dump halt 状态, 未来 reset 由 dispatcher
+//     自己处理。
 //
 //   - mmu_translate_pc 路径 (dummy.txt §1 路径 C, 不长跳): rc != 0 → continue, 让 while
 //     条件接管。
@@ -124,24 +126,58 @@ void dispatcher(cpu_t *hart) {
     total_count += local_count;
     local_count = 0;
 
+    // ========================================================================
+    // T3 临时 mtime 步进 (T5 timer 辅助线程上线时 grep "mtime_t3_temp" 清三点)
+    //
+    // **本调用违反 RV Priv Spec §3.2.1 mtime 异步语义** (mtime 应由 rtc_toggle 独立信号
+    // 驱动, 跟 guest 指令执行不锁步). 这里是 T3+T4 端到端 fixture 验证的临时桥:
+    // "1 RV 指令 = 1 mtime tick" 强行同步, 让 mip.MTIP fire 路径能跑.
+    //
+    // **副作用警告**: 本调用覆盖 guest 自己 sw 写入的 mtime (CLINT MMIO @ 0xBFF8). 如
+    // fixture 显式 sw mtime=N, 下一轮 dispatcher 顶就被 total_count 覆盖. fixture 必须
+    // 把"测 csrr mip / 验 mtime 状态"的指令放在 sw mtime 同一 block 内才看到 fixture
+    // 写入的值; 跨 block 看到的是 total_count.
+    //
+    // T5 走方案 C: 独立 timer 辅助线程 (dummy.txt §7 (b)) 异步累加 atomic clint.mtime,
+    // dispatcher 主帧只读; 跟 RV spec rtc_toggle 异步语义对齐. T5 实施前删本行 + clint
+    // setter decl/body + 加 timer 辅助线程 create/join. 详 start_plan_a_02.md §T3
+    // 末段 checklist + §T5 + clint.h 顶段 doc.
+    // ========================================================================
+    clint_set_mtime_t3_temp(total_count);
+
+    // ========================================================================
+    // 中断检查 (trap_check_interrupt; 详 dummy.txt §1 路径 2b' / trap.h doc 段)
+    //
+    // 必须在 DEBUG_REFETCH 之前: check 可能调 trap_set_interrupt_state 改 pc → xtvec,
+    // 'f' trace 应反映"新 pc 即将 fetch", 不是"check 前的旧 pc". 中断 fire 路径 trace
+    // 序列 = 't'/'s'/'e' (set_interrupt_state 打) → 'f' (本 DEBUG_REFETCH 打),
+    // 跟 exception 路径 longjmp 跳回 sigsetjmp 落点后 trace = 'E' → 'f' 同形态.
+    //
+    // 返非 0 = 已 set_interrupt_state, dispatcher continue 跳回 while 顶 (走 dummy.txt
+    // §9 路径 2b 浅栈 return-based, 不长跳 — 跟 mmu_translate_pc 失败路径同形态).
+    // ========================================================================
+    if (trap_check_interrupt(hart) != 0) continue;
+
     // 每轮 while 体进入 = 一次"重新派发取指" (块边界自然推进 / 跨页退块重派 / helper
     // longjmp 跳回 sigsetjmp 落点都走这里)。fixture 跨页 / 中断密度人工观察 (debug.h)。
+    // trap_check_interrupt 之后才打 'f' = pc 已敲定 (互斥协议见 debug.h 顶段).
     DEBUG_REFETCH();
 
     // ========================================================================
     // pc IALIGN 兜底 (single source; 详 dummy.txt §9)
     //
     // 不管 pc 怎么来 (cpu_create / 上轮 block 出口 / sigsetjmp 跳回后的 xtvec /
-    // 未来 reset_vector / mret/sret 写的 mepc/sepc), fetch 前统一兜底。pc 不对齐时
-    // regime / TLB / mmu_translate_pc 都没必要算 — 直接 trap_set_state + continue
-    // 让 while 条件接管。dispatcher 主帧内, 走返回机制不长跳 (§1 路径 2b)。
+    // 未来 reset_vector / mret/sret 写的 mepc/sepc / 中断 deliver 后 xtvec), fetch 前
+    // 统一兜底。pc 不对齐时 regime / TLB / mmu_translate_pc 都没必要算 — 直接
+    // trap_set_exception_state + continue 让 while 条件接管. dispatcher 主帧内, 走返回机
+    // 制不长跳 (§1 路径 2b).
     //
     // tval = pc 自身 (跟 mmu_translate_pc fetch fault 写 tval = gva = pc 同形态)。
     // 转跳指令 (jal/jalr/branch/mret/sret) 内的 IALIGN 自检占位实际是 dead code
     // (IALIGN=16 + encoding/mask 强制对齐), 这里是 single source。
     // ========================================================================
     if ((hart->regs[0] & IALIGN_MASK) != 0u) {
-        trap_set_state(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/hart->regs[0]);
+        trap_set_exception_state(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/hart->regs[0]);
         continue;
     }
 
@@ -220,7 +256,7 @@ void dispatcher(cpu_t *hart) {
     (void)pa;       // 未来给 JIT 查 jit_cache 用, 当前 interpreter 不消费
 
     // ========================================================================
-    // mmu_translate_pc 已在内部直调 trap_set_state 设好 xcause/xtval/xepc/regs[0]=xtvec,
+    // mmu_translate_pc 已在内部直调 trap_set_exception_state 设好 xcause/xtval/xepc/regs[0]=xtvec,
     // rc 是 in_trap 当前值 (0 / 非 0 状态)。非 0 → continue 让 while(in_trap < 3) 接管
     // (in_trap 已 ≥ 1, 第 3 次时退出 dispatcher)。
     // dummy.txt §1 路径 C (mmu fetch trap 不长跳)。

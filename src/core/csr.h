@@ -89,4 +89,24 @@ typedef enum {
 uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
                 csr_op_t op, uint32_t raw_inst);
 
+
+// ----------------------------------------------------------------------------
+// csr_mip_read —— mip 合成读 (跨模块 export; trap.c::trap_check_interrupt 也调)
+//
+// 合成 6 bit (dummy.txt §6 第 5 类 _mip_sw 合成读模型):
+//   bit 1/5/9 (SSIP/STIP/SEIP_sw) ← hart->trap._mip_sw 软件 inject 字段
+//   bit 3     MSIP ← clint_msip_pending(hartid) 异步源
+//   bit 7     MTIP ← clint_timer_pending(hartid) compute
+//   bit 9     SEIP_hw ← PLIC s_pending OR (未来; v1 永远 0)
+//   bit 11    MEIP ← PLIC m_pending (未来; v1 永远 0)
+//
+// 调用方:
+//   - csr_op 入口 CSR_MIP 路径 (大 switch)
+//   - csr_sip_read 内部 (sip 是 mip 的 mask view, 调 csr_mip_read & SIP_MASK)
+//   - trap_check_interrupt (dispatcher polling, 算 mip & mie & 全局 IE)
+//
+// 并发: hart->trap._mip_sw 是 plain (本 hart 单线程访问); 异步源 atomic load 在 clint
+// 模块内. csr_mip_read 整体无 atomic RMW (read-only 合成).
+uint32_t csr_mip_read(cpu_t *hart);
+
 #endif //CORE_CSR_H

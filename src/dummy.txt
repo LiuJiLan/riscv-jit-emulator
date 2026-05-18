@@ -90,31 +90,44 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
        这类 helper(OP_UNSUPPORTED, csr 权限失败, store_helper 越界, ...)
        已经在 block 控制流深处, 退栈到 dispatcher 的清理代价大于直接 longjmp。
        trap_raise_exception 内部:
-         a. 调 trap_set_state(hart, cause, tval) 设架构状态
+         a. 调 trap_set_exception_state(hart, cause, tval) 设架构状态
             (in_trap++; 写 xcause/xtval/xepc; 跳 xtvec)
          b. siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher 的落点
        trap_raise_exception 标 _Noreturn, 不返回 caller。
 
-    (2b) dispatcher 主帧内 —— 直接调 trap_set_state, 不长跳 (两条子路径)
+    (2b) dispatcher 主帧内 —— 直接调 trap_set_exception_state, 不长跳 (两条子路径)
        已经在 dispatcher 主循环帧内, 控制流回到主循环不需要长跳, 直接调
-       trap_set_state(写字段, 不长跳) + return / continue 即可:
+       trap_set_exception_state(写字段, 不长跳) + return / continue 即可:
 
        - mmu_translate_pc 取指 fault: 通过返回值告诉 dispatcher "已 deliver,
          continue 这一轮"。dispatcher 看 rc != 0 直接 continue。
        - dispatcher 循环顶 pc IALIGN 兜底 (block 1 之前): 检测 pc 未对齐时
-         直接 trap_set_state(CAUSE_INST_ADDR_MISALIGNED, pc) + continue。
+         直接 trap_set_exception_state(CAUSE_INST_ADDR_MISALIGNED, pc) + continue。
 
        本质规则 (长跳 vs 返回机制的分界) + cause 0 (CAUSE_INST_ADDR_MISALIGNED)
        产生路径细化见 §9。
 
-    两种路径共用同一个 trap_set_state 内核(写字段 + 计数 + 决定不 deliver
+    两种路径共用同一个 trap_set_exception_state 内核(写字段 + 计数 + 决定不 deliver
     when in_trap >= 3); 区别只是"控制流如何回到 dispatcher 主循环顶":
     longjmp(路径 a)还是 普通 return + continue(路径 b)。
 
-    [trap_set_state 在 in_trap >= 3 时的行为]
+    (2c) dispatcher 主帧 interrupt 路径 (T3+T4 加, return-based, 不长跳)
+       dispatcher loop 顶每轮调 trap_check_interrupt; 内部按 mip & mie & 全局 IE
+       / mideleg 算 ready, 非 0 时调 trap_set_interrupt_state (跟 trap_set_exception_
+       state 形态对偶但内部 mideleg/cause_low/tval=0/vectored mode 五点分歧, 详
+       trap.c doc). return 非 0 给 dispatcher → continue 跳回 while 顶, 跟
+       mmu_translate_pc 失败 (2b) 同形态 return-based 浅栈 dispatcher 主帧, 不长跳.
+
+       跟 (2a) trap_raise_exception 形态不对偶 by design: exception 在 helper 深栈
+       必须 longjmp; interrupt 在 dispatcher 主帧浅栈 return + continue 即可. 按
+       "对偶不教条" 原则承认形态差异, 内核共用思想 (trap_set_*_state 30 行 mstatus
+       翻转完全相同).
+
+    [trap_set_exception_state / trap_set_interrupt_state 在 in_trap >= 3 时的行为]
       早 return, 不写 xcause/xtval/xepc, 不跳 xtvec。理由: 第三次进 trap_
-      set_state 已经是"硬件 reset 信号", 字段保留第二次的状态作为 root cause
+      set_*_state 已经是"硬件 reset 信号", 字段保留第二次的状态作为 root cause
       给 main 端 fprintf 看, 比覆盖成第三次的"xtvec 死循环造成的"信息更有用。
+      exception / interrupt 共享 in_trap 计数器, 不区分嵌套类型一律累加。
 
 (3) 控制流路径
 
@@ -134,7 +147,7 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
       dispatcher 入口 sigsetjmp 一次性建立落点
         → 进 while 循环
         → block 1+2+3 内 helper 调 trap_raise_exception
-            → trap_raise_exception 调 trap_set_state(写字段 + in_trap++)
+            → trap_raise_exception 调 trap_set_exception_state(写字段 + in_trap++)
             → siglongjmp(*cpu->jmp_buf_ptr, 1)
         → 回到 dispatcher 入口的 sigsetjmp 落点 (栈帧已退到 dispatcher)
         → 顺序执行到 while 条件, 重新判 in_trap < 3
@@ -145,10 +158,23 @@ dispatcher 主循环,跳过 JIT 块剩余部分。
       dispatcher 入口 sigsetjmp 一次性建立落点
         → 进 while 循环
         → block 2 mmu_translate_pc 内 fetch fault
-            → 调 trap_set_state(写字段 + in_trap++)
+            → 调 trap_set_exception_state(写字段 + in_trap++)
             → return rc != 0 给 mmu_translate_pc 的 caller(dispatcher)
         → dispatcher 看 rc != 0 → continue (跳过 block 3)
         → 回 while 顶判 in_trap < 3, 继续下一轮
+
+    路径 D(dispatcher 主帧 interrupt check, 不 longjmp; T3+T4 加):
+      dispatcher 入口 sigsetjmp 一次性建立落点
+        → 进 while 循环
+        → 迭代头扫尾 (total_count += local_count; T3 临时 mtime 步进)
+        → trap_check_interrupt(hart)
+            → mip 合成读 & mie & 按 priv 全局 IE / mideleg → ready
+            → ready 非 0: 按优先级选 IRQ → 调 trap_set_interrupt_state
+                (写 xcause = IRQ | CAUSE_INTERRUPT_BIT, xtval=0, xepc, mstatus
+                 xPIE/xIE/xPP 翻转, jump-to base 或 base+4*cause 按 mode)
+            → return 非 0 给 dispatcher
+        → dispatcher 看 rc != 0 → continue (跳过 DEBUG_REFETCH / IALIGN / block 1-3)
+        → 回 while 顶判 in_trap < 3, 继续下一轮 (regs[0] 已是 xtvec 入口)
 
     dispatcher 视角(关键):
       sigsetjmp 返回值不被 dispatcher 用来分流。longjmp 不携带"trap 错误"
@@ -786,7 +812,8 @@ cpu_info_shared_t / 未来 fcsr_t 等), csr.c 大 switch 的 read/write helper �
       mideleg — M-mode 中断 delegation bitmask, MXLEN-bit (RV32 = 32 位; spec 未定义
                 midelegh, 中断 cause 不会超 32 位)。单字段单 csr 入口 (0x303), 字段类型
                 uint32_t, csr.c read/write helper 直读 (无 mask/shift)。项目当前中断
-                机制未实现, 字段就位但 trap_set_state 不读, 中断真做时启用。
+                T3+T4 中断机制真接; trap_set_interrupt_state 按 mideleg.bit(cause_low)
+                派发 deliver_priv, trap_check_interrupt 用 mideleg 算 deliver_mask。
       (未来) RV Unprivileged Vector CSRs 中的独立部分:
           vstart  — 单字段 (vector start position)
           vtype   — 单字段 (vector type, RW with WARL)
@@ -1147,7 +1174,7 @@ read_fn / write_fn 表达"收到访问做什么副作用", 不表达"是否允�
   - src/core/dispatcher.c   (循环顶兜底 pc IALIGN 检查 — single source)
   - src/core/interpreter.c  (jal/jalr/branch + mret/sret 自检占位; 实际 dead code)
   - src/core/mmu.{c,h}      (mmu_translate_pc 接口 "0=成功")
-  - src/core/trap.c         (trap_set_state 服务的三条 exception 路径)
+  - src/core/trap.c         (trap_set_exception_state 服务的三条 exception 路径)
   - src/platform/bus.{c,h}  (device 接口约定 "0=成功"; bus 自己 _Noreturn)
   - src/platform/clint.c + 未来其他 device  (read/write fn 返回 cause)
 
@@ -1177,7 +1204,7 @@ cause 0 的两条产生路径
     之前在 dispatcher 主循环顶兜底:
 
         if ((hart->regs[0] & IALIGN_MASK) != 0) {
-            trap_set_state(hart, CAUSE_INST_ADDR_MISALIGNED,
+            trap_set_exception_state(hart, CAUSE_INST_ADDR_MISALIGNED,
                            /*tval*/hart->regs[0]);
             continue;
         }
@@ -1218,9 +1245,9 @@ cause 0 (CAUSE_INST_ADDR_MISALIGNED) 不会作为 return code 出现 —— 它�
 本质规则: 长跳 vs 返回机制的分界
 --------------------------------------------------------------------------------
 
-trap_set_state vs trap_raise_exception 的选择依据:
+trap_set_exception_state vs trap_raise_exception 的选择依据:
 
-  - 在 dispatcher 主帧内, 还未进解释器 / JIT  →  trap_set_state (返回机制)
+  - 在 dispatcher 主帧内, 还未进解释器 / JIT  →  trap_set_exception_state (返回机制)
     + 上层 continue 让 while(in_trap < 3) 接管。栈帧浅, longjmp 是多余副作用。
     例: mmu_translate_pc fetch fault (§1 路径 2b); dispatcher 循环顶 pc
         IALIGN 兜底。
@@ -1310,9 +1337,9 @@ _Noreturn longjmp) 的位置。本项目当前 may-longjmp 边界:
     - 未来 amo_*_helper / amo_walker_helper_*   (同 lsu 形态)
 
   dispatcher 主帧内 (§1 路径 2b, **不长跳**):
-    - mmu_translate_pc                          (fetch 失败 trap_set_state +
+    - mmu_translate_pc                          (fetch 失败 trap_set_exception_state +
                                                  return; 不长跳)
-    - dispatcher 循环顶 pc IALIGN 兜底           (trap_set_state + continue;
+    - dispatcher 循环顶 pc IALIGN 兜底           (trap_set_exception_state + continue;
                                                  §9 (b))
 
 

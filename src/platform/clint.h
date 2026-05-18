@@ -39,4 +39,29 @@ int clint_init(void);
 int clint_msip_pending (uint32_t hartid);    /* 0/1; = !!atomic_load(msip[hartid]) */
 int clint_timer_pending(uint32_t hartid);    /* 0/1; = (mtime ≥ mtimecmp[hartid]) */
 
+
+// ----------------------------------------------------------------------------
+// T3 临时 mtime 步进源 (T5 timer 辅助线程上线时 grep "mtime_t3_temp" 清三点)
+//
+// **本接口是临时桥, 不是 long-term 方案**:
+//   RV Priv Spec §3.2.1 mtime 定义: "a 64-bit read-write register that contains
+//   the number of cycles counted from the rtc_toggle signal."  rtc_toggle 是
+//   独立于 hart 执行流的实时时钟信号 — 真硬件上 mtime 由外部 RTC 驱动, 跟
+//   guest 指令执行**异步**, 不跟某条指令 retire 锁步. 这是 RV 设计的 timer
+//   语义底色.
+//
+//   T3 临时方案 (本 setter): dispatcher 主帧顶用 total_count (指令数) 喂
+//   clint.mtime, 等价于 "RV 1 指令 = 1 mtime tick" 强行同步映射. **跟真硬件
+//   异步语义不符** — 仅作 T3+T4 端到端 fixture 验证用 (让 mip.MTIP 路径能 fire).
+//
+//   T5 真方案 (方案 C, 已 lock-in start_plan_a_02.md §T5): 独立 timer 辅助
+//   线程 (dummy.txt §7 (b) 辅助线程, 不持 cpu_t 不跑 guest), 按 wall clock
+//   或固定 cycle rate 异步累加 atomic clint.mtime. dispatcher 主帧只读, 不写.
+//   这样跟 RV spec rtc_toggle 异步语义对齐.
+//
+//   T5 实施前置: grep "mtime_t3_temp" 清三点 (本 decl / clint.c body /
+//   dispatcher.c 调用点) + 加 timer 辅助线程 create / join / shutdown 接口.
+// ----------------------------------------------------------------------------
+void clint_set_mtime_t3_temp(uint64_t v);
+
 #endif //PLATFORM_CLINT_H

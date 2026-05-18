@@ -76,12 +76,12 @@
 // 跨文件协议见 src/dummy.txt §1 (sigsetjmp / 大入口 vs 直调辅助函数)。两条路径:
 //
 // (1) mmu_translate_pc (本文件唯一对外接口, dispatcher 直接调; dummy.txt §1 路径 2b):
-//     失败时**内部直调 trap_set_state(hart, cause, tval)** 设架构状态 (写 xcause/xtval/xepc/
+//     失败时**内部直调 trap_set_exception_state(hart, cause, tval)** 设架构状态 (写 xcause/xtval/xepc/
 //     regs[0]=xtvec[deliver_priv]), 不长跳 (调用栈浅, 直接 return 给 dispatcher 接管即可)。
 //     return 值仅是 0/非0 的状态信号:
 //       0  = fetch OK, pa_out / hva_out 已填, dispatcher 进 block 3
 //       非0 = trap 已 deliver, dispatcher continue 让 while(in_trap < 3) 接管退出判断
-//     fetch 失败的 cause 集 (mmu_translate_pc 内部填给 trap_set_state):
+//     fetch 失败的 cause 集 (mmu_translate_pc 内部填给 trap_set_exception_state):
 //       1  = Instruction Access Fault   (PA 落在不可执行物理区域: MMIO / 不存在内存 / PMP 拒绝)
 //       12 = Instruction Page Fault     (Sv32 walker 翻译失败: PTE 无效 / X 位 / U 位等)
 //     tval = 触发 fault 的 GVA = hart->regs[0] (mmu 自己填, dispatcher 不再填)。
@@ -90,7 +90,7 @@
 //         code。详 dummy.txt §9 ("0=成功" 接口约定)。
 //
 // (2) mmu_walker_load/store/amo (JIT block / interpreter 调; dummy.txt §1 路径 2a):
-//     失败时调 **trap_raise_exception** (含长跳); helper 内部 trap_set_state + siglongjmp 到
+//     失败时调 **trap_raise_exception** (含长跳); helper 内部 trap_set_exception_state + siglongjmp 到
 //     dispatcher 的 sigsetjmp landing。调用方 (jit/interp) 不会真拿到 return 值 (longjmp
 //     已跳走)。
 //     这一族的 cause 集 (调 trap_raise_exception 时由调用方传入):
@@ -99,7 +99,7 @@
 //       13 = Load Page Fault
 //       15 = Store/AMO Page Fault
 //
-// 两条路径调用同一个 trap_set_state 内核 (dummy.txt §1 (2)), 区别只是"控制流如何回到
+// 两条路径调用同一个 trap_set_exception_state 内核 (dummy.txt §1 (2)), 区别只是"控制流如何回到
 // dispatcher": mmu_translate_pc 直接 return + continue, mmu_walker_* 经 longjmp。
 //
 // ============================================================================
@@ -108,7 +108,7 @@
 //
 // trap.h 暴露两层 helper:
 //
-//   trap_set_state(hart, cause, tval) —— 架构语义层 (不长跳)
+//   trap_set_exception_state(hart, cause, tval) —— 架构语义层 (不长跳)
 //     in_trap++; >= 3 早 return (候选 A: 不 deliver, 字段保留第二次状态作 root cause)
 //     否则: 选 deliver_priv (medeleg-driven; M-mode caller 总 M, 否则按 medeleg.bit(cause))
 //           写 xcause/xtval/xepc[deliver_priv]; 切 priv (mstatus/sstatus 字段按 deliver_priv
@@ -116,10 +116,10 @@
 //     返回 in_trap 当前值 (mmu_translate_pc 透传给 dispatcher 当 0/非0 状态信号)。
 //
 //   trap_raise_exception(hart, cause, tval) —— interpreter / JIT 长跳入口
-//     _Noreturn, 内部 trap_set_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher
+//     _Noreturn, 内部 trap_set_exception_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher
 //     一次性 sigsetjmp 落点。
 //
-// mmu_translate_pc 调路径 (1) trap_set_state, dispatcher 通过 return rc 接管;
+// mmu_translate_pc 调路径 (1) trap_set_exception_state, dispatcher 通过 return rc 接管;
 // mmu_walker_* / interpreter case 调路径 (2) trap_raise_exception, 经 longjmp 跳回 dispatcher。
 // 两路最终都靠 dispatcher 的 while(in_trap < 3) 退出判断。
 //
@@ -315,7 +315,7 @@ static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
 //     1. 试图命中 current_tlb (V 位 + tag 比对; 命中再 check X 位):
 //          命中 + check_perm(MMU_PERM_X)=1 → 返回 PA + HVA (PA 由 HVA 反推, RAM-only TLB
 //                                            缓存让 sub 一定有效)
-//          命中 + check_perm 失败 → trap_set_state(12 inst page fault)
+//          命中 + check_perm 失败 → trap_set_exception_state(12 inst page fault)
 //          未命中 → 走 step 2
 //     2. miss → mmu_walk(hart, gva, PERM_X, &pa, ...) 走页表
 //     3. PMP / PMA 物理侧检查 (当前不实现 PMP, 用 PA 在 RAM 区检查代替)
@@ -332,11 +332,11 @@ static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
 //
 // 返回值 (0/非0 状态信号, 不返回 cause):
 //   0   = OK,  pa_out / hva_out 已填, dispatcher 进 block 3
-//   非0 = trap 已 deliver (内部已调 trap_set_state 写 xcause/xtval/xepc/regs[0]=xtvec),
+//   非0 = trap 已 deliver (内部已调 trap_set_exception_state 写 xcause/xtval/xepc/regs[0]=xtvec),
 //          dispatcher continue 让 while(in_trap < 3) 接管退出判断
 //
 // 失败时不填 pa_out / hva_out (不需要, dispatcher continue 跳过本轮 block; 下一轮 fetch
-// 从 xtvec 开始)。dispatcher 不需要自己填 mtval — mmu_translate_pc 自己调 trap_set_state
+// 从 xtvec 开始)。dispatcher 不需要自己填 mtval — mmu_translate_pc 自己调 trap_set_exception_state
 // 时已经填好 (cause/tval/epc/regs[0] 都设)。
 //
 // ============================================================================

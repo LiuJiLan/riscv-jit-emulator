@@ -3,11 +3,24 @@
 # 验证 clint_init mtimecmp 初值 UINT64_MAX (不是 0; 否则 0>=0 → spurious MTIP).
 # RV Priv Spec §3.2.1 `>=` 边界 (mtime==mtimecmp 仍 pending).
 #
+# **本 fixture 假设 mtime 不主动步进** — guest sw 写多少, csrr 读多少, 跨 block 保留.
+#   T2 阶段 (T3+T4 前) 这个假设成立, 验证 csrr mip 合成路径 + mtimecmp WARL + `>=` 边界
+#   语义都不需要 mtime 真步进.
+#
+#   一旦后续 milestone 实现"真步进 mtime" (跟 RV Priv Spec §3.2.1 rtc_toggle 异步累加
+#   语义对齐), 本 fixture 的 a2 / a4 期望可能变化 (具体 0x80 / 0 取决于步进时机跟 sw
+#   写入的相对顺序). 不同实现方式 (dispatcher 主帧同步推进 / 独立 timer 辅助线程异步累
+#   加) 行为细节会不同, 但 csrr mip 合成读语义本身不变. 真步进上线后:
+#     - 如仍想保持本 fixture 的 a2/a4 = 0x80 期望, 需要把"mtime 步进"形态改成 fetch_add
+#       (累加而不是 reset), 让 guest sw mtime 写入保留.
+#     - 或接受 a2/a4 变 0, 把 "mtime ≥ mtimecmp 边界" 测试迁到能控制 mtime 步进的更端
+#       到端 fixture (例如 timer interrupt 真触发的 a02_5/01).
+#
 # BARE M-mode.
 # CLINT mtime     @ 0x0200BFF8 (低 32) / 0x0200BFFC (高 32)
 # CLINT mtimecmp[0] @ 0x02004000 (低 32) / 0x02004004 (高 32)
 #
-# 期望最终寄存器:
+# 期望最终寄存器 (mtime 不主动步进的前提下):
 #   a0 (x10) = 0x00000000   起步: mtime=0, mtimecmp=UINT64_MAX → MTIP=0 (验初值修复)
 #   a1 (x11) = 0x00000000   写 mtime=100, mtimecmp 仍 UINT64_MAX → MTIP=0 (100<MAX)
 #   a2 (x12) = 0x00000080   写 mtimecmp=50, mtime=100 → 100>=50 → MTIP=1 (1<<7)
