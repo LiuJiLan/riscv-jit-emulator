@@ -90,4 +90,21 @@
 #define CLINT_MTIMECMP_OFF  0x4000UL
 #define CLINT_MTIME_OFF     0xBFF8UL
 
+// ----------------------------------------------------------------------------
+// TIMEBASE / timer 辅助线程参数 (T5 方案 C 异步累加 atomic clint.mtime)
+// ----------------------------------------------------------------------------
+//
+// 跟 start_plan_a_02.md §T5 "频率参数拍定" 段一致 (10 MHz 跟 QEMU virt; 1ms
+// Linux nanosleep 精度甜点 + 跟 HZ=1000 / FreeRTOS 默认 tick 匹配)。RV mtime
+// 跟传统 wall clock RTC 是两个东西 (mtime = 高频 monotonic counter, 重启清
+// 零; wall clock 走 SBI / virtio-rtc, T5 不涉及)。
+#define TIMEBASE_FREQ_HZ        10000000UL   /* guest 视角: mtime tick 频率 (10 MHz, 100ns/tick) */
+#define TIMER_WAKE_INTERVAL_NS  1000000UL    /* host 实现: timer 辅助线程 nanosleep 周期 (1 ms) */
+
+// 一次唤醒 fetch_add 量 (编译期常量; 当前配置 = 10000)。
+// TIMEBASE_FREQ_HZ * TIMER_WAKE_INTERVAL_NS / 1e9, 解耦 guest 视角频率 vs host
+// 调度周期: guest 看到 mtime tick 单位 (100ns) 跟 host nanosleep 周期 (1ms)
+// 互不绑定, 改其一不影响其二语义。
+#define TIMEBASE_PER_WAKE       (TIMEBASE_FREQ_HZ * TIMER_WAKE_INTERVAL_NS / 1000000000ULL)
+
 #endif //CONFIG_H

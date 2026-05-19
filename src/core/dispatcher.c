@@ -14,10 +14,11 @@
 #include "tlb.h"
 #include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
 #include "riscv.h"
-#include "platform/clint.h"   // clint_set_mtime_t3_temp (T3 临时 mtime 步进; T5 清理 grep)
+#include "runtime.h"    // system_reset_signal (主循环 check + T5 简化触发)
 
 #include <inttypes.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -110,7 +111,13 @@ void dispatcher(cpu_t *hart) {
     // 一次性 sigsetjmp 建立永久落点; 返回值不分流 (dummy.txt §1 机制 (3) "dispatcher 视角"段)。
     sigsetjmp(*hart->jmp_buf_ptr, 1);
 
-    while (hart->trap.in_trap < 3) {
+    // 主循环条件: in_trap < 3 (hart 自身未 triple fault) AND system_reset_signal=1
+    // (cross-hart / 全机停机协议未触发)。后者跟 main while 同一 flag, 让"任一 hart
+    // 触发 system reset 时所有 hart 一起退" 成为单 hart 即可铺路的协议 (dummy.txt
+    // §12 + runtime.h doc 段)。memory_order_relaxed 内层 hot path 不付 acquire 代价
+    // (set 路径用 release, 见本文件函数末段 + main.c)。
+    while (hart->trap.in_trap < 3 &&
+           atomic_load_explicit(&system_reset_signal, memory_order_relaxed)) {
 
     // ========================================================================
     // 迭代头扫尾:
@@ -125,25 +132,6 @@ void dispatcher(cpu_t *hart) {
     // ========================================================================
     total_count += local_count;
     local_count = 0;
-
-    // ========================================================================
-    // T3 临时 mtime 步进 (T5 timer 辅助线程上线时 grep "mtime_t3_temp" 清三点)
-    //
-    // **本调用违反 RV Priv Spec §3.2.1 mtime 异步语义** (mtime 应由 rtc_toggle 独立信号
-    // 驱动, 跟 guest 指令执行不锁步). 这里是 T3+T4 端到端 fixture 验证的临时桥:
-    // "1 RV 指令 = 1 mtime tick" 强行同步, 让 mip.MTIP fire 路径能跑.
-    //
-    // **副作用警告**: 本调用覆盖 guest 自己 sw 写入的 mtime (CLINT MMIO @ 0xBFF8). 如
-    // fixture 显式 sw mtime=N, 下一轮 dispatcher 顶就被 total_count 覆盖. fixture 必须
-    // 把"测 csrr mip / 验 mtime 状态"的指令放在 sw mtime 同一 block 内才看到 fixture
-    // 写入的值; 跨 block 看到的是 total_count.
-    //
-    // T5 走方案 C: 独立 timer 辅助线程 (dummy.txt §7 (b)) 异步累加 atomic clint.mtime,
-    // dispatcher 主帧只读; 跟 RV spec rtc_toggle 异步语义对齐. T5 实施前删本行 + clint
-    // setter decl/body + 加 timer 辅助线程 create/join. 详 start_plan_a_02.md §T3
-    // 末段 checklist + §T5 + clint.h 顶段 doc.
-    // ========================================================================
-    clint_set_mtime_t3_temp(total_count);
 
     // ========================================================================
     // 中断检查 (trap_check_interrupt; 详 dummy.txt §1 路径 2b' / trap.h doc 段)
@@ -353,4 +341,19 @@ void dispatcher(cpu_t *hart) {
     // 调用)。cpu_reset 是状态重置 (不是 alloc/destroy), 是规范的合法例外, 允许由 dispatcher
     // 调用; 它在 cpu.c 实现, 跟 cpu_create / cpu_destroy 接口对称。
     // ========================================================================
+
+    // ========================================================================
+    // T5 简化触发: dispatcher 退出 (in_trap >= 3 tri-fault 或其他 break 路径)
+    // 后通知 main while 退出。release-store 让 main 的 acquire-load 跟随看到。
+    //
+    // 跟上部 "未来 reset 扩展占位" 不冲突 — 未来真做 per-hart reset 时:
+    //   - hart 参与 reset 路径: 不 set SRS, 走 cpu_reset + siglongjmp 重入 while
+    //   - hart 不参与 reset / 走全机停机路径: set SRS, main while 退
+    // 当前 T5 简化下 dispatcher 退出 = 全机停机, 一律 set。未来真分流时本行加判断。
+    //
+    // SDS 不在这里 set — dispatcher tri-fault 不一定意味全机 shutdown (例如未来
+    // user 触发的 SR-only reset); SDS 由 main 在 while 退出后 cleanup 段 set 0
+    // (谁 spawn 谁 join 协议见 dummy.txt §12 + runtime.h "SDS 蕴含 SRS" 段)。
+    // ========================================================================
+    atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
 }

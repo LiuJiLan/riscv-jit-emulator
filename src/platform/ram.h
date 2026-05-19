@@ -47,4 +47,13 @@ extern uint8_t *gpa_to_hva_offset;
 //   2. madvise(MADV_NOHUGEPAGE) 失败(此时已 munmap 清理)
 int ram_init(void);
 
+// 释放 ram_init 分配的 host mmap; host_ram_base / gpa_to_hva_offset 重置为
+// NULL。POR 收尾 (main 末段) 调一次, 跟 cpu_destroy / clint_destroy 三 destroy
+// 对称。
+//
+// 进程退出时 OS 会自动 munmap, 函数留作 lifecycle 对称 + valgrind clean 输出
+// (POR 退出前已主动还内存)。重复调或 ram_init 未成功调时 do nothing (host_ram_
+// base 已是 NULL)。
+void ram_destroy(void);
+
 #endif //PLATFORM_RAM_H

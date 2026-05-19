@@ -1,30 +1,32 @@
 //
 // Created by liujilan on 2026/5/16.
-// CLINT 实现 — mtime / mtimecmp[N] / msip[N] MMIO 寄存器 + bus 注册。
+// CLINT 实现 — mtime / mtimecmp[N] / msip[N] MMIO 寄存器 + bus 注册 + T5 timer
+// 辅助线程 (file-static timer_run, 异步累加 atomic clint.mtime)。
 //
 // 接口形态见 clint.h; 地址布局见 config.h CLINT_* 宏; 注册流程见 platform/bus.h。
 // 报错风格见 dummy.txt §5 (clint_init 失败 fprintf "why" + return -1; read/write
 // fn 走 dummy.txt §9 "0=成功 / 非0=cause" 接口约定)。
-// shared 字段 atomic 见 dummy.txt §7 (T5 timer 辅助线程跨线程读写, 必须 atomic;
-// MAX_HARTS=1 单 hart 时编译为 plain load/store, 零开销)。
+// shared 字段 atomic + monitor 模型 见 dummy.txt §7。
+// timer thread spawn / join 协议 (谁 spawn 谁 join) 见 dummy.txt §12。
 //
-// T1 阶段语义边界: read/write 路径走通, 跨写 mtimecmp 中间瞬间值不一致是 guest
-// 软件责任 (跟 QEMU 一致, 不做"原子 64-bit 写"保护); mtime 写啥读啥, 不真自动
-// 推进 (那是 T5 方案 A: dispatcher.total_count 映射 / 方案 C: timer 辅助线程
-// 异步累加 — 两条都不在 T1)。msip 写低 1 位 + 读, 不真触发 M-mode soft interrupt
-// (mip.MSIP 联动留 T2 + T4)。
-//
+
+#define _POSIX_C_SOURCE 200809L   // clock_gettime / clock_nanosleep / TIMER_ABSTIME
 
 #include "clint.h"
 
+#include <errno.h>
+#include <inttypes.h>   // PRIu64 (timer_log_stop mtime 输出)
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
-#include "config.h"          // CLINT_* / MAX_HARTS
+#include "config.h"          // CLINT_* / MAX_HARTS / TIMEBASE_PER_WAKE / TIMER_WAKE_INTERVAL_NS
 #include "platform/bus.h"    // mmio_dev_t / bus_register_mmio
 #include "riscv.h"           // CAUSE_LOAD/STORE_ACCESS_FAULT
+#include "runtime.h"         // system_reset_signal / shutdown_signal
 
 
 // ----------------------------------------------------------------------------
@@ -34,16 +36,23 @@
 // 字段类型 _Atomic 是 dummy.txt §7 关键约束 3 — RV spec 允许别的 hart 写另一个
 // hart 的 mtimecmp / msip (M-mode IPI / timer broadcast), 即使 T1 单 hart 也得
 // atomic 满足跨线程 host 内存安全。memory_order_relaxed 起步 (跟 plan §1.9
-// SMP 预留同形态), fence 按需加。
+// SMP 预留同形态), fence 按需加 (T5 timer thread 写 mtime release; consumer
+// is_clint_timer_pending 读 mtime acquire — producer/consumer 配对建立 happens-
+// before, 见 dummy.txt §7 monitor 模型段)。
 //
 // 静态全局: CLINT 是单例 (整个系统只有一个); 跟 ram_init 的 host mmap 同性质。
 // 通过 mmio_dev_t.ctx = &clint 透传给 read/write fn — 风格统一其他多实例 device
 // (例 UART), fn 内 (void)ctx; 抑制 unused warning, 但仍接收 ctx 参数, 接口风格
 // 一致 (C-style OOP "this 指针")。
+//
+// timer_thread 字段: T5 加。pthread_t 句柄, clint_start_timer 写 / clint_join_
+// timer 读 (跟 dummy.txt §12 "谁 spawn 谁 join" — 实际 spawn 调用方 = main,
+// 但 pthread_t 是 clint 内部状态, 由 clint_* 接口封装)。
 static struct {
     _Atomic uint64_t mtime;
     _Atomic uint64_t mtimecmps[MAX_HARTS];
     _Atomic uint32_t msip[MAX_HARTS];
+    pthread_t        timer_thread;
 } clint;
 
 
@@ -87,7 +96,9 @@ static int clint_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
         value = (bo & 0x4u) ? (uint32_t)(v64 >> 32) : (uint32_t)v64;
     } else if (off == (uint32_t)CLINT_MTIME_OFF ||
                off == (uint32_t)CLINT_MTIME_OFF + 4u) {
-        uint64_t v64 = atomic_load_explicit(&clint.mtime, memory_order_relaxed);
+        // mtime 读: acquire 跟 timer thread 的 release-fetch_add 配对 (consumer
+        // 看到 producer 的最新写; dummy.txt §7 monitor 模型 memory_order 配对规则)。
+        uint64_t v64 = atomic_load_explicit(&clint.mtime, memory_order_acquire);
         value = (off == (uint32_t)CLINT_MTIME_OFF) ? (uint32_t)v64 : (uint32_t)(v64 >> 32);
     } else {
         return CAUSE_LOAD_ACCESS_FAULT;
@@ -122,6 +133,10 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
         atomic_store_explicit(&clint.mtimecmps[idx], nxt, memory_order_relaxed);
     } else if (off == (uint32_t)CLINT_MTIME_OFF ||
                off == (uint32_t)CLINT_MTIME_OFF + 4u) {
+        // mtime 写: guest 主动写 mtime 是少见 (RV spec 允许但不常用); 跟 timer
+        // thread 的 atomic_fetch_add 并发时是边界情况, 当前简单 load-modify-store
+        // (不做 CAS loop)。memory_order_relaxed 起步, 真撞并发问题再升级 (T5
+        // 范围外)。
         uint64_t cur = atomic_load_explicit(&clint.mtime, memory_order_relaxed);
         uint64_t nxt = (off == (uint32_t)CLINT_MTIME_OFF)
                        ? (cur & 0xFFFFFFFF00000000ull) | (uint64_t)value
@@ -135,7 +150,80 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 
 
 // ----------------------------------------------------------------------------
-// clint_init — 初始化 + 注册到 bus
+// timer_run — T5 timer 辅助线程主 routine (file-static; 跟 dummy.txt §7 (b)
+// 辅助线程 + monitor 模型对齐, 不持 cpu_t, 只动 shared 字段)
+// ----------------------------------------------------------------------------
+//
+// 跨 system reset 一直跑 (跟真硬件 RTC oscillator 不掉电不停一致); 随 SDS 起停
+// (shutdown_signal=0 自然退)。clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)
+// 绝对时间唤醒避免 nanosleep 相对时间累积 drift。
+//
+// 错误处理 (跟 dummy.txt §5 报错风格 + start_plan_a_02.md §T5 一致):
+//   - EINTR: while-retry (Linux 习惯; TIMER_ABSTIME 下极罕见)
+//   - 其他 errno: fprintf + cooperative 退出 (set system_reset_signal=0 +
+//                  shutdown_signal=0 → main 走 cleanup 路径退出 + 此 routine
+//                  return NULL); 不 abort, 让 main 有机会 dump
+//
+// trace: timer thread 不打 trace (dummy.txt §7 末段; debug 真要打是临时 fprintf
+// 用完删, 不动 debug 模块)。
+
+// 退出前打 mtime — debug 用, 跟 [main] elapsed / [dispatcher] halted dump 同
+// 风格输出到 stderr, 让肉眼对照 "总累加 = wake 次数 * TIMEBASE_PER_WAKE"。
+// 跟 dummy.txt §7 末段 "timer thread 不打 trace" 不冲突 — 那条是说不写 trace
+// char-stream (跑期密集 fprintf 干扰), 单点 stop 时一次 fprintf 不属于此范围。
+static void timer_log_stop(const char *reason) {
+    uint64_t now = atomic_load_explicit(&clint.mtime, memory_order_acquire);
+    fprintf(stderr, "[clint timer] stopped (%s): mtime=%" PRIu64 "\n", reason, now);
+}
+
+static void *timer_run(void *arg) {
+    (void)arg;
+
+    struct timespec next_wake;
+    if (clock_gettime(CLOCK_MONOTONIC, &next_wake) != 0) {
+        fprintf(stderr, "[clint timer] clock_gettime(CLOCK_MONOTONIC) failed: %s\n",
+                strerror(errno));
+        atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
+        atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+        timer_log_stop("clock_gettime fail");
+        return NULL;
+    }
+
+    // 主循环: SDS=1 继续, SDS=0 退。acquire 跟 main 端 atomic_store(&SDS, 0,
+    // release) 配对 (consumer/producer; dummy.txt §7 monitor 模型 memory_order)。
+    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire)) {
+        // 累加 TIMER_WAKE_INTERVAL_NS 到 next_wake (normalize tv_sec / tv_nsec)。
+        next_wake.tv_nsec += (long)TIMER_WAKE_INTERVAL_NS;
+        if (next_wake.tv_nsec >= 1000000000L) {
+            next_wake.tv_sec  += next_wake.tv_nsec / 1000000000L;
+            next_wake.tv_nsec %= 1000000000L;
+        }
+
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wake, NULL);
+        if (rc == EINTR) continue;            // Linux 习惯: 信号中断 retry
+        if (rc != 0) {
+            fprintf(stderr, "[clint timer] clock_nanosleep failed: %s\n",
+                    strerror(rc));
+            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
+            atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+            timer_log_stop("clock_nanosleep fail");
+            return NULL;
+        }
+
+        // release 跟 consumer (is_clint_timer_pending / clint_read mtime) 的
+        // acquire-load 配对, 建立 happens-before。
+        atomic_fetch_add_explicit(&clint.mtime,
+                                  (uint64_t)TIMEBASE_PER_WAKE,
+                                  memory_order_release);
+    }
+
+    timer_log_stop("SDS=0");
+    return NULL;
+}
+
+
+// ----------------------------------------------------------------------------
+// lifecycle: clint_init / clint_reset / clint_destroy
 // ----------------------------------------------------------------------------
 
 int clint_init(void) {
@@ -154,6 +242,9 @@ int clint_init(void) {
         atomic_store_explicit(&clint.msip[i],      0,          memory_order_relaxed);
     }
 
+    // timer_thread 字段不在此处写 — clint_start_timer 才 pthread_create (dummy.txt
+    // §12 "clint_init 是线程无关的, 要有一个专门的行为发出线程")。
+
     mmio_dev_t dev = {
         .gpa_start = (uint32_t)CLINT_BASE,
         .gpa_end   = (uint32_t)(CLINT_BASE + CLINT_SIZE),
@@ -169,14 +260,63 @@ int clint_init(void) {
     return 0;
 }
 
+int clint_reset(void) {
+    // system reset 每 iter: mtimecmp / msip 清回 init 时的哨兵值; mtime 不动
+    // (跟真硬件 RTC oscillator 不掉电不停一致); timer 辅助线程不动 (跨 system
+    // reset 持续运行, 随 SDS 才退)。
+    for (uint32_t i = 0; i < MAX_HARTS; i++) {
+        atomic_store_explicit(&clint.mtimecmps[i], UINT64_MAX, memory_order_relaxed);
+        atomic_store_explicit(&clint.msip[i],      0,          memory_order_relaxed);
+    }
+    return 0;
+}
+
+void clint_destroy(void) {
+    // 纯模块 cleanup — 不含 pthread_join (timer thread 由 main 调 clint_join_
+    // timer 显式回收; dummy.txt §12 谁 spawn 谁 join)。当前实际工作量极小:
+    // atomic 字段值在进程退出时不影响别处, bus 未来加 unregister 时这里调。
+    // 函数留作 lifecycle 对称 (跟 cpu_destroy / ram_destroy)。
+    atomic_store_explicit(&clint.mtime, 0, memory_order_relaxed);
+    for (uint32_t i = 0; i < MAX_HARTS; i++) {
+        atomic_store_explicit(&clint.mtimecmps[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&clint.msip[i],      0, memory_order_relaxed);
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// thread lifecycle: clint_start_timer / clint_join_timer (dummy.txt §12)
+// ----------------------------------------------------------------------------
+
+int clint_start_timer(void) {
+    int rc = pthread_create(&clint.timer_thread, NULL, timer_run, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "clint_start_timer: pthread_create failed: %s\n",
+                strerror(rc));
+        return -1;
+    }
+    return 0;
+}
+
+void clint_join_timer(void) {
+    // 调用前置: main 已 atomic_store(&shutdown_signal, 0); 否则 pthread_join
+    // 永远 block (timer thread 在 while(SDS) 内永不退)。
+    int rc = pthread_join(clint.timer_thread, NULL);
+    if (rc != 0) {
+        // 已在退出路径, 不 fatal — fprintf 报警即可。
+        fprintf(stderr, "clint_join_timer: pthread_join failed: %s\n",
+                strerror(rc));
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // 中断 pending 语义查询 (csr.c csr_mip_read 合成路径用)
 //
 // 接口约定见 clint.h 顶段; hartid 越界返 0 防御; 内部 atomic_load_explicit 跨
 // hart 安全 (单 hart 时编译为 plain load, 零开销)。memory_order_acquire 跟
-// dummy.txt §7 跨线程读取异步源约定一致 (T5 timer 辅助线程 release-store
-// mtime 之后, dispatcher 这边 acquire-load 看到新值)。
+// timer thread 的 release-fetch_add 配对 (producer/consumer; dummy.txt §7
+// monitor 模型)。
 // ----------------------------------------------------------------------------
 
 int is_clint_msip_pending(uint32_t hartid) {
@@ -189,19 +329,4 @@ int is_clint_timer_pending(uint32_t hartid) {
     uint64_t now = atomic_load_explicit(&clint.mtime,             memory_order_acquire);
     uint64_t cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
     return (now >= cmp) ? 1 : 0;
-}
-
-
-// ----------------------------------------------------------------------------
-// T3 临时 mtime 步进源 (T5 timer 辅助线程上线时 grep "mtime_t3_temp" 清三点)
-//
-// 接口语义见 clint.h 顶段。注: RV Priv Spec §3.2.1 mtime 由 rtc_toggle 驱动,
-// 跟 guest 指令执行**异步**; 本 setter "1 指令 = 1 tick" 强行同步是 T3 临时桥,
-// T5 走方案 C 独立 timer 辅助线程才跟 spec 异步语义对齐.
-//
-// memory_order_relaxed 起步 (跟 clint_read/write mtime 路径同序; T5 timer 辅助
-// 线程上线时改 release-store, 让 dispatcher acquire-load 看到 happens-before).
-// ----------------------------------------------------------------------------
-void clint_set_mtime_t3_temp(uint64_t v) {
-    atomic_store_explicit(&clint.mtime, v, memory_order_relaxed);
 }

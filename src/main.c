@@ -1,14 +1,20 @@
 //
 // Created by liujilan on 2026/4/28.
-// 入口。本文件做三件事:
-//   1. 全局 ram_init (host mmap; ram.h 暴露的 host_ram_base / gpa_to_hva_offset 之后可用)
-//   2. guest 程序加载 (按文件后缀 .bin / .elf 分发; .elf 当前 stub)
-//   3. 运行一个 hart 线程 (hart 准备 + dispatcher; 当前单 hart, dispatcher 直接 main
-//      调用; 多 hart 时换成 pthread_create(dispatcher_thread_fn, hart))
+// 入口。本文件按 reset 三层 lifecycle 组织 (a_02_t5_plan.md §3 / start_plan_a_02.md
+// §T5 "host runtime + reset 三层 lifecycle"):
 //
-// hart 准备阶段写入启动协议: pc=GUEST_RAM_START / satp=0 (bare) / priv=PRIV_M /
-// a0=mhartid / a1=dtb 占位 (仿 Linux RV boot 协议); mtvec / 其它 trap 字段保持 0,
-// 由 fixture 自己 csrw 设, 跟真实 hart reset 后由 firmware 设 mtvec 同形态。
+//   POR (Power-On Reset) — 进程启动一次
+//     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) / cpu_create
+//     (内部已写硬件 reset 默认状态)
+//     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
+//     clint_start_timer (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
+//     SDS 才退; dummy.txt §12 谁 spawn 谁 join)
+//
+//   System reset — main while 每 iter
+//     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
+//     dispatcher(hart) / SR-vs-shutdown 判断 (T5 简化恒 shutdown)
+//
+//   HART reset — dispatcher 内部 per-hart 重启 (future; dispatcher.c 末段注释占位)
 //
 // 顶上 decode_test() 是 main 内嵌单测 (52 case, 纯函数 sanity), 每跑一次顺手过一遍,
 // fail 立即 return 1; tests/unit/ 框架待 unit runner 真做时迁出。
@@ -22,9 +28,12 @@
 #include "platform/clint.h"
 #include "platform/ram.h"
 #include "riscv.h"
+#include "runtime.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>       // clock_gettime / struct timespec (main lifecycle 总耗时)
 
 static int has_suffix(const char *s, const char *suffix) {
     size_t ns = strlen(s);
@@ -254,6 +263,12 @@ static int decode_test(void) {
 // 否则 LSan 撞 ptrace 冲突会报 "LeakSanitizer has encountered a fatal error" 并 exit 1,
 // 看起来像本程序的 bug 但其实是工具链限制。Run 模式(无 gdb)正常, 想查泄漏走 Run 即可。
 int main(int argc, char **argv) {
+    // 程序总耗时起点 (CLOCK_MONOTONIC 跟 clint.c timer_run 同 clock 源, 一致;
+    // 不用 CLOCK_REALTIME 避免 wall clock 跳变干扰)。
+    // 终点在 main return 0 之前; 失败 return 1 路径不打耗时 (无意义且 fail 已 fprintf)。
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     // 命令行参数 ./jit-emu <bin-or-elf-path>
     if (argc < 2) {
         fprintf(stderr, "usage: %s <bin-or-elf-path>\n", argv[0]);
@@ -304,26 +319,90 @@ int main(int argc, char **argv) {
 
     // hart 构造: misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
     // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的
-    // entries 由 dispatcher 懒分配 (当前 #if 0)。
+    // entries 由 dispatcher 懒分配。cpu_create 内部已写入硬件 reset 后默认状态
+    // (regs[0]=GUEST_RAM_START / priv=PRIV_M / satp=0 / regs[10]=mhartid),
+    // 跟 cpu_reset 序列一致, 不需要 main 端再写 hart 字段。
     cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/0);
     if (hart == NULL) {  // cpu_create 内部已 fprintf "why"
         fprintf(stderr, "cpu_create failed\n");
         return 1;
     }
 
-    // hart 字段初始化 (启动协议; 必须在 dispatcher 外, 因为 hart 热插拔 = 寄存器
-    // 初始化 + 开始运行)。regs[0] 在 cpu_t 内物理占 x0 位置, 但实际存 pc (见 cpu.h)。
-    // 启动状态参考 https://docs.kernel.org/arch/riscv/boot.html
-    hart->regs[0] = GUEST_RAM_START;       // pc; 程序起点; 未来热插拔核时由外部参数设置
-    hart->satp    = 0;                      // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
-    hart->priv    = PRIV_M;                 // M 模式
-    hart->regs[10] = hart->per_hart_info.mhartid;  // a0 = hartid (Linux RV boot; x10 = a0)
-    // hart->regs[11] = 0;  // a1 = device tree pointer (暂无 dtb; x11 = a1; 真做时改右值)
+    // ------------------------------------------------------------------------
+    // POR runtime lifecycle 初始化 (cpu_create 之后, while 之前)
+    //
+    // SRS / SDS 极性: 1=继续, 0=触发 (runtime.h doc 段)。runtime.c 定义时已初值
+    // 1 兜底, 这里再显式 set 1 表达"程序 lifecycle 显式可读" (跟 user 伪码顺序
+    // 一致 — 进 while 之前明确把两个 flag 设到允许状态)。
+    //
+    // 顺序: SRS 先 / SDS 后 — 因为 CLINT timer 等不受 SRS 控制的辅助线程可能
+    // 中途出错主动 set SDS=0 (同时 set SRS=0 跟随; "SDS 蕴含 SRS" 协议); SRS
+    // 必须在 timer 线程发出前已置 1, 否则线程错路径 set SRS 后被这里覆盖。
+    // ------------------------------------------------------------------------
+    atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
+    atomic_store_explicit(&shutdown_signal,     1, memory_order_release);
 
-    // dispatcher() 跑一次 (返回时 hart 已 halt; halt 状态由 hart->trap.in_trap 表达,
-    // 位段编码见 dispatcher.c 末尾 in_trap 位段编码段)。后续 dump 段印 reg / trap / state
-    // 给 fixture 肉眼对照 (期望见各 fixture 目录注释)。
-    dispatcher(hart);
+    // main 起 timer 辅助线程 (受 SDS 控制, 跨 system reset 一直跑; 见 dummy.txt
+    // §12 谁 spawn 谁 join + clint.h 顶段 doc)。
+    if (clint_start_timer() != 0) {
+        fprintf(stderr, "clint_start_timer failed\n");
+        clint_destroy();   // 跟主路径 destroy 顺序一致
+        cpu_destroy(hart);
+        ram_destroy();
+        return 1;
+    }
+
+    // ------------------------------------------------------------------------
+    // 主 while: system reset 每 iter 进一次
+    //
+    // 当前单 hart 直调 dispatcher; 未来多 hart 这里 pthread_create per hart +
+    // join (受 SRS 控制的线程 spawn / join 占位见下方注释段)。
+    // ------------------------------------------------------------------------
+    while (atomic_load_explicit(&system_reset_signal, memory_order_acquire)) {
+        cpu_reset(hart);
+        (void)clint_reset();
+
+        // ====================================================================
+        // 占位: SRS-controlled 线程 spawn (未来多 hart pthread_create per hart;
+        // 受 SRS 控制 — 每 iter spawn / join, 跟 system reset 同步起停)
+        // 当前单 hart 直调 dispatcher
+        // ====================================================================
+        dispatcher(hart);
+        // ====================================================================
+        // 占位: SRS-controlled 线程 join (未来多 hart pthread_join 各 hart 退;
+        // 受 SRS 控制的辅助线程也在这里 join)
+        // ====================================================================
+
+        // ====================================================================
+        // T5 简化: 区分 system reset 重 iter vs shutdown 退出
+        //
+        // "只需要 SR" 临时恒 0 — 因为 timer thread 受 SDS 控制, 必须有人通知
+        // 它停止才能干净退进程。未来真做 system reset 重 iter 时:
+        //   - 区分条件: 某种状态判断 (例如 dispatcher 退出原因 / 外部 reset
+        //               trigger / hart 是否参与本轮 reset 等)
+        //   - SR 路径: continue (复位 SRS=1; timer 不重启, 跨 reset)
+        //   - shutdown 路径: 走 else (set SDS, join, 退)
+        //
+        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" / "block 3 完整形态"
+        // (L266~L288 风格) 一致: 实装能跑的部分 + 注释表达未来扩展。
+        // ====================================================================
+        if (0 /* SR_only; T5 恒 0 — timer 需 SDS 通知, 没真 reset 重 iter */) {
+            atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
+            continue;
+        } else {
+            atomic_store_explicit(&shutdown_signal, 0, memory_order_release);
+            break;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → dump → 三 destroy
+    //
+    // clint_join_timer 调用前置 (SDS=0) 在 while else 分支或 break 路径已做; 这里
+    // pthread_join 不会永远 block。dump 在 join 之后 / destroy 之前 (hart 字段
+    // 仍可读, 让 fixture 肉眼对照期望值)。
+    // ------------------------------------------------------------------------
+    clint_join_timer();
 
     /* dump 格式:
      *   - reg 分 [reg dec] + [reg hex] 两段, 每段 x1-x31 (x0 跳过, 占位 pc)
@@ -391,6 +470,29 @@ int main(int argc, char **argv) {
     /* tohost / privrd 在 csr.c 内 csrw/csrr 时直接 fprintf 流式输出, 不缓存到 cpu_t,
      * main.c 不需要 dump。 */
 
+    // ------------------------------------------------------------------------
+    // 程序总耗时 (main lifecycle scope; CLOCK_MONOTONIC delta)
+    //
+    // 不进 debug.{c,h} — debug.{c,h} scope = interpreter / dispatcher 内部
+    // char-stream trace (per-block 'f' / 'E' 等); 程序总耗时是 main 边界级,
+    // 不是 hot path 内部状态。未来 per-hart wall clock 时再考虑放 cpu_info /
+    // debug。
+    //
+    // 输出: "X min Y.YYY s (total Z.ZZZ s)"
+    //   - 前段 min + s 拆分给人类视角直观 (跑了几分钟还是几秒)
+    //   - 括号内总秒数 (double) 给后期 fixture 自动解析友好
+    // ------------------------------------------------------------------------
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double total_s = (double)(t_end.tv_sec - t_start.tv_sec)
+                   + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+    int    e_min   = (int)(total_s / 60.0);
+    double e_sec   = total_s - (double)e_min * 60.0;
+    fprintf(stderr, "[main] elapsed: %d min %.3f s (total %.3f s)\n",
+            e_min, e_sec, total_s);
+
+    clint_destroy();
     cpu_destroy(hart);
+    ram_destroy();
     return 0;
 }

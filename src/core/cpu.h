@@ -88,15 +88,43 @@ typedef struct cpu_s {
                                                 //   cpu_info_shared_default
 } cpu_t;
 
-// 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。
+// 工厂: 分配 (cache-line 对齐) + 初始化 cpu_t。POR 一次性调用 (main 入口)。
 // 失败返回 NULL, 内部已 fprintf。
+//
+// 内部含 RV "硬件 reset 后默认状态" 写入 (regs[0]=GUEST_RAM_START / priv=PRIV_M /
+// satp=0 / regs[10]=mhartid 等; 跟 cpu_reset 一致), 所以 main 拿到 cpu_t 直接
+// 可进 dispatcher, 不需要 main 端再写 hart 字段。
+//
+// TODO future: 按 misa 派发 cpu_t 子结构 alloc — F/D 扩展按 misa.fdv 决定 fcsr
+// alloc, H 扩展按 misa.h 决定 [PRIV_H] tlb 容器 alloc 等。当前 misa 字段只作
+// csr_misa_read 返回值, 不真做运行时派发。
 //
 // 入参:
 //   misa    — 写入 hart->per_hart_info.misa (csr_misa_read 直读); per-hart 私有, 异构 SMP
-//             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。当前不按 misa 派发
-//             cpu_t 子结构 alloc (e.g. F/D 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
+//             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。
 //   mhartid — 写入 hart->per_hart_info.mhartid (csr_mhartid_read 直读); per-hart 不同。
 cpu_t *cpu_create(uint32_t misa, uint32_t mhartid);
+
+// system reset 每 iter 调 (main while 顶段): 重置 RV-spec reset-state 字段, 让
+// hart 从"硬件 reset 后状态"重新跑。
+//
+// 重置:
+//   regs[0] = GUEST_RAM_START   (pc 启动点 / reset vector)
+//   regs[1..31] = 0; 但 regs[10] = mhartid (a0; RV Linux boot 协议)
+//   regs[11] = 0                 (a1 = dtb 占位, 未来)
+//   priv    = PRIV_M
+//   satp    = 0                  (bare; dispatcher 再选 leaf TLB)
+//   trap    全 memset 0          (xcause/xtval/xepc/xtvec/xscratch 各 [4] +
+//                                 _mstatus/_medeleg/mideleg/_mie/_mip_sw/in_trap)
+//   tlb_table 容器 不动, entries 调 tlb_table_reset(hart) 清
+//
+// 保留 (硬件 ID 类, 真硬件 reset 后不变):
+//   per_hart_info (mhartid / misa); shared_info 指针 (mvendorid/marchid/mimpid)
+//   jmp_buf_ptr (dispatcher 进入时重设, reset 时不动 NULL 也 OK)
+//
+// TODO future: 按 hart 内部 misa 派发 (运行时 misa 切换决定哪些 CSR 字段要清零;
+// 当前 misa 字段不实装运行时切换, 全 hart 同 reset 序)。
+void cpu_reset(cpu_t *hart);
 
 // 释放 cpu_create 分配的 cpu_t 及其下所有子结构 (tlb 容器 + 共享 leaf + 已懒分配的 entries)。
 // NULL 入参 do nothing。

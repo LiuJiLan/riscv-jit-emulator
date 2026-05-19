@@ -43,3 +43,13 @@ int ram_init(void) {
     gpa_to_hva_offset = (uint8_t *)p - GUEST_RAM_START;
     return 0;
 }
+
+void ram_destroy(void) {
+    if (host_ram_base == NULL) return;   // 未 init / 已 destroy, do nothing
+    if (munmap(host_ram_base, GUEST_RAM_SIZE) != 0) {
+        // POR 退出路径, 不 fatal; 进程结束后 OS 仍会回收。
+        fprintf(stderr, "ram_destroy: munmap failed: %s\n", strerror(errno));
+    }
+    host_ram_base = NULL;
+    gpa_to_hva_offset = NULL;
+}

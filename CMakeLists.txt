@@ -81,7 +81,9 @@ add_executable(riscv_jit_emulator
         src/platform/bus.c
         src/platform/bus.h
         src/platform/clint.c
-        src/platform/clint.h)
+        src/platform/clint.h
+        src/runtime.c
+        src/runtime.h)
 
 # Test
 enable_testing()

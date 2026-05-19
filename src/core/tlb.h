@@ -79,6 +79,11 @@
 #include <stdint.h>
 #include "config.h"
 
+// forward typedef cpu_t — tlb_table_reset 签名要 cpu_t*, 但 cpu.h 反过来
+// #include "tlb.h", 不能反向 include 形成循环。跟 trap.h 同形态; 见 trap.h
+// 顶段 doc。tlb.c 内 #include "cpu.h" 走完整定义。
+typedef struct cpu_s cpu_t;
+
 // 单条 TLB entry, 16 字节, 布局照 RV PTE 排位。
 //
 //   gva_tag  : 命中比较用 (gva >> 12), 低 20 位有效。
@@ -113,6 +118,19 @@ tlb_t *tlb_alloc(void);
 //
 // 调用方:
 //   - sfence.vma helper: 清 [1][asid] 的 entries (具体 ASID 选择见 sfence.c 4 组合分流)
+//   - tlb_table_reset:    system reset 路径全清各 ASID entries (本头下方)
 void tlb_clear(tlb_t *tlb);
+
+// 整 hart 级 TLB 全清 (system reset 时由 cpu_reset 调)。遍历 [PRIV_S] 容器
+// 的全部 ASID entries 调 tlb_clear; [PRIV_H] 容器也走同形态遍历 (当前永远
+// NULL, 循环天然 no-op, 写出来未来 H 扩展不漏)。
+//
+// 不走的槽:
+//   [PRIV_M] 永远 NULL (Trust regime 不查 TLB)
+//   [PRIV_U] alias [PRIV_S] (副本语义, 跟 S 共享 entries, 不重复清)
+//
+// 容器本身 (tlb_t ** ASID 数组) 不释放, 保留给后续 dispatcher 懒分配复用 —
+// 跟 sfence 形态一致 (entries 内容清 / 容器不动)。
+void tlb_table_reset(cpu_t *hart);
 
 #endif //CORE_TLB_H

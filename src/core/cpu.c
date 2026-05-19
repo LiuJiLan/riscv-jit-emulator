@@ -39,6 +39,9 @@ static const cpu_info_shared_t cpu_info_shared_default = {
 };
 
 cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
+    // init 依赖 misa (future) — 当前只把 misa 值存入 per_hart_info.misa 给
+    // csr_misa_read 用, 不按 misa 真做派发 (F/D 扩展按 misa.fdv 决定 fcsr alloc /
+    // H 扩展按 misa.h 决定 [PRIV_H] tlb 容器 alloc 等都属于未来)。
     cpu_t *hart = aligned_alloc(64, sizeof(cpu_t));
     if (hart == NULL) {
         fprintf(stderr, "cpu_create: aligned_alloc(64, %zu) failed: %s\n",
@@ -46,9 +49,6 @@ cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
         return NULL;
     }
     memset(hart, 0, sizeof(*hart));
-
-    hart->priv = PRIV_M;    // M 模式 (启动)
-    hart->satp = 0;         // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
 
     // per-hart 私有 RO CSR 数据 (mhartid + misa); cpu_create 入参直接写入
     // cpu_t.per_hart_info 字段。misa 入参当前仅作为 csr_misa_read 返回值 (不按 misa 派发
@@ -58,6 +58,19 @@ cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
 
     // 多 hart 共享 RO CSR 数据 (mvendorid/marchid/mimpid); 指针指向全局 static const default。
     hart->shared_info = &cpu_info_shared_default;
+
+    // ------------------------------------------------------------------------
+    // RV "硬件 reset 后默认状态" 写入 (regs / priv / satp; 原 main.c hart 字段
+    // 初始化段 L314~L321 挪入)。跟 cpu_reset 内的写入序列一致 — POR 一次性 init
+    // 等同于 "刚加电 + 第一次 reset" 后的 hart 状态。详 cpu_reset doc 段。
+    //
+    // 启动状态参考 https://docs.kernel.org/arch/riscv/boot.html
+    // ------------------------------------------------------------------------
+    hart->regs[0]   = GUEST_RAM_START;      // pc = 程序起点 (reset vector)
+    hart->regs[10]  = mhartid;              // a0 = hartid (Linux RV boot 协议)
+    // regs[11] = 0 (a1 = dtb 占位, 未来; memset 已置 0)
+    hart->priv      = PRIV_M;               // M 模式 (启动)
+    hart->satp      = 0;                    // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
 
     // ------------------------------------------------------------------------
     // tlb_table[4] 装载 (Trust regime bypass TLB; 当前默认 MSU)
@@ -95,6 +108,37 @@ cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
     // [PRIV_M] / [PRIV_H]: 不分配, memset 0 保证 NULL。
 
     return hart;
+}
+
+void cpu_reset(cpu_t *hart) {
+    // reset 依赖 misa (future) — 真硬件 reset 后哪些字段清 / 哪些保留按 misa 决定
+    // (例 misa.F=0 时 fcsr 不存在不需清; misa.H=0 时 [PRIV_H] tlb 容器不存在不需
+    // tlb_table_reset 内遍历)。当前不实装运行时 misa 切换, 全 hart 同 reset 序。
+    if (hart == NULL) return;
+
+    // regs: 全清 0, 然后写 RV-spec reset 后的启动协议字段。
+    // (顺序: 先 memset, 再写需要非 0 的 — regs[0]=pc / regs[10]=a0)
+    memset(hart->regs, 0, sizeof(hart->regs));
+    hart->regs[0]  = GUEST_RAM_START;            // pc = reset vector
+    hart->regs[10] = hart->per_hart_info.mhartid; // a0 = hartid (Linux RV boot 协议)
+    // regs[11] = 0  (a1 = dtb 占位, memset 已 0)
+
+    // 控制状态: priv = M / satp = 0 (bare)
+    hart->priv = PRIV_M;
+    hart->satp = 0;
+
+    // trap_csrs_t 全 memset 0 — xcause/xtval/xepc/xtvec/xscratch 各 [4] +
+    // _mstatus/_medeleg/mideleg/_mie/_mip_sw/in_trap 等所有字段一次清。
+    // jmp_buf_ptr / per_hart_info / shared_info 不在 trap 内, 不影响。
+    memset(&hart->trap, 0, sizeof(hart->trap));
+
+    // tlb_table 容器不动 (跟 sfence 形态一致); entries 全清 (跨地址空间防 PTE
+    // 残留撞 hash 命中)。详 tlb.h tlb_table_reset doc 段。
+    tlb_table_reset(hart);
+
+    // 保留 (硬件 ID 类, 真硬件 reset 后不变):
+    //   per_hart_info (mhartid / misa); shared_info 指针 (mvendorid 等)
+    //   jmp_buf_ptr (dispatcher 进入时重设永久落点, reset 时不动也无害)
 }
 
 void cpu_destroy(cpu_t *hart) {

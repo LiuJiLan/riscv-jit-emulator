@@ -1462,3 +1462,56 @@ vs 标注式" 的策略选择。
   - 不替代 module_verb_object schema — 非 predicate 函数 (init / reset /
     destroy / read / write / walk / ...) 仍走 schema
 
+
+================================================================================
+## §12. 线程 lifecycle (spawn / join 配对)
+================================================================================
+
+涉及文件:
+  - src/main.c                (当前所有 host thread 的 spawn / join 责任)
+  - src/runtime.{c,h}         (system_reset_signal / shutdown_signal extern flag)
+  - src/platform/clint.{c,h}  (clint_start_timer / clint_join_timer 对偶)
+  - 未来任何 spawn host thread 的模块
+
+
+--------------------------------------------------------------------------------
+背景
+--------------------------------------------------------------------------------
+
+a_02 T5 引入辅助线程 (timer 累加 atomic mtime); 之后 SMP 真做时还会加 hart
+线程, 未来 monitor 也可能起线程。本节固定 "谁 spawn 谁 join" 协议, 避免
+destroy 函数隐含 pthread_join 导致控制流隐式 block (看 destroy 不知道里面
+还会等线程)。
+
+--------------------------------------------------------------------------------
+约定
+--------------------------------------------------------------------------------
+
+默认 — 线程由谁 spawn 就由谁 (或某个清晰的层级) join。
+当前 case: main 调 clint_start_timer 起 timer thread → main 调 clint_join_timer
+显式 join, 不埋进 clint_destroy。
+
+函数命名 — spawn / join 对偶函数单独暴露, module_verb_object schema:
+  - clint_start_timer  / clint_join_timer  (T5 加)
+  - 未来 hart_start    / hart_join         (SMP 真做时)
+  - 未来 monitor_start / monitor_join      (perf shm 接口)
+
+destroy 函数纯 cleanup — atomic 字段清 / 资源 free 类, **不含 pthread_join**。
+跟 init 对偶, 反 init 做的事 (init 做了 atomic 字段初始化 + bus 注册 →
+destroy 反过来)。
+
+例外: 模块内部临时异步任务 (模块自己起的) 由模块自己 join, 但要在 sheet 写明
+"此线程模块内部 lifecycle"。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 不规定 SDS / SRS 信号的具体 memory_order (relaxed 起步; §7 monitor 模型
+    规则覆盖 — producer release / consumer acquire)
+  - 不规定线程优先级 / SCHED_FIFO 等调度策略 (各模块自定)
+  - 不规定 cancellation 机制 (项目不用 pthread_cancel / pthread_kill,
+    一律 cooperative — atomic flag + worker periodic check + main join)
+  - 不教条 — 真有特殊设计场景模块内部 join 也行 (但 sheet 写明)
+
