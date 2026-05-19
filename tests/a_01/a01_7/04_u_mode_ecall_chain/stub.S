@@ -4,7 +4,7 @@
 #
 # 覆盖范围:
 #   1. ecall from U → cause=8 (验 8 + PRIV_U=0 公式; 之前 fixture 都只验 cause=11 from M)
-#   2. mret 真切回 U (cross-priv mret, 跟 a_01_5_c 04_trap_chain M 自我 mret 风格不同)
+#   2. mret 真切回 U (cross-priv mret, 跟 a_01_5 04_trap_chain M 自我 mret 风格不同)
 #   3. U 多次 ecall 都走同 m_handler (handler 复用)
 #   4. U mode GPR (x1/x2) 跨 trap/mret 保留 (precise trap 语义; trap_set_state / mret 不动 GPR)
 #   5. handler GPR (x3) 跨多次 trap/mret 调用累计 (host 路径不动 guest GPR)

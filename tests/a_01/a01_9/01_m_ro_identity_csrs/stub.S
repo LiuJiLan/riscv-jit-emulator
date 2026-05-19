@@ -1,8 +1,8 @@
 # a_01_9 / 01_m_ro_identity_csrs
-# 验 step 3 加的 5 个 M-mode RO Identity CSR (mhartid + misa + mvendorid + marchid + mimpid)。
+# 验 5 个 M-mode RO Identity CSR (mhartid + misa + mvendorid + marchid + mimpid)。
 #
-# 测试组织 (a_01_session_012 D11 拍): a_01_8 fixture 文件夹只放 a_01_8 主轴 fixture; a01_9
-# 新增 fixture 在 tests/a_01/a01_9/ 下。
+# 测试组织: a_01_8 fixture 文件夹只放 a_01_8 主轴 fixture (SV32 walker); a01_9
+# 新增 csr 整理类 fixture 单独在 tests/a_01/a01_9/ 下。
 #
 # 模板: 纯 .S (没 PT 要建, 没 C 函数容器需求, 跟 fixture 02/03 同形态; 跟 a_01_8 04-09 的
 # .S+.c 模板相对; .c 模板留给真要 PT 的 fixture)。

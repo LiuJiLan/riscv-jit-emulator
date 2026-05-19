@@ -1,10 +1,10 @@
-# a_01_5_c / 02_trap_arch_basic
+# a_01_5 / 02_trap_arch_basic
 # 验证 trap_set_state 架构语义层 + 候选 A 早 return + dispatcher while(in_trap<3) 退出 +
 #       sigsetjmp 一次性落点 + trap_raise_exception _Noreturn longjmp 路径。
 # 9 条指令 = 36 字节 (32-bit only, .option norvc 强制不生 RVC)。
 #
-# 起步 (a_01_5_c 起): fixture 自己用 csrw mtvec 设 handler 地址 (a_01_5_b 时由 main.c
-# hard-code 设, 现已删, fixture 必须自包含)。
+# 起步: fixture 自己用 csrw mtvec 设 handler 地址 (main.c 不 hard-code 设 xtvec,
+# fixture 自包含)。
 #
 # 主程序 (0x80000000 ~ 0x80000018, 28 字节):
 #   la   x4, handler      ; auipc + addi 两条 pseudo, x4 = handler 地址

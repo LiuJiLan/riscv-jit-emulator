@@ -5,12 +5,12 @@
 // 两个 atomic flag, 都默认 1 = "继续运行", 0 = "触发对应停机路径":
 //
 //   system_reset_signal  (SRS)
-//     极性: 1=继续, 0=触发 system reset (T5 简化下 = 退出 main while)
+//     极性: 1=继续, 0=触发 system reset (当前简化形态 = 退出 main while)
 //     触发点: dispatcher tri-fault (in_trap >= 3) 后 set 0; 未来 user 端
 //             reset 按钮 / 严重 hart 错也 set 0
 //     check 点: dispatcher 主循环 (while (in_trap < 3 && atomic_load(SRS)))
 //               + main while (while (atomic_load(SRS)))
-//     T5 简化语义: dispatcher set SRS=0 → main while 失败 → 走 cleanup 退出
+//     当前简化语义: dispatcher set SRS=0 → main while 失败 → 走 cleanup 退出
 //                   (没真"reset 重 iter"路径; 那是未来事)
 //
 //   shutdown_signal  (SDS)

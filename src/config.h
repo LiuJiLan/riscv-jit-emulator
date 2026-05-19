@@ -70,7 +70,7 @@
 // hart 数量
 // ----------------------------------------------------------------------------
 //
-// v1 单 hart; T5 真接 SMP 时改这个宏, clint.msip[] / mtimecmps[] 等数组自动跟随。
+// v1 单 hart; SMP 真接时改这个宏, clint.msip[] / mtimecmps[] 等数组自动跟随。
 // 不放运行期变量 (跟 GUEST_RAM_* 同性质 — 编译期已知, 数组形态稳定)。
 #define MAX_HARTS         1U
 
@@ -91,13 +91,13 @@
 #define CLINT_MTIME_OFF     0xBFF8UL
 
 // ----------------------------------------------------------------------------
-// TIMEBASE / timer 辅助线程参数 (T5 方案 C 异步累加 atomic clint.mtime)
+// TIMEBASE / timer 辅助线程参数 (timer 辅助线程异步累加 atomic clint.mtime)
 // ----------------------------------------------------------------------------
 //
-// 跟 start_plan_a_02.md §T5 "频率参数拍定" 段一致 (10 MHz 跟 QEMU virt; 1ms
-// Linux nanosleep 精度甜点 + 跟 HZ=1000 / FreeRTOS 默认 tick 匹配)。RV mtime
-// 跟传统 wall clock RTC 是两个东西 (mtime = 高频 monotonic counter, 重启清
-// 零; wall clock 走 SBI / virtio-rtc, T5 不涉及)。
+// 10 MHz 跟 QEMU virt machine (guest dtb timebase-frequency 复用); 1ms 是 Linux
+// nanosleep 精度甜点 + 跟 HZ=1000 / FreeRTOS 默认 tick 匹配。RV mtime 跟传统 wall
+// clock RTC 是两个东西 (mtime = 高频 monotonic counter, 重启清零; wall clock 走
+// SBI / virtio-rtc, 本项目当前不涉及)。
 #define TIMEBASE_FREQ_HZ        10000000UL   /* guest 视角: mtime tick 频率 (10 MHz, 100ns/tick) */
 #define TIMER_WAKE_INTERVAL_NS  1000000UL    /* host 实现: timer 辅助线程 nanosleep 周期 (1 ms) */
 

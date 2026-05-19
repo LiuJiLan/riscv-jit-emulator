@@ -1,10 +1,9 @@
-# a_01_5_c / 02_trap_arch_basic
+# a_01_5 / 02_trap_arch_basic
 # 产出 out.bin: 36 字节, 起步 3 条 (la+csrw 设 mtvec) + 主程序 4 条 + handler 2 条;
 # loader 加载到 GUEST_RAM_START。
 #
-# 验证目标 (a_01_5_c 阶段):
-#   - csr.c 真接读写: csrw mtvec 设 handler 地址 (a_01_5_b 由 main.c hard-code, a_01_5_c
-#     起 fixture 自包含, main.c 不再设 xtvec)
+# 验证目标:
+#   - csr.c 真接读写: csrw mtvec 设 handler 地址 (fixture 自包含, main.c 不设 xtvec)
 #   - trap_set_state 写 xcause/xtval/xepc 字段对
 #   - regs[0] = xtvec[PRIV_M] 跳 trap handler 真生效 (跳到 0x8000001c 跑 addi x3)
 #   - 候选 A 早 return: 第 3 次 trap 字段保留第 2 次状态
@@ -34,10 +33,10 @@
 #                          total_count 不变
 #   while (3<3) false → 退出, total_count = 3
 #
-# 注: a_01_5_c 起 trap_raise_exception 是 _Noreturn longjmp, 跳过 dispatcher 的
-# total_count += local_count 行; 所以 trap 触发的 block 内"trap 之前已跑的指令" 不计入
-# total_count。这是与 a_01_5_b 的行为差异 (a_01_5_b 时 trap_raise return + caller
-# goto out + fetch loop 末尾 *count_out=count + dispatcher total_count += 都正常执行)。
+# 注: trap_raise_exception 是 _Noreturn longjmp, 跳过 dispatcher 的 total_count +=
+# local_count 行; 所以 trap 触发的 block 内"trap 之前已跑的指令" 不计入 total_count。
+# count 同步契约: case 内 SYNC_COUNT 在 trap_raise 之前同步 count_out 给 dispatcher
+# (见 src/core/interpreter.c SYNC_COUNT 宏 doc + dispatcher.c count 同步契约段)。
 #
 # 工具链 / 模式: 套 a01_4 + 01_csr_basic 同款。
 

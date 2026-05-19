@@ -19,7 +19,7 @@
 #   in_trap = 3
 #   mcause = 1, mtval = 0, mepc = 0, mtvec = 0
 #     (字段保留第 2 次 trap = 主程序末 ecall 后 mmu fail at 0; cause=1 access fault on fetch
-#      —— 跟 a_01_5_c 05_triple_fault_halt 同形态)
+#      —— 跟 a_01_5 05_triple_fault_halt 同形态)
 #   priv = 3                (M; mret 切回 M, 末 ecall 后 trap 切到 M=deliver_priv 不变)
 #   mstatus = 0x1800        (字段保留第 2 次 trap 设的 MPP=M=3<<11=0x1800; MPIE=MIE=0 因为
 #                             末 ecall 时 mstatus.MIE 已经 0)

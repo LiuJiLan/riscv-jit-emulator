@@ -1,4 +1,4 @@
-# a_01_5_c / 04_trap_chain
+# a_01_5 / 04_trap_chain
 # 验证完整的 trap → handler → mret → 主程序继续 流程:
 #   - ecall 触发 trap, _epc 写 ecall PC; handler 内手动 csrw mepc, mepc+4 让 mret 跳过 ecall
 #     (RV spec ECALL: mret 默认跳 mepc, software 必须自己 +4 跳过 ecall)

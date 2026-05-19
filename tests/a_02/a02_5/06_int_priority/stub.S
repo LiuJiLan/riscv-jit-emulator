@@ -76,5 +76,5 @@ m_handler:
 # 关键验证: 即使 MTIP 跟 MSIP 同时 pending (mtime >= mtimecmp 跟 msip=1 都成立), trap_check_
 # interrupt 内 encoder 按 §3.1.9 选 M_SOFT (bit 3) 而不是 M_TIMER (bit 7).
 #
-# 注: fixture 依赖 mtime 主动步进 (假设 mtime 起步会推进过 mtimecmp=5; 实现方式见
-# platform/clint.h 顶段). 真异步实现上线后期望寄存器值仍同 (encoder 优先级语义不变).
+# 注: fixture 依赖 timer 辅助线程异步累加 mtime, 第一次 wake 就推进过 mtimecmp=5
+# (实现方式见 platform/clint.h 顶段).

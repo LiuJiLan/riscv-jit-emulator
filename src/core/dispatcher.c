@@ -14,7 +14,7 @@
 #include "tlb.h"
 #include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
 #include "riscv.h"
-#include "runtime.h"    // system_reset_signal (主循环 check + T5 简化触发)
+#include "runtime.h"    // system_reset_signal (主循环 check + 函数末 set 0 触发停机)
 
 #include <inttypes.h>
 #include <setjmp.h>
@@ -99,12 +99,11 @@ void dispatcher(cpu_t *hart) {
     // total_count + local_count: 跨 longjmp 累加 / 持久, volatile 强制放栈 (dummy.txt §1
     // 末段)。两个变量都必须在 sigsetjmp 之前声明 + 初始化, 否则 longjmp 跳回时重新执行初始化,
     // local_count 丢失上一轮 SYNC_COUNT 写好的值, total_count 累加丢失。
-    // total_count / local_count 类型统一 uint64_t: T1 方案 A 时直接拿 total_count 暴露
-    // 给 csrr time / clint mtime 入口 (RV spec mtime/time 是 64 位无符号; 32 位 ~4G 指令
-    // 在 1GHz host 下几秒就溢出)。local_count 也 64 bit, 跟 interpret_one_block 的
-    // count_out 签名 + 内部 count 类型一致 — "count 一律 64 bit"心智, 跟未来
-    // perf_counters / cycle / instret 等 64-bit 字段铺路。x86-64 host 上 32/64 ALU 单
-    // cycle 等价, .text +REX prefix 几字节可忽略 (性能差 ≈ 0)。
+    // total_count / local_count 类型统一 uint64_t: RV spec mtime/time 是 64 位无符号,
+    // 跟 perf_counters / cycle / instret 等 64-bit 字段铺路。32 位 ~4G 指令在 1GHz host
+    // 下几秒就溢出, 不可用。local_count 也 64 bit, 跟 interpret_one_block 的 count_out
+    // 签名 + 内部 count 类型一致 — "count 一律 64 bit" 心智。x86-64 host 上 32/64 ALU
+    // 单 cycle 等价, .text +REX prefix 几字节可忽略 (性能差 ≈ 0)。
     volatile uint64_t total_count = 0;
     volatile uint64_t local_count = 0;
 
@@ -267,7 +266,7 @@ void dispatcher(cpu_t *hart) {
     // 出块后所有扫尾搬到迭代头 (helper longjmp 跳回 sigsetjmp 落点会跳过迭代尾;
     // 只有迭代头才能保证一定执行)。
     //
-    // 当前临时调用 (jit_cache / 热度计数未接): 直接 interpret_one_block, 块边界由解释器
+    // 当前调用 (jit_cache / 热度计数未接): 直接 interpret_one_block, 块边界由解释器
     // 末尾 is_block_boundary_inst 自然产生 (branch/jal/jalr 命中后退出 fetch loop)。
     // ========================================================================
     /* local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在迭代头
@@ -343,13 +342,13 @@ void dispatcher(cpu_t *hart) {
     // ========================================================================
 
     // ========================================================================
-    // T5 简化触发: dispatcher 退出 (in_trap >= 3 tri-fault 或其他 break 路径)
-    // 后通知 main while 退出。release-store 让 main 的 acquire-load 跟随看到。
+    // 通知 main while 退出: dispatcher 退出 (in_trap >= 3 tri-fault 或其他 break
+    // 路径) 后 set SRS=0。release-store 让 main 的 acquire-load 跟随看到。
     //
     // 跟上部 "未来 reset 扩展占位" 不冲突 — 未来真做 per-hart reset 时:
     //   - hart 参与 reset 路径: 不 set SRS, 走 cpu_reset + siglongjmp 重入 while
     //   - hart 不参与 reset / 走全机停机路径: set SRS, main while 退
-    // 当前 T5 简化下 dispatcher 退出 = 全机停机, 一律 set。未来真分流时本行加判断。
+    // 当前简化下 dispatcher 退出 = 全机停机, 一律 set。未来真分流时本行加判断。
     //
     // SDS 不在这里 set — dispatcher tri-fault 不一定意味全机 shutdown (例如未来
     // user 触发的 SR-only reset); SDS 由 main 在 while 退出后 cleanup 段 set 0

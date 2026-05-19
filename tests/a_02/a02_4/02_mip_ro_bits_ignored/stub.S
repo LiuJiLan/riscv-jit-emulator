@@ -1,6 +1,6 @@
 # a02_4 / 02_mip_ro_bits_ignored
 # csrw mip 写 RO 位 (MSIP/MTIP/MEIP) 验证 — RO 位被 MIP_SW_WRITABLE_MASK 截掉,
-# 不影响 _mip_sw 任何 bit; csrr mip 合成时 RO 位仍来自异步源 (T2 阶段 0).
+# 不影响 _mip_sw 任何 bit; csrr mip 合成时 RO 位仍来自异步源 (clint_init 后初值 0).
 #
 # BARE M-mode; 不切 S.
 #

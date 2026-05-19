@@ -147,7 +147,7 @@ static uint32_t csr_mtvec_read(cpu_t *hart) {
 }
 
 static void csr_mtvec_write(cpu_t *hart, uint32_t v) {
-    // WARL MODE 位处理 (项目支持 Direct + Vectored 两种 mode; T3+T4 解绑):
+    // WARL MODE 位处理 (项目支持 Direct + Vectored 两种 mode):
     //   - mtvec[1:0] = MODE:
     //       00 = Direct   (sync exception + async interrupt 都跳 BASE; 项目支持)
     //       01 = Vectored (sync exception 跳 BASE; async interrupt 跳 BASE+4*cause; 项目支持)

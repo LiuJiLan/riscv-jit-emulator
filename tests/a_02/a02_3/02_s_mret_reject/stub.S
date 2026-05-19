@@ -1,9 +1,9 @@
 # a02_3 / 02_s_mret_reject
-# P5 priv check fixture — S-mode 调 MRET reject (a_02 session_005)。
+# priv check fixture — S-mode 调 MRET reject。
 #
 # MRET 仅在 priv >= M 时合法 (M-only system 指令); S-mode 调 MRET 触发
 # PRIV_CHECK_OR_TRAP(PRIV_M) cause 2 illegal + tval=raw_inst (interpreter case
-# 入口判, a_02 session_005 P5)。
+# 入口判)。
 #
 # 触发 case (1 个):
 #   case 0: S-mode mret → cause 2, tval = 0x30200073

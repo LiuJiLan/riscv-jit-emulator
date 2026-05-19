@@ -1,16 +1,14 @@
 # a02_5 / 03_int_mie_mask_off
 # mstatus.MIE = 0 时不触发 trap (验全局 IE 屏蔽; trap_check_interrupt 内 deliver_mask = 0):
 #   1. 设 mtimecmp 小 + mie.MTIE 但 不设 mstatus.MIE (默认 0)
-#   2. mtime 推进 (假设主动步进), trap_check_interrupt: mip.MTIP=1 但 mstatus.MIE=0 →
-#      deliver_mask = 0 → ready = 0 → 'c' (check no fire), 永不 trap 跳 mtvec
+#   2. mtime 由 timer 辅助线程异步累加越过 mtimecmp 后, trap_check_interrupt: mip.MTIP=1
+#      但 mstatus.MIE=0 → deliver_mask = 0 → ready = 0 → 'c' (check no fire), 永不
+#      trap 跳 mtvec
 #   3. csrr mip 看到 MTIP=1 (验合成读跟 IE 屏蔽 解耦)
 #   4. main 跑一段后直接 halt (没有 handler 进入)
 #
 # 跟 fixture 01 区别: 不调 csrrsi mstatus, MIE; 不进 m_handler; halt 走 main 自己的 ecall.
 # trace 期望: 全程 'cf' (从不 't' fire). a0 验 csrr mip 时看到 MTIP=1 不被 IE 屏蔽掩盖.
-#
-# 注: 行为依赖 mtime 主动步进 (实现方式见 platform/clint.h 顶段); 真异步实现上线后期望
-# 寄存器值仍同 (不依赖 sw 写 mtime, 只看 mtime 推进过 10 后的 MTIP set).
 
 .section .text
 .option norvc

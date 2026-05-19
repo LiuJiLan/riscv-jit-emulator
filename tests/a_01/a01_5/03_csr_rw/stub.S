@@ -1,4 +1,4 @@
-# a_01_5_c / 03_csr_rw
+# a_01_5 / 03_csr_rw
 # 验证 csr.c 6 小 helper 真读写 (csrw 写 → csrr 读回相同值; WARL 截断对 mtvec/mepc 真生效)。
 # 8 条指令 = 32 字节 (32-bit only, .option norvc)。
 #

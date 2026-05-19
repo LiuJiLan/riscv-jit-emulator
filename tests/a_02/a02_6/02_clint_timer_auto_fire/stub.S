@@ -1,5 +1,5 @@
 # a02_6 / 02_clint_timer_auto_fire
-# 验 T5 timer 辅助线程真异步累加 mtime → mtimecmp 越过阈值 → MTIP → trap deliver
+# 验 timer 辅助线程真异步累加 mtime → mtimecmp 越过阈值 → MTIP → trap deliver
 # 端到端 — 跟 a02_5/01 同形态, 区别在 mtimecmp 设大点 (跨多个 timer wake), 体现
 # "mtime 跟 host wall clock 推进 / 不靠 dispatcher 指令数".
 #
@@ -16,8 +16,8 @@
 #   9. main 看 s0=1 → 跳出 wait_loop → halt
 #
 # 跟 a02_5/01 区别:
-#   - a02_5/01 mtimecmp=50: T3 setter 时代 dispatcher 主帧 50 个指令就 fire; T5
-#     真异步下也能 fire 但只是"刚好第一个 wake 就跨过", 没充分体现异步
+#   - a02_5/01 mtimecmp=50: 第一个 wake 就跨过 (1 ms 内 fetch_add += 10000), 没充分
+#     体现异步
 #   - 本 fixture mtimecmp=100000: 必须跨 10 次 timer wake, dispatcher 主帧 wait_loop
 #     跑大量循环 (a5 累加器 > 0 显著体现); 唯一驱动 mtime 推进的是 timer thread
 #     的 atomic_fetch_add, 跟 dispatcher 指令数完全解耦

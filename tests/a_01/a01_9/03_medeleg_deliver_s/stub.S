@@ -1,5 +1,6 @@
 # a_01_9 / 03_medeleg_deliver_s
-# 验 step 4b — medeleg delegate ecall_from_S 给 S handler 真生效。
+# 验 medeleg delegate ecall_from_S 给 S handler 真生效 (deliver_priv 按 medeleg.bit
+# 派发, 不是 hard-coded PRIV_M)。
 #
 # 模板: .S + .c (跟 a_01_8 fixture 02/03 同; 需要 setup_pt 建 SV32 PT)。
 #
@@ -10,7 +11,7 @@
 #      sp + mtvec → m_handler + stvec → s_handler + medeleg = (1<<9) (delegate ecall_from_S)
 #      call setup_pt + csrw satp + sfence + mret 切 S
 #   2. S phase: addi x11, x0, 1 (S phase 标记) + ecall (cause=9 ecall_from_S)
-#   3. trap_set_state 内 (4b 加): hart->priv=S + cause=9 + medeleg.bit(9)=1 → deliver_priv=S
+#   3. trap_set_state 内: hart->priv=S + cause=9 + medeleg.bit(9)=1 → deliver_priv=S
 #      → 写 [PRIV_S] 槽 (scause=9, sepc=s_target ecall PC) + 写 SPP/SPIE/SIE → 跳 stvec=s_handler
 #   4. S handler:
 #      csrr x10, scause (期望 9; 验 medeleg deliver S 真写 [PRIV_S] 槽)
@@ -23,7 +24,7 @@
 #   6. m_handler 走不到 (m_handler 段为空, 跟 halt label 同地址但永不执行)
 #
 # 期望 main dump:
-#   x10 = 9              (scause; 4b deliver S 写 [PRIV_S] 槽 — 核心验证点)
+#   x10 = 9              (scause; deliver S 写 [PRIV_S] 槽 — 核心验证点)
 #   x11 = 1              (S phase 标记)
 #   x12 = 0x8000005C     (s_target ecall PC; sepc 第 1 次 deliver 写)
 #   mcause = 0           (deliver M 路径从未走过, mcause 保持初值 0)
@@ -34,16 +35,16 @@
 #   in_trap = 3
 #
 # 关键验证点:
-#   - x10 = 9 → step 4b medeleg deliver S 真生效 (4a 时此值会是 0; 因 deliver M 写 mcause=9
-#     而不是 scause=9, scause 保持 0)
-#   - priv = 1 (PRIV_S) → 4b 真切到 S 后保持 (4a 时 priv 永远是 M=3)
-#   - mcause = 0 → deliver M 路径从未走过 (4a 时 mcause = 9 因 ecall_from_S deliver M)
+#   - x10 = 9 → medeleg deliver S 真生效 (deliver_priv 按 medeleg.bit 派发, 不是
+#     hard-coded PRIV_M; 后者会让 mcause=9, scause=0)
+#   - priv = 1 (PRIV_S) → 真切到 S 后保持
+#   - mcause = 0 → deliver M 路径从未走过 (hard-coded PRIV_M 形态下 mcause=9)
 #
-# 失败模式 (4b 没生效, 仍 hard-coded PRIV_M):
+# 反例 (deliver_priv 仍 hard-coded PRIV_M, 用 medeleg 派发未实装时):
 #   - x10 = 0 (scause 没写)
 #   - mcause = 9 (ecall_from_S 直接 deliver M)
 #   - priv = 3 (M; 没切 S)
-#   这种情况能立即识别 4b 没生效。
+#   这种情况能立即识别 medeleg 真接的回归 bug。
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0

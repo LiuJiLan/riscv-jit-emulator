@@ -1,18 +1,18 @@
 //
 // Created by liujilan on 2026/4/28.
-// 入口。本文件按 reset 三层 lifecycle 组织 (a_02_t5_plan.md §3 / start_plan_a_02.md
-// §T5 "host runtime + reset 三层 lifecycle"):
+// 入口。本文件按 reset 三层 lifecycle 组织:
 //
 //   POR (Power-On Reset) — 进程启动一次
 //     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) / cpu_create
 //     (内部已写硬件 reset 默认状态)
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
-//     clint_start_timer (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
+//     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join)
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
-//     dispatcher(hart) / SR-vs-shutdown 判断 (T5 简化恒 shutdown)
+//     dispatcher(hart) / SR-vs-shutdown 判断 (当前简化恒 shutdown; if(0) 骨架
+//     占位预留真 SR 路径)
 //
 //   HART reset — dispatcher 内部 per-hart 重启 (future; dispatcher.c 末段注释占位)
 //
@@ -289,8 +289,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // CLINT 注册到 bus (ram_init 之后, dispatcher 启动之前; 多线程 timer 真接
-    // 在 T5, 现在只走 MMIO 读写路径)。详 platform/clint.h。
+    // CLINT 注册到 bus (ram_init 之后, dispatcher 启动之前)。本调用不发线程,
+    // timer 辅助线程由下方 clint_start_timer_thread 显式起 (谁 spawn 谁 join, dummy.txt
+    // §12)。详 platform/clint.h。
     if (clint_init() != 0) {
         fprintf(stderr, "clint_init failed\n");
         return 1;
@@ -344,13 +345,11 @@ int main(int argc, char **argv) {
 
     // main 起 timer 辅助线程 (受 SDS 控制, 跨 system reset 一直跑; 见 dummy.txt
     // §12 谁 spawn 谁 join + clint.h 顶段 doc)。
-    if (clint_start_timer() != 0) {
-        fprintf(stderr, "clint_start_timer failed\n");
-        clint_destroy();   // 跟主路径 destroy 顺序一致
-        cpu_destroy(hart);
-        ram_destroy();
-        return 1;
-    }
+    //
+    // 错误不走分支 — clint_start_timer_thread 内部 fail 路径 fprintf + set SRS=0 +
+    // SDS=0 (release); 下面 while 因 SRS=0 自然不进, 直接走 cleanup 路径。
+    // 不分 spawn-fail error path, destroy chain 只在 while 外写一次。
+    clint_start_timer_thread();
 
     // ------------------------------------------------------------------------
     // 主 while: system reset 每 iter 进一次
@@ -363,30 +362,37 @@ int main(int argc, char **argv) {
         (void)clint_reset();
 
         // ====================================================================
-        // 占位: SRS-controlled 线程 spawn (未来多 hart pthread_create per hart;
-        // 受 SRS 控制 — 每 iter spawn / join, 跟 system reset 同步起停)
-        // 当前单 hart 直调 dispatcher
+        // 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
+        // system reset 同步起停。
+        //
+        // 范围 = 所有"跟 system reset 周期绑定" 的线程, 不限于 hart:
+        //   - 未来多 hart 走 pthread_create per hart (主要 case)
+        //   - 其他受 SRS 控制的辅助线程也走这里 (跟 timer/monitor 类受 SDS
+        //     控制的"跨 system reset 持续运行" 辅助线程分开 — 那类在 POR
+        //     段 spawn / POR 收尾段 join, 不在本 while 内)
+        //
+        // 当前单 hart 直调 dispatcher。
         // ====================================================================
         dispatcher(hart);
         // ====================================================================
-        // 占位: SRS-controlled 线程 join (未来多 hart pthread_join 各 hart 退;
-        // 受 SRS 控制的辅助线程也在这里 join)
+        // 占位: 所有 SRS-controlled 线程 join — 跟上面 spawn 对偶, 同范围
+        // (hart 线程 + 其他受 SRS 控制的辅助线程都在这里 join, 不限于 hart)。
         // ====================================================================
 
         // ====================================================================
-        // T5 简化: 区分 system reset 重 iter vs shutdown 退出
+        // 区分 system reset 重 iter vs shutdown 退出
         //
-        // "只需要 SR" 临时恒 0 — 因为 timer thread 受 SDS 控制, 必须有人通知
-        // 它停止才能干净退进程。未来真做 system reset 重 iter 时:
+        // 当前简化: "只需要 SR" 恒 0 — 因为 timer thread 受 SDS 控制, 必须有人
+        // 通知它停止才能干净退进程, 没真 "reset 重 iter" 路径。未来真做时:
         //   - 区分条件: 某种状态判断 (例如 dispatcher 退出原因 / 外部 reset
         //               trigger / hart 是否参与本轮 reset 等)
         //   - SR 路径: continue (复位 SRS=1; timer 不重启, 跨 reset)
         //   - shutdown 路径: 走 else (set SDS, join, 退)
         //
-        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" / "block 3 完整形态"
-        // (L266~L288 风格) 一致: 实装能跑的部分 + 注释表达未来扩展。
+        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" 一致风格: 实装能跑的部分
+        // (else 分支) + if(0) 骨架表达未来扩展。
         // ====================================================================
-        if (0 /* SR_only; T5 恒 0 — timer 需 SDS 通知, 没真 reset 重 iter */) {
+        if (0 /* SR_only; 当前恒 0 — timer 需 SDS 通知, 没真 reset 重 iter */) {
             atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
             continue;
         } else {
@@ -398,11 +404,21 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → dump → 三 destroy
     //
-    // clint_join_timer 调用前置 (SDS=0) 在 while else 分支或 break 路径已做; 这里
-    // pthread_join 不会永远 block。dump 在 join 之后 / destroy 之前 (hart 字段
-    // 仍可读, 让 fixture 肉眼对照期望值)。
+    // clint_join_timer_thread 调用前置 (SDS=0) 在三条路径之一已做:
+    //   1. 正常 path: while else 分支 set SDS=0 + break
+    //   2. spawn fail path: clint_start_timer_thread 内部 set SRS=0 + SDS=0
+    //      (while 因 SRS=0 不进, SDS=0 已生效)
+    //   3. dispatcher tri-fault path: dispatcher 函数末 set SRS=0 → while 退 →
+    //      else 分支 set SDS=0 + break
+    // pthread_join 不会永远 block。
+    //
+    // 注: spawn fail path 下 clint.timer_thread 是 BSS 0 init, pthread_join 在
+    // glibc/musl 下返 ESRCH "No such process", fprintf 一行不 fatal。详
+    // clint.h clint_join_timer_thread 顶段 doc。
+    //
+    // dump 在 join 之后 / destroy 之前 (hart 字段仍可读, 让 fixture 肉眼对照期望值)。
     // ------------------------------------------------------------------------
-    clint_join_timer();
+    clint_join_timer_thread();
 
     /* dump 格式:
      *   - reg 分 [reg dec] + [reg hex] 两段, 每段 x1-x31 (x0 跳过, 占位 pc)

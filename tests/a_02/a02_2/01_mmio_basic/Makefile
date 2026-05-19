@@ -1,5 +1,5 @@
 # a02_2 / 01_mmio_basic
-# 产出 out.bin: CLINT MMIO 读写基础验证 fixture (T1 阶段)。
+# 产出 out.bin: CLINT MMIO 读写基础验证 fixture。
 # 跑法: ./jit-emu out.bin; main dump 段验证 a0 / a1 / a2 / a3 / a4 寄存器值。
 # 详 stub.S 顶部注释。
 

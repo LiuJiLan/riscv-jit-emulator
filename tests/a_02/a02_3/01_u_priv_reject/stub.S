@@ -1,6 +1,6 @@
 # a02_3 / 01_u_priv_reject
-# P5 priv check fixture — U-mode 调 SYSTEM priv-required 指令 (MRET / SRET /
-# SFENCE.VMA) reject 验证 (a_02 session_005)。
+# priv check fixture — U-mode 调 SYSTEM priv-required 指令 (MRET / SRET /
+# SFENCE.VMA) reject 验证。
 #
 # 触发 case (3 个; 都期望 cause=2 illegal + tval=raw_inst):
 #   case 0: U-mode mret           → cause 2, tval = 0x30200073
@@ -17,7 +17,7 @@
 #   - 启动 priv=M (cpu_create 默认); 写 mstatus.MPP=PRIV_U=0 + mepc=u_test, mret
 #     一次切到 U-mode (M-mode mret 走 PRIV_CHECK_OR_TRAP(PRIV_M) 通过, M >= M)
 #   - U-mode 三条指令依次 trap; 每次 PRIV_CHECK_OR_TRAP 触发 cause 2 + tval=raw_inst
-#     (interpreter case 入口判, a_02 session_005 P5)
+#     (interpreter case 入口判)
 #   - mtvec 指 m_handler, handler 用 s0 计数分流, 写 cause / tval 到 a 寄存器
 #   - medeleg=0 (默认; cpu_create 时 trap._medeleg=0), illegal-inst trap 全 deliver 到 M
 #

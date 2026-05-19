@@ -1,4 +1,4 @@
-# a_01_5_c / 04_trap_chain
+# a_01_5 / 04_trap_chain
 # 见 stub.S 顶部 doc。
 
 TOOL    := riscv64-unknown-elf

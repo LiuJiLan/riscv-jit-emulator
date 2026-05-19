@@ -1,9 +1,10 @@
 # a02_4 / 01_mip_mie_basic
-# mie / mip / sip 基本读写 + mie WARL 截断 验证 (T2: csr 入口 + 字段就位).
+# mie / mip / sip 基本读写 + mie WARL 截断 验证 (csr 入口 + 字段就位).
 #
 # BARE M-mode 启动 (priv=M, satp=0); 不切 S, 不依赖 mret / medeleg.
-# T2 阶段 IRQ 永远不来; mip 异步源 (CLINT.msip=0 / mtime=0 / mtimecmp=UINT64_MAX
-# clint_init 初值) + _mip_sw=0 → 合成 mip 应为 0.
+# 本 fixture IRQ 永远不来 — mip 异步源 (CLINT.msip=0 / mtimecmp=UINT64_MAX
+# clint_init 初值 → MTIP=0 即使 mtime 由 timer 累加也极远不到 UINT64_MAX) +
+# _mip_sw=0 → 合成 mip 应为 0.
 #
 # 期望最终寄存器:
 #   a0 (x10) = 0x00000288   csrw mie set (M_TIMER=128 | M_SOFT=8 | S_EXT=512), 直读 mie
@@ -22,7 +23,7 @@ _start:
     csrw    mie, t0
     csrr    a0, mie                              # a0 = 0x288
 
-    # --- 2. csrr mip — T2 阶段无 IRQ 源 + _mip_sw=0 → 0 ---
+    # --- 2. csrr mip — 无 IRQ 源 + _mip_sw=0 → 0 ---
     csrr    a1, mip                              # a1 = 0
 
     # --- 3. csrr sip — 同形态合成 + mask, 0 ---

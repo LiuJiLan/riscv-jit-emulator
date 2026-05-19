@@ -1,5 +1,5 @@
 # a02_4 / 01_mip_mie_basic
-# 产出 out.bin: mie / mip / sip 基本读写 + WARL 截断 验证 fixture (T2 阶段).
+# 产出 out.bin: mie / mip / sip 基本读写 + WARL 截断 验证 fixture.
 # 跑法: ./jit-emu out.bin; main dump 段验证 a0 / a1 / a2 / a3 寄存器值.
 # 详 stub.S 顶部注释.
 

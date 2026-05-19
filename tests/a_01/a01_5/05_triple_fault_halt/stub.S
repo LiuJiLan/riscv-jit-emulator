@@ -1,11 +1,11 @@
-# a_01_5_c / 05_triple_fault_halt
+# a_01_5 / 05_triple_fault_halt
 # 验证项目内部停机协议: csrw mtvec,x0 + ecall 触发 triple fault 链 → in_trap=3 dispatcher 退出。
 # 2 条指令 = 8 字节 (32-bit only, .option norvc)。
 #
 # 这是项目当前的"标准停机机制" (dummy.txt §1 + 候选 A): hart 被 reset 时对应 mtvec=0 的状态,
 # guest 触发任何 trap 都会跳 0, fetch 0 失败, 又 trap, 直到 in_trap >= 3 dispatcher 退出。
 # 未来 MMIO bus / sifive_test 起来后, 改 MMIO finisher 路径 (例如 sifive_test 0x100000 写
-# finisher value), 但当前 a_01_5_c 用 triple fault 当停机协议。
+# finisher value), 但当前 a_01_5 用 triple fault 当停机协议。
 #
 # 期望:
 #   x1 = x2 = x3 = 0       (没设)

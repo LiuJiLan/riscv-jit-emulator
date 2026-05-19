@@ -117,7 +117,7 @@ typedef struct {
     //   trap_set_interrupt_state 按 mideleg.bit(cause_low) 派发 deliver_priv
     //   (U/S-mode 时 bit=1 → S, bit=0 → M; M-mode 总 M)。trap_check_interrupt 算
     //   deliver_mask 时也读 mideleg 决定哪些 IRQ 在当前 priv 下接受。
-    uint32_t  mideleg;         // csr 入口 mideleg (0x303); T3+T4 中断机制真接
+    uint32_t  mideleg;         // csr 入口 mideleg (0x303)
 
     // 第 (2a) 类: 副本基本字段 (mie / sie 两 csr 入口同级看不同 mask 子集, dummy.txt §6)。
     // mie 入口看全部 32 位 (项目用 bit 1/3/5/7/9/11 = IRQ_S/M × SOFT/TIMER/EXT 六位,
@@ -235,7 +235,7 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low);
 // 返非 0 = 已调 trap_set_interrupt_state, dispatcher 应 continue (重派发 from xtvec)
 //
 // 内部步骤:
-//   1. mip_view = csr_mip_read(hart)                        // T2 合成读: _mip_sw | clint pending
+//   1. mip_view = csr_mip_read(hart)                        // 合成读: _mip_sw | clint pending
 //   2. enabled = mip_view & hart->trap._mie
 //   3. deliver_mask = 按当前 priv + mstatus.MIE/SIE + mideleg 决定哪些 IRQ 在本 priv 接受
 //        priv=M: mstatus.MIE ? MIE_VALID_MASK : 0

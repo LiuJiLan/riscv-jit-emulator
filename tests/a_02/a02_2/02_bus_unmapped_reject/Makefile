@@ -1,5 +1,5 @@
 # a02_2 / 02_bus_unmapped_reject
-# 产出 out.bin: bus_dispatch_* 未命中 reject fixture (T1 阶段; bus 自产 access fault)。
+# 产出 out.bin: bus 未命中 reject fixture (bus 自产 access fault)。
 # 跑法: ./jit-emu out.bin; main dump 段验证 a0 / a1 / a2 / s0 寄存器值。
 # 详 stub.S 顶部注释。
 

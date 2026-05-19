@@ -27,7 +27,7 @@
 //                 表头。多 hart 线程 + 辅助线程都可能读写, 需 atomic。
 //   thread-local: debug_cnt 等 host trace 状态。当前 hart 线程独占 (单 hart);
 //                 SMP 多 hart 时若要"全局密度"需 atomic / 若要"per-hart 密度"
-//                 改 per-hart 字段 (T5 时确认)。
+//                 改 per-hart 字段 (SMP 真做时确认)。
 //
 // 关键: "多 hart" ≠ "多线程"。timer / monitor 等辅助线程数不算 hart 数 (它们不持
 // cpu_t, 不影响 misa / mhartid 等 hart-counting 属性)。
@@ -40,7 +40,7 @@
 #include <stdio.h>
 
 // 全局 trace tick counter。单 hart 单线程下安全; SMP 多 hart 时按上方
-// "thread-local"分类策略改 atomic 或 per-hart 字段 (T5 时确认)。
+// "thread-local"分类策略改 atomic 或 per-hart 字段 (SMP 真做时确认)。
 extern uint32_t debug_cnt;
 
 // DEBUG_TICK_TH: trace 流自动换行阈值 (每 N 个事件后 fputc('\n'))。80 按经典终端

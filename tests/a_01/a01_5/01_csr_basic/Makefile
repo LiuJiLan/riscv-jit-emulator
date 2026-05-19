@@ -1,7 +1,8 @@
-# a_01_5_a / 01_csr_basic
+# a_01_5 / 01_csr_basic
 # 产出 out.bin: 32 字节, 1 addi + 6 csr 变体 + 1 ecall, loader 加载到 GUEST_RAM_START。
 #
-# 验证目标 (a_01_5_a 阶段):
+# 验证目标 (注: fixture 描述含 csr stub 阶段叙事; csr 已完整实装后期望 + stderr 输出
+# 可能跟下文 doc 不一致, 留 T6.2 fixture 注释统一时校准):
 #   - decode 路径: 6 个 csr op_kind 都路由对 (Step 1 + decode_test 已验)
 #   - csr_op 大 helper 分发对 (stderr 出 6 read 占位 + 5 write 占位; csrrsi zimm=0 不写)
 #   - 硬边界路径: 每条 csr 独立 block, dispatcher 多次重派发 (total_count=7)

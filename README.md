@@ -339,7 +339,7 @@ graph TD
     Cpu --> Disp[dispatcher]
     Disp --> Sj[sigsetjmp 永久落点]
     Sj --> Wh{"in_trap < 3?"}
-    Wh -->|true| Hd["迭代头扫尾<br/>count 累加 / 未来 mtime / 中断检查"]
+    Wh -->|true| Hd["迭代头扫尾<br/>count 累加 / trap_check_interrupt"]
     Hd --> B1["block 1<br/>regime + current_tlb"]
     B1 --> B2["block 2<br/>mmu_translate_pc<br/>→ (pa, hva)"]
     B2 --> B3["block 3<br/>interpret_one_block"]
@@ -350,6 +350,171 @@ graph TD
     Wh -->|false| Halt["halt<br/>(bit 0-1 = 3 或 bit 3 设)"]
     Halt --> Dump["main: dump<br/>reg / trap / state"]
 ```
+
+
+## 多线程 + reset lifecycle
+
+a_02 T5 落地后, 项目从单线程 (hart 线程独占 mtime 推进) 演化为多线程
+(hart 线程 + timer 辅助线程并发, atomic mtime + monitor 模型同步)。本节
+集中描述 main 流程 / 三层 reset / monitor 行为 / 错误处理统一走 signal
+通道的伪码。详细协议见 `src/dummy.txt §7` (monitor 模型) + `§12` (谁
+spawn 谁 join), 信号语义见 `src/runtime.h` 顶段 doc。
+
+### 三层 reset lifecycle
+
+```mermaid
+graph LR
+    A["POR<br/>(Power-On Reset)"] --> B["System reset<br/>(main while 每 iter)"]
+    B --> A2["POR 收尾<br/>(while 退出后)"]
+    B -.->|cpu_reset / clint_reset| B
+    subgraph "未来 (future)"
+        Hr["HART reset<br/>(dispatcher 内部 per-hart 重启)"]
+    end
+    B -.->|跟 HART reset 协同| Hr
+```
+
+- **POR (Power-On Reset)** — 进程启动一次: ram_init / clint_init / cpu_create
+  (内部已写硬件 reset 默认状态) / 显式 set SRS=1 SDS=1 / 起 timer 辅助线程
+  (clint_start_timer_thread)。timer 辅助线程跨 system reset 一直跑 (跟真硬件
+  RTC oscillator 不掉电不停一致), 随 SDS 才退
+- **System reset** — main while 每 iter: cpu_reset (regs/pc/mstatus/in_trap 清,
+  保留 hartid hardwired) + clint_reset (mtimecmp/msip 清回 sentinel, **mtime
+  不动 timer 不动**) + dispatcher(hart) + 区分 SR-only 重 iter vs shutdown 退
+  出 (当前简化恒 shutdown, if(0) 占位预留)
+- **HART reset** — dispatcher 内部 per-hart 重启 (future; dispatcher.c 末段
+  注释占位); SMP 多 hart 时单 hart fail 不影响其他 hart
+
+### main 流程伪码 (当前形态, a_02 T5 落地)
+
+```c
+int main(int argc, char **argv) {
+    /* === POR === */
+    ram_init();                   // 失败 → main 返 1
+    clint_init();                 // 失败 → main 返 1 (走 destroy chain + return)
+    cpu_t *hart = cpu_create();   // 失败 → main 返 1
+
+    /* lifecycle 信号显式 set 1 (跟 runtime.c BSS 1 init 兜底重叠, 但显式更可读) */
+    atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
+    atomic_store_explicit(&shutdown_signal,     1, memory_order_release);
+
+    /* 起 timer 辅助线程; 失败内部 fprintf + set SRS=0 + SDS=0;
+       main 不 check, 不分 error path — 错误走 SRS/SDS signal 通道 */
+    clint_start_timer_thread();
+
+    /* === System reset === */
+    while (atomic_load_explicit(&system_reset_signal, memory_order_acquire)) {
+        cpu_reset(hart);
+        clint_reset();
+
+        /* 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
+           system reset 同步起停 (例: 未来多 hart 走 pthread_create per hart;
+           其他受 SRS 控制的辅助线程也在这里) */
+        dispatcher(hart);                   /* 单 hart 直调; tri-fault 内部 set SRS=0 */
+        /* 占位: 所有 SRS-controlled 线程 join — 跟上面 spawn 对偶 (hart 线程 +
+           其他受 SRS 控制的辅助线程都在这里 join) */
+
+        /* SR-only vs shutdown 分支 (当前简化恒 shutdown) */
+        if (0 /* SR_only 占位; 未来真做 reset 重 iter */) {
+            atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
+            continue;
+        } else {
+            atomic_store_explicit(&shutdown_signal, 0, memory_order_release);
+            break;
+        }
+    }
+
+    /* === POR 收尾 === */
+    clint_join_timer_thread();    /* timer thread 看到 SDS=0 自然退后 join */
+    /* dump (reg + trap + state) */
+    clint_destroy();
+    cpu_destroy(hart);
+    ram_destroy();
+    return 0;
+}
+```
+
+三种退出路径都收敛到 `while → join → cleanup → return 0`:
+
+1. **正常退出** (dispatcher tri-fault): dispatcher 函数末 `atomic_store(&SRS,
+   0, release)` → main while 退 → else 分支 set SDS=0 → break → join (正常退) →
+   cleanup
+2. **timer spawn 失败**: clint_start_timer_thread 内 `atomic_store(&SRS, 0) +
+   atomic_store(&SDS, 0)` → main while 因 SRS=0 不进 → SDS 已 0 (else 分支不执行) →
+   join (pthread_t = BSS 0, glibc 返 ESRCH fprintf 一行不 fatal) → cleanup
+3. **timer routine 内部 fail** (clock_nanosleep / clock_gettime errno): timer
+   routine 同样 set SRS=0 + SDS=0 + return NULL → main while 退 → else 分支
+   set SDS=0 (已是 0 no-op) → break → join (timer thread 已 return, 正常 join) →
+   cleanup
+
+错误处理统一走 SRS/SDS signal 通道, **不分 error path** — destroy chain 只在
+cleanup 段写一次, 不在 spawn-fail / dispatcher-fail 路径重复。
+
+### monitor 行为 (dummy.txt §7)
+
+来自 Hoare/Hansen 并发 monitor 范式 — 每个共享状态模块封装内部 atomic 字段 +
+memory_order, 对外只暴露 consumer / producer 接口; 调用方不感知内部同步细节。
+
+项目内两个实例:
+
+```mermaid
+graph TB
+    subgraph "clint = 完整 monitor"
+        CL_State["_Atomic mtime / mtimecmps[N] / msip[N]<br/>+ pthread_t timer_thread"]
+        CL_Actor["file-static timer_run<br/>(异步 atomic_fetch_add mtime)"]
+        CL_Cons["consumer:<br/>is_clint_msip_pending<br/>is_clint_timer_pending<br/>clint_read"]
+        CL_Prod["producer:<br/>clint_write"]
+        CL_Life["lifecycle:<br/>clint_init / clint_reset / clint_destroy<br/>clint_start_timer_thread / clint_join_timer_thread"]
+    end
+
+    subgraph "runtime = degenerate monitor"
+        RT_State["extern _Atomic int<br/>system_reset_signal (SRS)<br/>shutdown_signal (SDS)"]
+        RT_Use["caller 直接 atomic_load_explicit /<br/>atomic_store_explicit (无封装函数)"]
+    end
+```
+
+- **clint** = 完整 monitor: 三函数 lifecycle (init / reset / destroy) + spawn /
+  join 对偶 (clint_start_timer_thread / clint_join_timer_thread, main 端显式调,
+  不埋 destroy 内); file-static timer_run routine 跑在内部 actor, 不持 cpu_t
+  只动 shared 字段。memory_order: producer release (atomic_fetch_add &mtime) /
+  consumer acquire (is_clint_timer_pending / clint_read), 配对建立 happens-
+  before
+- **runtime** = degenerate monitor (单 flag 简化): `extern _Atomic int` 直接
+  读写, 无封装函数; 单字段无跨字段一致性问题, 不强制接口函数。"SDS 蕴含 SRS"
+  触发关系契约 — set SDS=0 之前必须先 set SRS=0 ("通知所有辅助线程退" 蕴含
+  "system 自己也得退")
+
+外部模块 (csr.c / dispatcher.c / bus.c 等) **不直接 atomic_\* 操作 clint 内部
+字段**, 一律走 consumer/producer 接口。例: csr_mip_read 合成读时走
+`is_clint_msip_pending(hartid) | is_clint_timer_pending(hartid)`, 不直接
+`atomic_load_explicit(&clint.mtime, ...)` (后者破坏 monitor encapsulation,
+违反 dummy.txt §7)。
+
+### 协作式停机协议 (dummy.txt §12 + runtime.h)
+
+```
+spawn 调用方 (main)      worker thread (timer_run)       lifecycle signal
+─────────────────       ────────────────────────        ────────────────
+SRS = 1, SDS = 1                                        runtime.c
+clint_start_timer_thread() ─→  pthread_create
+                                                        SRS = 1, SDS = 1
+                          ─→  while(atomic_load(SDS))
+                                accumulate mtime
+                                ...
+正常: dispatcher tri-fault                              SRS = 0 (dispatcher)
+main while 退                                           SDS = 0 (main else 分支)
+                          ←  timer 看到 SDS=0 退
+clint_join_timer_thread() ←  pthread_join
+cleanup chain
+return 0
+```
+
+- **不用 pthread_cancel / pthread_kill**: deferred cancel 在 interpreter / JIT
+  深栈取消 = 状态半更新风险; pthread_kill 是发 signal SIGKILL 杀整进程不是
+  杀线程; 一律 cooperative (atomic flag + worker periodic check + main join)
+- **不引入 SIGINT/SIGTERM signal handler**: Ctrl-C 默认杀进程足够 (atomic_fetch_add
+  是 lock-prefixed 单指令, 杀进程不破坏数据); 等 reset 体系成熟 (a_03+) 再做
+- **destroy 函数纯 cleanup**: 不含 pthread_join (避免控制流隐式 block); spawn /
+  join 对偶函数单独暴露由 spawn 调用方显式 join
 
 
 ## 当前已落地

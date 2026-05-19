@@ -1,18 +1,16 @@
 # a02_6 / 01_clint_mtime_async
-# 验 T5 timer 辅助线程真异步累加 atomic clint.mtime:
+# 验 timer 辅助线程真异步累加 atomic clint.mtime:
 #   1. 读 CLINT mtime 低 32 (MMIO @ 0x0200BFF8) → t0
 #   2. poll 等 mtime 值变 (max 10M iter 防卡死) → t1
 #   3. 验 t1 > t0 → s0=1 success / 否则 s0=0xBAD fail
 #   4. ecall → mtvec=0 triple fault halt
 #
-# 期望 (T5 timer thread 真接后, 1ms 一次 fetch_add += TIMEBASE_PER_WAKE=10000):
+# 期望 (1ms 一次 fetch_add += TIMEBASE_PER_WAKE=10000):
 #   host CPU ~ns 量级跑 poll, mtime 真异步推进; 几 ms host wall clock 后 t1 必 > t0,
 #   delta 大概率 ~10000 量级 (一次 wake) 或更多 (跨多个 wake; host schedule 抖动).
 #
-# 跟 a02_5 fixture 区别: a02_5 各 在 T3 临时 setter 下 mtime 跟 dispatcher 指令数
-# 1:1 锁步 (主帧步进); 本 fixture 走 T5 后 mtime 真异步, poll loop 内只有 lw +
-# beq, 没指令数依赖 — 如果 timer thread 不真跑, poll 永远 stuck 直到 iteration
-# 耗尽 → fail (s0=0xBAD).
+# 本 fixture poll loop 内只有 lw + beq, 没指令数依赖 — 如果 timer thread 不真跑,
+# poll 永远 stuck 直到 iteration 耗尽 → fail (s0=0xBAD)。
 #
 # trace 期望 (debug.h 互斥协议): 'f' 个数取决于 poll 多少轮才看到变化 (各 block
 # 结束 boundary 再 refetch 一次), 末段 'Ef' × 3 (halt path ecall triple fault).

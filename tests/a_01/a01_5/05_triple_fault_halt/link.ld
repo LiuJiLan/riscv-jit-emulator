@@ -1,4 +1,4 @@
-/* a_01_5_c / 05_triple_fault_halt linker script
+/* a_01_5 / 05_triple_fault_halt linker script
  * .text 钉 0x80000000 (GUEST_RAM_START)
  */
 

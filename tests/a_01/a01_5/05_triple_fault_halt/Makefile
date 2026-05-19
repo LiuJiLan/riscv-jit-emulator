@@ -1,4 +1,4 @@
-# a_01_5_c / 05_triple_fault_halt
+# a_01_5 / 05_triple_fault_halt
 # 见 stub.S 顶部 doc。
 
 TOOL    := riscv64-unknown-elf

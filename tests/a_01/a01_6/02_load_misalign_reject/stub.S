@@ -37,7 +37,7 @@
 #   block 3 (RAM+0x18): csrr x1, mcause(boundary)         count=1,  total=4   x1=4
 #   block 4 (RAM+0x1c): csrr x2, mtval(boundary)          count=1,  total=5   x2=0x80001001
 #   block 5 (RAM+0x20): csrr x3, mepc(boundary)           count=1,  total=6   x3=0x80000014
-#                        (handler 内 csrr 之间不连成一块, 跟 a_01_5_c 03_csr_rw 一致)
+#                        (handler 内 csrr 之间不连成一块, 跟 a_01_5 03_csr_rw 一致)
 #   block 6 (RAM+0x24): csrw mtvec, x0(boundary)          count=1,  total=7   mtvec=0
 #   block 7 (RAM+0x28): ecall → trap longjmp              count++ 不到, total=7
 #                        in_trap 1→2, _cause=11, _tval=0, _epc=RAM+0x28, regs[0]=mtvec=0

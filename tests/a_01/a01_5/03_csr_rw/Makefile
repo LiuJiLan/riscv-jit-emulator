@@ -1,4 +1,4 @@
-# a_01_5_c / 03_csr_rw
+# a_01_5 / 03_csr_rw
 # 见 stub.S 顶部 doc。
 
 TOOL    := riscv64-unknown-elf

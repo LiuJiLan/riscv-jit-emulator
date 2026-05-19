@@ -50,6 +50,6 @@ _start:
     # ---- 测试 3: lbu zero-ext (同字节, 验 helper 不做 sext) ----
     lbu  x3,  4(x6)         # 0x8000001c: x3 = zext(0xFF) = 0xFF
 
-    # ---- 停机 (项目内部 triple fault 协议, 跟 a_01_5_c 05_triple_fault_halt 一致) ----
+    # ---- 停机 (项目内部 triple fault 协议, 跟 a_01_5 05_triple_fault_halt 一致) ----
     csrw mtvec, x0          # 0x80000020: mtvec = 0 (准备 triple fault)
     ecall                   # 0x80000024: trap → 跳 0 → mmu fail x2 → triple fault 退出

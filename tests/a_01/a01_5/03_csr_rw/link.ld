@@ -1,4 +1,4 @@
-/* a_01_5_c / 03_csr_rw linker script
+/* a_01_5 / 03_csr_rw linker script
  * .text 钉 0x80000000 (GUEST_RAM_START)
  */
 

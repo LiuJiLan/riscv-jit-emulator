@@ -1,9 +1,11 @@
 # a_01_9 / 02_m_s_trap_csrs
-# 验 step 4a 加的 7 个 csr (mscratch + medeleg + mideleg + sscratch + stvec + scause + stval)
-# csrw + csrr 字段值。
+# 验 7 个 csr (mscratch + medeleg + mideleg + sscratch + stvec + scause + stval) csrw +
+# csrr 字段值。
 #
-# 测试组织 (a_01_session_012 D11): 4a 阶段 deliver_priv 仍 hard-coded PRIV_M, 没接 medeleg
-# 真生效路径; 本 fixture 只在 M 态测 csrw/csrr 字段读写, 不测 trap delivery (那是 4b 的事)。
+# 测试组织: 本 fixture 只在 M 态测 csrw/csrr 字段读写, 不测 trap delivery (那归
+# a_01_9/03 medeleg_deliver_s)。stvec WARL "MODE 低 2 位截到 0" 描述: csrw 0x80100003
+# 写入 mode = 0b11 reserved → WARL 落 0, 结果 0x80100000; 跟"接受 mode=0/1 + reserved
+# 落 0"的真 WARL 行为巧合一致, 期望值仍对 (本 fixture 不测 mode=1 vectored case)。
 #
 # 模板: 纯 .S (跟 fixture a01_9/01 同; 没 PT 建立工作)。
 #

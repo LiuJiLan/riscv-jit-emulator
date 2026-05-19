@@ -1,5 +1,5 @@
 # a02_4 / 03_mip_sw_writable
-# 产出 out.bin: csrw mip 写软件位 (SSIP/STIP/SEIP_sw) 验证生效 fixture (T2 阶段).
+# 产出 out.bin: csrw mip 写软件位 (SSIP/STIP/SEIP_sw) 验证生效 fixture.
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

@@ -1,4 +1,4 @@
-# a_01_5_a / 01_csr_basic
+# a_01_5 / 01_csr_basic
 # 验证 csr decode 路径 + csr_op 大 helper 分发 + 硬边界 dispatcher 多块循环。
 # 8 条指令 = 32 字节 (32-bit only, .option norvc 强制不生 RVC)。
 #
@@ -26,9 +26,10 @@
 #   read mtval                          (csrrsi zimm=0 不写)
 #   read mtvec → write mtvec=0        (csrrci zimm=31 但 read_old=0 & ~0x1F = 0)
 #
-# 注: a_01_5_a 阶段 csr 无物理存储 (read 永远返 0), 写写不进, 所以连续写同一 csr 也读不出
-#     "上次写过的值"。这是 a_01_5_b 的范围 (cpu_t 加 trap_csrs_t + 小 helper 改真读写)。
-#     当前 fixture 仅验证 "decode + 大 switch 分发 + 硬边界 + dispatcher 多块" 四件事。
+# 注: 本 fixture 描述写于 csr stub 阶段 (csr 无物理存储, read 永远返 0); csr 已完整
+#     实装后期望寄存器值不再全 0 (例 x6 = csrrci 读 mtvec 应是上次 csrrw 写入的 0x42
+#     不是 0)。fixture 期望校准留 T6.2 (fixture 注释统一); 本 fixture 验证的核心
+#     ("decode + 大 switch 分发 + 硬边界 + dispatcher 多块") 仍成立。
 
 .section .text
 .option norvc                       # 强制不生 RVC; csr 指令本身就是 32-bit

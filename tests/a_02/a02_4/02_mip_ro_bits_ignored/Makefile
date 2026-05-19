@@ -1,5 +1,5 @@
 # a02_4 / 02_mip_ro_bits_ignored
-# 产出 out.bin: csrw mip 写 RO 位 (MSIP/MTIP/MEIP) 验证忽略 fixture (T2 阶段).
+# 产出 out.bin: csrw mip 写 RO 位 (MSIP/MTIP/MEIP) 验证忽略 fixture.
 # 跑法: ./jit-emu out.bin; main dump 段验证 a0 寄存器值.
 
 TOOL    := riscv64-unknown-elf
