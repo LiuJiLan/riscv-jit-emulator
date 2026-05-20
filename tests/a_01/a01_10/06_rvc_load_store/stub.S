@@ -1,10 +1,13 @@
 # a_01_10 / 06_rvc_load_store
+#
+# ===== 测试目的 =====
 # 验 RVC load/store case (a_01_10 (7) step 4):
 #   C.LW   (C0 funct3=010, CL-format) — load word, rd'/rs1' 都 3-bit (x8-x15)
 #   C.SW   (C0 funct3=110, CS-format) — store word, rs1'/rs2' 都 3-bit
 #   C.LWSP (C2 funct3=010, CI-format) — load word sp-relative, rd 5-bit
 #   C.SWSP (C2 funct3=110, CSS-format) — store word sp-relative, rs2 5-bit
 #
+# ===== 思路 =====
 # 模板风格: 纯 .S, BARE M-mode (无 SV32 / 无 PT), 套 a_01_3/02_arith_compressed; -march=rv32imac。
 # BARE M-mode 下 lsu identity 路径: gva == pa (current_tlb=NULL), 直接 host load/store。
 #
@@ -21,26 +24,6 @@
 #   (b) C.SWSP + C.LWSP (sp-relative, offset 16): x11=7 → mem[sp+16] → x12
 #   (c) C.SW + C.LW with offset != 0 (offset 4): x13=12 → mem[x8+4] → x14
 #   (d) C.SWSP with offset != 0 (offset 20): x15=5 → mem[sp+20] (不验回读, sp+16 验过)
-#
-# 期望 main.c dump:
-#   sp (x2) = 0x80100000   (lui sp, 0x80100; decimal 2148532224)
-#   x8  = 0x80200000       (lui x8, 0x80200; hex 0x80200000)
-#   x9  = 0x0000001f       (= 31; rs2' for C.SW; hex)
-#   x10 = 31               (C.LW 回读 mem[x8] = 31; decimal)
-#   x11 = 7                (rs2 for C.SWSP; decimal)
-#   x12 = 7                (C.LWSP 回读 mem[sp+16] = 7; decimal)
-#   x13 = 12               (rs2' for C.SW offset 4; decimal)
-#   x14 = 12               (C.LW 回读 mem[x8+4] = 12; decimal)
-#   x15 = 5                (rs2 for C.SWSP offset 20; decimal)
-#
-# 末态 (跟 fixture 03/04/05 同 BARE M-mode mtvec=0 chain):
-#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3
-#
-# 关键验证点:
-#   - x10 == x9 → C.SW + C.LW (rd-relative, offset 0) 通过
-#   - x12 == x11 → C.SWSP + C.LWSP (sp-relative, offset 16) 通过
-#   - x14 == x13 → C.SW + C.LW with offset != 0 (offset 4) 通过
-#   - sp / x8 都对 → 寄存器 5-bit / 3-bit 编码正确, sp-relative imm 解码正确
 
 .section .text
 .globl _start
@@ -78,3 +61,24 @@ _start:
 
     # ---- 退出 (BARE M-mode, mtvec=0, ecall chain in_trap=3 halt) ----
     ecall
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   sp (x2) = 0x80100000   (lui sp, 0x80100; decimal 2148532224)
+#   x8  = 0x80200000       (lui x8, 0x80200; hex 0x80200000)
+#   x9  = 0x0000001f       (= 31; rs2' for C.SW; hex)
+#   x10 = 31               (C.LW 回读 mem[x8] = 31; decimal)
+#   x11 = 7                (rs2 for C.SWSP; decimal)
+#   x12 = 7                (C.LWSP 回读 mem[sp+16] = 7; decimal)
+#   x13 = 12               (rs2' for C.SW offset 4; decimal)
+#   x14 = 12               (C.LW 回读 mem[x8+4] = 12; decimal)
+#   x15 = 5                (rs2 for C.SWSP offset 20; decimal)
+#
+# 末态 (跟 fixture 03/04/05 同 BARE M-mode mtvec=0 chain):
+#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3
+#
+# 关键验证点:
+#   - x10 == x9 → C.SW + C.LW (rd-relative, offset 0) 通过
+#   - x12 == x11 → C.SWSP + C.LWSP (sp-relative, offset 16) 通过
+#   - x14 == x13 → C.SW + C.LW with offset != 0 (offset 4) 通过
+#   - sp / x8 都对 → 寄存器 5-bit / 3-bit 编码正确, sp-relative imm 解码正确

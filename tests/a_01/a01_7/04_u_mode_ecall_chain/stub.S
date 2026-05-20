@@ -1,4 +1,6 @@
 # a_01_7 / 04_u_mode_ecall_chain
+#
+# ===== 测试目的 =====
 # 验证完整的 syscall-like 端到端路径: M 设 handler → mret 切 U → U 跑程序 → ecall(U) cause=8 →
 # M handler 处理 → mret 回 U → U 继续跑 → 再次 ecall(U) → handler 决定停机 (triple fault)。
 #
@@ -11,6 +13,7 @@
 #
 # 21 条指令 (la×2 算 4 条) = 84 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # 字节地址布局:
 #   _start:      0x00 la x4(8); 0x08 csrw mtvec; 0x0c csrw mstatus,x0;
 #                0x10 la x6(8); 0x18 csrw mepc;  0x1c mret
@@ -22,20 +25,6 @@
 #                0x3c csrr x5,mepc; 0x40 addi x5,x5,4; 0x44 csrw mepc,x5; 0x48 mret
 #   halt (0x4c):
 #                0x4c csrw mtvec,x0; 0x50 ecall (triple fault)
-#
-# 期望 (main.c dump):
-#   x1 = 1                  (U 1st ecall 前设)
-#   x2 = 2                  (mret 真生效证据 — 没 mret 跑不到这条)
-#   x3 = 2                  (handler 累计计数器, ecall 进 handler 2 次)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11             (字段保留第 2 次 trap = handler 末 ecall from M)
-#   mtval = 0
-#   mepc = 0x80000050       (handler 末 ecall 的 PC)
-#   mtvec = 0
-#   priv = 3                (handler 在 M 模式; 第 2 次 trap 切 M, 候选 A 早 return 不动 priv)
-#   mstatus = 0x1800        (handler 末 ecall trap 时 MPP=M=3<<11=0x1800; MPIE=MIE=0)
-#   total_count = 19
 #
 # 控制流追 (带 0x80000000 RAM 起点偏移):
 #   block 1 (RAM+0x00): la(2)+csrw mtvec(boundary)         count=3,  total=3
@@ -122,3 +111,18 @@ halt:
     # ---- 第 2 次到 (x3==2): handler 不 mret, 走 triple fault 退出协议 ----
     csrw mtvec, x0          # 0x4c:      mtvec = 0
     ecall                   # 0x50:      ecall from M (cause=11) → 跳 0 → mmu fail → triple fault
+
+# ===== 期望结果 =====
+# 期望 (main.c dump):
+#   x1 = 1                  (U 1st ecall 前设)
+#   x2 = 2                  (mret 真生效证据 — 没 mret 跑不到这条)
+#   x3 = 2                  (handler 累计计数器, ecall 进 handler 2 次)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 11             (字段保留第 2 次 trap = handler 末 ecall from M)
+#   mtval = 0
+#   mepc = 0x80000050       (handler 末 ecall 的 PC)
+#   mtvec = 0
+#   priv = 3                (handler 在 M 模式; 第 2 次 trap 切 M, 候选 A 早 return 不动 priv)
+#   mstatus = 0x1800        (handler 末 ecall trap 时 MPP=M=3<<11=0x1800; MPIE=MIE=0)
+#   total_count = 19

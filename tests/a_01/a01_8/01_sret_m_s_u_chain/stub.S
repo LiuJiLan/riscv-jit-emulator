@@ -1,11 +1,8 @@
 # a_01_8 / 01_sret_m_s_u_chain
-# 验证 sret 切 priv (S→U) + sstatus / sepc CSR 入口 (Step 6 加).
 #
-# 路径 (user "M→S→U→M (没代理, 先同一回 M)" — 不依赖 SV32 walker, 不用 lw/sw):
-#   1. M-mode 起步: 设 mtvec / mepc / mstatus.MPP=PRIV_S → mret → 切 S
-#   2. S-mode: 设 sepc / sstatus.SPP=PRIV_U → sret → 切 U
-#   3. U-mode: ecall (cause=8 from U) → trap deliver M (deliver_priv hard-code PRIV_M)
-#   4. M-handler: 验 cause=8; csrw mtvec=0 + ecall 触发 triple fault 退出 dispatcher
+# ===== 测试目的 =====
+# 验证 sret 切 priv (S→U) + sstatus / sepc CSR 入口 (Step 6 加).
+# 22 条指令 (la×2 算 4 条) = 88 字节 (32-bit only, .option norvc).
 #
 # 覆盖范围:
 #   1. sret 切 priv (S→U): 验 _mstatus.SPP/SPIE/SIE 字段操作 + sepc 拿 PC
@@ -13,7 +10,12 @@
 #   3. mret 切 priv (M→S): 跟 a_01_7 mret 切 U 同形态 (不同 MPP 值)
 #   4. 跨 priv ecall: U-mode ecall 走 cause=8 (跟 a_01_7/04 cause=8 路径一致, 但走 sret)
 #
-# 22 条指令 (la×2 算 4 条) = 88 字节 (32-bit only, .option norvc).
+# ===== 思路 =====
+# 路径 (user "M→S→U→M (没代理, 先同一回 M)" — 不依赖 SV32 walker, 不用 lw/sw):
+#   1. M-mode 起步: 设 mtvec / mepc / mstatus.MPP=PRIV_S → mret → 切 S
+#   2. S-mode: 设 sepc / sstatus.SPP=PRIV_U → sret → 切 U
+#   3. U-mode: ecall (cause=8 from U) → trap deliver M (deliver_priv hard-code PRIV_M)
+#   4. M-handler: 验 cause=8; csrw mtvec=0 + ecall 触发 triple fault 退出 dispatcher
 #
 # 字节地址布局 (.text 钉 0x80000000):
 #   0x00 la x4, m_handler   (8B; gcc auipc+addi)
@@ -42,27 +44,6 @@
 #   0x54 csrw mtvec, x0     (mtvec=0)
 #   0x58 ecall              (cause=11 from M; trap → mtvec=0 → fetch 0 fail → triple fault)
 #
-# 期望 (main.c dump):
-#   x10 = 1                  (S 起步标记)
-#   x11 = 2                  (U 起步标记 — sret 真生效证据!)
-#   x12 = 8                  (mcause from U ecall, csrr 进 handler 时读)
-#   x13 = 8                  (比较寄存器)
-#   pc = 0                   (handler 末 ecall trap 跳 mtvec=0; 第 3 次 trap 候选 A 早 return)
-#   in_trap = 3              (triple fault)
-#   mcause = 11              (handler 末 ecall = ecall from M; 字段保留第 2 次)
-#   mtval = 0                (ecall tval=0)
-#   mepc = 0x80000058        (handler 末 ecall PC)
-#   mtvec = 0                (handler 自己清的)
-#   priv = 3                 (M; deliver_priv hard-code PRIV_M)
-#   mstatus = 0x1820         (推算: 详见末段; 实际跑出来核对)
-#     - MPP = M = 0b11 << 11 = 0x1800   (handler 末 ecall trap 设 MPP=caller=M)
-#     - MPIE = 0                          (旧 MIE = 0 → MPIE = 0)
-#     - MIE = 0                           (trap 入口 disable interrupt)
-#     - SPP = 0                           (sret 末段 reset)
-#     - SPIE = 1                          (sret 末段设; deliver M 路径不动 S 字段, 残留)
-#     - 0x1800 | 0x20 = 0x1820 ✓
-#   total_count: 待算 (跑出来核对)
-#
 # mstatus 推算时序 (注释方便 debug):
 #   阶段 1 起步:                          mstatus = 0
 #   阶段 2 csrw mstatus, 0x800:          mstatus = 0x800   (MPP=01=S)
@@ -75,12 +56,6 @@
 #   阶段 8 ecall (M→M trap):              mstatus = 0x1820  (MPP=caller=M=3; MPIE=MIE=0;
 #                                                              MIE=0; SPIE 残留)
 #   阶段 9 fetch 0 fail (in_trap 2→3):    mstatus = 0x1820  (候选 A 早 return 不动字段)
-#
-# 关键验证点:
-#   - x11 = 2 → sret 真生效 (没 sret 跑不到 0x40)
-#   - x12 = 8 → cause=8 from U (ecall_from_U 跟 a_01_7 cause=8 编码一致)
-#   - mstatus.SPIE = 1 → sret 末段把 SPIE 设 1 (RV spec)
-#   - mstatus.SPP = 0 → sret 末段把 SPP reset 为 PRIV_U=0
 
 .section .text
 .option norvc
@@ -133,3 +108,31 @@ halt:
     # ---- 停机: csrw mtvec=0 + ecall 触发 triple fault 退出 dispatcher ----
     csrw mtvec, x0          # 0x54: mtvec = 0
     ecall                   # 0x58: ecall from M (cause=11) → 跳 0 → mmu fail → triple fault
+
+# ===== 期望结果 =====
+# 期望 (main.c dump):
+#   x10 = 1                  (S 起步标记)
+#   x11 = 2                  (U 起步标记 — sret 真生效证据!)
+#   x12 = 8                  (mcause from U ecall, csrr 进 handler 时读)
+#   x13 = 8                  (比较寄存器)
+#   pc = 0                   (handler 末 ecall trap 跳 mtvec=0; 第 3 次 trap 候选 A 早 return)
+#   in_trap = 3              (triple fault)
+#   mcause = 11              (handler 末 ecall = ecall from M; 字段保留第 2 次)
+#   mtval = 0                (ecall tval=0)
+#   mepc = 0x80000058        (handler 末 ecall PC)
+#   mtvec = 0                (handler 自己清的)
+#   priv = 3                 (M; deliver_priv hard-code PRIV_M)
+#   mstatus = 0x1820         (推算: 详见上段 mstatus 推算时序; 实际跑出来核对)
+#     - MPP = M = 0b11 << 11 = 0x1800   (handler 末 ecall trap 设 MPP=caller=M)
+#     - MPIE = 0                          (旧 MIE = 0 → MPIE = 0)
+#     - MIE = 0                           (trap 入口 disable interrupt)
+#     - SPP = 0                           (sret 末段 reset)
+#     - SPIE = 1                          (sret 末段设; deliver M 路径不动 S 字段, 残留)
+#     - 0x1800 | 0x20 = 0x1820 ✓
+#   total_count: 待算 (跑出来核对)
+#
+# 关键验证点:
+#   - x11 = 2 → sret 真生效 (没 sret 跑不到 0x40)
+#   - x12 = 8 → cause=8 from U (ecall_from_U 跟 a_01_7 cause=8 编码一致)
+#   - mstatus.SPIE = 1 → sret 末段把 SPIE 设 1 (RV spec)
+#   - mstatus.SPP = 0 → sret 末段把 SPP reset 为 PRIV_U=0

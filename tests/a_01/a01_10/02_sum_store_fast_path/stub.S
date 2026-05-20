@@ -1,8 +1,11 @@
 # a_01_10 / 02_sum_store_fast_path
+#
+# ===== 测试目的 =====
 # 验 lsu store fast path SUM corner case (a01_9 (6) → a_01_10 修):
 #   S+PTE_U=1+SUM=1 sw user page → check_perm(W) 通过 → 成功
 #   S+PTE_U=1+SUM=0 sw user page → check_perm(W) 拒绝 → store page fault (cause 15)
 #
+# ===== 思路 =====
 # 跟 fixture 01 (load SUM 验证) 互补 — 02 验 store 路径; 验证哲学跟 01 同。
 #
 # store fast path 哲学注 (跟 lsu.h load fast path 不同):
@@ -36,28 +39,6 @@
 #                        → mem 内容不变 (但本 fixture 不验内存, 只验 cause/mtval)
 #   5. m_handler phase2 (cause=15): dump x12=mcause(15)/x13=mtval(0x80001000)/x14=mepc;
 #      csrw mtvec=0; ecall → triple fault
-#
-# 期望 main.c dump:
-#   x10    = 0xCAFEBABE   (SUM=1 sw 成功, lw 回读到 sw 写入值 — 核心验证点 1)
-#   x11    = 0xDEADBEEF   (预设比较值; sw page fault 不影响 GPR — 核心验证点 2 间接)
-#   x12    = 15           (CAUSE_STORE_PAGE_FAULT — phase2 mcause)
-#   x13    = 0x80001000   (mtval = sw GVA — phase2 mtval)
-#   x14    = s_phase_sum0 sw 指令 PC (具体值看 gcc 编出来)
-#   in_trap = 3
-#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
-#   priv   = 3            (M)
-#
-# 关键验证点:
-#   - x10 = 0xCAFEBABE → SUM=1 路径 sw 通过 store_helper 命中段 (check_perm(W) 通过) +
-#                          lw 回读对 (验 sw 真把值写进了 PA 0x80200000)
-#   - x12 = 15 → cause 正确 (store page fault, 不是 store access fault 7)
-#   - x13 = 0x80001000 → mtval = sw GVA (跟 mmu_walker_helper_store 内 trap_raise tval 一致)
-#
-# 跟 fixture 01 比较 (load vs store cause/路径):
-#   01: cause 13 (load page fault), trap_raise 在 mmu_walker_helper_load 内
-#   02: cause 15 (store page fault), trap_raise 在 mmu_walker_helper_store 内
-#       (store_helper 命中段 check_perm 拒绝 → fall back walker → walker check_perm 拒绝
-#        → trap_raise(15) 长跳)
 
 .equ CSR_TOHOST,    0x800
 .equ CSR_PRIVRD,    0xCC0
@@ -147,3 +128,26 @@ m_handler_phase2:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → mmu fail → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10    = 0xCAFEBABE   (SUM=1 sw 成功, lw 回读到 sw 写入值 — 核心验证点 1)
+#   x11    = 0xDEADBEEF   (预设比较值; sw page fault 不影响 GPR — 核心验证点 2 间接)
+#   x12    = 15           (CAUSE_STORE_PAGE_FAULT — phase2 mcause)
+#   x13    = 0x80001000   (mtval = sw GVA — phase2 mtval)
+#   x14    = s_phase_sum0 sw 指令 PC (具体值看 gcc 编出来)
+#   in_trap = 3
+#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
+#   priv   = 3            (M)
+#
+# 关键验证点:
+#   - x10 = 0xCAFEBABE → SUM=1 路径 sw 通过 store_helper 命中段 (check_perm(W) 通过) +
+#                          lw 回读对 (验 sw 真把值写进了 PA 0x80200000)
+#   - x12 = 15 → cause 正确 (store page fault, 不是 store access fault 7)
+#   - x13 = 0x80001000 → mtval = sw GVA (跟 mmu_walker_helper_store 内 trap_raise tval 一致)
+#
+# 跟 fixture 01 比较 (load vs store cause/路径):
+#   01: cause 13 (load page fault), trap_raise 在 mmu_walker_helper_load 内
+#   02: cause 15 (store page fault), trap_raise 在 mmu_walker_helper_store 内
+#       (store_helper 命中段 check_perm 拒绝 → fall back walker → walker check_perm 拒绝
+#        → trap_raise(15) 长跳)

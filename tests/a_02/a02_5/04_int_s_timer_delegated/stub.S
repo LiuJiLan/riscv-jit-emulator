@@ -1,5 +1,10 @@
 # a02_5 / 04_int_s_timer_delegated
-# S-mode timer interrupt 委托 (mideleg.STIE=1, M-mode 软件 inject STIP):
+#
+# ===== 测试目的 =====
+# S-mode timer interrupt 委托 (mideleg.STIE=1, M-mode 软件 inject STIP)。
+# 形态特点: 验证 mideleg / S-mode trap delivery / scause 高位 = CAUSE_INTERRUPT_BIT 拼接.
+#
+# ===== 思路 =====
 #   1. M setup: mtvec=m_handler, stvec=s_handler, mideleg.STIE=0x20, mie.STIE=0x20
 #   2. M csrw mip = 0x20 (软件 inject _mip_sw bit 5 = STIP; 项目无 Sstc, STIP 只能软件 inject)
 #   3. M mret 到 S-mode (mepc=s_program, mstatus.MPP=PRIV_S=1, mstatus.SIE=1)
@@ -8,8 +13,6 @@
 #   5. s_handler: 验 scause=0x80000005, 清 sie.STIE (csrw sie, 0; mie.STIE=0 防重复), sret
 #   6. S 恢复 wait_loop → s0=1 → ecall_from_S → cause=9 deliver M (medeleg=0 默认) →
 #      m_handler halt: 清 mtvec, ecall → triple fault
-#
-# 形态特点: 验证 mideleg / S-mode trap delivery / scause 高位 = CAUSE_INTERRUPT_BIT 拼接.
 
 .section .text
 .option norvc
@@ -74,6 +77,7 @@ m_handler:
     csrw    mtvec, x0
     ecall                        # ecall_from_M (cause=11) → mtvec=0 → triple fault
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80000005   (handler 写 s1, main mv 到 a0)
 #   s0 = 1            (handler 设置)

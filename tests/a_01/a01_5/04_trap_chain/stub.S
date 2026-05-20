@@ -1,4 +1,6 @@
 # a_01_5 / 04_trap_chain
+#
+# ===== 测试目的 =====
 # 验证完整的 trap → handler → mret → 主程序继续 流程:
 #   - ecall 触发 trap, _epc 写 ecall PC; handler 内手动 csrw mepc, mepc+4 让 mret 跳过 ecall
 #     (RV spec ECALL: mret 默认跳 mepc, software 必须自己 +4 跳过 ecall)
@@ -6,19 +8,7 @@
 #   - 主程序末尾 csrw mtvec,x0 + ecall 强制 triple fault 退出 (= 项目内部停机协议)
 # 13 条指令 = 52 字节 (32-bit only, .option norvc)。
 #
-# 期望:
-#   x1 = 1     (主程序起点 addi)
-#   x2 = 99    (mret 回来后跑; 这是 mret 真生效的证据 — 没 mret 就跑不到这里)
-#   x3 = 7     (handler 跑过)
-#   pc = 0     (主程序末尾 mtvec=0, ecall trap → 跳 0 → mmu fail x2 → 候选 A 早 return,
-#                regs[0] 停在 0)
-#   in_trap = 3
-#   mcause = 1, mtval = 0, mepc = 0, mtvec = 0
-#     (字段保留第 2 次 trap = mmu fail at 0 的状态; 第 3 次候选 A 早 return 不动)
-#   total_count = 10
-#     (block 1 la+csrw=3 + block 3 handler addi+csrr=2 + block 4 addi+csrw=2 +
-#      block 5 mret=1 + block 6 主程序 addi x2 + csrw mtvec=2; 共 10)
-#
+# ===== 思路 =====
 # 控制流追:
 #   block 1 (0x00):    la(2) + csrw mtvec(boundary)         count=3,  total=3
 #                       mtvec = 0x80000020 (handler)
@@ -56,3 +46,17 @@ handler:
     addi x5, x5, 4          # 0x28:      x5 = 0x14 (跳过 ecall, 指向 addi x2)
     csrw mepc, x5           # 0x2c:      mepc = 0x14
     mret                    # 0x30:      跳 mepc=0x14, in_trap=0; 回主程序 addi x2
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 1     (主程序起点 addi)
+#   x2 = 99    (mret 回来后跑; 这是 mret 真生效的证据 — 没 mret 就跑不到这里)
+#   x3 = 7     (handler 跑过)
+#   pc = 0     (主程序末尾 mtvec=0, ecall trap → 跳 0 → mmu fail x2 → 候选 A 早 return,
+#                regs[0] 停在 0)
+#   in_trap = 3
+#   mcause = 1, mtval = 0, mepc = 0, mtvec = 0
+#     (字段保留第 2 次 trap = mmu fail at 0 的状态; 第 3 次候选 A 早 return 不动)
+#   total_count = 10
+#     (block 1 la+csrw=3 + block 3 handler addi+csrr=2 + block 4 addi+csrw=2 +
+#      block 5 mret=1 + block 6 主程序 addi x2 + csrw mtvec=2; 共 10)

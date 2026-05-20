@@ -1,13 +1,11 @@
 # a02_4 / 02_mip_ro_bits_ignored
+#
+# ===== 测试目的 =====
 # csrw mip 写 RO 位 (MSIP/MTIP/MEIP) 验证 — RO 位被 MIP_SW_WRITABLE_MASK 截掉,
 # 不影响 _mip_sw 任何 bit; csrr mip 合成时 RO 位仍来自异步源 (clint_init 后初值 0).
 #
+# ===== 思路 =====
 # BARE M-mode; 不切 S.
-#
-# 期望最终寄存器:
-#   a0 (x10) = 0x00000000   csrw mip set MSIP|MTIP|MEIP → 全 RO 忽略, csrr mip = 0
-#
-# halt: ecall.
 
 .section .text
 .option norvc
@@ -22,3 +20,9 @@ _start:
     csrr    a0, mip                                # a0 = 0
 
     ecall
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 (x10) = 0x00000000   csrw mip set MSIP|MTIP|MEIP → 全 RO 忽略, csrr mip = 0
+#
+# halt: ecall.

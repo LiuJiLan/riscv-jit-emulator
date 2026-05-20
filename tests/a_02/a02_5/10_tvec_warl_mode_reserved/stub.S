@@ -1,13 +1,15 @@
 # a02_5 / 10_tvec_warl_mode_reserved
+#
+# ===== 测试目的 =====
 # csrw mtvec / stvec WARL mode bit 处理 (D9 解绑后):
 #   mode=0 Direct       — 接受
 #   mode=1 Vectored     — 接受
 #   mode=2/3 Reserved   — RV Priv Spec §3.1.7 WARL 允许实现拒绝; 项目落 0 (合法值)
+# 测试 mtvec + stvec 两个 csr 入口, 各 4 个 mode case (2/3/1/0 顺序). 不触发任何 trap.
 #
+# ===== 思路 =====
 #   验证步骤: csrw 各 mode 值 → csrr 读回 → 期望 mode bit 等于实际 store 的值
 #   (mode=2/3 store 后读回 mode=0; mode=0/1 store 后读回 mode=0/1).
-#
-# 测试 mtvec + stvec 两个 csr 入口, 各 4 个 mode case (2/3/1/0 顺序). 不触发任何 trap.
 #
 # 实现验证: src/core/csr.c::csr_mtvec_write / csr_stvec_write 内 WARL 处理 mode bit
 #   (汇编 preprocessor 不识别 C if-语法, 注释省去等价 C 片段; 看 csr.c 实际实现).
@@ -61,6 +63,7 @@ _start:
     csrw    mtvec, x0
     ecall
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 (x10) = 0x80000100   mtvec mode=2 → 0
 #   a1 (x11) = 0x80000100   mtvec mode=3 → 0

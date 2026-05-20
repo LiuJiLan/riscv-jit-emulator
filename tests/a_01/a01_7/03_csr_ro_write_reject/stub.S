@@ -1,34 +1,17 @@
 # a_01_7 / 03_csr_ro_write_reject
+#
+# ===== 测试目的 =====
 # 验证 csr_op 入口 RO 写检查激活: M 模式写 RO csr (mhartid 0xF14, bits 11:10 = 11 = RO)
 # → trap cause=2 (illegal instruction); 即使 priv=M 够 (mhartid 是 unprivileged csr, bits 9:8=00),
 # RO 写仍然 block。
 # 9 条指令 (la 算 2 条) = 36 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # 字节地址布局:
 #   _start: 0x00 la(8); 0x08 csrw mtvec; 0x0c csrw mhartid (trap)
 #   handler = 0x10:
 #       0x10 csrr x1 mcause; 0x14 csrr x2 mtval; 0x18 csrr x3 mepc;
 #       0x1c csrw mtvec,x0; 0x20 ecall (triple fault)
-#
-# 期望:
-#   x1 = 2          (mcause = illegal instruction)
-#   x2 = 0xF1451073 = 4047835251
-#                    (mtval = raw_inst of `csrw mhartid, x10`; 编码:
-#                     csr=0xF14 << 20 = 0xF1400000
-#                     rs1=10 << 15 = 0x00050000
-#                     funct3=001 << 12 = 0x00001000
-#                     rd=0 << 7  = 0
-#                     opcode=0x73
-#                     总 = 0xF1451073)
-#   x3 = 0x8000000c = 2147483660 (mepc = csrw mhartid 的 PC)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall)
-#   mtval = 0
-#   mepc = 0x80000020 (handler 末 ecall PC)
-#   mtvec = 0
-#   priv = 3        (handler 在 M 模式跑)
-#   mstatus = 0x1800
 #
 # 控制流追:
 #   block 1 (RAM+0x00): la(2)+csrw mtvec(boundary)        count=3,  total=3
@@ -68,3 +51,24 @@ handler:
     # ---- 停机 ----
     csrw mtvec, x0          # 0x1c:      mtvec = 0
     ecall                   # 0x20:      trap → 跳 0 → mmu fail x2 → triple fault 退出
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 2          (mcause = illegal instruction)
+#   x2 = 0xF1451073 = 4047835251
+#                    (mtval = raw_inst of `csrw mhartid, x10`; 编码:
+#                     csr=0xF14 << 20 = 0xF1400000
+#                     rs1=10 << 15 = 0x00050000
+#                     funct3=001 << 12 = 0x00001000
+#                     rd=0 << 7  = 0
+#                     opcode=0x73
+#                     总 = 0xF1451073)
+#   x3 = 0x8000000c = 2147483660 (mepc = csrw mhartid 的 PC)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall)
+#   mtval = 0
+#   mepc = 0x80000020 (handler 末 ecall PC)
+#   mtvec = 0
+#   priv = 3        (handler 在 M 模式跑)
+#   mstatus = 0x1800

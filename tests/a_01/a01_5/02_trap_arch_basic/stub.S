@@ -1,8 +1,11 @@
 # a_01_5 / 02_trap_arch_basic
+#
+# ===== 测试目的 =====
 # 验证 trap_set_state 架构语义层 + 候选 A 早 return + dispatcher while(in_trap<3) 退出 +
 #       sigsetjmp 一次性落点 + trap_raise_exception _Noreturn longjmp 路径。
 # 9 条指令 = 36 字节 (32-bit only, .option norvc 强制不生 RVC)。
 #
+# ===== 思路 =====
 # 起步: fixture 自己用 csrw mtvec 设 handler 地址 (main.c 不 hard-code 设 xtvec,
 # fixture 自包含)。
 #
@@ -17,16 +20,6 @@
 # handler (0x8000001c ~ 0x80000023, 8 字节):
 #   addi x3, x0, 7        ; handler 跑过标记 (handler 起点; mtvec 指向这里)
 #   ecall                 ; handler 末尾, 第 2 次 trap (cause=11 env-call from M)
-#
-# 期望 (main 末尾输出):
-#   x1=1, x2=0, x3=7, pc=0x80000020
-#     (block 4 内 addi x3 跑完 pc += 4 → 0x20, ecall 触发第 3 次 trap 候选 A 早 return
-#      不动 pc; pc 停在 ecall PC = 0x80000020)
-#   in_trap=3, mcause=11, mtval=0, mepc=0x80000020, mtvec=0x8000001c
-#     (字段保留第 2 次 trap = ecall 的状态; mtvec 由 fixture 自己写, 不再是 0x80000010)
-#   dispatcher halted: in_trap=3 total_count=3 pc=0x80000020
-#     (total_count = 3 来自 block 1 的 la + csrw 三条; block 2/3/4 内 trap 触发块的 count
-#      被 longjmp 跳过 dispatcher 的 total_count += 行, 不计入)
 #
 # 控制流追踪:
 #   block 1 (0x80000000): la(2) + csrw(boundary) → count_out=3, total_count += 3 = 3
@@ -53,3 +46,14 @@ _start:
 handler:
     addi x3, x0, 7          # 0x8000001c: handler 起点 (= mtvec)
     ecall                   # 0x80000020: handler 末尾, 第 2/3 次 trap (cause=11)
+
+# ===== 期望结果 =====
+# 期望 (main 末尾输出):
+#   x1=1, x2=0, x3=7, pc=0x80000020
+#     (block 4 内 addi x3 跑完 pc += 4 → 0x20, ecall 触发第 3 次 trap 候选 A 早 return
+#      不动 pc; pc 停在 ecall PC = 0x80000020)
+#   in_trap=3, mcause=11, mtval=0, mepc=0x80000020, mtvec=0x8000001c
+#     (字段保留第 2 次 trap = ecall 的状态; mtvec 由 fixture 自己写, 不再是 0x80000010)
+#   dispatcher halted: in_trap=3 total_count=3 pc=0x80000020
+#     (total_count = 3 来自 block 1 的 la + csrw 三条; block 2/3/4 内 trap 触发块的 count
+#      被 longjmp 跳过 dispatcher 的 total_count += 行, 不计入)

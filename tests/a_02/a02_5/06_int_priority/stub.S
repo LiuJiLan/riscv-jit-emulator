@@ -1,7 +1,11 @@
 # a02_5 / 06_int_priority
+#
+# ===== 测试目的 =====
 # 中断优先级 (RV Priv Spec §3.1.9 + trap_check_interrupt 优先级 encoder):
 #   优先级: M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER
-# Fixture 同时让 MSIP + MTIP pending, 期望 mcause = 0x80000003 (M_SOFT, 优先 M_TIMER):
+# Fixture 同时让 MSIP + MTIP pending, 期望 mcause = 0x80000003 (M_SOFT, 优先 M_TIMER)。
+#
+# ===== 思路 =====
 #   1. M setup: mtvec=m_handler, mie = MSIE | MTIE = 0x88, mstatus.MIE = 1
 #   2. 设 mtimecmp[0] = 5 (small, 立即 pending after few iterations)
 #   3. 设 CLINT.msip[0] = 1 (MSIP pending)
@@ -67,6 +71,7 @@ m_handler:
     li      s0, 1
     mret
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80000003   (M_SOFT 优先于 M_TIMER; priority encoder 选 IRQ_M_SOFT)
 #   s0 = 1

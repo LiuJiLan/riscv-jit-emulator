@@ -1,7 +1,10 @@
 # a_01_10 / 07_cross_page
+#
+# ===== 测试目的 =====
 # 验 BARE M-mode 下 interpreter 跨页保护 (interpreter.c 内 page_mask 检测推进后跨页 →
 # goto out, dispatcher 重新 mmu_translate_pc 拿新 page hva 进新 block)。
 #
+# ===== 思路 =====
 # 模板风格: 纯 .S, BARE M-mode, 套 a_01_10/03-06 同形态。
 #
 # 内存布局 (link.ld . = 0x80000000 + .text section .org pad):
@@ -12,17 +15,6 @@
 #                                     → interpreter.c goto out, dispatcher 重派发
 #   0x80001000  cross_page          第 2 页起点 — dispatcher 重 mmu_translate_pc 进新
 #                                     block, 跑 ADDI x13/x14 + ecall
-#
-# 期望 dump (M-mode, mtvec=0 默认):
-#   x10 = 1   (_start: ADDI; 入口块 li)
-#   x11 = 2   (page_end_block 第 1 条 0xFF8 ADDI; 推进后 hva_pc=0xFFC 仍第 1 页, 不退出)
-#   x12 = 3   (page_end_block 第 2 条 0xFFC ADDI; 推进后 hva_pc=0x1000 跨页 → goto out)
-#   x13 = 4   (cross_page 第 1 条 0x1000 ADDI; 验 dispatcher 真重派发)
-#   x14 = 5   (cross_page 第 2 条 0x1004 ADDI)
-#   pc  = 0   (ecall trap_set_state 写 regs[0]=mtvec[PRIV_M]=0; 后续 fetch trap 链到 in_trap=3)
-#   in_trap = 3
-#   total_count = 6  (li + jal + 4 ADDI; ecall 触发 trap, SYNC_COUNT 在 trap_raise 之前
-#                     count 还没 ++, ecall 那条不计入)
 #
 # 调试观察点 (gdb / CLion debug):
 #   src/core/interpreter.c 内 `if (((uintptr_t)hva_pc & page_mask) != entry_page) goto out;`
@@ -53,3 +45,15 @@ cross_page:
     addi    x13, x0, 4                   # 0x80001000: x13 = 4 (第 2 页起点)
     addi    x14, x0, 5                   # 0x80001004: x14 = 5
     ecall                                # 0x80001008: trap → mtvec=0 → fetch trap 链 → in_trap=3
+
+# ===== 期望结果 =====
+# 期望 dump (M-mode, mtvec=0 默认):
+#   x10 = 1   (_start: ADDI; 入口块 li)
+#   x11 = 2   (page_end_block 第 1 条 0xFF8 ADDI; 推进后 hva_pc=0xFFC 仍第 1 页, 不退出)
+#   x12 = 3   (page_end_block 第 2 条 0xFFC ADDI; 推进后 hva_pc=0x1000 跨页 → goto out)
+#   x13 = 4   (cross_page 第 1 条 0x1000 ADDI; 验 dispatcher 真重派发)
+#   x14 = 5   (cross_page 第 2 条 0x1004 ADDI)
+#   pc  = 0   (ecall trap_set_state 写 regs[0]=mtvec[PRIV_M]=0; 后续 fetch trap 链到 in_trap=3)
+#   in_trap = 3
+#   total_count = 6  (li + jal + 4 ADDI; ecall 触发 trap, SYNC_COUNT 在 trap_raise 之前
+#                     count 还没 ++, ecall 那条不计入)

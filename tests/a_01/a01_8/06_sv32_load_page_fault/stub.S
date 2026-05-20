@@ -1,5 +1,9 @@
 # a_01_8 / 06_sv32_load_page_fault
+#
+# ===== 测试目的 =====
 # 验 SV32 walker → trap 路径 (load page fault, cause 13)。
+#
+# ===== 思路 =====
 # PT 故意构造 leaf_pt[1] PTE.V=0; S phase lw vaddr 0x80001000 触发 walker fail →
 # walker_helper_load 内 trap_raise_exception(13, gva) 长跳 → dispatcher trap deliver →
 # M handler csrr 验 mcause/mtval/mepc。
@@ -25,20 +29,6 @@
 #      csrr x13, mepc             # lw 指令 PC (期望 0x80000044, 见反汇编)
 #      csrr x14, mtval            # 期望 0x80001000 (lw 的 GVA)
 #      ecall halt → triple fault (但 mcause/mtval/mepc 会被第 2 次 trap 覆盖, GPR 保留)
-#
-# 期望 main.c dump:
-#   x10 = 0                  (lw 失败没写; 默认 0)
-#   x12 = 13                 (mcause = LOAD_PAGE_FAULT, csrr 到 GPR 保留)
-#   x13 = 0x80000044         (lw 指令 PC, 实际值看反汇编)
-#   x14 = 0x80001000         (mtval = lw GVA)
-#   mcause = 11              (handler 末 ecall_from_M, 字段 in_trap=3 第 2 次保留)
-#   mtval  = 0               (ecall_from_M 不存 tval)
-#   priv = 3, in_trap = 3
-#
-# 关键验证点:
-#   - x12 = 13 → walker 失败正确报 LOAD_PAGE_FAULT
-#   - x14 = 0x80001000 → mtval 写的是失败 lw 的 GVA (跟 trap_raise_exception 第 2 参一致)
-#   - x13 = lw PC → mepc 写的是失败 lw 指令的 PC
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -88,3 +78,18 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 0                  (lw 失败没写; 默认 0)
+#   x12 = 13                 (mcause = LOAD_PAGE_FAULT, csrr 到 GPR 保留)
+#   x13 = 0x80000044         (lw 指令 PC, 实际值看反汇编)
+#   x14 = 0x80001000         (mtval = lw GVA)
+#   mcause = 11              (handler 末 ecall_from_M, 字段 in_trap=3 第 2 次保留)
+#   mtval  = 0               (ecall_from_M 不存 tval)
+#   priv = 3, in_trap = 3
+#
+# 关键验证点:
+#   - x12 = 13 → walker 失败正确报 LOAD_PAGE_FAULT
+#   - x14 = 0x80001000 → mtval 写的是失败 lw 的 GVA (跟 trap_raise_exception 第 2 参一致)
+#   - x13 = lw PC → mepc 写的是失败 lw 指令的 PC

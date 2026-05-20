@@ -1,7 +1,10 @@
 # a_02_2 / 07_sv32_leaf_pt_in_mmio
+#
+# ===== 测试目的 =====
 # 验 SV32 walker level=0 PT 落 CLINT (MMIO) 区时报 access fault (cause 5; load 路径)
 # — a_01_8/08 (PT 落完全 RAM 外 0xC0000000) 的 MMIO 版本。
 #
+# ===== 思路 =====
 # 验证 mmu_walk 内 IS_GPA_RAM(pte0_pa) 检查对 "PT 落 MMIO" 跟 "PT 落完全不存在" 行为
 # 一致 (都拒 → access fault); P3 后 walker 不应该把 MMIO 上的 PT 当合法 PT 走 mmio
 # dispatch 读出来当 PTE 用 (那会让 PT walker 走 device 端 read 拿到的"假 PTE")。
@@ -19,13 +22,6 @@
 #      lw   x10, 0(x4)              # walker level=0 PT 检查失败 → trap 5 (longjmp)
 #      ecall                        # 防御
 #   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; halt
-#
-# 期望 main.c dump:
-#   x10 = 0                        (lw 失败没写)
-#   x12 = 5                        (LOAD_ACCESS_FAULT)
-#   x13 = 失败 lw 的 PC            (mepc; 看反汇编, 在 s_target 内)
-#   x14 = 0x90000000               (mtval = 失败 lw 的 GVA)
-#   in_trap=3 mcause=11 priv=3
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -68,3 +64,11 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 0                        (lw 失败没写)
+#   x12 = 5                        (LOAD_ACCESS_FAULT)
+#   x13 = 失败 lw 的 PC            (mepc; 看反汇编, 在 s_target 内)
+#   x14 = 0x90000000               (mtval = 失败 lw 的 GVA)
+#   in_trap=3 mcause=11 priv=3

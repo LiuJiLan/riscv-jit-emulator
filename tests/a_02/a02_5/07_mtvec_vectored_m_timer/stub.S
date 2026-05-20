@@ -1,5 +1,11 @@
 # a02_5 / 07_mtvec_vectored_m_timer
-# mtvec mode=1 vectored, M timer interrupt fire → pc = base + 4 * IRQ_M_TIMER (= base + 28):
+#
+# ===== 测试目的 =====
+# mtvec mode=1 vectored, M timer interrupt fire → pc = base + 4 * IRQ_M_TIMER (= base + 28)。
+# 跟 a02_5/01 区别: mtvec mode=1 (vectored) vs mode=0 (direct); 验 trap_set_interrupt_state
+# vectored 分支 (base + 4*cause_low) 而不是 direct (base).
+#
+# ===== 思路 =====
 #   1. mtvec = vec_table | 1 (mode 1)
 #   2. mtimecmp = 50 (mtime 推进过 50 后 MTIP fire)
 #   3. mie.MTIE + mstatus.MIE
@@ -7,9 +13,6 @@
 #   5. slot 7 内 `j timer_handler` → 跳真 handler
 #   6. timer_handler 验 mcause = 0x80000007, 清 MTIP, mret
 #   7. main 看 s0=1 → halt path
-#
-# 跟 a02_5/01 区别: mtvec mode=1 (vectored) vs mode=0 (direct); 验 trap_set_interrupt_state
-# vectored 分支 (base + 4*cause_low) 而不是 direct (base).
 
 .section .text
 .option norvc
@@ -77,6 +80,7 @@ halt:
     csrw    mtvec, x0
     ecall
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80000007   (mcause from M_TIMER; vectored 跳 slot 7 → timer_handler 真跑过)
 #   s0 = 1

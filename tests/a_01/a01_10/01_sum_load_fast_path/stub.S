@@ -1,8 +1,11 @@
 # a_01_10 / 01_sum_load_fast_path
+#
+# ===== 测试目的 =====
 # 验 lsu load fast path SUM corner case (a01_9 (6) → a_01_10 修):
 #   S+PTE_U=1+SUM=1 lw user page → fast path / walker check_perm(R) 通过 → 成功
 #   S+PTE_U=1+SUM=0 lw user page → fast path / walker check_perm(R) 拒绝 → load page fault (cause 13)
 #
+# ===== 思路 =====
 # 跟 a_01_8 fixture 04 (lw_sw_basic, leaf_pt[1] PTE_U=0) 区别:
 #   - leaf_pt[1] PTE_U=1 — 核心验证点, S 模式访问受 mstatus.SUM 控制
 #   - 单 fixture 跑两 phase: 顺序 SUM=1 (期望 lw 成功) → SUM=0 (期望 page fault)
@@ -37,23 +40,6 @@
 #      (check_perm 拒绝, x11 不写, 保留预设 0)
 #   5. m_handler phase2 (cause=13): dump x12=mcause(13)/x13=mtval(0x80001000)/x14=mepc;
 #      csrw mtvec=0; ecall → cause=11 from M → mmu fail → triple fault
-#
-# 期望 main.c dump:
-#   x10    = 0xDEADBEEF   (SUM=1 lw 成功 — 核心验证点 1)
-#   x11    = 0            (SUM=0 lw page fault, x11 不写, 保留预设 0 — 核心验证点 2)
-#   x12    = 13           (CAUSE_LOAD_PAGE_FAULT — phase2 mcause)
-#   x13    = 0x80001000   (mtval = lw GVA — phase2 mtval)
-#   x14    = s_phase_sum0 PC (lw 指令 PC, 具体值看 gcc 编出来)
-#   in_trap = 3
-#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
-#   priv   = 3            (M)
-#
-# 关键验证点:
-#   - x10 = 0xDEADBEEF → SUM=1 路径 lw 通过 fast path / walker (TLB miss → walker fall back)
-#   - x11 = 0 → SUM=0 路径 lw 触发 page fault, fast path 命中 V+tag 但 check_perm 拒绝
-#                (验 a_01_10 (6) 修复: 旧形态 V+tag+R 命中会错放过)
-#   - x12 = 13 → cause 正确 (load page fault, 不是 access fault 5)
-#   - x13 = 0x80001000 → mtval = lw GVA (跟 mmu_walker_helper_load 内 trap_raise tval 一致)
 
 .equ CSR_TOHOST,    0x800
 .equ CSR_PRIVRD,    0xCC0
@@ -143,3 +129,21 @@ m_handler_phase2:
 halt:
     csrw mtvec, x0                  # mtvec=0
     ecall                           # cause=11 from M → mmu fail → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10    = 0xDEADBEEF   (SUM=1 lw 成功 — 核心验证点 1)
+#   x11    = 0            (SUM=0 lw page fault, x11 不写, 保留预设 0 — 核心验证点 2)
+#   x12    = 13           (CAUSE_LOAD_PAGE_FAULT — phase2 mcause)
+#   x13    = 0x80001000   (mtval = lw GVA — phase2 mtval)
+#   x14    = s_phase_sum0 PC (lw 指令 PC, 具体值看 gcc 编出来)
+#   in_trap = 3
+#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
+#   priv   = 3            (M)
+#
+# 关键验证点:
+#   - x10 = 0xDEADBEEF → SUM=1 路径 lw 通过 fast path / walker (TLB miss → walker fall back)
+#   - x11 = 0 → SUM=0 路径 lw 触发 page fault, fast path 命中 V+tag 但 check_perm 拒绝
+#                (验 a_01_10 (6) 修复: 旧形态 V+tag+R 命中会错放过)
+#   - x12 = 13 → cause 正确 (load page fault, 不是 access fault 5)
+#   - x13 = 0x80001000 → mtval = lw GVA (跟 mmu_walker_helper_load 内 trap_raise tval 一致)

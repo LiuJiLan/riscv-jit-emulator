@@ -1,8 +1,11 @@
 # a02_6 / 03_perf_estimate
+#
+# ===== 测试目的 =====
 # 跑一段长工作循环, 读 mtime 前后做 delta, 配合 [dispatcher] halted total_count
 # 算 effective MIPS — debug 解释器性能基线 (release + JIT 接入后跑同 fixture
 # 对比, 性能数据进论文)。
 #
+# ===== 思路 =====
 # 仅用现有指令: lw / sw / add / addi / lui / bnez / sub / mv / csrw / ecall;
 # 不依赖 PLIC / UART / S-mode / Sv32 / RVC (无 .option rvc)。
 #
@@ -54,6 +57,7 @@ work_loop:
     csrw    mtvec, x0
     ecall
 
+# ===== 期望结果 =====
 # 期望最终寄存器 (粗略):
 #   a0 (x10) = start_mtime_lo  (一般几千 ~ 几万, 取决于 host 启动到 _start 间隔)
 #   a1 (x11) = end_mtime_lo    (> a0; 长跑后 mtime 跨过多个 timer wake)

@@ -1,28 +1,14 @@
 # a_01_6 / 02_load_misalign_reject
+#
+# ===== 测试目的 =====
 # 验证 load_helper 的 misalign 检查 (Spike 风格): lw 一个奇地址 → trap_raise(4 load misalign)。
 # 跳 handler 后 csrr 验 mcause/mtval/mepc, 然后 ecall + triple fault 退出。
 # 11 条指令 (la 算 2 条) = 44 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # misalign 触发条件 (lsu.h load_helper Step 1):
 #   (gva & (size - 1)) != 0
 # lw size=4, mask=3; gva=0x80001001 → 0x80001001 & 3 = 1 != 0 → trap cause=4, tval=0x80001001。
-#
-# 期望 (handler 内 csrr 拿到 trap 当时的 csr 值):
-#   x1 = 4          (mcause = load address misaligned, RV spec §3.1.16)
-#   x2 = 0x80001001 (mtval = 触发 misalign 的 GVA)
-#   x3 = 0x80000014 (mepc = lw 指令的 PC = RAM 起点 + 0x14)
-#   pc = 0          (handler 末 ecall + triple fault 退出, 字段被覆盖)
-#   in_trap = 3
-#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall, cause 11 ECALL_FROM_M)
-#                    注意: x1=4 是 handler 内 csrr 拿到的 trap 当时值, mcause 是 trap dump 时
-#                    被 ecall 覆盖的值; 两者一个验"misalign 真触发", 一个是项目停机协议副作用。
-#   mtval = 0       (ecall tval=0)
-#   mepc = 0x80000028 (handler 末 ecall PC)
-#   mtvec = 0
-#   total_count = 7
-#     (block 1 la(2)+csrw=3; block 2 lui+addi+lw → lw misalign longjmp, count++ 不到, total 不变;
-#      block 3 csrr x1=1; block 4 csrr x2=1; block 5 csrr x3=1; block 6 csrw mtvec=1; total 累加 = 7;
-#      block 7 ecall longjmp; mmu fail x2 → triple fault 退出)
 #
 # 字节地址 (la 是 pseudo, 展开 auipc+addi 占 8 字节):
 #   _start: 0x00 la(8) → 0x00-0x07; 0x08 csrw mtvec; 0x0c lui; 0x10 addi; 0x14 lw (trap here)
@@ -65,3 +51,21 @@ handler:
     # ---- 停机 (项目内部 triple fault 协议) ----
     csrw mtvec, x0          # 0x24:  mtvec = 0
     ecall                   # 0x28:  trap → 跳 0 → mmu fail x2 → triple fault 退出
+
+# ===== 期望结果 =====
+# 期望 (handler 内 csrr 拿到 trap 当时的 csr 值):
+#   x1 = 4          (mcause = load address misaligned, RV spec §3.1.16)
+#   x2 = 0x80001001 (mtval = 触发 misalign 的 GVA)
+#   x3 = 0x80000014 (mepc = lw 指令的 PC = RAM 起点 + 0x14)
+#   pc = 0          (handler 末 ecall + triple fault 退出, 字段被覆盖)
+#   in_trap = 3
+#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall, cause 11 ECALL_FROM_M)
+#                    注意: x1=4 是 handler 内 csrr 拿到的 trap 当时值, mcause 是 trap dump 时
+#                    被 ecall 覆盖的值; 两者一个验"misalign 真触发", 一个是项目停机协议副作用。
+#   mtval = 0       (ecall tval=0)
+#   mepc = 0x80000028 (handler 末 ecall PC)
+#   mtvec = 0
+#   total_count = 7
+#     (block 1 la(2)+csrw=3; block 2 lui+addi+lw → lw misalign longjmp, count++ 不到, total 不变;
+#      block 3 csrr x1=1; block 4 csrr x2=1; block 5 csrr x3=1; block 6 csrw mtvec=1; total 累加 = 7;
+#      block 7 ecall longjmp; mmu fail x2 → triple fault 退出)

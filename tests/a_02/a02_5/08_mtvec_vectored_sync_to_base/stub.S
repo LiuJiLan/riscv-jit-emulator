@@ -1,9 +1,12 @@
 # a02_5 / 08_mtvec_vectored_sync_to_base
+#
+# ===== 测试目的 =====
 # mtvec mode=1 vectored 时 sync exception 仍走 base (RV Priv Spec §3.1.7):
 #   "When MODE=Vectored, all synchronous exceptions ... cause the pc to be set to the
 #    address in the BASE field, whereas interrupts cause the pc to be set to the
 #    address in the BASE field plus four times the interrupt cause number."
 #
+# ===== 思路 =====
 #   1. mtvec = vec_table | 1 (mode 1)
 #   2. ecall (cause = 11 ECALL_FROM_M, sync exception)
 #   3. trap_set_exception_state 内 jump-to = xtvec & ~0x3 = base (mask 掉 mode bit) → slot 0
@@ -57,6 +60,7 @@ halt:
     csrw    mtvec, x0
     ecall                        # ecall_from_M → mtvec=0 → triple fault
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 11           (sync exception mcause; sync_handler 跑过证明 sync → base 不是 base + 44)
 #   s0 = 1            (sync_handler 真跑过)

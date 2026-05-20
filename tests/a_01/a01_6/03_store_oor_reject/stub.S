@@ -1,9 +1,12 @@
 # a_01_6 / 03_store_oor_reject
+#
+# ===== 测试目的 =====
 # 验证 store_helper 的 RAM 边界检查: sw 到 RAM 之外 (0x40000000) → trap_raise(7 store access fault)。
 # stderr 还会有一行 "[lsu] store: PA 0x40000000 not in RAM (MMIO bus_dispatch not implemented in
 # a_01_6)" 由 store_helper 的 fprintf 输出 (a_01_6 占位提示, 未来 a_01_7+ 接 bus_dispatch 时替换)。
 # 11 条指令 (la 算 2 条) = 44 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # 触发条件 (lsu.c store_helper Step 2 BARE 路径):
 #   (uint32_t)(pa - GUEST_RAM_START) >= GUEST_RAM_SIZE
 # pa=0x40000000, GUEST_RAM_START=0x80000000, GUEST_RAM_SIZE=128MB:
@@ -11,18 +14,6 @@
 #
 # RAM 区是 [0x80000000, 0x88000000); 0x40000000 显然不在 (在 RAM 起点之下)。
 # misalign 不会撞 (0x40000000 是 4-byte 对齐)。
-#
-# 期望:
-#   x1 = 7          (mcause = store/AMO access fault, RV spec §3.1.16)
-#   x2 = 0x40000000 (mtval = 触发 store 的 GVA)
-#   x3 = 0x80000014 (mepc = sw 指令的 PC)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall 覆盖)
-#   mtval = 0
-#   mepc = 0x80000028 (handler 末 ecall PC)
-#   mtvec = 0
-#   total_count = 7 (跟 02_load_misalign_reject 同形态)
 #
 # 字节地址 (la 是 pseudo, 展开 auipc+addi 占 8 字节):
 #   _start: 0x00 la(8) → 0x00-0x07; 0x08 csrw mtvec; 0x0c lui; 0x10 addi; 0x14 sw (trap here)
@@ -64,3 +55,16 @@ handler:
     # ---- 停机 ----
     csrw mtvec, x0          # 0x24:  mtvec = 0
     ecall                   # 0x28:  trap → 跳 0 → mmu fail x2 → triple fault 退出
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 7          (mcause = store/AMO access fault, RV spec §3.1.16)
+#   x2 = 0x40000000 (mtval = 触发 store 的 GVA)
+#   x3 = 0x80000014 (mepc = sw 指令的 PC)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall 覆盖)
+#   mtval = 0
+#   mepc = 0x80000028 (handler 末 ecall PC)
+#   mtvec = 0
+#   total_count = 7 (跟 02_load_misalign_reject 同形态)

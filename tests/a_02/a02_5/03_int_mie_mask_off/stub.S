@@ -1,5 +1,9 @@
 # a02_5 / 03_int_mie_mask_off
-# mstatus.MIE = 0 时不触发 trap (验全局 IE 屏蔽; trap_check_interrupt 内 deliver_mask = 0):
+#
+# ===== 测试目的 =====
+# mstatus.MIE = 0 时不触发 trap (验全局 IE 屏蔽; trap_check_interrupt 内 deliver_mask = 0)。
+#
+# ===== 思路 =====
 #   1. 设 mtimecmp 小 + mie.MTIE 但 不设 mstatus.MIE (默认 0)
 #   2. mtime 由 timer 辅助线程异步累加越过 mtimecmp 后, trap_check_interrupt: mip.MTIP=1
 #      但 mstatus.MIE=0 → deliver_mask = 0 → ready = 0 → 'c' (check no fire), 永不
@@ -42,6 +46,7 @@ busy_loop:
     # halt: ecall (cause=11; mtvec=0 默认 → fetch 0 fail → triple fault)
     ecall
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80                (mip.MTIP=1, 合成读看到; 但 IE 屏蔽不 trap)
 #   a1 = 0                   (mcause; trap 没发生过 (handler ecall 第 2 次 trap 后 cause=11

@@ -1,12 +1,10 @@
 # a_01_4 / 01_branch_loop
+#
+# ===== 测试目的 =====
 # 验证 BNE + dispatcher while(1) 多块循环 + boundary inst 自然产生块边界。
 # 6 条 RV32I 指令, 24 字节 (32-bit only, .option norvc 强制不生 RVC)。
 #
-# 期望执行后:
-#   x1 = 0          (loop 倒计数器到 0 退出)
-#   x2 = 5          ← 主测试目标 (累加 5 次, x2 += 1 在 loop 体内每次 +1)
-#   pc = 0x80000014 ← ecall 地址 (OP_UNSUPPORTED 时 pc 停在触发指令本身)
-#
+# ===== 思路 =====
 # 期望 dispatcher 行为:
 #   total_count = 5 + 3*4 + 0 = 17
 #     iter 1 (block from 0x80000000): addi x1,x0,5 / addi x2,x0,0 /
@@ -41,3 +39,10 @@ loop:
     addi x1, x1, -1     # 0x8000000c: x1 -= 1                               (0xFFF08093)
     bne  x1, x0, loop   # 0x80000010: if x1 != 0 goto loop (offset = -8)    (0xFE009CE3)
     ecall               # 0x80000014: OP_UNSUPPORTED, dispatcher halt       (0x00000073)
+
+# ===== 期望结果 =====
+# 期望执行后:
+#   x1 = 0          (loop 倒计数器到 0 退出)
+#   x2 = 5          ← 主测试目标 (累加 5 次, x2 += 1 在 loop 体内每次 +1)
+#   pc = 0x80000014 ← ecall 地址 (OP_UNSUPPORTED 时 pc 停在触发指令本身)
+#   total_count = 17

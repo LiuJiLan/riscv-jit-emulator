@@ -1,6 +1,9 @@
 # a02_2 / 03_clint_reject
+#
+# ===== 测试目的 =====
 # CLINT 内部 reject 验证 — clint_write 4 类 branch + clint_read 1 类 sample。
 #
+# ===== 思路 =====
 # clint.c read/write 是对称镜像 (cause 5 vs 7 区别, 内部 branch 完全同源); write
 # 端 cover 4 类 reject branch, read 端用 1 个 sample (idx 越界) 验 cause 5 路径
 # 走通 + clint_read 函数被调到 — 5 个 case 已 cover 全部 branch。
@@ -11,19 +14,6 @@
 #   case 2: sw → 0x0200C000 → clint_write final else (off >= MTIME_OFF+4)        → cause 7
 #   case 3: sb → 0x02000000 → clint_write size != 4                              → cause 7
 #   case 4: lw → 0x02000004 → clint_read  msip idx 越界 (verify cause 5 path)    → cause 5
-#
-# 期望最终寄存器:
-#   a0 (x10) = 0x02000004   case 0 mtval
-#   a1 (x11) = 0x02004008   case 1 mtval
-#   a2 (x12) = 0x0200C000   case 2 mtval
-#   a3 (x13) = 0x02000000   case 3 mtval
-#   a4 (x14) = 5            case 4 mcause
-#   a5 (x15) = 0x02000004   case 4 mtval
-#   s0 (x8)  = 5            (5 case 都进了 handler)
-#   s1 (x9)  = 4*7 + 5 = 33 (cause sanity sum)
-#
-# halt 路径: 5 case 完后 csrw mtvec, x0 + ecall → triple fault halt; cause 7/5
-# 通过 handler 写入 a/s 寄存器, dump 验证。
 
 .section .text
 .option norvc
@@ -99,3 +89,17 @@ epilogue:
     addi t3, t3, 4               # mepc += 4 (sw / lw / sb 都是 4 byte; .option norvc)
     csrw mepc, t3
     mret
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 (x10) = 0x02000004   case 0 mtval
+#   a1 (x11) = 0x02004008   case 1 mtval
+#   a2 (x12) = 0x0200C000   case 2 mtval
+#   a3 (x13) = 0x02000000   case 3 mtval
+#   a4 (x14) = 5            case 4 mcause
+#   a5 (x15) = 0x02000004   case 4 mtval
+#   s0 (x8)  = 5            (5 case 都进了 handler)
+#   s1 (x9)  = 4*7 + 5 = 33 (cause sanity sum)
+#
+# halt 路径: 5 case 完后 csrw mtvec, x0 + ecall → triple fault halt; cause 7/5
+# 通过 handler 写入 a/s 寄存器, dump 验证。

@@ -1,7 +1,10 @@
 # a_01_9 / 02_m_s_trap_csrs
+#
+# ===== 测试目的 =====
 # 验 7 个 csr (mscratch + medeleg + mideleg + sscratch + stvec + scause + stval) csrw +
 # csrr 字段值。
 #
+# ===== 思路 =====
 # 测试组织: 本 fixture 只在 M 态测 csrw/csrr 字段读写, 不测 trap delivery (那归
 # a_01_9/03 medeleg_deliver_s)。stvec WARL "MODE 低 2 位截到 0" 描述: csrw 0x80100003
 # 写入 mode = 0b11 reserved → WARL 落 0, 结果 0x80100000; 跟"接受 mode=0/1 + reserved
@@ -21,12 +24,6 @@
 # main dump 范围 = x4-x7 + x10-x15 共 8 GPR; 7 个 csr 读回值分配如下:
 #   x10 mscratch / x11 medeleg / x12 mideleg / x13 sscratch /
 #   x14 stvec    / x15 scause  / x4  stval (m_handler 地址 csrw 完不再用, x4 重用)
-#
-# 关键验证点:
-#   - x10/x12/x13/x15/x4 = 写入值原样回读 → csr 字段读写路径走通
-#   - x11 = 0xFFFFF7FF (bit 11 清 0) → medeleg WARL hardwire bit 11 真生效
-#   - x14 = 0x80100000 (低 2 位清 0) → stvec WARL MODE 截 (跟 mtvec 同)
-#   - mcause = 11 (handler 末 ecall, 跟 fixture a01_9/01 同, 验 csr_op trap delivery 没退化)
 
 .section .text
 .option norvc
@@ -77,3 +74,10 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                       # cause=11 from M, mtvec=0 fetch fail → triple fault
+
+# ===== 期望结果 =====
+# 关键验证点:
+#   - x10/x12/x13/x15/x4 = 写入值原样回读 → csr 字段读写路径走通
+#   - x11 = 0xFFFFF7FF (bit 11 清 0) → medeleg WARL hardwire bit 11 真生效
+#   - x14 = 0x80100000 (低 2 位清 0) → stvec WARL MODE 截 (跟 mtvec 同)
+#   - mcause = 11 (handler 末 ecall, 跟 fixture a01_9/01 同, 验 csr_op trap delivery 没退化)

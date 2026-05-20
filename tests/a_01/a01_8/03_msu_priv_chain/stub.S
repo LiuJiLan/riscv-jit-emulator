@@ -1,7 +1,10 @@
 # a_01_8 / 03_msu_priv_chain
+#
+# ===== 测试目的 =====
 # 综合 fixture (f) sret 切 priv + (g) SV32 walker, 验 MSU 三态都能正确通过 mmu fetch
 # + csrr CSR_PRIVRD (0xCC0) 验当前 priv 值 + csrw CSR_TOHOST (0x800) 输出.
 #
+# ===== 思路 =====
 # RV spec check_perm 矛盾点: 同一个 PTE 不能同时让 S 和 U 跑 fetch:
 #   - S-mode 默认能访问 PTE.U=0 (kernel page); 不能 fetch X-on-PTE.U=1 (X 路径不享 SUM)
 #   - U-mode 必须 PTE.U=1 (user page)
@@ -19,28 +22,6 @@
 #   3. U phase (走 walker root_pt[0x210] PTE.U=1): csrr 0xCC0=0 → x12 + csrw 0x800 (tohost=0)
 #      + ecall (cause=8 from U)
 #   4. M handler: csrr 0xCC0=3 → x13 + csrw 0x800 (tohost=3) + 验 cause=8 + halt triple fault
-#
-# 期望 main.c dump:
-#   x10 = 3                      (M phase priv)
-#   x11 = 1                      (S phase priv, 经 SV32 walker fetch)
-#   x12 = 0                      (U phase priv, 经 SV32 walker fetch + PTE.U=1)
-#   x13 = 3                      (M handler priv)
-#   x14 = 8                      (handler csrr mcause)
-#   x15 = 8                      (比较 reg)
-#   tohost = 3                   (handler 末 csrw, 覆盖之前)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11                  (handler 末 ecall, 字段保留第 2 次)
-#   mepc = 0x800000xx            (handler 末 ecall PC, 实际值跑出来核对)
-#   mtvec = 0
-#   priv = 3
-#   mstatus = 0x18A0 (?)         (推算: SPIE=1 sret 残留 + MPP=M=0x1800 + ... 跑出来核对)
-#
-# 关键验证点:
-#   - x10/x11/x12/x13 = 3/1/0/3 → MSU 三态都被正确 csrr 0xCC0 拿到 priv (= csr_privrd_read 对)
-#   - x11 = 1 + S phase fetch 实际经 SV32 walker (root_pt[0x200] PTE.U=0, S 默认允许)
-#   - x12 = 0 + U phase fetch 实际经 SV32 walker (root_pt[0x210] PTE.U=1, U 强制 U=1)
-#   - tohost = 3 → handler 写最后
 
 # CSR alias (gcc as 接受 .equ 定义后跟 named csr 一致用法; 直接 numeric 也 OK 但 .equ 可读)
 .equ CSR_TOHOST, 0x800
@@ -125,3 +106,26 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                       # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 3                      (M phase priv)
+#   x11 = 1                      (S phase priv, 经 SV32 walker fetch)
+#   x12 = 0                      (U phase priv, 经 SV32 walker fetch + PTE.U=1)
+#   x13 = 3                      (M handler priv)
+#   x14 = 8                      (handler csrr mcause)
+#   x15 = 8                      (比较 reg)
+#   tohost = 3                   (handler 末 csrw, 覆盖之前)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 11                  (handler 末 ecall, 字段保留第 2 次)
+#   mepc = 0x800000xx            (handler 末 ecall PC, 实际值跑出来核对)
+#   mtvec = 0
+#   priv = 3
+#   mstatus = 0x18A0 (?)         (推算: SPIE=1 sret 残留 + MPP=M=0x1800 + ... 跑出来核对)
+#
+# 关键验证点:
+#   - x10/x11/x12/x13 = 3/1/0/3 → MSU 三态都被正确 csrr 0xCC0 拿到 priv (= csr_privrd_read 对)
+#   - x11 = 1 + S phase fetch 实际经 SV32 walker (root_pt[0x200] PTE.U=0, S 默认允许)
+#   - x12 = 0 + U phase fetch 实际经 SV32 walker (root_pt[0x210] PTE.U=1, U 强制 U=1)
+#   - tohost = 3 → handler 写最后

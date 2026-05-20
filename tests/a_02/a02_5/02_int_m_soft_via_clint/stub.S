@@ -1,5 +1,9 @@
 # a02_5 / 02_int_m_soft_via_clint
-# M-mode software interrupt 通过 CLINT.msip MMIO 触发:
+#
+# ===== 测试目的 =====
+# M-mode software interrupt 通过 CLINT.msip MMIO 触发。
+#
+# ===== 思路 =====
 #   1. CLINT msip[0] @ 0x02000000 写 1 (MMIO; clint_msip_pending 异步源)
 #   2. csr_mip_read 合成 bit 3 (MSIP) ← clint_msip_pending(0)
 #   3. trap_check_interrupt: mip.MSIP & mie.MSIE & mstatus.MIE → fire IRQ_M_SOFT (3)
@@ -49,6 +53,7 @@ m_handler:
     li      s0, 1
     mret
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80000003   (CAUSE_INTERRUPT_BIT | IRQ_M_SOFT = 0x80000000 | 3)
 #   s0 = 1

@@ -1,8 +1,11 @@
 # a_01_8 / 04_sv32_lw_sw_basic
+#
+# ===== 测试目的 =====
 # 验 lsu SV32 在 4KB 页 (level=1 → level=0 leaf) 上 lw/sw 走通 + 第二次 fast path。
 # 跟 fixture 02 (4MB superpage fetch) 互补 — 02 走 level=1 leaf, 04 走 level=0 leaf。
 # 不混 superpage; superpage lw/sw 留给 fixture 07。
 #
+# ===== 思路 =====
 # .S+.c 模板首次启用 (a_01_8 fixture 验证 task 起步): main.c 仅放 setup_pt() — 用
 # volatile uint32_t* 直接写 PA, 比 stub.S 内 lui+addi+sw 链可读性高很多。stub.S 仍
 # 写 _start + S phase + handler (主线汇编)。setup_pt 被 _start call 调用, 需要 sp.
@@ -27,20 +30,6 @@
 #      lw vaddr 0x80001004 → x11  (TLB hit fast path)
 #      ecall (cause=9 from S; trap deliver M)
 #   3. M handler: csrr mcause=9; halt triple fault
-#
-# 期望 main.c dump:
-#   x10    = 0xCAFEBABE   (第一次 lw, 同地址刚被 sw)
-#   x11    = 0x12345678   (第二次 lw, 同地址刚被 sw)
-#   x12    = 9            (ecall_from_S cause)
-#   x13    = 9            (比较 reg)
-#   in_trap = 3
-#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
-#   priv   = 3            (M)
-#
-# 关键验证点:
-#   - x10 / x11 都对 → lsu SV32 4KB lw/sw 路径全跑通 (含 walker fall back + fast path)
-#   - x12 = 9 → ecall from S; trap delivery 到 M handler 走通 (跟 fixture 02 同)
-#   - 跟 fixture 02 比, root_pt[0x200] 是非叶子 (R=W=X=0), walker 真走 level=0 leaf
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -103,3 +92,18 @@ m_handler:
 halt:
     csrw mtvec, x0                  # mtvec=0
     ecall                           # cause=11 from M → mmu fail → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10    = 0xCAFEBABE   (第一次 lw, 同地址刚被 sw)
+#   x11    = 0x12345678   (第二次 lw, 同地址刚被 sw)
+#   x12    = 9            (ecall_from_S cause)
+#   x13    = 9            (比较 reg)
+#   in_trap = 3
+#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
+#   priv   = 3            (M)
+#
+# 关键验证点:
+#   - x10 / x11 都对 → lsu SV32 4KB lw/sw 路径全跑通 (含 walker fall back + fast path)
+#   - x12 = 9 → ecall from S; trap delivery 到 M handler 走通 (跟 fixture 02 同)
+#   - 跟 fixture 02 比, root_pt[0x200] 是非叶子 (R=W=X=0), walker 真走 level=0 leaf

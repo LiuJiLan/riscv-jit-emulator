@@ -1,8 +1,11 @@
 # a02_6 / 02_clint_timer_auto_fire
+#
+# ===== 测试目的 =====
 # 验 timer 辅助线程真异步累加 mtime → mtimecmp 越过阈值 → MTIP → trap deliver
 # 端到端 — 跟 a02_5/01 同形态, 区别在 mtimecmp 设大点 (跨多个 timer wake), 体现
 # "mtime 跟 host wall clock 推进 / 不靠 dispatcher 指令数".
 #
+# ===== 思路 =====
 # 流程:
 #   1. mtvec = m_handler (direct mode)
 #   2. mie.MTIE = 1
@@ -69,6 +72,7 @@ m_handler:
     li      s0, 1                   # 完成标志
     mret
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 (x10) = 0x80000007   (handler s1 → main a0; CAUSE_INTERRUPT_BIT | IRQ_M_TIMER)
 #   s0 (x8)  = 1            (handler 设, 验 handler 真跑)

@@ -1,6 +1,9 @@
 # a_01_9 / 01_m_ro_identity_csrs
+#
+# ===== 测试目的 =====
 # 验 5 个 M-mode RO Identity CSR (mhartid + misa + mvendorid + marchid + mimpid)。
 #
+# ===== 思路 =====
 # 测试组织: a_01_8 fixture 文件夹只放 a_01_8 主轴 fixture (SV32 walker); a01_9
 # 新增 csr 整理类 fixture 单独在 tests/a_01/a01_9/ 下。
 #
@@ -19,16 +22,6 @@
 #   - mhartid = 0 (cpu_create mhartid 入参; 写入 hart->per_hart_info.mhartid)
 #   - misa    = 0 (cpu_create misa 入参; 写入 hart->per_hart_info.misa)
 #   - mvendorid/marchid/mimpid = 0 (cpu.c static const cpu_info_shared_default 全 0)
-#
-# 期望 main dump:
-#   x10 = 0    (mhartid)
-#   x11 = 0    (misa)
-#   x12 = 0    (mvendorid)
-#   x13 = 0    (marchid)
-#   x14 = 0    (mimpid)
-#   x15 = 0    (csrw misa 0xFFFFFFFF 后 csrr misa, 验 noop)
-#   mcause = 11 (handler 末 ecall_from_M, 字段保留第 2 次)
-#   priv = 3, in_trap = 3, mtvec = 0
 #
 # 关键验证点:
 #   - x10-x14 全 0 → 5 个 RO Identity CSR 走 csr.c csr_op switch read path; 数据来源:
@@ -69,3 +62,14 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                   # cause=11 from M → mmu fail (mtvec=0) → triple fault
+
+# ===== 期望结果 =====
+# 期望 main dump:
+#   x10 = 0    (mhartid)
+#   x11 = 0    (misa)
+#   x12 = 0    (mvendorid)
+#   x13 = 0    (marchid)
+#   x14 = 0    (mimpid)
+#   x15 = 0    (csrw misa 0xFFFFFFFF 后 csrr misa, 验 noop)
+#   mcause = 11 (handler 末 ecall_from_M, 字段保留第 2 次)
+#   priv = 3, in_trap = 3, mtvec = 0

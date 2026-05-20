@@ -1,13 +1,11 @@
 # a02_4 / 03_mip_sw_writable
+#
+# ===== 测试目的 =====
 # csrw mip 写软件位 (SSIP/STIP/SEIP_sw) — MIP_SW_WRITABLE_MASK 三位生效, csrr mip
 # 合成读看见软件 inject 位 set (异步源仍 0).
 #
+# ===== 思路 =====
 # BARE M-mode.
-#
-# 期望最终寄存器:
-#   a0 (x10) = 0x00000222   csrw mip set (S_SOFT=2 | S_TIMER=32 | S_EXT=512) 全部生效
-#
-# halt: ecall.
 
 .section .text
 .option norvc
@@ -21,3 +19,9 @@ _start:
     csrr    a0, mip                              # a0 = 0x222
 
     ecall
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 (x10) = 0x00000222   csrw mip set (S_SOFT=2 | S_TIMER=32 | S_EXT=512) 全部生效
+#
+# halt: ecall.

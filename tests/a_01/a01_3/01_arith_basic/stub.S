@@ -1,13 +1,8 @@
 # a01_3 / 01_arith_basic
+#
+# ===== 测试目的 =====
 # 4 条 RV32I 指令, 16 字节 (与 a01_1 / 01_bin_basic 同尺寸)。
 # 末尾 ecall 触发 OP_UNSUPPORTED, 让 interpreter break 出 fetch loop。
-#
-# 期望执行后:
-#   x1 = 42
-#   x2 = 8
-#   x3 = 50          ← 主测试目标
-#   pc = 0x8000000c  ← ecall 地址 (OP_UNSUPPORTED 时 pc 停在触发指令本身, RV trap 语义对齐)
-#   interpret_one_block 的 count_out = 3 (不含 ecall)
 
 .section .text
 # Makefile 用 -march=rv32imac (与 a01_1 一致, 包含 c = compressed 扩展)。
@@ -24,3 +19,11 @@ _start:
     addi x2, x0, 8       # 0x80000004: OP_ADDI, x2 = 0 + 8  = 8        (0x00800113)
     add  x3, x1, x2      # 0x80000008: OP_ADD,  x3 = x1 + x2 = 50      (0x002081B3)
     ecall                # 0x8000000c: OP_UNSUPPORTED (a01_3), break   (0x00000073)
+
+# ===== 期望结果 =====
+# 期望执行后:
+#   x1 = 42
+#   x2 = 8
+#   x3 = 50          ← 主测试目标
+#   pc = 0x8000000c  ← ecall 地址 (OP_UNSUPPORTED 时 pc 停在触发指令本身, RV trap 语义对齐)
+#   interpret_one_block 的 count_out = 3 (不含 ecall)

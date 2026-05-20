@@ -1,10 +1,13 @@
 # a_01_10 / 05_rvc_jump
+#
+# ===== 测试目的 =====
 # 验 RVC jump case (a_01_10 (7) step 3):
 #   C.J     (funct3=101, CJ-format) — 无条件跳, rd=x0
 #   C.JAL   (funct3=001, CJ-format, RV32-only) — call subroutine, ra=x1=pc+2
 #   C.JR    (C2 funct3=100, bit12=0+rs2=0) — return, rd=x0, jump to rs1
 #   C.JALR  (C2 funct3=100, bit12=1+rs1!=0+rs2=0) — indirect call, ra=x1=pc+2
 #
+# ===== 思路 =====
 # 关键验证点 (修复 a_01_4 起步 hardcoded `pc + 4u` ra bug):
 #   - C.JAL ra = pc + 2 (RVC 长度), 不是 pc + 4 (32-bit JAL 长度)
 #   - C.JALR ra = pc + 2 同
@@ -20,16 +23,6 @@
 #   (c) C.JALR + sub2 内 C.JR return — 验 x12 被 sub2 修改 + 返回正确
 #
 # 模板风格: 纯 .S, BARE M-mode, 套 a_01_3/02_arith_compressed; -march=rv32imac, c.* 强制 RVC。
-#
-# 期望 main.c dump:
-#   x10 = 1       (C.J taken, 跳过 c.li x10, 0; 保留初始 1; decimal 1)
-#   x11 = 1       (C.JAL → sub1 → c.addi x11, 1 → c.jr x1 return; decimal 1)
-#   x12 = 7       (C.JALR → sub2 → c.li x12, 7 → c.jr x1 return; decimal 7)
-#   x6 = sub2 PC  (la x6, sub2 设的; 0x80000xxx 范围, hex 显示 0x800000xx)
-#   x1 = ret_jalr (最后 C.JALR 设的 ra; 0x80000xxx 范围)
-#
-# 末态 (跟 fixture 03/04 同 BARE M-mode mtvec=0 chain):
-#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3
 
 .section .text
 .globl _start
@@ -73,3 +66,14 @@ sub1:
 sub2:
     c.li      x12, 7             # x12 = 7
     c.jr      x1                 # 返回
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 1       (C.J taken, 跳过 c.li x10, 0; 保留初始 1; decimal 1)
+#   x11 = 1       (C.JAL → sub1 → c.addi x11, 1 → c.jr x1 return; decimal 1)
+#   x12 = 7       (C.JALR → sub2 → c.li x12, 7 → c.jr x1 return; decimal 7)
+#   x6 = sub2 PC  (la x6, sub2 设的; 0x80000xxx 范围, hex 显示 0x800000xx)
+#   x1 = ret_jalr (最后 C.JALR 设的 ra; 0x80000xxx 范围)
+#
+# 末态 (跟 fixture 03/04 同 BARE M-mode mtvec=0 chain):
+#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3

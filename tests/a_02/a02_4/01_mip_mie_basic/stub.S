@@ -1,18 +1,13 @@
 # a02_4 / 01_mip_mie_basic
+#
+# ===== 测试目的 =====
 # mie / mip / sip 基本读写 + mie WARL 截断 验证 (csr 入口 + 字段就位).
 #
+# ===== 思路 =====
 # BARE M-mode 启动 (priv=M, satp=0); 不切 S, 不依赖 mret / medeleg.
 # 本 fixture IRQ 永远不来 — mip 异步源 (CLINT.msip=0 / mtimecmp=UINT64_MAX
 # clint_init 初值 → MTIP=0 即使 mtime 由 timer 累加也极远不到 UINT64_MAX) +
 # _mip_sw=0 → 合成 mip 应为 0.
-#
-# 期望最终寄存器:
-#   a0 (x10) = 0x00000288   csrw mie set (M_TIMER=128 | M_SOFT=8 | S_EXT=512), 直读 mie
-#   a1 (x11) = 0x00000000   csrr mip 合成 (无源 + 无 inject)
-#   a2 (x12) = 0x00000000   csrr sip 合成 mask view (空)
-#   a3 (x13) = 0x00000AAA   csrw mie set 0xFFFFFFFF → MIE_VALID_MASK 截 (bit 1|3|5|7|9|11)
-#
-# halt 路径: ecall (M-mode, mtvec=0 未设 → pc=0 inst access fault → triple trap halt).
 
 .section .text
 .option norvc
@@ -35,3 +30,12 @@ _start:
     csrr    a3, mie                              # a3 = 0xAAA
 
     ecall                                         # halt
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 (x10) = 0x00000288   csrw mie set (M_TIMER=128 | M_SOFT=8 | S_EXT=512), 直读 mie
+#   a1 (x11) = 0x00000000   csrr mip 合成 (无源 + 无 inject)
+#   a2 (x12) = 0x00000000   csrr sip 合成 mask view (空)
+#   a3 (x13) = 0x00000AAA   csrw mie set 0xFFFFFFFF → MIE_VALID_MASK 截 (bit 1|3|5|7|9|11)
+#
+# halt 路径: ecall (M-mode, mtvec=0 未设 → pc=0 inst access fault → triple trap halt).

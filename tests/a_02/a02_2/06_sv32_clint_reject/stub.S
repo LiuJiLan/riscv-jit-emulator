@@ -1,5 +1,9 @@
 # a_02_2 / 06_sv32_clint_reject
+#
+# ===== 测试目的 =====
 # 验 SV32 经 mmu 翻译后到 CLINT 内部 reject 路径 (a_02_2/03 BARE 版的 SV32 版本)。
+#
+# ===== 思路 =====
 # 跟 a_02_2/03 比, 多走一遍 walker; clint_read/write 内部判 reject 行为应一致。
 #
 # 5 个 case (mret +4 chain, 跟 a_02_2/03 同):
@@ -8,17 +12,6 @@
 #   case 2: sw → 0x0200C000 → clint_write final else (off >= MTIME_OFF+4)       → cause 7
 #   case 3: sb → 0x02000000 → clint_write size != 4                             → cause 7
 #   case 4: lw → 0x02000004 → clint_read  msip idx 越界 (verify cause 5 path)   → cause 5
-#
-# 期望 main.c dump (跟 a_02_2/03 一致):
-#   a0 (x10) = 0x02000004
-#   a1 (x11) = 0x02004008
-#   a2 (x12) = 0x0200C000
-#   a3 (x13) = 0x02000000
-#   a4 (x14) = 5                  case 4 mcause
-#   a5 (x15) = 0x02000004         case 4 mtval
-#   s0 (x8)  = 5
-#   s1 (x9)  = 33                 (4*7 + 5)
-#   in_trap=3 mcause=11 priv=3
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -127,3 +120,15 @@ epilogue:
 m_halt:
     csrw mtvec, x0
     ecall
+
+# ===== 期望结果 =====
+# 期望 main.c dump (跟 a_02_2/03 一致):
+#   a0 (x10) = 0x02000004
+#   a1 (x11) = 0x02004008
+#   a2 (x12) = 0x0200C000
+#   a3 (x13) = 0x02000000
+#   a4 (x14) = 5                  case 4 mcause
+#   a5 (x15) = 0x02000004         case 4 mtval
+#   s0 (x8)  = 5
+#   s1 (x9)  = 33                 (4*7 + 5)
+#   in_trap=3 mcause=11 priv=3

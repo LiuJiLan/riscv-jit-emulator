@@ -1,4 +1,6 @@
 # a_01_4 / 02_jal_jalr_call
+#
+# ===== 测试目的 =====
 # 验证 jal (call) + jalr (return) 经典 RV 函数调用模式。
 # 6 条 RV32I 指令, 24 字节 (32-bit only, .option norvc 强制不生 RVC)。
 #
@@ -7,14 +9,9 @@
 #   - jalr return-style (rs1=x1, imm=0, rd=x0): pc ← (ra+0) & ~1u, ra 不被覆盖
 #   - dispatcher 处理非单调 pc (向前 jal 跳到 sub, 向后 jalr 跳回 main)
 #
+# ===== 思路 =====
 # 寄存器选 x1/x2/x3 (不用 a0/a1 = x10/x11 调用约定名), 与 main.c 现有 fprintf 输出对齐。
 # 实际工程用 a0/a1 传参更标准, 但本 fixture 仅验证指令语义, 寄存器编号选 main.c 能直接打的。
-#
-# 期望执行后:
-#   x1 = 0x8000000c       ← jal 写的返回地址 (= jal 自身 pc + 4 = 0x80000008 + 4)
-#   x2 = 12               ← 主测试目标 (= 7 + 5, sub 内 add 算)
-#   x3 = 5                ← 未动 (sub 内只读)
-#   pc = 0x8000000c       ← ecall 地址 (jalr 跳回这里, ecall = OP_UNSUPPORTED)
 #
 # 期望 dispatcher 行为:
 #   total_count = 5 = 3 + 2 + 0
@@ -43,3 +40,11 @@ sub:
                         #             rd = x0 → 不写 (走 x0_garbage),
                         #             ra (x1) 不被覆盖, 返回地址保持
                         #             encoding = 0x00008067 (I-type, rd=0, rs1=1, imm=0)
+
+# ===== 期望结果 =====
+# 期望执行后:
+#   x1 = 0x8000000c       ← jal 写的返回地址 (= jal 自身 pc + 4 = 0x80000008 + 4)
+#   x2 = 12               ← 主测试目标 (= 7 + 5, sub 内 add 算)
+#   x3 = 5                ← 未动 (sub 内只读)
+#   pc = 0x8000000c       ← ecall 地址 (jalr 跳回这里, ecall = OP_UNSUPPORTED)
+#   total_count = 5

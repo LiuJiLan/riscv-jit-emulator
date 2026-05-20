@@ -1,8 +1,11 @@
 # a_01_8 / 07_sv32_superpage_lw_sw
+#
+# ===== 测试目的 =====
 # 验 lsu SV32 在 4MB superpage (level=1 leaf) 上 lw/sw 走通 + fast path 命中。
 # 跟 fixture 04 (level=1 → level=0 4KB 路径) 互补, 验 walker 另一条主路径。
 # 跟 fixture 02 (superpage fetch) 互补, 02 只验 fetch, 07 加 lw/sw 验 lsu superpage。
 #
+# ===== 思路 =====
 # PT layout (4MB superpage, identity):
 #   root_pt @ PA 0x80100000:
 #     [0x200] (vaddr 0x80000000 段 4MB) = 4MB superpage leaf
@@ -26,17 +29,6 @@
 #      lw  vaddr 0x80001004 → x11 (fast path)
 #      ecall (cause=9 from S)
 #   3. M handler: csrr mcause → x12; halt triple fault
-#
-# 期望 main.c dump (跟 fixture 04 同 — 只是 PT 路径不同, S phase 行为相同):
-#   x10 = 0xCAFEBABE
-#   x11 = 0x12345678
-#   x12 = 9
-#   mcause = 11, priv = 3, in_trap = 3, mtvec = 0
-#
-# 关键验证点:
-#   - x10 / x11 都对 → walker superpage 路径正确 + fill TLB 4KB 粒度 OK
-#   - 跟 fixture 04 比 (4KB leaf 路径), 07 走 superpage 路径; 两个加起来覆盖 mmu_walk
-#     两条主路径 (level=1 leaf 4MB + level=1→level=0 leaf 4KB)
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -95,3 +87,15 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump (跟 fixture 04 同 — 只是 PT 路径不同, S phase 行为相同):
+#   x10 = 0xCAFEBABE
+#   x11 = 0x12345678
+#   x12 = 9
+#   mcause = 11, priv = 3, in_trap = 3, mtvec = 0
+#
+# 关键验证点:
+#   - x10 / x11 都对 → walker superpage 路径正确 + fill TLB 4KB 粒度 OK
+#   - 跟 fixture 04 比 (4KB leaf 路径), 07 走 superpage 路径; 两个加起来覆盖 mmu_walk
+#     两条主路径 (level=1 leaf 4MB + level=1→level=0 leaf 4KB)

@@ -1,7 +1,10 @@
 # a_02_2 / 04_sv32_mmio_basic
+#
+# ===== 测试目的 =====
 # 验 SV32 经 mmu 翻译后到 CLINT MMIO 的读写路径 — a_02_2/01 (BARE) 的 SV32 版本,
 # 同时也是 a_01_8/04 (SV32 + RAM lw/sw) 的 MMIO 版本。
 #
+# ===== 思路 =====
 # P3 后路径 (跟 BARE 路径同语义, 不同入口):
 #   lsu_load_helper / lsu_store_helper 内 SV32 路径:
 #     TLB miss (MMIO 不进 TLB, 永远 miss) → mmu_walker_helper_load/store
@@ -31,20 +34,6 @@
 #      lw 0x0200BFFC → a4
 #      ecall (cause=9 from S)
 #   3. M handler: csrr mcause → x15; halt
-#
-# 期望 main.c dump:
-#   a0 (x10) = 0xDEADBEEF
-#   a1 (x11) = 0x12345678
-#   a2 (x12) = 0x00000001
-#   a3 (x13) = 0xCAFEBABE
-#   a4 (x14) = 0xFEEDFACE
-#   x15      = 9          (mcause from handler entry; ecall_from_S)
-#   in_trap=3 mcause=11 priv=3  (handler 末 ecall_from_M 第 2 次保留)
-#
-# 关键验证点:
-#   - 5 个 a 寄存器对 → SV32 walker_helper_load/store 真走 MMIO 分支 + mmio_*_helper
-#   - 跟 a_02_2/01 (BARE) dump 完全一致 → 证 lsu_load_helper / lsu_store_helper inline
-#     顶层对两条 priv 路径都收敛到同一 mmio_*_helper
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -109,3 +98,18 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   a0 (x10) = 0xDEADBEEF
+#   a1 (x11) = 0x12345678
+#   a2 (x12) = 0x00000001
+#   a3 (x13) = 0xCAFEBABE
+#   a4 (x14) = 0xFEEDFACE
+#   x15      = 9          (mcause from handler entry; ecall_from_S)
+#   in_trap=3 mcause=11 priv=3  (handler 末 ecall_from_M 第 2 次保留)
+#
+# 关键验证点:
+#   - 5 个 a 寄存器对 → SV32 walker_helper_load/store 真走 MMIO 分支 + mmio_*_helper
+#   - 跟 a_02_2/01 (BARE) dump 完全一致 → 证 lsu_load_helper / lsu_store_helper inline
+#     顶层对两条 priv 路径都收敛到同一 mmio_*_helper

@@ -1,33 +1,17 @@
 # a_01_7 / 01_trap_priv_save_restore
+#
+# ===== 测试目的 =====
 # 验证 trap_set_state 真切 priv + 写 mstatus.MPP/MPIE/MIE; OP_MRET 真切 priv (从 MPP 恢复)。
 # M 自我 trap chain (M → ecall → handler → mret → M); 当前 deliver_priv hard-code M, 切前后
 # priv 都是 M, 但 mstatus 字段保存/恢复的代码路径完整跑通。
 # 13 条指令 (la 算 2 条) = 52 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # 字节地址布局 (la 是 pseudo, 展开 auipc+addi 占 8 字节):
 #   _start: 0x00 la(8); 0x08 csrw mtvec; 0x0c addi; 0x10 csrw mstatus; 0x14 ecall(1st);
 #           0x18 csrr x2 mstatus; 0x1c csrw mtvec,x0; 0x20 ecall(2nd, triple fault)
 #   handler 起点 = 0x24:
 #       0x24 csrr x1 mstatus; 0x28 csrr x5 mepc; 0x2c addi x5 +4; 0x30 csrw mepc x5; 0x34 mret
-#
-# 期望:
-#   x1 = 0x1880 = 6272      (handler 内 csrr mstatus: MPP=M=3<<11=0x1800 + MPIE=1<<7=0x80)
-#   x2 = 0x88   = 136       (mret 后主程序 csrr mstatus: MIE=1 (恢复 from MPIE) + MPIE=1 (RV spec) +
-#                             MPP=PRIV_U=0 (RV spec least-priv reset))
-#   x3 = 0                  (没设)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 1, mtval = 0, mepc = 0, mtvec = 0
-#     (字段保留第 2 次 trap = 主程序末 ecall 后 mmu fail at 0; cause=1 access fault on fetch
-#      —— 跟 a_01_5 05_triple_fault_halt 同形态)
-#   priv = 3                (M; mret 切回 M, 末 ecall 后 trap 切到 M=deliver_priv 不变)
-#   mstatus = 0x1800        (字段保留第 2 次 trap 设的 MPP=M=3<<11=0x1800; MPIE=MIE=0 因为
-#                             末 ecall 时 mstatus.MIE 已经 0)
-#   total_count = 12
-#     (block 1: la(2)+csrw mtvec=3; block 2: addi+csrw mstatus=2 → total=5; ecall longjmp 不计;
-#      block 3-7: 5 条 csr/mret 各独立 boundary, 加 1 个 addi+csrw mepc 块 = 1+1+2+1 = 5 → total=10;
-#      mret 后 csrr x2(boundary)=1 → 11; csrw mtvec(boundary)=1 → 12; ecall longjmp; mmu fail x2
-#      不计)
 #
 # 控制流追 (带 0x80000000 RAM 起点偏移):
 #   block 1 (RAM+0x00): la(2)+csrw mtvec(boundary)        count=3,  total=3
@@ -83,3 +67,23 @@ handler:
     addi x5,  x5, 4         # 0x2c:      x5 = 0x80000018 (跳过 ecall, 指向下一条)
     csrw mepc, x5           # 0x30:      mepc = 0x80000018
     mret                    # 0x34:      切 priv from MPP = M; pc = mepc = 0x80000018
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 0x1880 = 6272      (handler 内 csrr mstatus: MPP=M=3<<11=0x1800 + MPIE=1<<7=0x80)
+#   x2 = 0x88   = 136       (mret 后主程序 csrr mstatus: MIE=1 (恢复 from MPIE) + MPIE=1 (RV spec) +
+#                             MPP=PRIV_U=0 (RV spec least-priv reset))
+#   x3 = 0                  (没设)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 1, mtval = 0, mepc = 0, mtvec = 0
+#     (字段保留第 2 次 trap = 主程序末 ecall 后 mmu fail at 0; cause=1 access fault on fetch
+#      —— 跟 a_01_5 05_triple_fault_halt 同形态)
+#   priv = 3                (M; mret 切回 M, 末 ecall 后 trap 切到 M=deliver_priv 不变)
+#   mstatus = 0x1800        (字段保留第 2 次 trap 设的 MPP=M=3<<11=0x1800; MPIE=MIE=0 因为
+#                             末 ecall 时 mstatus.MIE 已经 0)
+#   total_count = 12
+#     (block 1: la(2)+csrw mtvec=3; block 2: addi+csrw mstatus=2 → total=5; ecall longjmp 不计;
+#      block 3-7: 5 条 csr/mret 各独立 boundary, 加 1 个 addi+csrw mepc 块 = 1+1+2+1 = 5 → total=10;
+#      mret 后 csrr x2(boundary)=1 → 11; csrw mtvec(boundary)=1 → 12; ecall longjmp; mmu fail x2
+#      不计)

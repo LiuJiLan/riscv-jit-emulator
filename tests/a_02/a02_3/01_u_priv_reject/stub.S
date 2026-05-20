@@ -1,7 +1,10 @@
 # a02_3 / 01_u_priv_reject
+#
+# ===== 测试目的 =====
 # priv check fixture — U-mode 调 SYSTEM priv-required 指令 (MRET / SRET /
 # SFENCE.VMA) reject 验证。
 #
+# ===== 思路 =====
 # 触发 case (3 个; 都期望 cause=2 illegal + tval=raw_inst):
 #   case 0: U-mode mret           → cause 2, tval = 0x30200073
 #   case 1: U-mode sret           → cause 2, tval = 0x10200073
@@ -20,15 +23,6 @@
 #     (interpreter case 入口判)
 #   - mtvec 指 m_handler, handler 用 s0 计数分流, 写 cause / tval 到 a 寄存器
 #   - medeleg=0 (默认; cpu_create 时 trap._medeleg=0), illegal-inst trap 全 deliver 到 M
-#
-# 期望最终寄存器:
-#   a0 = 2          case 0 mcause (illegal instruction)
-#   a1 = 0x30200073 case 0 mtval  (mret raw_inst)
-#   a2 = 2          case 1 mcause
-#   a3 = 0x10200073 case 1 mtval  (sret raw_inst)
-#   a4 = 2          case 2 mcause
-#   a5 = 0x12000073 case 2 mtval  (sfence.vma raw_inst)
-#   s0 = 3          (3 case 都进了 handler)
 #
 # halt 路径: case 2 handler 内 csrw mtvec, x0 + ecall → 下轮 fetch pc=0 → triple
 #            fault halt; main dump 的 mcause/mtval 是 cause 1 / 0 (最后 root cause),
@@ -100,3 +94,13 @@ epilogue:
     addi t3, t3, 4               # 3 条触发指令都是 4-byte (RV32 SYSTEM, .option norvc)
     csrw mepc, t3
     mret
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 = 2          case 0 mcause (illegal instruction)
+#   a1 = 0x30200073 case 0 mtval  (mret raw_inst)
+#   a2 = 2          case 1 mcause
+#   a3 = 0x10200073 case 1 mtval  (sret raw_inst)
+#   a4 = 2          case 2 mcause
+#   a5 = 0x12000073 case 2 mtval  (sfence.vma raw_inst)
+#   s0 = 3          (3 case 都进了 handler)

@@ -1,8 +1,11 @@
 # a_01_8 / 09_sv32_root_pt_not_in_ram
+#
+# ===== 测试目的 =====
 # 验 SV32 walker level=1 PT (root_pt 自身) 不在 RAM 时报 access fault — 走 fetch 路径
 # 触发 INST_ACCESS_FAULT (cause 1)。跟 fixture 08 (level=0 leaf_pt 不在 RAM, load 路径
 # cause 5) 互补; 两个 fixture 加起来覆盖 mmu_walk RAM 检查两段 (mmu.c 内 level=1 + level=0)。
 #
+# ===== 思路 =====
 # 跟 04-08 模板区别: 不分配 PT (root_pt 故意 satp.PPN 指 RAM 外); main.c setup_pt() 保留
 # 但函数体空, 跟模板形态一致。
 #
@@ -33,20 +36,6 @@
 #   2. mret 后: dispatcher 调 mmu_translate_pc(s_target vaddr) → walker level=1 PT 读
 #      RAM 检查 fail → trap 1 (路径 2b); s_target 内任何指令都不会执行
 #   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; halt
-#
-# 期望 main.c dump:
-#   x10 = 0                  (s_target 永未执行)
-#   x12 = 1                  (mcause = INST_ACCESS_FAULT)
-#   x13 = 0x80000040         (mepc = s_target PA = mret 后 cpu->pc, 实际值看反汇编)
-#   x14 = 0x80000040         (mtval = s_target PA, mmu_translate_pc trap_set_state 第 2 参 = gva)
-#   mcause = 11              (handler 末 ecall_from_M 第 2 次保留)
-#   priv = 3, in_trap = 3
-#
-# 关键验证点:
-#   - x12 = 1 → mmu_translate_pc 真在 PT-not-in-RAM 路径报 INST_ACCESS_FAULT (跟 lw cause 5 区分)
-#   - x14 = 0x80000040 → trap_set_state 路径 mtval 协议跟 trap_raise_exception 一致 (都写 gva)
-#   - x13 = 0x80000040 → mepc = 失败 fetch 的 vaddr (没真执行任何指令, mret 后 cpu->pc)
-#   - 跟 fixture 08 形成 walker RAM 检查两段 (level=1 + level=0) 完整覆盖
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -93,3 +82,18 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 0                  (s_target 永未执行)
+#   x12 = 1                  (mcause = INST_ACCESS_FAULT)
+#   x13 = 0x80000040         (mepc = s_target PA = mret 后 cpu->pc, 实际值看反汇编)
+#   x14 = 0x80000040         (mtval = s_target PA, mmu_translate_pc trap_set_state 第 2 参 = gva)
+#   mcause = 11              (handler 末 ecall_from_M 第 2 次保留)
+#   priv = 3, in_trap = 3
+#
+# 关键验证点:
+#   - x12 = 1 → mmu_translate_pc 真在 PT-not-in-RAM 路径报 INST_ACCESS_FAULT (跟 lw cause 5 区分)
+#   - x14 = 0x80000040 → trap_set_state 路径 mtval 协议跟 trap_raise_exception 一致 (都写 gva)
+#   - x13 = 0x80000040 → mepc = 失败 fetch 的 vaddr (没真执行任何指令, mret 后 cpu->pc)
+#   - 跟 fixture 08 形成 walker RAM 检查两段 (level=1 + level=0) 完整覆盖

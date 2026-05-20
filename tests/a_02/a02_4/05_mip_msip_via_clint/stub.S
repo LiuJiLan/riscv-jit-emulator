@@ -1,16 +1,12 @@
 # a02_4 / 05_mip_msip_via_clint
+#
+# ===== 测试目的 =====
 # mip.MSIP 合成路径验证 — 写 CLINT.msip[0] MMIO → mip.MSIP 合成读看见; csrw mip
 # 不能清 MSIP (RO in mip 视角); 只能 MMIO 写 clint.msip[0] = 0 清.
 #
+# ===== 思路 =====
 # BARE M-mode.
 # CLINT msip[0] @ 0x02000000 (config.h CLINT_BASE + CLINT_MSIP_OFFSET).
-#
-# 期望最终寄存器:
-#   a0 (x10) = 0x00000008   写 msip[0]=1 → csrr mip MSIP (bit 3) = 1
-#   a1 (x11) = 0x00000008   csrw mip 0 不影响 MSIP (RO); 仍 set
-#   a2 (x12) = 0x00000000   写 msip[0]=0 → csrr mip MSIP=0
-#
-# halt: ecall.
 
 .section .text
 .option norvc
@@ -33,3 +29,11 @@ _start:
     csrr    a2, mip                               # a2 = 0
 
     ecall
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 (x10) = 0x00000008   写 msip[0]=1 → csrr mip MSIP (bit 3) = 1
+#   a1 (x11) = 0x00000008   csrw mip 0 不影响 MSIP (RO); 仍 set
+#   a2 (x12) = 0x00000000   写 msip[0]=0 → csrr mip MSIP=0
+#
+# halt: ecall.

@@ -1,7 +1,10 @@
 # a_01_5 / 03_csr_rw
+#
+# ===== 测试目的 =====
 # 验证 csr.c 6 小 helper 真读写 (csrw 写 → csrr 读回相同值; WARL 截断对 mtvec/mepc 真生效)。
 # 8 条指令 = 32 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # csrw / csrr 是 pseudo:
 #   csrw csr, rs1 = csrrw x0, csr, rs1  (op=RW, do_write=true)
 #   csrr rd, csr  = csrrs rd, csr, x0   (op=RS, new_val=0, do_write=false → 只读不写)
@@ -10,14 +13,6 @@
 #   - mtvec write 0x42 (0b01000010) → mask 低 2 位 → 0x40 (Vectored 不实现, 强制 Direct)
 #   - mepc write 0x42 → mask IALIGN_MASK (=1) → 0x42 (低 1 位本来就 0, 不变)
 #   - mcause / mtval 无 WARL, 接受任意值
-#
-# 期望:
-#   x1 = 0x40   (csrr mtvec 读回 csrw 写的; 验 mtvec WARL 真截断 0x42→0x40)
-#   x2 = 0x42   (csrr mcause 读回; 验 mcause 无 WARL)
-#   x3 = 0x42   (csrr mepc 读回; 验 mepc WARL 对偶数不影响)
-#   ecall 末尾触发 trap → 跳 mtvec=0x40 → mmu fail → triple fault → 退出
-#   in_trap=3, mcause=1, mtval=0x40, mepc=0x40, mtvec=0x40
-#   pc=0x40, total_count=7
 #
 # dispatcher 行为:
 #   block 1 (0x80000000): addi + csrw mtvec (boundary)        count=2, total += 2 = 2
@@ -44,3 +39,12 @@ _start:
     csrw mepc, x10           # 0x80000014: mepc = 0x42 → WARL IALIGN=1 → 0x42 (低 1 位 0)
     csrr x3, mepc            # 0x80000018: x3 = mepc = 0x42
     ecall                    # 0x8000001c: 触发 trap → 跳 mtvec=0x40 → mmu fail → triple
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 0x40   (csrr mtvec 读回 csrw 写的; 验 mtvec WARL 真截断 0x42→0x40)
+#   x2 = 0x42   (csrr mcause 读回; 验 mcause 无 WARL)
+#   x3 = 0x42   (csrr mepc 读回; 验 mepc WARL 对偶数不影响)
+#   ecall 末尾触发 trap → 跳 mtvec=0x40 → mmu fail → triple fault → 退出
+#   in_trap=3, mcause=1, mtval=0x40, mepc=0x40, mtvec=0x40
+#   pc=0x40, total_count=7

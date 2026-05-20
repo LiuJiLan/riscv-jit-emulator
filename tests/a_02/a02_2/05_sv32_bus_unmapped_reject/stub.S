@@ -1,22 +1,15 @@
 # a_02_2 / 05_sv32_bus_unmapped_reject
+#
+# ===== 测试目的 =====
 # 验 SV32 经 mmu 翻译后落 bus 未注册 PA, mmio_*_helper 扫表未命中 → access fault
 # (a_02_2/02 BARE 版的 SV32 版本)。
 #
+# ===== 思路 =====
 # 跟 a_02_2/02 比, 多走一遍 walker; mmio_*_helper 行为应一致 (cause 5/7, mtval=gva)。
 #
 # 触发 case (2 个, mret +4 chain):
 #   case 0: sw → vaddr 0x03000000 (经 walker → pa 0x03000000) → 未命中 → cause 7
 #   case 1: lw → vaddr 0x03000000 → 未命中 → cause 5
-#
-# 期望 main.c dump:
-#   a0 (x10) = 0x03000000   case 0 mtval
-#   a1 (x11) = 5            case 1 mcause
-#   a2 (x12) = 0x03000000   case 1 mtval
-#   s0 (x8)  = 2            (2 case 都进 handler)
-#   in_trap=3 mcause=11 priv=3
-#
-# halt: 2 case 完后 csrw mtvec, x0 + ecall → 下轮 fetch pc=0 → triple fault。
-# main dump 的 mcause/mtval 是 1/0 (最后 root cause, 不是 7/5; 7/5 走 a 寄存器)。
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -100,3 +93,14 @@ epilogue:
 m_halt:
     csrw mtvec, x0
     ecall                           # ecall_from_M (cause 11) → triple fault path
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   a0 (x10) = 0x03000000   case 0 mtval
+#   a1 (x11) = 5            case 1 mcause
+#   a2 (x12) = 0x03000000   case 1 mtval
+#   s0 (x8)  = 2            (2 case 都进 handler)
+#   in_trap=3 mcause=11 priv=3
+#
+# halt: 2 case 完后 csrw mtvec, x0 + ecall → 下轮 fetch pc=0 → triple fault。
+# main dump 的 mcause/mtval 是 1/0 (最后 root cause, 不是 7/5; 7/5 走 a 寄存器)。

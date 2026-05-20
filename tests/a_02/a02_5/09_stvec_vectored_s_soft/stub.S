@@ -1,5 +1,11 @@
 # a02_5 / 09_stvec_vectored_s_soft
-# stvec mode=1 vectored + delegated SSIP fire → pc = stvec_base + 4 * IRQ_S_SOFT:
+#
+# ===== 测试目的 =====
+# stvec mode=1 vectored + delegated SSIP fire → pc = stvec_base + 4 * IRQ_S_SOFT。
+# 跟 fixture 07 区别: stvec (S-mode trap vector) 代替 mtvec; 验 stvec mode=1 路径跟 mtvec
+# 同形态生效 (trap_set_interrupt_state 内部统一读 xtvec[deliver_priv]).
+#
+# ===== 思路 =====
 #   1. M setup: mtvec=m_handler, stvec=s_vec_table|1, mideleg.SSIE=0x2, mie.SSIE=0x2
 #   2. mret 切 S (mstatus.MPP=S, mstatus.SIE=1)
 #   3. S-mode csrw sip 设 SSIP (软件 inject; SIP_WRITABLE_MASK 仅 SSIP)
@@ -8,9 +14,6 @@
 #   6. slot 1 = `j s_handler_ssip` → 真 handler
 #   7. handler 验 scause = 0x80000001, 清 SSIP, sret
 #   8. S resume → wait_loop 退出 → ecall → M halt path
-#
-# 跟 fixture 07 区别: stvec (S-mode trap vector) 代替 mtvec; 验 stvec mode=1 路径跟 mtvec
-# 同形态生效 (trap_set_interrupt_state 内部统一读 xtvec[deliver_priv]).
 
 .section .text
 .option norvc
@@ -91,6 +94,7 @@ halt:
     # s_vec_table 错跳 slot 兜底 (不该走到)
     j       m_handler
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80000001   (scause = CAUSE_INTERRUPT_BIT | IRQ_S_SOFT)
 #   s0 = 1

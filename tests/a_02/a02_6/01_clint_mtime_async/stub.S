@@ -1,10 +1,13 @@
 # a02_6 / 01_clint_mtime_async
+#
+# ===== 测试目的 =====
 # 验 timer 辅助线程真异步累加 atomic clint.mtime:
 #   1. 读 CLINT mtime 低 32 (MMIO @ 0x0200BFF8) → t0
 #   2. poll 等 mtime 值变 (max 10M iter 防卡死) → t1
 #   3. 验 t1 > t0 → s0=1 success / 否则 s0=0xBAD fail
 #   4. ecall → mtvec=0 triple fault halt
 #
+# ===== 思路 =====
 # 期望 (1ms 一次 fetch_add += TIMEBASE_PER_WAKE=10000):
 #   host CPU ~ns 量级跑 poll, mtime 真异步推进; 几 ms host wall clock 后 t1 必 > t0,
 #   delta 大概率 ~10000 量级 (一次 wake) 或更多 (跨多个 wake; host schedule 抖动).
@@ -54,6 +57,7 @@ halt:
     csrw    mtvec, x0               # 清 mtvec, ecall 走 pc=0 → mmu fail triple fault
     ecall
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   s0 (x8)  = 1            (success)
 #   a0 (x10) = mtime t0     (一般 ~几千; cpu_create / clint_init 到 _start 已过几 us)

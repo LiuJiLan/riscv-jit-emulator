@@ -1,8 +1,11 @@
 # a_01_8 / 08_sv32_pt_not_in_ram
+#
+# ===== 测试目的 =====
 # 验 SV32 walker 内 PT 不在 RAM 时报 access fault (cause 5; load 路径)。
 # 项目 a_01 不实现 PMP, 用 RAM 区检查代替 (mmu.c walker level=0 PT 读检查); 未来 PMP
 # 接入时 cause 不变, 只是 RAM 检查改为 PMP allow 检查。
 #
+# ===== 思路 =====
 # PT 设计:
 #   代码段 (vaddr 0x80000000 段, vpn1=0x200) 走 4MB superpage identity, 在 RAM 内, fetch OK
 #   数据段 (vaddr 0x90000000 段, vpn1=0x240) 走 pointer-to-next-level, leaf_pt PA 故意指
@@ -33,19 +36,6 @@
 #      lw   x10, 0(x4)            # walker(R) level=0 PT RAM 检查失败 → trap 5 (longjmp)
 #      ecall                      # 防御
 #   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; halt
-#
-# 期望 main.c dump:
-#   x10 = 0                  (lw 失败没写)
-#   x12 = 5                  (mcause = LOAD_ACCESS_FAULT)
-#   x13 = 失败 lw 的 PC      (mepc; 实际值看反汇编)
-#   x14 = 0x90000000         (mtval = 失败 lw 的 GVA)
-#   mcause = 11              (handler 末 ecall_from_M 第 2 次)
-#   priv = 3, in_trap = 3
-#
-# 关键验证点:
-#   - x12 = 5 → walker 真在 PT-not-in-RAM 路径报 LOAD_ACCESS_FAULT (跟 page fault 区分)
-#   - x14 = 0x90000000 → mtval = GVA (跟 page fault fixture 06 同协议)
-#   - 跟 fixture 06 (page fault, cause 13) 互补; 06 验 PTE.V=0, 08 验 PT 物理不可达
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -95,3 +85,17 @@ m_handler:
 halt:
     csrw mtvec, x0
     ecall                           # cause=11 from M → triple fault
+
+# ===== 期望结果 =====
+# 期望 main.c dump:
+#   x10 = 0                  (lw 失败没写)
+#   x12 = 5                  (mcause = LOAD_ACCESS_FAULT)
+#   x13 = 失败 lw 的 PC      (mepc; 实际值看反汇编)
+#   x14 = 0x90000000         (mtval = 失败 lw 的 GVA)
+#   mcause = 11              (handler 末 ecall_from_M 第 2 次)
+#   priv = 3, in_trap = 3
+#
+# 关键验证点:
+#   - x12 = 5 → walker 真在 PT-not-in-RAM 路径报 LOAD_ACCESS_FAULT (跟 page fault 区分)
+#   - x14 = 0x90000000 → mtval = GVA (跟 page fault fixture 06 同协议)
+#   - 跟 fixture 06 (page fault, cause 13) 互补; 06 验 PTE.V=0, 08 验 PT 物理不可达

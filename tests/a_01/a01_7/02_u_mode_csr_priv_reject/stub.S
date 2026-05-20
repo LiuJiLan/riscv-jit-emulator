@@ -1,9 +1,12 @@
 # a_01_7 / 02_u_mode_csr_priv_reject
+#
+# ===== 测试目的 =====
 # 验证 csr_op 入口 priv 检查激活: U 模式写 M-only csr (mtvec 0x305, bits 9:8 = 11 = M-required)
 # → trap cause=2 (illegal instruction)。
 # 切 U 路径: M 模式设 mstatus.MPP=PRIV_U=0 + csrw mepc, u_target + mret → priv 切 U + pc=u_target。
 # 14 条指令 (la×2 算 4 条) = 56 字节 (32-bit only, .option norvc)。
 #
+# ===== 思路 =====
 # 字节地址布局:
 #   _start: 0x00 la x4, handler(8); 0x08 csrw mtvec; 0x0c csrw mstatus,x0;
 #           0x10 la x6, u_target(8); 0x18 csrw mepc; 0x1c mret
@@ -12,27 +15,6 @@
 #   handler = 0x24:
 #       0x24 csrr x1 mcause; 0x28 csrr x2 mtval; 0x2c csrr x3 mepc;
 #       0x30 csrw mtvec,x0; 0x34 ecall (triple fault)
-#
-# 期望:
-#   x1 = 2          (mcause = illegal instruction)
-#   x2 = 0x30521073 = 810684531
-#                    (mtval = raw_inst of `csrw mtvec, x4`; 编码:
-#                     csr=0x305 << 20 = 0x30500000
-#                     rs1=4 << 15  = 0x00020000
-#                     funct3=001 << 12 = 0x00001000
-#                     rd=0 << 7    = 0
-#                     opcode=0x73  = 0x00000073
-#                     总 = 0x30521073)
-#   x3 = 0x80000020 = 2147483680 (mepc = u_target 处 csrw mtvec 的 PC)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall)
-#   mtval = 0
-#   mepc = 0x80000034 (handler 末 ecall PC)
-#   mtvec = 0
-#   priv = 3        (handler 在 M 模式跑; trap 切 priv 已切 M)
-#   mstatus = 0x1800 (handler 末 ecall trap 时 MPP=M=3<<11=0x1800; MPIE=MIE=0 因为
-#                      MIE 在前一次 trap 时已 0)
 #
 # 控制流追:
 #   block 1 (RAM+0x00): la(2)+csrw mtvec(boundary)        count=3,  total=3
@@ -92,3 +74,25 @@ handler:
     # ---- 停机 ----
     csrw mtvec, x0          # 0x30:      mtvec = 0
     ecall                   # 0x34:      trap → 跳 0 → mmu fail x2 → triple fault 退出
+
+# ===== 期望结果 =====
+# 期望:
+#   x1 = 2          (mcause = illegal instruction)
+#   x2 = 0x30521073 = 810684531
+#                    (mtval = raw_inst of `csrw mtvec, x4`; 编码:
+#                     csr=0x305 << 20 = 0x30500000
+#                     rs1=4 << 15  = 0x00020000
+#                     funct3=001 << 12 = 0x00001000
+#                     rd=0 << 7    = 0
+#                     opcode=0x73  = 0x00000073
+#                     总 = 0x30521073)
+#   x3 = 0x80000020 = 2147483680 (mepc = u_target 处 csrw mtvec 的 PC)
+#   pc = 0
+#   in_trap = 3
+#   mcause = 11     (字段保留第 2 次 trap = handler 末 ecall)
+#   mtval = 0
+#   mepc = 0x80000034 (handler 末 ecall PC)
+#   mtvec = 0
+#   priv = 3        (handler 在 M 模式跑; trap 切 priv 已切 M)
+#   mstatus = 0x1800 (handler 末 ecall trap 时 MPP=M=3<<11=0x1800; MPIE=MIE=0 因为
+#                      MIE 在前一次 trap 时已 0)

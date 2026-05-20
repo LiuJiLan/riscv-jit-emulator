@@ -1,5 +1,9 @@
 # a02_5 / 01_int_m_timer_basic
-# M-mode timer interrupt 基本路径 — 端到端验证 (假设 mtime 在主动步进):
+#
+# ===== 测试目的 =====
+# M-mode timer interrupt 基本路径 — 端到端验证 (假设 mtime 在主动步进)。
+#
+# ===== 思路 =====
 #   1. mtime 推进 (实现方式取决于当前阶段, 见 platform/clint.h 顶段; 行为受步进
 #      实现影响, 但 mip.MTIP 合成读 + trap 路径语义不变)
 #   2. trap_check_interrupt 看到 mip.MTIP (clint_timer_pending) & mie.MTIE & mstatus.MIE → fire
@@ -7,10 +11,6 @@
 #      = 0x80000007; jump-to xtvec base (mode=0 direct)
 #   4. m_handler: 验 mcause, 清 MTIP via 写 mtimecmp = UINT64_MAX, mret
 #   5. main 看 s0=1 → 跳出 wait_loop → halt path
-#
-# trace 期望 (debug.h 互斥协议): 'cf' × N (主 setup 阶段 + wait_loop 多轮 check no fire)
-# → 'tf' (timer fire + refetch from mtvec) → 'cf' (handler 内 MIE=0 deliver_mask=0)
-# → 'Ef' × 3 (halt path ecall triple fault).
 
 .section .text
 .option norvc
@@ -62,6 +62,7 @@ m_handler:
     li      s0, 1                   # 完成标志
     mret
 
+# ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 (x10) = 0x80000007   (handler s1 → main a0; CAUSE_INTERRUPT_BIT | IRQ_M_TIMER)
 #   s0 (x8)  = 1            (handler 设置, 验证 handler 真跑)
@@ -73,3 +74,7 @@ m_handler:
 #   mcause  = 1             (CAUSE_INST_ACCESS_FAULT 第 2 次保留; 路径:
 #                            ecall_from_M (cause 11, in_trap=1) → mtvec=0 → mmu fail pc=0
 #                            (cause 1, in_trap=2) → mmu fail again (cause 1, in_trap=3 早 return))
+#
+# trace 期望 (debug.h 互斥协议): 'cf' × N (主 setup 阶段 + wait_loop 多轮 check no fire)
+# → 'tf' (timer fire + refetch from mtvec) → 'cf' (handler 内 MIE=0 deliver_mask=0)
+# → 'Ef' × 3 (halt path ecall triple fault).

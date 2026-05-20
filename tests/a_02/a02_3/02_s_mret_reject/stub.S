@@ -1,10 +1,13 @@
 # a02_3 / 02_s_mret_reject
+#
+# ===== 测试目的 =====
 # priv check fixture — S-mode 调 MRET reject。
 #
 # MRET 仅在 priv >= M 时合法 (M-only system 指令); S-mode 调 MRET 触发
 # PRIV_CHECK_OR_TRAP(PRIV_M) cause 2 illegal + tval=raw_inst (interpreter case
 # 入口判)。
 #
+# ===== 思路 =====
 # 触发 case (1 个):
 #   case 0: S-mode mret → cause 2, tval = 0x30200073
 #
@@ -16,11 +19,6 @@
 #   - S-mode mret → PRIV_CHECK_OR_TRAP(PRIV_M) trap (S=1 < M=3)
 #   - mtvec 指 m_handler; medeleg=0 (默认; 显式确保 illegal-inst trap deliver 到 M
 #     而不是经 S 委托回 S 形成循环)
-#
-# 期望最终寄存器:
-#   a0 = 2          mcause (illegal instruction)
-#   a1 = 0x30200073 mtval  (mret raw_inst)
-#   s0 = 1          (handler 进过 1 次)
 #
 # halt: handler 内 csrw mtvec, x0 + ecall → fetch pc=0 → triple fault.
 
@@ -73,3 +71,9 @@ m_handler:
     # halt: csrw mtvec, x0 + ecall → fetch pc=0 → triple fault
     csrw mtvec, x0
     ecall
+
+# ===== 期望结果 =====
+# 期望最终寄存器:
+#   a0 = 2          mcause (illegal instruction)
+#   a1 = 0x30200073 mtval  (mret raw_inst)
+#   s0 = 1          (handler 进过 1 次)
