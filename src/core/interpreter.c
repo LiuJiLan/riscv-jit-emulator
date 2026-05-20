@@ -29,14 +29,14 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     // dummy.txt §2 局部垃圾桶变量: 写 x0 的 dead store 落点。
     // 编译器 DCE 会把这个 store 干掉, 等于 NO-OP; 保留是为统一 "所有写都通过同一个宏" 风格,
     // 让未来 IR / 后端不感知 x0 特殊性。
-    uint32_t x0_garbage = 0;
+    uxlen_t  x0_garbage = 0;
     (void)x0_garbage;            // 防 -Wunused-variable; 真有 WRITE_REG(0,...) 时编译器会用
 
     // 局部宏: hart / x0_garbage / pc 隐式捕获 (interpret_one_block 函数内, 上下文清楚)。
     // 函数末尾统一 #undef, 不污染翻译单元其它部分。
     // 注: 调用方必须传简单 lvalue (decode 后 d.rd / d.rs1 / d.rs2 都是 struct 字段, 无副作用)。
     #define READ_REG(r)       ((r) == 0u ? 0u : hart->regs[r])
-    #define WRITE_REG(r, val) (*((r) == 0u ? &x0_garbage : &hart->regs[r]) = (uint32_t)(val))
+    #define WRITE_REG(r, val) (*((r) == 0u ? &x0_garbage : &hart->regs[r]) = (uxlen_t)(val))
 
     // WRITE_PC_OR_TRAP: control flow case 内统一写 pc 入口, 含对齐检查 + trap 占位。
     //   - target 对齐 → hart->regs[0] = target, case 正常 break, fetch loop 末尾 +=
@@ -47,7 +47,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //                    precise trap 语义对齐)
     //   隐式捕获: hart (写 pc + 调 helper)。pc 不在宏内用 (helper 自己读 hart->regs[0])。
     #define WRITE_PC_OR_TRAP(target) do {                                  \
-        uint32_t _t = (target);                                            \
+        uxlen_t  _t = (target);                                            \
         if ((_t & IALIGN_MASK) != 0u) {                                    \
             SYNC_COUNT();                                                  \
             trap_raise_exception(hart, CAUSE_INST_ADDR_MISALIGNED, /*tval*/_t); \
@@ -182,13 +182,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         // 下一 page。BARE / SV32 下 mmap 连续 128MB, over-read 物理无 segfault; decode_rvc
         // 只读低 16 位, over-read 字节不参与解码, 逻辑无害。RAM 末尾 4 字节是唯一例外
         // (fixture 不写到那)。
-        uint32_t inst;
+        u32_t    inst;
         memcpy(&inst, hva_pc, 4);
 
         const decoded_inst_t d = decode(inst);
 
         // 当前 PC = regs[0] (cpu.h: regs[0] 物理位置存 pc, x0 走 garbage 路径不碰这里)
-        const uint32_t pc = hart->regs[0];
+        const uxlen_t  pc = hart->regs[0];
 
         // SLLI/SRLI/SRAI 的 shamt: decode 已把 5 位 shamt 放进 imm 低 5 位; R-type SLL/SRL/SRA
         // 用 rs2 寄存器值的低 5 位 (RV 规范要求; mini-rv32ima 同)。
@@ -517,35 +517,35 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // 长跳走 dispatcher 落点; 这里 break 后的 fetch loop 末尾 += pc_step / count++ /
             // boundary 检查不会执行。
             case OP_LB: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 LOAD_MISALIGN_CHECK(ea, 1u);
                 WRITE_REG(d.rd, (uint32_t)(int32_t)(int8_t) lsu_load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LH: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 LOAD_MISALIGN_CHECK(ea, 2u);
                 WRITE_REG(d.rd, (uint32_t)(int32_t)(int16_t)lsu_load_helper(hart, current_tlb, ea, 2u));
                 break;
             }
             case OP_LW: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 LOAD_MISALIGN_CHECK(ea, 4u);
                 WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 4u));
                 break;
             }
             case OP_LBU: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 LOAD_MISALIGN_CHECK(ea, 1u);
                 WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 1u));
                 break;
             }
             case OP_LHU: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 LOAD_MISALIGN_CHECK(ea, 2u);
                 WRITE_REG(d.rd,                              lsu_load_helper(hart, current_tlb, ea, 2u));
@@ -569,21 +569,21 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //   BARE PA 不在 RAM, MMIO 未命中 / device 拒绝 → cause 7 (access fault) / cause
             //   SV32 walker fault                          → cause 15 (page fault) / 7 (access fault)
             case OP_SB: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 STORE_MISALIGN_CHECK(ea, 1u);
                 lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 1u);
                 break;
             }
             case OP_SH: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 STORE_MISALIGN_CHECK(ea, 2u);
                 lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 2u);
                 break;
             }
             case OP_SW: {
-                uint32_t ea = READ_REG(d.rs1) + (uint32_t)d.imm;
+                uxlen_t  ea = READ_REG(d.rs1) + (uint32_t)d.imm;
                 SYNC_COUNT();
                 STORE_MISALIGN_CHECK(ea, 4u);
                 lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);

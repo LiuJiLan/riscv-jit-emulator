@@ -91,11 +91,11 @@
 // read 取对应半边; write 通过 mask 改半边保留另半边。
 // sstatus 是 _mstatus 的 masked view, 见下方 sstatus 段。
 
-static uint32_t csr_mstatus_read(cpu_t *hart) {
+static uxlen_t csr_mstatus_read(cpu_t *hart) {
     return (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
 }
 
-static void csr_mstatus_write(cpu_t *hart, uint32_t v) {
+static void csr_mstatus_write(cpu_t *hart, uxlen_t v) {
     // 低 32 位换成 v (经 WARL 截断), 高 32 位保留。
     //
     // WARL 截断 (按字段递增加, 当前只截 MPP; MIE/MPIE 等不截):
@@ -128,11 +128,11 @@ static void csr_mstatus_write(cpu_t *hart, uint32_t v) {
                         | (uint64_t)v;
 }
 
-static uint32_t csr_mstatush_read(cpu_t *hart) {
+static uxlen_t csr_mstatush_read(cpu_t *hart) {
     return (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu);
 }
 
-static void csr_mstatush_write(cpu_t *hart, uint32_t v) {
+static void csr_mstatush_write(cpu_t *hart, uxlen_t v) {
     // 高 32 位 WARL 强制 0 — mstatush 字段 (SBE bit 4 / MBE bit 5 / GVA / MPV / 其余 WPRI)
     // 项目当前都不实现 (无大端切换 / 无 H 扩展); 任何写入被忽略, 读回保持 0。
     // 未来真做 H 扩展或大端时改这里 (按合法字段加 mask)。
@@ -142,11 +142,11 @@ static void csr_mstatush_write(cpu_t *hart, uint32_t v) {
 
 // ---- mtvec / mepc / mcause / mtval (映射到 hart->trap.{xtvec,xepc,xcause,xtval}[PRIV_M]) ----
 
-static uint32_t csr_mtvec_read(cpu_t *hart) {
+static uxlen_t csr_mtvec_read(cpu_t *hart) {
     return hart->trap.xtvec[PRIV_M];
 }
 
-static void csr_mtvec_write(cpu_t *hart, uint32_t v) {
+static void csr_mtvec_write(cpu_t *hart, uxlen_t v) {
     // WARL MODE 位处理 (项目支持 Direct + Vectored 两种 mode):
     //   - mtvec[1:0] = MODE:
     //       00 = Direct   (sync exception + async interrupt 都跳 BASE; 项目支持)
@@ -164,11 +164,11 @@ static void csr_mtvec_write(cpu_t *hart, uint32_t v) {
     hart->trap.xtvec[PRIV_M] = (v & ~0x3u) | mode;
 }
 
-static uint32_t csr_mepc_read(cpu_t *hart) {
+static uxlen_t csr_mepc_read(cpu_t *hart) {
     return hart->trap.xepc[PRIV_M];
 }
 
-static void csr_mepc_write(cpu_t *hart, uint32_t v) {
+static void csr_mepc_write(cpu_t *hart, uxlen_t v) {
     // WARL 截断 IALIGN 对齐位:
     //   - IALIGN=16 (项目当前): mepc[0] = 0 (低 1 位强制 0)
     //   - IALIGN=32: mepc[1:0] = 0 (低 2 位强制 0)
@@ -180,33 +180,33 @@ static void csr_mepc_write(cpu_t *hart, uint32_t v) {
     hart->trap.xepc[PRIV_M] = v & ~IALIGN_MASK;
 }
 
-static uint32_t csr_mcause_read(cpu_t *hart) {
+static uxlen_t csr_mcause_read(cpu_t *hart) {
     return hart->trap.xcause[PRIV_M];
 }
 
-static void csr_mcause_write(cpu_t *hart, uint32_t v) {
+static void csr_mcause_write(cpu_t *hart, uxlen_t v) {
     // mcause 字段: bit[31] = Interrupt (1) vs Exception (0); bit[30:0] = Exception/Interrupt code。
     // RV spec §3.1.16 没强制 WARL (除了 MSB; "implementations may further restrict"), 我们当前
     // 接受全 32 位写入。fixture 一般也不直接写 mcause (handler 只读, trap_set_*_state 写)。
     hart->trap.xcause[PRIV_M] = v;
 }
 
-static uint32_t csr_mtval_read(cpu_t *hart) {
+static uxlen_t csr_mtval_read(cpu_t *hart) {
     return hart->trap.xtval[PRIV_M];
 }
 
-static void csr_mtval_write(cpu_t *hart, uint32_t v) {
+static void csr_mtval_write(cpu_t *hart, uxlen_t v) {
     // mtval RV spec §3.1.17 没强制 WARL, 接受任意值。
     hart->trap.xtval[PRIV_M] = v;
 }
 
 // ---- mscratch (xscratch[PRIV_M], 类 3) ----
 
-static uint32_t csr_mscratch_read(cpu_t *hart) {
+static uxlen_t csr_mscratch_read(cpu_t *hart) {
     return hart->trap.xscratch[PRIV_M];
 }
 
-static void csr_mscratch_write(cpu_t *hart, uint32_t v) {
+static void csr_mscratch_write(cpu_t *hart, uxlen_t v) {
     /* RV spec §3.1.18 mscratch RW, 任意值, 无 WARL */
     hart->trap.xscratch[PRIV_M] = v;
 }
@@ -223,22 +223,22 @@ static void csr_mscratch_write(cpu_t *hart, uint32_t v) {
 //   (spec 未定义 midelegh, 中断 cause 不会超 32 位)。trap_set_interrupt_state 按
 //   mideleg.bit(cause_low) 派发; trap_check_interrupt 也用 mideleg 算 deliver_mask。
 
-static uint32_t csr_medeleg_read(cpu_t *hart) {
+static uxlen_t csr_medeleg_read(cpu_t *hart) {
     return (uint32_t)(hart->trap._medeleg & 0xFFFFFFFFu);
 }
 
-static void csr_medeleg_write(cpu_t *hart, uint32_t v) {
+static void csr_medeleg_write(cpu_t *hart, uxlen_t v) {
     /* WARL: bit 11 (ecall_from_M) hardwire 0 — M 不能 delegate ecall_from_M 给 S */
     v &= ~(1u << CAUSE_ECALL_FROM_M);
     /* 低 32 位换成 v, 高 32 位 (medelegh 未来占位) 保留 — 跟 _mstatus 拆访问同形态 */
     hart->trap._medeleg = (hart->trap._medeleg & 0xFFFFFFFF00000000ULL) | (uint64_t)v;
 }
 
-static uint32_t csr_mideleg_read(cpu_t *hart) {
+static uxlen_t csr_mideleg_read(cpu_t *hart) {
     return hart->trap.mideleg;
 }
 
-static void csr_mideleg_write(cpu_t *hart, uint32_t v) {
+static void csr_mideleg_write(cpu_t *hart, uxlen_t v) {
     /* mideleg WARL 项目当前简化 — 接受全 32 位写 (中断机制未实现, 字段不真用)。
      * 中断机制真做时按 RV spec 加 mask reserved bits + per-bit WARL */
     hart->trap.mideleg = v;
@@ -250,11 +250,11 @@ static void csr_mideleg_write(cpu_t *hart, uint32_t v) {
 // (跟 mstatus_write WARL 风格一致). 项目 mie 6 有效位 (IRQ_S/M × SOFT/TIMER/EXT,
 // bit 1/3/5/7/9/11), 其他位 reserved 永远 0.
 
-static uint32_t csr_mie_read(cpu_t *hart) {
+static uxlen_t csr_mie_read(cpu_t *hart) {
     return hart->trap._mie;
 }
 
-static void csr_mie_write(cpu_t *hart, uint32_t v) {
+static void csr_mie_write(cpu_t *hart, uxlen_t v) {
     /* WARL: 截 reserved bits (高 20 位 + 偶数低位永远 0) */
     hart->trap._mie = v & MIE_VALID_MASK;
 }
@@ -273,9 +273,9 @@ static void csr_mie_write(cpu_t *hart, uint32_t v) {
 
 /* csr_mip_read 非 static (跨模块 export): trap_check_interrupt 也调本函数算合成 mip view.
  * csr.h 加声明. */
-uint32_t csr_mip_read(cpu_t *hart) {
-    uint32_t mip_view = hart->trap._mip_sw;
-    uint32_t hartid   = hart->per_hart_info.mhartid;
+uxlen_t csr_mip_read(cpu_t *hart) {
+    uxlen_t  mip_view = hart->trap._mip_sw;
+    uint32_t hartid   = hart->per_hart_info.mhartid;   /* hartid 当数组下标, 保持 uint32_t */
 
     if (is_clint_msip_pending(hartid))
         mip_view |= (1U << IRQ_M_SOFT);
@@ -289,7 +289,7 @@ uint32_t csr_mip_read(cpu_t *hart) {
     return mip_view;
 }
 
-static void csr_mip_write(cpu_t *hart, uint32_t v) {
+static void csr_mip_write(cpu_t *hart, uxlen_t v) {
     /* 只动 _mip_sw 软件可写位 (SSIP/STIP/SEIP_sw); RO 位 (MSIP/MTIP/MEIP) 忽略.
      * read-modify-write 单 hart 单线程 (本字段不跨 hart 写, 见 trap.h _mip_sw
      * 顶段并发注释). */
@@ -310,11 +310,11 @@ static void csr_mip_write(cpu_t *hart, uint32_t v) {
 // satp 物理存储在 hart->satp (cpu_t 顶层字段, 不在 trap_csrs_t 内 — satp 不属于
 // trap-related CSR 范畴, 设计意图见 cpu.h)。
 
-static uint32_t csr_satp_read(cpu_t *hart) {
+static uxlen_t csr_satp_read(cpu_t *hart) {
     return hart->satp;
 }
 
-static void csr_satp_write(cpu_t *hart, uint32_t v) {
+static void csr_satp_write(cpu_t *hart, uxlen_t v) {
     // satp 字段 (RV32 Sv32; RV Privileged Spec Vol II §4.1.11 fig 4.11):
     //   bit  31     = MODE  (1-bit; 0 = Bare 恒等, 1 = Sv32)
     //   bits 30:22 = ASID  (Sv32 spec 9 位; 项目 ASIDLEN = TLB_ASID_BITS = 4 位)
@@ -360,23 +360,23 @@ static void csr_satp_write(cpu_t *hart, uint32_t v) {
 // sepc 物理存储 = trap.xepc[PRIV_S] (按 priv 索引数组的 [PRIV_S] 槽, 跟 mepc=xepc[PRIV_M]
 // 同形态)。WARL 截 IALIGN 对齐位 (跟 mepc 同)。
 
-static uint32_t csr_sstatus_read(cpu_t *hart) {
+static uxlen_t csr_sstatus_read(cpu_t *hart) {
     /* 取 _mstatus 低 32 位 (mstatus 视图) ∩ SSTATUS_MASK = sstatus 视图 */
     return (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu) & SSTATUS_MASK;
 }
 
-static void csr_sstatus_write(cpu_t *hart, uint32_t v) {
+static void csr_sstatus_write(cpu_t *hart, uxlen_t v) {
     /* 只改 sstatus mask 内的位; 保留 _mstatus 其余字段 (M-mode-only + 高 32 位) */
-    const uint64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;
-    const uint64_t set  = (uint64_t)(v & SSTATUS_MASK);
+    const u64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;
+    const u64_t set  = (uint64_t)(v & SSTATUS_MASK);
     hart->trap._mstatus = keep | set;
 }
 
-static uint32_t csr_sepc_read(cpu_t *hart) {
+static uxlen_t csr_sepc_read(cpu_t *hart) {
     return hart->trap.xepc[PRIV_S];
 }
 
-static void csr_sepc_write(cpu_t *hart, uint32_t v) {
+static void csr_sepc_write(cpu_t *hart, uxlen_t v) {
     /* WARL 截 IALIGN 对齐位 (跟 mepc 同; RV spec §3.1.15 / sepc 同样要求) */
     hart->trap.xepc[PRIV_S] = v & ~IALIGN_MASK;
 }
@@ -387,39 +387,39 @@ static void csr_sepc_write(cpu_t *hart, uint32_t v) {
 // mtvec 同 (Direct + Vectored 都支持, 2/3 → 0)。trap_set_exception_state 按 medeleg /
 // trap_set_interrupt_state 按 mideleg 派发 deliver_priv = S 时写 [PRIV_S] 槽。
 
-static uint32_t csr_sscratch_read(cpu_t *hart) {
+static uxlen_t csr_sscratch_read(cpu_t *hart) {
     return hart->trap.xscratch[PRIV_S];
 }
 
-static void csr_sscratch_write(cpu_t *hart, uint32_t v) {
+static void csr_sscratch_write(cpu_t *hart, uxlen_t v) {
     hart->trap.xscratch[PRIV_S] = v;
 }
 
-static uint32_t csr_stvec_read(cpu_t *hart) {
+static uxlen_t csr_stvec_read(cpu_t *hart) {
     return hart->trap.xtvec[PRIV_S];
 }
 
-static void csr_stvec_write(cpu_t *hart, uint32_t v) {
+static void csr_stvec_write(cpu_t *hart, uxlen_t v) {
     /* WARL MODE 处理跟 mtvec 同 (Direct + Vectored 都支持, 2/3 reserved → 0; 详 csr_mtvec_write) */
     uint32_t mode = v & 0x3u;
     if (mode >= 2u) mode = 0u;
     hart->trap.xtvec[PRIV_S] = (v & ~0x3u) | mode;
 }
 
-static uint32_t csr_scause_read(cpu_t *hart) {
+static uxlen_t csr_scause_read(cpu_t *hart) {
     return hart->trap.xcause[PRIV_S];
 }
 
-static void csr_scause_write(cpu_t *hart, uint32_t v) {
+static void csr_scause_write(cpu_t *hart, uxlen_t v) {
     /* RV spec §5.1.6 scause; 跟 mcause 同, 接受全 32 位 */
     hart->trap.xcause[PRIV_S] = v;
 }
 
-static uint32_t csr_stval_read(cpu_t *hart) {
+static uxlen_t csr_stval_read(cpu_t *hart) {
     return hart->trap.xtval[PRIV_S];
 }
 
-static void csr_stval_write(cpu_t *hart, uint32_t v) {
+static void csr_stval_write(cpu_t *hart, uxlen_t v) {
     /* RV spec §5.1.7 stval; 跟 mtval 同, 接受全 32 位 */
     hart->trap.xtval[PRIV_S] = v;
 }
@@ -432,21 +432,21 @@ static void csr_stval_write(cpu_t *hart, uint32_t v) {
 // (RV spec §5.1.4 + §3.1.9 强制 — S-mode 不直接清 STIP/SEIP, 清靠 PLIC complete
 // 或 M-mode csrw mip).
 
-static uint32_t csr_sie_read(cpu_t *hart) {
+static uxlen_t csr_sie_read(cpu_t *hart) {
     return hart->trap._mie & SIE_MASK;
 }
 
-static void csr_sie_write(cpu_t *hart, uint32_t v) {
+static void csr_sie_write(cpu_t *hart, uxlen_t v) {
     /* 只动 SIE_MASK 子集; 保留 M-mode 中断使能位 */
     hart->trap._mie = (hart->trap._mie & ~SIE_MASK) | (v & SIE_MASK);
 }
 
-static uint32_t csr_sip_read(cpu_t *hart) {
+static uxlen_t csr_sip_read(cpu_t *hart) {
     /* mip readout 的 mask view (合成走 csr_mip_read) */
     return csr_mip_read(hart) & SIP_MASK;
 }
 
-static void csr_sip_write(cpu_t *hart, uint32_t v) {
+static void csr_sip_write(cpu_t *hart, uxlen_t v) {
     /* S-mode 只可写 SSIP; STIP / SEIP RO in sip */
     hart->trap._mip_sw = (hart->trap._mip_sw & ~SIP_WRITABLE_MASK)
                        | (v & SIP_WRITABLE_MASK);
@@ -470,15 +470,15 @@ static void csr_sip_write(cpu_t *hart, uint32_t v) {
 
 // ---- 4a: mhartid + misa (per-hart 私有, 嵌入 hart->per_hart_info) ----
 
-static uint32_t csr_mhartid_read(cpu_t *hart) {
+static uxlen_t csr_mhartid_read(cpu_t *hart) {
     return hart->per_hart_info.mhartid;
 }
 
-static uint32_t csr_misa_read(cpu_t *hart) {
+static uxlen_t csr_misa_read(cpu_t *hart) {
     return hart->per_hart_info.misa;
 }
 
-static void csr_misa_write(cpu_t *hart, uint32_t v) {
+static void csr_misa_write(cpu_t *hart, uxlen_t v) {
     /* RV spec §3.1.1 WARL: 实现可 hardwire 不支持的扩展位忽略写入。项目所有扩展位
      * hardwire (per_hart_info.misa fixed by cpu_create 入参), 写入忽略 — read 仍返
      * hart->per_hart_info.misa。真要按 misa 切扩展行为时改这里 (累加可写位 mask)。 */
@@ -488,15 +488,15 @@ static void csr_misa_write(cpu_t *hart, uint32_t v) {
 
 // ---- 4b: mvendorid + marchid + mimpid (多 hart 共享, hart->shared_info 解引用) ----
 
-static uint32_t csr_mvendorid_read(cpu_t *hart) {
+static uxlen_t csr_mvendorid_read(cpu_t *hart) {
     return hart->shared_info->mvendorid;
 }
 
-static uint32_t csr_marchid_read(cpu_t *hart) {
+static uxlen_t csr_marchid_read(cpu_t *hart) {
     return hart->shared_info->marchid;
 }
 
-static uint32_t csr_mimpid_read(cpu_t *hart) {
+static uxlen_t csr_mimpid_read(cpu_t *hart) {
     return hart->shared_info->mimpid;
 }
 
@@ -517,14 +517,14 @@ static uint32_t csr_mimpid_read(cpu_t *hart) {
 // 跟 csr_privrd_read 同形态 — 都是"接 csr.c 入口直接 console 输出, 不缓存"。
 // 任何 priv 都能 csrw/csrr (priv >= U=0; csr_op 入口判通过); 不影响 trap_csrs_t 任何字段.
 
-static uint32_t csr_tohost_read(cpu_t *hart) {
+static uxlen_t csr_tohost_read(cpu_t *hart) {
     /* read 不缓存, 不存值; return 0 让 csrr 不 trap (csr_op 大 switch case 必须有
      * read helper, 否则 default → fprintf+trap_raise illegal). fixture 不应 csrr 0x800. */
     (void)hart;
     return 0;
 }
 
-static void csr_tohost_write(cpu_t *hart, uint32_t v) {
+static void csr_tohost_write(cpu_t *hart, uxlen_t v) {
     /* 直接 fprintf 流式输出, 不存字段 (cpu_t 内不缓存). */
     (void)hart;
     fprintf(stderr, "[tohost] 0x%08" PRIx32 "\n", v);
@@ -545,7 +545,7 @@ static char priv_to_char(uint8_t priv) {
     return chars[priv & 0x3u];
 }
 
-static uint32_t csr_privrd_read(cpu_t *hart) {
+static uxlen_t csr_privrd_read(cpu_t *hart) {
     fprintf(stderr, "[priv] %c\n", priv_to_char(hart->priv));
     return (uint32_t)hart->priv;
 }
@@ -555,8 +555,8 @@ static uint32_t csr_privrd_read(cpu_t *hart) {
 // csr_op —— 大 helper, decode 分发入口
 // ============================================================================
 
-uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
-                csr_op_t op, uint32_t raw_inst) {
+uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
+               csr_op_t op, u32_t raw_inst) {
     // ----------------------------------------------------------------------------
     // 入口判: priv 要求 + RO 写检查 (csr 编号自带权限位段, riscv.h CSR_ADDR_PRIV_*)
     //
@@ -592,7 +592,7 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
     // BARE 不在 RAM 路径同风格 — fprintf 留下 dev-friendly 定位信息, trap 走 RV spec §2.1
     // "访问未实现 csr → illegal instruction" 路径)。
     // ----------------------------------------------------------------------------
-    uint32_t read_old;
+    uxlen_t read_old;
     switch (csr_addr) {
         case CSR_MSTATUS:  read_old = csr_mstatus_read (hart); break;
         case CSR_MSTATUSH: read_old = csr_mstatush_read(hart); break;
@@ -629,7 +629,7 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
     }
 
     // 算 new + write_back; switch on csr_op_t (3 case 全覆盖, -Wswitch-enum 强制)
-    uint32_t to_write;
+    uxlen_t to_write;
     switch (op) {
         case CSR_OP_RW: to_write = new_val;             break;
         case CSR_OP_RS: to_write = read_old |  new_val; break;

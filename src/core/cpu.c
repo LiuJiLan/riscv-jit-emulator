@@ -38,7 +38,7 @@ static const cpu_info_shared_t cpu_info_shared_default = {
     .mimpid    = 0,
 };
 
-cpu_t *cpu_create(uint32_t misa, uint32_t mhartid) {
+cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     // init 依赖 misa (future) — 当前只把 misa 值存入 per_hart_info.misa 给
     // csr_misa_read 用, 不按 misa 真做派发 (F/D 扩展按 misa.fdv 决定 fcsr alloc /
     // H 扩展按 misa.h 决定 [PRIV_H] tlb 容器 alloc 等都属于未来)。

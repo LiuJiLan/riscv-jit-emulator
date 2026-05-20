@@ -36,6 +36,7 @@
 #include <setjmp.h>
 #include <stdint.h>
 
+#include "riscv.h" // uxlen_t / u32_t (typedef family; dummy.txt §13)
 #include "tlb.h"   // tlb_t * 类型 (tlb_table 元素是 tlb_t **)
 #include "trap.h"  // trap_csrs_t 内嵌字段类型 (trap.h forward decl cpu_t,
                    // 单向链 trap.h ← cpu.h, 不循环)
@@ -50,9 +51,9 @@
 // mhartid: hartid 编号; misa: 该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
 // 嵌入 cpu_t 字段 (非指针; per-hart 私有就跟着 cpu_t 走, 不需要外部 alloc)。
 typedef struct cpu_info_per_hart_s {
-    uint32_t mhartid;     // RV spec §3.1.5; per-hart 不同; csr_mhartid_read 直读
-    uint32_t misa;        // RV spec §3.1.1; bit 30 = MXL (RV32 = 1); bits[25:0] = extension flags;
-                          //   异构 SMP 时不同 hart 可不同 (例如某些 hart 不带 S-mode)
+    uxlen_t mhartid;      // RV spec §3.1.5; MXLEN-bit; per-hart 不同; csr_mhartid_read 直读
+    uxlen_t misa;         // RV spec §3.1.1; MXLEN-bit; bit 30 = MXL (RV32 = 1); bits[25:0] =
+                          //   extension flags; 异构 SMP 时不同 hart 可不同 (某些 hart 不带 S)
 } cpu_info_per_hart_t;
 
 // cpu_info_shared_t (类 4: 多 hart 共享 RO CSR 数据; 见 dummy.txt §6)
@@ -61,9 +62,9 @@ typedef struct cpu_info_per_hart_s {
 // 多 hart 共享一份 (cpu.c 内 static const cpu_info_shared_default); cpu_t 内持指针。
 // 只放 CSR — cache_size / tlb_size 等"硬件参数"不进这里, 进 config.h (编译期宏)。
 typedef struct cpu_info_shared_s {
-    uint32_t mvendorid;   // RV spec §3.1.2; JEDEC vendor ID; 0 = open-source / no JEDEC
-    uint32_t marchid;     // RV spec §3.1.3; architecture ID;  0 = no architecture ID
-    uint32_t mimpid;      // RV spec §3.1.4; implementation ID; 0 = no impl ID
+    u32_t   mvendorid;    // RV spec §3.1.2; spec 钉死 32-bit; 0 = open-source / no JEDEC
+    uxlen_t marchid;      // RV spec §3.1.3; MXLEN-bit; 0 = no architecture ID
+    uxlen_t mimpid;       // RV spec §3.1.4; MXLEN-bit; 0 = no impl ID
 } cpu_info_shared_t;
 
 typedef struct cpu_s {
@@ -72,9 +73,9 @@ typedef struct cpu_s {
     //
     // regs[0] 实际是 pc (物理占 x0 位置, x0 走特殊路径不碰 regs[0])
     // regs[1..31] = x1..x31, offset(reg N) = N * 4
-    _Alignas(64) uint32_t regs[32];
+    _Alignas(64) uxlen_t  regs[32];
     uint8_t               priv;             // RV privilege encoding (riscv.h PRIV_*); 当前启动 PRIV_M
-    uint32_t              satp;             // Sv32 satp; 当前 0 (bare; MODE=0, ASID=0, PPN=0)
+    uxlen_t               satp;             // Sv32 satp; 当前 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
     trap_csrs_t              trap;             // trap-related CSR 镜像 + host trap 流程状态
@@ -103,7 +104,7 @@ typedef struct cpu_s {
 //   misa    — 写入 hart->per_hart_info.misa (csr_misa_read 直读); per-hart 私有, 异构 SMP
 //             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。
 //   mhartid — 写入 hart->per_hart_info.mhartid (csr_mhartid_read 直读); per-hart 不同。
-cpu_t *cpu_create(uint32_t misa, uint32_t mhartid);
+cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid);
 
 // system reset 每 iter 调 (main while 顶段): 重置 RV-spec reset-state 字段, 让
 // hart 从"硬件 reset 后状态"重新跑。

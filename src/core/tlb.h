@@ -78,13 +78,15 @@
 
 #include <stdint.h>
 #include "config.h"
+#include "riscv.h"   // uxlen_t (typedef family; dummy.txt §13)
 
 // forward typedef cpu_t — tlb_table_reset 签名要 cpu_t*, 但 cpu.h 反过来
 // #include "tlb.h", 不能反向 include 形成循环。跟 trap.h 同形态; 见 trap.h
 // 顶段 doc。tlb.c 内 #include "cpu.h" 走完整定义。
 typedef struct cpu_s cpu_t;
 
-// 单条 TLB entry, 16 字节, 布局照 RV PTE 排位。
+// 单条 TLB entry, RV32 下 16 字节, 布局照 RV PTE 排位。
+// (gva_tag = uxlen_t; 切 RV64 时 gva_tag 变 8 字节, 16B 布局 + tlb_alloc 对齐需重审。)
 //
 //   gva_tag  : 命中比较用 (gva >> 12), 低 20 位有效。
 //   pte_flags: bit0=V bit1=R bit2=W bit3=X bit4=U bit5=G bit6=A bit7=D bit8-9=RSW
@@ -93,7 +95,7 @@ typedef struct cpu_s cpu_t;
 //   host_ptr : 指向该 guest page 起点的 host 地址, walker miss 路径填表时一次算好,
 //              fast path 命中后无地址算术。
 typedef struct {
-    uint32_t  gva_tag;
+    uxlen_t   gva_tag;
     uint16_t  pte_flags;
     uint16_t  _pad;
     uint8_t  *host_ptr;

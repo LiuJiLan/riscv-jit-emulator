@@ -64,6 +64,8 @@
 
 #include <stdint.h>
 
+#include "riscv.h"  // uxlen_t / u64_t (typedef family; dummy.txt §13)
+
 // ----------------------------------------------------------------------------
 // forward decl cpu_t —— 因为 cpu.h 内嵌 trap_csrs_t 字段时要 #include "trap.h", 而本头
 // 文件的 helper 签名又要用 cpu_t*。如果两边互 include 会形成循环 include + 跳过 → cpu_t
@@ -95,11 +97,11 @@ typedef struct {
     // 命名 "x" 前缀对应 RV 手册 xepc 风格 (xepc[PRIV_M] = mepc, xepc[PRIV_S] = sepc 等);
     // csr 大 switch 的 mepc / sepc / ... read/write helper 映射到对应槽位。
     // 详见 dummy.txt §6 CSR 物理存储字段命名四类划分。
-    uint32_t  xcause[4];
-    uint32_t  xtval[4];
-    uint32_t  xepc[4];
-    uint32_t  xtvec[4];
-    uint32_t  xscratch[4];     // mscratch=xscratch[PRIV_M], sscratch=xscratch[PRIV_S]
+    uxlen_t   xcause[4];
+    uxlen_t   xtval[4];
+    uxlen_t   xepc[4];
+    uxlen_t   xtvec[4];
+    uxlen_t   xscratch[4];     // mscratch=xscratch[PRIV_M], sscratch=xscratch[PRIV_S]
 
     // 第一类: RV32 物理 64 位, csr 入口拆 32 位访问 (dummy.txt §6)。
     // _mstatus: csr 入口 mstatus + mstatush 拆访问低/高半边 (RV32 ABI)。sstatus 是
@@ -109,21 +111,21 @@ typedef struct {
     //   (medelegh 未实装, 跟 mstatush 平行 future), 字段类型 uint64_t 已 RV64-ready。
     //   trap_set_exception_state 按 _medeleg.bit(cause) 派发 deliver_priv (U/S-mode trap +
     //   bit=1 → deliver S, 否则 deliver M; M-mode trap 总 M)。
-    uint64_t  _mstatus;
-    uint64_t  _medeleg;        // csr 入口 medeleg (0x302); medelegh (0x312) 未实装
+    u64_t     _mstatus;
+    u64_t     _medeleg;        // csr 入口 medeleg (0x302); medelegh (0x312) 未实装
 
     // 第三类: 单字段, 单 csr 入口, 不带前缀 (dummy.txt §6)。
     // mideleg: MXLEN-bit (RV32 = 32 位; spec 未定义 midelegh, 中断 cause 不会超 32 位)。
     //   trap_set_interrupt_state 按 mideleg.bit(cause_low) 派发 deliver_priv
     //   (U/S-mode 时 bit=1 → S, bit=0 → M; M-mode 总 M)。trap_check_interrupt 算
     //   deliver_mask 时也读 mideleg 决定哪些 IRQ 在当前 priv 下接受。
-    uint32_t  mideleg;         // csr 入口 mideleg (0x303)
+    uxlen_t   mideleg;         // csr 入口 mideleg (0x303)
 
     // 第 (2a) 类: 副本基本字段 (mie / sie 两 csr 入口同级看不同 mask 子集, dummy.txt §6)。
     // mie 入口看全部 32 位 (项目用 bit 1/3/5/7/9/11 = IRQ_S/M × SOFT/TIMER/EXT 六位,
     //   见 riscv.h IRQ_* 宏); sie 入口看 32 位 ∩ SIE_MASK = IRQ_S × SOFT/TIMER/EXT
     //   三位。两入口实现独立, 关系是"同级看不同 mask"。
-    uint32_t  _mie;            // csr 入口 mie (0x304) / sie (0x104) 同级 mask view
+    uxlen_t   _mie;            // csr 入口 mie (0x304) / sie (0x104) 同级 mask view
 
     // 第 (5) 类: 软件可写子集 + 异步源 OR 合成读 (dummy.txt §6 第 5 类)。
     // mip 入口的软件可写子集物理存储:
@@ -145,7 +147,7 @@ typedef struct {
     // 目标 hart M-handler 自己 csrw mip 设 SSIP), 仍是本 hart 写自己 _mip_sw。
     // SMP/H/AIA: H 扩展 (跨虚拟 hart inject) / AIA (IMSIC MSI 直接写远 hart) 会
     // 破坏 "本 hart 单线程访问 _mip_sw" 前提, 真做时需改 _Atomic + atomic 路径。
-    uint32_t  _mip_sw;         // csr 入口 mip (0x344) / sip (0x144) 软件可写子集
+    uxlen_t   _mip_sw;         // csr 入口 mip (0x344) / sip (0x144) 软件可写子集
 
     // host trap 流程状态: 嵌套 trap 计数器 + 内部停机位段 (位段编码详见 dispatcher.c
     // 末尾 in_trap 位段编码段)。
@@ -191,7 +193,7 @@ typedef struct {
 //   hart->priv    = deliver_priv;
 //   hart->regs[0] = xtvec[deliver_priv] & ~0x3u;  /* exception 永走 base, 忽略 MODE */
 //   return in_trap;
-uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uint32_t tval);
+uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval);
 
 
 // ----------------------------------------------------------------------------
@@ -264,6 +266,6 @@ int trap_check_interrupt(cpu_t *hart);
 // dispatcher 主帧; interrupt 在 dispatcher 主帧浅栈 return + continue 即可. 见
 // dummy.txt §1 路径 2a vs 2b'. 按"对偶不教条" 原则承认形态差异, trap_set_*_state 内
 // 核共用思想.
-_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval);
+_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uxlen_t tval);
 
 #endif //CORE_TRAP_H

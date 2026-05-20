@@ -28,6 +28,40 @@
 #ifndef RISCV_H
 #define RISCV_H
 
+#include <stdint.h>
+
+// ============================================================================
+// 寄存器宽度 typedef family (跨文件类型规约见 dummy.txt §13)
+//
+// 目的: 不是引入运行期 XLEN 抽象 —— 项目当前 v1 = RV32 单 XLEN (MXLEN = SXLEN =
+// UXLEN = 32 不可变)。这组 typedef 是给字段标 trail: 看名字立刻知道一个字段的
+// "宽度来源是什么", 切 RV64 时 grep 一下就能分流"哪个要 review / 哪个不动"。
+//
+//   uxlen_t — 宽度跟 build target XLEN 走 (RV32=32, RV64=64)。整数寄存器 / pc /
+//             MXLEN-bit CSR (mcause/mtvec/mepc/mip/mie/mideleg/satp/mhartid/misa
+//             ...) / GVA / PA 等; 切 RV64 时这些字段跟着变。借鉴 Rust usize。
+//   ixlen_t — uxlen_t 的有符号对偶 (借鉴 Rust isize)。
+//   u32_t   — RV spec 钉死 32-bit, 跟 XLEN 无关 (Sv32 PTE / msip / 指令编码 ...)。
+//   u64_t   — RV spec 钉死 64-bit, 跟 XLEN 无关 (RV32 物理 64 位 mstatus/medeleg /
+//             mtime / mtimecmp / 未来 mcycle/minstret ...)。
+//
+// 跟 stdint uint32_t / uint64_t 的语义差异 (命名看着像, 语义不同):
+//   uint32_t = 普通 32-bit 无符号整数, 不约束语义 (host 概念 / index 随便用)。
+//   u32_t    = 项目内部约定 "spec 钉死的 32-bit, 不跟 XLEN 动"。
+//   编译器看是同 alias 不区分; 人 grep u32_t 找"故意 32-bit 不变"的字段。
+//
+// 类型检查行为: C typedef = 纯名字 alias, 不增强类型检查 (uxlen_t / u32_t / u64_t
+// 互相赋值 / 传参 / 隐式转换都不警告)。真 strong-typing 要 struct wrapper, 改
+// codebase 太大不补偿成本, 不引入。
+//
+// 切 RV64 工作流: 改下面 uxlen_t / ixlen_t 定义为 64 位, 然后 grep uxlen_t 逐字段
+// review (u32_t / u64_t 不动)。完整规约见 dummy.txt §13。
+// ============================================================================
+typedef uint32_t uxlen_t;   /* RV32 build; RV64 build 时改 uint64_t */
+typedef int32_t  ixlen_t;   /* RV32 build; RV64 build 时改 int64_t  */
+typedef uint32_t u32_t;     /* RV spec 钉死 32-bit; 不跟 XLEN, 切 RV64 不动 */
+typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不动 */
+
 // ----------------------------------------------------------------------------
 // Privilege mode encoding
 // RISC-V Privileged Spec Vol II, table 1.1

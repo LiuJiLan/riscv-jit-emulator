@@ -441,7 +441,7 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
     return d;
 }
 
-decoded_inst_t decode(uint32_t inst) {
+decoded_inst_t decode(u32_t inst) {
     // RVC (16-bit) 分流: inst[1:0] != 11 → 走 decode_rvc 路径
     if ((inst & 0x3u) != 0x3u) {
         return decode_rvc((uint16_t)inst);

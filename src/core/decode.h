@@ -43,6 +43,8 @@
 
 #include <stdint.h>
 
+#include "riscv.h"  // u32_t (typedef family; dummy.txt §13)
+
 typedef enum {
     // ---- U-type (2) ----
     OP_LUI = 0,         // U-type, opcode 0x37
@@ -301,7 +303,7 @@ typedef struct {
     uint32_t  rs1;
     uint32_t  rs2;
     int32_t   imm;
-    uint32_t  raw_inst;     // 原始指令; debug / illegal trap mtval 用
+    u32_t     raw_inst;     // 原始指令; debug / illegal trap mtval 用
                             // (32-bit 指令 = 完整 32 位; 16-bit RVC 时 = 低 16 位 + 高
                             // 16 位 0, 因为 decode_rvc 用 (uint16_t)inst cast 截断;
                             // RV illegal trap mtval 规范也是按指令长度填, 取低 16 位即可)
@@ -311,7 +313,7 @@ typedef struct {
 // 纯函数: 不读 / 不写 cpu_t, 不依赖 mmu / tlb / ram。
 // 对于不识别的 opcode, kind = OP_UNSUPPORTED; 其它字段 (rd/rs1/rs2/imm) 仍按通用编码位置
 // 填入, 但调用方不应使用 (除 raw_inst 用作 trap mtval)。
-decoded_inst_t decode(uint32_t inst);
+decoded_inst_t decode(u32_t inst);
 
 // ----------------------------------------------------------------------------
 // is_block_boundary_inst —— 块边界判定 (硬边界), 共享给 interpreter + 未来 translator

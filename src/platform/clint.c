@@ -52,9 +52,9 @@
 // 仍保持 0 — clint_join_timer_thread 内 pthread_join(0, NULL) glibc 下返 ESRCH
 // 容错 (详 clint.h 顶段)。
 static struct {
-    _Atomic uint64_t mtime;
-    _Atomic uint64_t mtimecmps[MAX_HARTS];
-    _Atomic uint32_t msip[MAX_HARTS];
+    _Atomic u64_t    mtime;
+    _Atomic u64_t    mtimecmps[MAX_HARTS];
+    _Atomic u32_t    msip[MAX_HARTS];
     pthread_t        timer_thread;
 } clint;
 
@@ -95,13 +95,13 @@ static int clint_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
         uint32_t bo  = off - (uint32_t)CLINT_MTIMECMP_OFF;
         uint32_t idx = bo / 8u;
         if (idx >= MAX_HARTS) return CAUSE_LOAD_ACCESS_FAULT;
-        uint64_t v64 = atomic_load_explicit(&clint.mtimecmps[idx], memory_order_relaxed);
+        u64_t    v64 = atomic_load_explicit(&clint.mtimecmps[idx], memory_order_relaxed);
         value = (bo & 0x4u) ? (uint32_t)(v64 >> 32) : (uint32_t)v64;
     } else if (off == (uint32_t)CLINT_MTIME_OFF ||
                off == (uint32_t)CLINT_MTIME_OFF + 4u) {
         // mtime 读: acquire 跟 timer thread 的 release-fetch_add 配对 (consumer
         // 看到 producer 的最新写; dummy.txt §7 monitor 模型 memory_order 配对规则)。
-        uint64_t v64 = atomic_load_explicit(&clint.mtime, memory_order_acquire);
+        u64_t    v64 = atomic_load_explicit(&clint.mtime, memory_order_acquire);
         value = (off == (uint32_t)CLINT_MTIME_OFF) ? (uint32_t)v64 : (uint32_t)(v64 >> 32);
     } else {
         return CAUSE_LOAD_ACCESS_FAULT;
@@ -129,8 +129,8 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
         if (idx >= MAX_HARTS) return CAUSE_STORE_ACCESS_FAULT;
         // 8B 字段拆 RV32 2 条 sw: load-modify-store (atomic 加载现值, 改一半, atomic
         // store 回去); 中间瞬态值不一致是 guest 责任 (见顶部 doc)。
-        uint64_t cur = atomic_load_explicit(&clint.mtimecmps[idx], memory_order_relaxed);
-        uint64_t nxt = (bo & 0x4u)
+        u64_t    cur = atomic_load_explicit(&clint.mtimecmps[idx], memory_order_relaxed);
+        u64_t    nxt = (bo & 0x4u)
                        ? (cur & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32)
                        : (cur & 0xFFFFFFFF00000000ull) | (uint64_t)value;
         atomic_store_explicit(&clint.mtimecmps[idx], nxt, memory_order_relaxed);
@@ -140,8 +140,8 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
         // thread 的 atomic_fetch_add 并发时是边界情况, 当前简单 load-modify-store
         // (不做 CAS loop)。memory_order_relaxed 起步, 真撞并发问题再升级 (TODO
         // 单独 RMW 安全审计, 跟 OS 真上才有现实压力)。
-        uint64_t cur = atomic_load_explicit(&clint.mtime, memory_order_relaxed);
-        uint64_t nxt = (off == (uint32_t)CLINT_MTIME_OFF)
+        u64_t    cur = atomic_load_explicit(&clint.mtime, memory_order_relaxed);
+        u64_t    nxt = (off == (uint32_t)CLINT_MTIME_OFF)
                        ? (cur & 0xFFFFFFFF00000000ull) | (uint64_t)value
                        : (cur & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32);
         atomic_store_explicit(&clint.mtime, nxt, memory_order_relaxed);
@@ -175,7 +175,7 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 // 跟 dummy.txt §7 末段 "timer thread 不打 trace" 不冲突 — 那条是说不写 trace
 // char-stream (跑期密集 fprintf 干扰), 单点 stop 时一次 fprintf 不属于此范围。
 static void timer_log_stop(const char *reason) {
-    uint64_t now = atomic_load_explicit(&clint.mtime, memory_order_acquire);
+    u64_t    now = atomic_load_explicit(&clint.mtime, memory_order_acquire);
     fprintf(stderr, "[clint timer] stopped (%s): mtime=%" PRIu64 "\n", reason, now);
 }
 
@@ -349,7 +349,7 @@ int is_clint_msip_pending(uint32_t hartid) {
 
 int is_clint_timer_pending(uint32_t hartid) {
     if (hartid >= MAX_HARTS) return 0;
-    uint64_t now = atomic_load_explicit(&clint.mtime,             memory_order_acquire);
-    uint64_t cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
+    u64_t    now = atomic_load_explicit(&clint.mtime,             memory_order_acquire);
+    u64_t    cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
     return (now >= cmp) ? 1 : 0;
 }

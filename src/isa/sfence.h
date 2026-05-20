@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "core/cpu.h"        // cpu_t
+#include "riscv.h"           // uxlen_t (typedef family; dummy.txt §13)
 
 
 // ----------------------------------------------------------------------------
@@ -77,7 +78,7 @@
 // trap 协议: 当前不抛 trap (TVM 检查未实现, 见文件顶部); 接口签名不预留 trap 出参。
 // ----------------------------------------------------------------------------
 void sfence_vma_helper(cpu_t *hart,
-                       uint32_t vaddr_val, uint32_t asid_val,
+                       uxlen_t  vaddr_val, uint32_t asid_val,
                        uint32_t rs1,       uint32_t rs2);
 
 #endif //ISA_SFENCE_H

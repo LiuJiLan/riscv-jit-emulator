@@ -1514,3 +1514,115 @@ destroy 反过来)。
     一律 cooperative — atomic flag + worker periodic check + main join)
   - 不教条 — 真有特殊设计场景模块内部 join 也行 (但 sheet 写明)
 
+
+================================================================================
+## §13. 类型规约 (typedef family)
+================================================================================
+
+涉及文件:
+  - src/riscv.h              (typedef family 4 个定义 + 顶段 doc)
+  - src/core/cpu.{c,h}       (regs[32] / satp / per_hart_info / shared_info CSR 字段)
+  - src/core/trap.{c,h}      (trap_csrs_t 物理字段 + trap helper 签名)
+  - src/core/csr.{c,h}       (csr_op + 各 csr_*_read/_write helper 签名)
+  - src/core/mmu.{c,h}       (translate / walker 签名 + 内部 PTE / PA 变量)
+  - src/core/decode.{c,h}    (decoded_inst_t.raw_inst + decode() 参数)
+  - src/core/tlb.{c,h}       (tlb_e_t.gva_tag)
+  - src/platform/clint.{c,h} (mtime / mtimecmp / msip)
+  - src/isa/lsu.{c,h} / sfence.{c,h}  (helper 签名)
+  - 未来任何"宽度有 XLEN / spec 语义"的字段
+
+
+--------------------------------------------------------------------------------
+背景与目的
+--------------------------------------------------------------------------------
+
+项目当前 v1 = RV32 单 XLEN (MXLEN = SXLEN = UXLEN = 32 不可变), 没有运行期切
+XLEN 需求。但字段大量用裸 uint32_t / uint64_t 写, 看不出哪个跟 XLEN 绑、哪个
+spec 钉死 32、哪个 spec 钉死 64。切 RV64 时要逐字段 review, 工作量爆炸。
+
+typedef family 不是引入"真 XLEN 抽象", 是给字段加宽度来源标注 trail —— 看名字
+立刻知道字段宽度来源, 切 RV64 时 grep 即可分流"哪个要 review / 哪个不动"。
+
+
+--------------------------------------------------------------------------------
+4 个 typedef (定义在 riscv.h 顶段)
+--------------------------------------------------------------------------------
+
+  uxlen_t  (= uint32_t @ RV32; RV64 时改 uint64_t)
+    XLEN-tied unsigned, 宽度跟 build target XLEN 走。借鉴 Rust usize。
+    用法: 整数寄存器 + pc (regs[]) / MXLEN-bit CSR (xcause / xtval / xepc /
+          xtvec / xscratch / mideleg / _mie / _mip_sw / satp / mhartid / misa /
+          marchid / mimpid) / GVA / PA。
+
+  ixlen_t  (= int32_t @ RV32; RV64 时改 int64_t)
+    uxlen_t 的有符号对偶, 借鉴 Rust isize。family 完整性保留 —— 当前无字段实际
+    用到 (decoded_inst_t.imm 留作切 RV64 时连 decode 整体重审, 不提前改)。
+
+  u32_t    (= uint32_t; 切 RV64 不动)
+    RV spec 钉死 32-bit, 跟 XLEN 无关。
+    用法: Sv32 PTE (mmu.c pte0/pte1, mmu_walk 出参 pte_flags / pte_wb_new) /
+          msip (CLINT) / 指令编码 (decoded_inst_t.raw_inst, decode() 参数,
+          csr_op raw_inst 参数) / mvendorid。
+
+  u64_t    (= uint64_t; 切 RV64 不动)
+    RV spec 钉死 64-bit, 跟 XLEN 无关。
+    用法: RV32 物理 64 位 CSR (_mstatus / _medeleg, csr 入口 RV32 拆 32 位访问) /
+          mtime / mtimecmp (CLINT)。
+
+
+--------------------------------------------------------------------------------
+跟 stdint uint32_t / uint64_t 的语义差异
+--------------------------------------------------------------------------------
+
+  uint32_t / uint64_t = 普通定宽整数, 不约束语义 (host 概念 / index / 位段分解
+                        临时 / size 等随便用)。
+  u32_t / u64_t       = 项目内部约定 "RV spec 钉死的宽度, 不跟 XLEN 动"。
+
+编译器看 u32_t 跟 uint32_t 是同 alias 不区分; 区别只在人 grep —— grep u32_t 找
+"故意 32-bit 不变"的字段, grep uxlen_t 找"切 RV64 要 review"的字段。
+
+阅读者第一次见 u32_t 可能误以为 uint32_t 的简写 —— 这是命名风险, 但跟
+uxlen_t / ixlen_t / u64_t 在 family 内表达一致 (短形态)。
+
+
+--------------------------------------------------------------------------------
+类型检查行为 (C typedef = 纯 alias)
+--------------------------------------------------------------------------------
+
+C typedef 是纯名字 alias, 不增强类型检查 (跟 Rust `type Foo = u32` 同; 跟 Rust
+newtype `struct Foo(u32)` 不同)。uxlen_t / u32_t / u64_t 互相赋值 / 函数参数
+互传 / 隐式转换都不警告。
+
+真要 strong typing 在 C 里只能 struct wrapper (struct { uint32_t v; } + .v
+访问), 改 codebase 太大、项目规模不补偿成本 —— 不引入。
+
+附加收益: 切 RV64 时 typedef 定义改 (uxlen_t uint32 → uint64), 若 build flag 带
+-Wconversion 会自然查出 "uxlen_t (uint64) → u32_t (uint32) 隐式 truncation" 类
+bug。注: -Wconversion 当前不在项目 build flag 内, 此收益要等真加该 flag。
+
+
+--------------------------------------------------------------------------------
+切 RV64 工作流
+--------------------------------------------------------------------------------
+
+  1. 改 riscv.h 的 typedef 定义: uxlen_t → uint64_t, ixlen_t → int64_t
+     (u32_t / u64_t 不动)。
+  2. grep uxlen_t / ixlen_t 逐字段 review (这就是 typedef 的真正收益)。
+  3. 同步处理 typedef 不覆盖的部分 (本次有意推迟):
+     format string (%u / %08x → %lu / %016lx) / decode.c imm·sext·指令编码整体
+     重审 / CAUSE_INTERRUPT_BIT 等 mask 宏 / mstatus.SXL·UXL 字段 / tlb_e_t 16B
+     布局 (gva_tag 变 8 字节) / CLINT MMIO size=8 路径。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 不引入运行期 XLEN 切换 (v1 = RV32 单 XLEN 不可变)。
+  - 不引入 struct wrapper 强类型 (C 无原生 newtype, 成本不补偿)。
+  - 不覆盖 host 概念字段 (jmp_buf_ptr / 计数器 / size / host 指针 / pthread_t /
+    size_t 等) / enum encoding (priv / op_kind / cause 等) / index (rd/rs1/rs2 /
+    asid / hartid / TLB index) / 位段分解临时 —— 这些跟 guest XLEN 无关。
+  - 不规定 mask 宏类型 (IRQ_* / CAUSE_* / SIP_MASK 等是 bit pattern 无类型,
+    caller 用时按 caller 字段类型 promote)。
+

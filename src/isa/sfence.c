@@ -16,7 +16,7 @@
 
 
 void sfence_vma_helper(cpu_t *hart,
-                       uint32_t vaddr_val, uint32_t asid_val,
+                       uxlen_t  vaddr_val, uint32_t asid_val,
                        uint32_t rs1,       uint32_t rs2) {
     /* 4.a 简化下不读 vaddr_val (因为 (b)/(d) 都退化为全清, 不需要 vaddr 维度);
      * 接口里保留 vaddr_val 参数是为未来精确实现 (b)/(d) 时启用, 不需要改签名。

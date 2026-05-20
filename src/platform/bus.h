@@ -59,6 +59,7 @@
 #include <stdint.h>
 
 #include "core/cpu.h"     // cpu_t (mmio_*_helper 失败路径调 trap_raise_exception)
+#include "riscv.h"        // uxlen_t (typedef family; dummy.txt §13)
 
 typedef struct {
     uint32_t gpa_start;
@@ -94,8 +95,8 @@ int bus_register_mmio(const mmio_dev_t *dev);
 //           取指落 MMIO 直接 access fault, 见 mmu.h "PA 落 MMIO 时的行为差异"段。
 //
 // 失败语义见 dummy.txt §9 ("0=成功" 接口约定 + cause 0 产生路径)。
-uint32_t mmio_read_helper (cpu_t *hart, uint32_t pa, uint32_t gva, uint32_t size);
-void     mmio_write_helper(cpu_t *hart, uint32_t pa, uint32_t gva,
-                            uint32_t value, uint32_t size);
+uxlen_t mmio_read_helper (cpu_t *hart, uxlen_t pa, uxlen_t gva, uint32_t size);
+void    mmio_write_helper(cpu_t *hart, uxlen_t pa, uxlen_t gva,
+                           uxlen_t value, uint32_t size);
 
 #endif //PLATFORM_BUS_H

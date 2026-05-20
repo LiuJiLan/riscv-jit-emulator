@@ -195,7 +195,7 @@ void dispatcher(cpu_t *hart) {
     // current_tlb=NULL; satp.MODE=Sv32 时查 tlb_table[PRIV_U][...]=NULL 走懒分配 (但
     // MU-only 实际不会让 satp 写非 bare 值, csr 层应卡)。
     // ========================================================================
-    uint32_t xatp = hart->satp;
+    uxlen_t  xatp = hart->satp;
     regime_t regime;
     tlb_t *current_tlb;
 
@@ -237,7 +237,7 @@ void dispatcher(cpu_t *hart) {
     // regime)。这是 mmu_translate_pc / interpret_one_block 的接口形态; JIT 一侧不同
     // (block 编译时 baked regime, jit_cache key = (PA, regime))。
     // ========================================================================
-    uint32_t pa;
+    uxlen_t  pa;
     uint8_t *hva;
     int rc = mmu_translate_pc(hart, current_tlb, &pa, &hva);
     (void)pa;       // 未来给 JIT 查 jit_cache 用, 当前 interpreter 不消费

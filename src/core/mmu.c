@@ -45,7 +45,7 @@
 //   store:  RAM ✓ ROM × (写 ROM 是 access fault) 其它 → bus_dispatch
 // 所以三个 helper 分别命名 + 各自实现, 不强求统一。
 // ----------------------------------------------------------------------------
-static int pa_to_fetch_hva(uint32_t pa, uint8_t **hva_out) {
+static int pa_to_fetch_hva(uxlen_t pa, uint8_t **hva_out) {
     // RAM 区检查 (IS_GPA_RAM 见 ram.h)
     if (IS_GPA_RAM(pa)) {
         *hva_out = gpa_to_hva_offset + pa;
@@ -62,8 +62,8 @@ static int pa_to_fetch_hva(uint32_t pa, uint8_t **hva_out) {
 }
 
 int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
-                     uint32_t *pa_out, uint8_t **hva_out) {
-    uint32_t gva = hart->regs[0];   // pc (cpu.h: regs[0] 物理位置存 pc, x0 走特殊路径)
+                     uxlen_t *pa_out, uint8_t **hva_out) {
+    uxlen_t gva = hart->regs[0];    // pc (cpu.h: regs[0] 物理位置存 pc, x0 走特殊路径)
 
     // ========================================================================
     // REGIME_BARE (Trust): current_tlb == NULL, bypass TLB, identity
@@ -75,7 +75,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     // 详见 mmu.h regime_t doc 段)。
     // ========================================================================
     if (current_tlb == NULL) {
-        uint32_t pa = gva;          // identity 映射
+        uxlen_t pa = gva;           // identity 映射
         if (pa_to_fetch_hva(pa, hva_out) != 0) {
             // 直调 trap_set_exception_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
             // cause=1 (Instruction Access Fault, RV spec §3.1.16 cause table); tval=fetch GVA。
@@ -125,7 +125,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
             uint8_t *hva = entry->host_ptr + (gva & 0xFFFu);
             *hva_out = hva;
             // PA 由 HVA 反推 (TLB 只缓存 RAM, gpa_to_hva_offset 一定有效)
-            *pa_out = (uint32_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);
+            *pa_out = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);
             return 0;
         }
         // 未命中: tag 不匹配 或 V = 0 → 走 Step 2
@@ -133,8 +133,11 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
 
     // Step 2: miss → mmu_walk
     {
-        uint32_t pa, pte_flags, fault_cause;
-        uint32_t pte_wb_pa, pte_wb_new;
+        uxlen_t  pa;
+        u32_t    pte_flags;
+        uint32_t fault_cause;
+        uxlen_t  pte_wb_pa;
+        u32_t    pte_wb_new;
         if (mmu_walk(hart, gva, MMU_PERM_X, &pa, &pte_flags, &fault_cause,
                      &pte_wb_pa, &pte_wb_new) != 0) {
             /* walker 失败 cause: X 路径 page fault 12 (V=0 / perm 错 / superpage misaligned),
@@ -227,10 +230,10 @@ static uint32_t af_cause_for(mmu_perm_t perm) {
 // SMP atomic 占位: 当前 caller 单 hart 用 memcpy 写回 PT; SMP 时改 atomic_fetch_or
 // 跨 hart 同步 (PTE 位 set 必须 atomic; 多 hart 并发 walk 同 PTE 时不丢 set)。
 
-int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
-             uint32_t *pa_out, uint32_t *pte_flags_out,
+int mmu_walk(cpu_t *hart, uxlen_t gva, mmu_perm_t perm,
+             uxlen_t *pa_out, u32_t *pte_flags_out,
              uint32_t *fault_cause_out,
-             uint32_t *pte_wb_pa_out, uint32_t *pte_wb_new_out) {
+             uxlen_t *pte_wb_pa_out, u32_t *pte_wb_new_out) {
     /* 默认无 writeback; level=0/level=1 leaf 分支按需覆盖 */
     *pte_wb_pa_out  = 0;
     *pte_wb_new_out = 0;
@@ -239,9 +242,9 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
     const uint32_t af_cause = af_cause_for(perm);
 
     // satp 拆段 (项目仅支持 satp.MODE = 0/1; walker 不应在 BARE 路径调; 信任 caller)
-    const uint32_t satp = hart->satp;
+    const uxlen_t  satp = hart->satp;
     const uint32_t root_ppn = satp & 0x3FFFFFu;          /* 22 位 PPN */
-    const uint32_t root_pa  = root_ppn << 12;
+    const uxlen_t  root_pa  = root_ppn << 12;
 
     // SV32 VA 拆 (10|10|12)
     const uint32_t vpn1   = (gva >> 22) & 0x3FFu;
@@ -249,14 +252,14 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
     const uint32_t offset = gva & 0xFFFu;
 
     // ---- level=1 walk ----
-    const uint32_t pte1_pa = root_pa + (vpn1 << 2);      /* 4 字节每 PTE */
+    const uxlen_t  pte1_pa = root_pa + (vpn1 << 2);      /* 4 字节每 PTE */
     if (!IS_GPA_RAM(pte1_pa)) {
         /* PT 物理地址不在 RAM (当前不实现 PMP, 用 RAM 区检查代替) → access fault.
          * 未来 PMP 接入: 这里改成 PMP allow 检查 + cause 不变。 */
         *fault_cause_out = af_cause;
         return -1;
     }
-    uint32_t pte1;
+    u32_t    pte1;
     memcpy(&pte1, gpa_to_hva_offset + pte1_pa, 4);
 
     if ((pte1 & PTE_V) == 0) {
@@ -267,14 +270,14 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
     if ((pte1 & (PTE_R | PTE_W | PTE_X)) == 0) {
         // ---- pointer-to-next-level → level=0 walk ----
         const uint32_t pte1_full_ppn = (pte1 >> 10);     /* PTE bits[31:10] = PPN 22 位 */
-        const uint32_t pte1_full_pa  = pte1_full_ppn << 12;
+        const uxlen_t  pte1_full_pa  = pte1_full_ppn << 12;
 
-        const uint32_t pte0_pa = pte1_full_pa + (vpn0 << 2);
+        const uxlen_t  pte0_pa = pte1_full_pa + (vpn0 << 2);
         if (!IS_GPA_RAM(pte0_pa)) {
             *fault_cause_out = af_cause;
             return -1;
         }
-        uint32_t pte0;
+        u32_t    pte0;
         memcpy(&pte0, gpa_to_hva_offset + pte0_pa, 4);
 
         if ((pte0 & PTE_V) == 0) {
@@ -293,7 +296,7 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
         }
 
         // hw-managed A/D 建议 set (walker 只算, 不写回 PT; caller 在 RAM 路径写)
-        uint32_t new_pte0 = pte0 | PTE_A;
+        u32_t    new_pte0 = pte0 | PTE_A;
         if (perm == MMU_PERM_W) new_pte0 |= PTE_D;
         if (new_pte0 != pte0) {
             /* PTE.A 或 PTE.D 需要 set; 把"写回任务"返给 caller */
@@ -326,7 +329,7 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
     }
 
     // hw-managed A/D 建议 set — superpage 形态, 跟 level=0 leaf 同 (walker 只算, 不写回)
-    uint32_t new_pte1 = pte1 | PTE_A;
+    u32_t    new_pte1 = pte1 | PTE_A;
     if (perm == MMU_PERM_W) new_pte1 |= PTE_D;
     if (new_pte1 != pte1) {
         *pte_wb_pa_out  = pte1_pa;
@@ -347,10 +350,13 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
 // mmu_walker_helper_load —— SV32 load 路径完整流程 (slow path; 长跳风格)
 // ============================================================================
 
-uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
-                                uint32_t gva, uint32_t size) {
-    uint32_t pa, pte_flags, fault_cause;
-    uint32_t pte_wb_pa, pte_wb_new;
+uxlen_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
+                               uxlen_t gva, uint32_t size) {
+    uxlen_t  pa;
+    u32_t    pte_flags;
+    uint32_t fault_cause;
+    uxlen_t  pte_wb_pa;
+    u32_t    pte_wb_new;
     if (mmu_walk(hart, gva, MMU_PERM_R, &pa, &pte_flags, &fault_cause,
                  &pte_wb_pa, &pte_wb_new) != 0) {
         trap_raise_exception(hart, fault_cause, /*tval*/gva);   /* _Noreturn longjmp */
@@ -386,7 +392,7 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
     entry->host_ptr  = page_host_base;
 
     // host load size 字节 (低 size 字节有效, 高位 0); sext/zext 由 caller 做
-    uint32_t value = 0;
+    uxlen_t value = 0;
     memcpy(&value, host_ptr, size);
     return value;
 }
@@ -397,9 +403,12 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
 // ============================================================================
 
 void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
-                             uint32_t gva, uint32_t value, uint32_t size) {
-    uint32_t pa, pte_flags, fault_cause;
-    uint32_t pte_wb_pa, pte_wb_new;
+                             uxlen_t gva, uxlen_t value, uint32_t size) {
+    uxlen_t  pa;
+    u32_t    pte_flags;
+    uint32_t fault_cause;
+    uxlen_t  pte_wb_pa;
+    u32_t    pte_wb_new;
     if (mmu_walk(hart, gva, MMU_PERM_W, &pa, &pte_flags, &fault_cause,
                  &pte_wb_pa, &pte_wb_new) != 0) {
         trap_raise_exception(hart, fault_cause, /*tval*/gva);

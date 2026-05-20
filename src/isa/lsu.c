@@ -20,8 +20,8 @@
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
 
-void store_helper(cpu_t *hart, uint8_t *hva, uint32_t gva_for_tval,
-                  uint32_t value, uint32_t size) {
+void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
+                  uxlen_t value, uint32_t size) {
     (void)hart;          /* 当前 reservation/SMC 占位未真做, hart 未消费 */
     (void)gva_for_tval;  /* 同上, gva 仅供未来副作用 trap_raise 当 tval 透传 */
 

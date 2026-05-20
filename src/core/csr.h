@@ -40,6 +40,7 @@
 #include <stdint.h>
 
 #include "cpu.h"
+#include "riscv.h"  // uxlen_t / u32_t (typedef family; dummy.txt §13)
 
 // 6 csr 指令变体的内核操作类型。 caller (interpreter / translator) 把"指令变体"翻译到这
 // 三个内核操作 + (new_val 是不是 zimm) 由 caller 自己决定:
@@ -86,8 +87,8 @@ typedef enum {
 //   - 不存在的 csr addr → fprintf 提示 + trap_raise_exception(hart, 2, raw_inst), 不返回
 //                          (大 switch default; 跟 lsu.h/c BARE 不在 RAM 路径 fprintf+trap 同
 //                          风格, dev-friendly 定位 + 跟 RV spec §2.1 一致)
-uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
-                csr_op_t op, uint32_t raw_inst);
+uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
+               csr_op_t op, u32_t raw_inst);
 
 
 // ----------------------------------------------------------------------------
@@ -107,6 +108,6 @@ uint32_t csr_op(cpu_t *hart, uint32_t csr_addr, uint32_t new_val,
 //
 // 并发: hart->trap._mip_sw 是 plain (本 hart 单线程访问); 异步源 atomic load 在 clint
 // 模块内. csr_mip_read 整体无 atomic RMW (read-only 合成).
-uint32_t csr_mip_read(cpu_t *hart);
+uxlen_t csr_mip_read(cpu_t *hart);
 
 #endif //CORE_CSR_H

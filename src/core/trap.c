@@ -26,7 +26,7 @@
 // ----------------------------------------------------------------------------
 // trap_set_exception_state —— 架构语义层 (sync exception 路径), 不长跳; 详见 trap.h doc
 // ----------------------------------------------------------------------------
-uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uint32_t tval) {
+uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
     // DEBUG trace 'E'. 三条调用路径都是 sync exception:
     //   (a) trap_raise_exception 内部长跳 (interpreter / JIT helper 走 dummy.txt §1 路径 2a)
     //   (b) mmu_translate_pc fetch fault 非长跳 (dispatcher 主帧, 路径 2b)
@@ -181,9 +181,9 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
     //     mode == 2/3       : WARL 已落 0, 不会到这条
     // ------------------------------------------------------------------------
     {
-        uint32_t tvec = hart->trap.xtvec[deliver_priv];
+        uxlen_t  tvec = hart->trap.xtvec[deliver_priv];
         uint32_t mode = tvec & 0x3u;
-        uint32_t base = tvec & ~0x3u;
+        uxlen_t  base = tvec & ~0x3u;
         hart->regs[0] = (mode == 1u) ? (base + 4u * cause_low) : base;
     }
 
@@ -199,27 +199,27 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
 // trace 互斥: ready==0 时本函数打 'c'; ready!=0 时 set_interrupt_state 内打 't/s/e'.
 // ----------------------------------------------------------------------------
 int trap_check_interrupt(cpu_t *hart) {
-    uint32_t mip_view = csr_mip_read(hart);
-    uint32_t enabled  = mip_view & hart->trap._mie;
+    uxlen_t mip_view = csr_mip_read(hart);
+    uxlen_t enabled  = mip_view & hart->trap._mie;
 
     /* deliver_mask: 当前 priv 下哪些 IRQ 在全局 IE / mideleg 允许下接受 deliver. */
-    uint32_t deliver_mask;
+    uxlen_t deliver_mask;
     if (hart->priv == PRIV_M) {
         uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
         deliver_mask = (mstatus_lo & MSTATUS_MIE) ? MIE_VALID_MASK : 0u;
     } else if (hart->priv == PRIV_S) {
         uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
-        uint32_t m_level = (~hart->trap.mideleg) & MIE_VALID_MASK;        /* M-level IRQ 始终接受 */
-        uint32_t s_level = (mstatus_lo & MSTATUS_SIE)
-                           ? (hart->trap.mideleg & SIE_MASK)              /* S-level IRQ 视 SIE */
-                           : 0u;
+        uxlen_t m_level = (~hart->trap.mideleg) & MIE_VALID_MASK;         /* M-level IRQ 始终接受 */
+        uxlen_t s_level = (mstatus_lo & MSTATUS_SIE)
+                          ? (hart->trap.mideleg & SIE_MASK)               /* S-level IRQ 视 SIE */
+                          : 0u;
         deliver_mask = m_level | s_level;
     } else {
         /* PRIV_U: 低 priv 无法 mask 高 priv interrupt, 全部接受 */
         deliver_mask = MIE_VALID_MASK;
     }
 
-    uint32_t ready = enabled & deliver_mask;
+    uxlen_t ready = enabled & deliver_mask;
     if (ready == 0u) {
         DEBUG_INT_CHECK();   /* 'c' = check but no fire (互斥协议 vs 't/s/e') */
         return 0;
@@ -247,7 +247,7 @@ int trap_check_interrupt(cpu_t *hart) {
 // _Noreturn, 内部 trap_set_exception_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回
 // dispatcher 入口的一次性 sigsetjmp 落点.
 // ----------------------------------------------------------------------------
-_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uint32_t tval) {
+_Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uxlen_t tval) {
     (void)trap_set_exception_state(hart, cause, tval);
     siglongjmp(*hart->jmp_buf_ptr, 1);
     /* unreachable; siglongjmp 不返回. _Noreturn 标识. */

@@ -266,7 +266,7 @@ typedef enum {
 //   是块边界 (decode.h is_block_boundary_inst), 块内 mstatus 不变, 块间重派发用新值。
 //   见 mmu.h 段 "立即生效语义"。
 // ----------------------------------------------------------------------------
-static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
+static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
     /* 物理上 _mstatus 一份 uint64_t 字段 (dummy.txt §6 (1)+(2a) 特殊); SUM/MXR 在低
      * 32 位, 直接 mask 即可 (不需要先 cast 低 32 位再 mask) */
     int sum = (hart->trap._mstatus & MSTATUS_SUM) != 0;
@@ -356,7 +356,7 @@ static inline int check_perm(cpu_t *hart, uint32_t pte, mmu_perm_t perm) {
 //
 // ----------------------------------------------------------------------------
 int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
-                     uint32_t *pa_out, uint8_t **hva_out);
+                     uxlen_t *pa_out, uint8_t **hva_out);
 
 
 // ============================================================================
@@ -544,10 +544,10 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
 //       if (pte_wb_pa != 0) memcpy(gpa_to_hva_offset + pte_wb_pa, &pte_wb_new, 4);
 //       /* RAM 真访问 */
 //   }
-int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
-             uint32_t *pa_out, uint32_t *pte_flags_out,
+int mmu_walk(cpu_t *hart, uxlen_t gva, mmu_perm_t perm,
+             uxlen_t *pa_out, u32_t *pte_flags_out,
              uint32_t *fault_cause_out,
-             uint32_t *pte_wb_pa_out, uint32_t *pte_wb_new_out);
+             uxlen_t *pte_wb_pa_out, u32_t *pte_wb_new_out);
 
 
 // ============================================================================
@@ -580,8 +580,8 @@ int mmu_walk(cpu_t *hart, uint32_t gva, mmu_perm_t perm,
 //      e. return uint32_t (低 size 字节有效, sext/zext 由 caller 做)
 //
 // 错误路径 trap_raise_exception 长跳, 不返回 caller (caller 不需要 goto out 处理失败)。
-uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
-                                uint32_t gva, uint32_t size);
+uxlen_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
+                               uxlen_t gva, uint32_t size);
 
 
 // ============================================================================
@@ -611,6 +611,6 @@ uint32_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
 //
 // 错误路径 trap_raise_exception 长跳, 不返回 caller。
 void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
-                             uint32_t gva, uint32_t value, uint32_t size);
+                             uxlen_t gva, uxlen_t value, uint32_t size);
 
 #endif //CORE_MMU_H

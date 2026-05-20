@@ -109,8 +109,8 @@
 // (函数调用前必须先声明), 否则会被 clangd / gcc 误认为隐式 int 声明跟下面真 void
 // 声明 conflict。
 // ----------------------------------------------------------------------------
-void store_helper(cpu_t *hart, uint8_t *hva, uint32_t gva_for_tval,
-                  uint32_t value, uint32_t size);
+void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
+                  uxlen_t value, uint32_t size);
 
 
 // ----------------------------------------------------------------------------
@@ -136,8 +136,8 @@ void store_helper(cpu_t *hart, uint8_t *hva, uint32_t gva_for_tval,
 //   - BARE PA 不在 RAM → mmio_read_helper 内未命中 / device 拒绝 → trap_raise(5/cause)
 //   - SV32 walker fault → walker_helper_load 内 trap_raise(13/5, gva)
 // ----------------------------------------------------------------------------
-static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
-                                       uint32_t gva, uint32_t size) {
+static inline uxlen_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
+                                      uxlen_t gva, uint32_t size) {
     // misalign check: 由 caller (interpreter case 入口 LOAD_MISALIGN_CHECK 宏) 已查;
     // helper 内不重复 — 形成隐式契约 (见顶段 doc "misalign check 隐式契约")。
 
@@ -146,7 +146,7 @@ static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
          * 因为 BARE 不进 TLB) */
         if (IS_GPA_RAM(gva)) {
             uint8_t *host_ptr = gpa_to_hva_offset + gva;
-            uint32_t value = 0;
+            uxlen_t value = 0;
             memcpy(&value, host_ptr, size);  // 低 size 字节有效, 高位 0
             return value;
         }
@@ -176,7 +176,7 @@ static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
             && entry->gva_tag == vpn
             && check_perm(hart, (uint32_t)entry->pte_flags, MMU_PERM_R)) {
             uint8_t *host_ptr = entry->host_ptr + (gva & 0xFFFu);
-            uint32_t value = 0;
+            uxlen_t value = 0;
             memcpy(&value, host_ptr, size);
             return value;
         }
@@ -210,7 +210,7 @@ static inline uint32_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
 //   - SV32 walker fault → walker_helper_store 内 trap_raise (cause 15/7, gva)
 // ----------------------------------------------------------------------------
 static inline void lsu_store_helper(cpu_t *hart, tlb_t *current_tlb,
-                                    uint32_t gva, uint32_t value, uint32_t size) {
+                                    uxlen_t gva, uxlen_t value, uint32_t size) {
     // misalign 由 caller 已查 (interpreter case 入口 STORE_MISALIGN_CHECK 宏)
 
     if (current_tlb == NULL) {
