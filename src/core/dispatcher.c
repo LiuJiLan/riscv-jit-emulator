@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>       // perf: clock_gettime ([perf] 主循环计时; DEBUG_PERF_ON gate)
 
 
 // ============================================================================
@@ -106,6 +107,17 @@ void dispatcher(cpu_t *hart) {
     // 单 cycle 等价, .text +REX prefix 几字节可忽略 (性能差 ≈ 0)。
     volatile uint64_t total_count = 0;
     volatile uint64_t local_count = 0;
+
+    // === perf timing (DEBUG_PERF_ON gate; 见 debug.h) ===
+    // 紧挨主循环前打 t_start —— 必须在 sigsetjmp 之前 (longjmp 跳回不重跑此行,
+    // 跟 total_count 同处理)。t_start 在 setjmp/longjmp 窗口内不被修改, 无需 volatile。
+    // Release 配置仍开 DEBUG_PERF_ON (自动化 perf 套件读 [perf]); 是 trace 类标志在
+    // Release 关掉, 所以 [perf] 计时不被 trace 的 stderr 写入污染。
+#ifdef DEBUG_PERF_ON
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+#endif
+    // === end perf timing ===
 
     // 一次性 sigsetjmp 建立永久落点; 返回值不分流 (dummy.txt §1 机制 (3) "dispatcher 视角"段)。
     sigsetjmp(*hart->jmp_buf_ptr, 1);
@@ -278,14 +290,37 @@ void dispatcher(cpu_t *hart) {
 
     }  /* while (in_trap < 3) */
 
+    // === perf timing (DEBUG_PERF_ON gate) ===
+    // 紧挨主循环后打 t_end。
+#ifdef DEBUG_PERF_ON
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+#endif
+    // === end perf timing ===
+
+    // DEBUG trace 流尾部换行: dispatcher 在 while 体内通过 DEBUG_XXX 宏写入单字符流
+    // (无换行)。while 退出 = trace 流到此为止, 立刻打一次 \n 收尾, 让后面的 [perf] /
+    // [dispatcher] halted 各占干净一行。放 t_end 之后 (fputc 的 I/O 不算进 [perf] 计时
+    // 窗口)。受 DEBUG_TRACE_ON gate (DEBUG_NEWLINE; trace 关时无字符流, 换行同步退化 no-op)。
+    DEBUG_NEWLINE();
+
     // 退出循环后再做一次扫尾累加 — 最后一轮 block 的 local_count 还没进 total_count
     // (迭代头扫尾负责的是"上一轮", 最后一轮没下一轮迭代头来扫)。
     total_count += local_count;
 
-    // DEBUG trace 流尾部换行: dispatcher 在 while 体内通过 DEBUG_XXX 宏写入单字符流 (无
-    // 换行); 退出前打一次 \n 把 trace 字符跟下面的 halted dump + main.c 的 trap/state
-    // dump 分开。debug_cnt 不另外打印 (字符流自身可数, 后续需要数值再加)。
-    fputc('\n', stderr);
+    // === perf timing (DEBUG_PERF_ON gate; 直接 fprintf, 不走 debug 模块) ===
+#ifdef DEBUG_PERF_ON
+    {
+        double perf_elapsed = (double)(t_end.tv_sec  - t_start.tv_sec)
+                            + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+        fprintf(stderr,
+                "[perf] elapsed=%.6f s  total_count=%" PRIu64 "  MIPS=%.3f\n",
+                perf_elapsed, total_count,
+                perf_elapsed > 0.0
+                    ? (double)total_count / perf_elapsed / 1e6
+                    : 0.0);
+    }
+#endif
+    // === end perf timing ===
 
     fprintf(stderr,
             "[dispatcher] halted: in_trap=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "\n",

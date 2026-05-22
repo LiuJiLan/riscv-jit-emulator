@@ -170,13 +170,18 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 // trace: timer thread 不打 trace (dummy.txt §7 末段; debug 真要打是临时 fprintf
 // 用完删, 不动 debug 模块)。
 
-// 退出前打 mtime — debug 用, 跟 [main] elapsed / [dispatcher] halted dump 同
-// 风格输出到 stderr, 让肉眼对照 "总累加 = wake 次数 * TIMEBASE_PER_WAKE"。
+// 退出前打 mtime — debug 用, 跟 [main] elapsed / [dispatcher] halted 同风格输出到
+// stderr, 让肉眼对照 "总累加 = wake 次数 * TIMEBASE_PER_WAKE"。受 DEBUG_CLINT_TIMER_ON
+// gate (CMake 非 Release 配置才开; 见 debug.h)。
 // 跟 dummy.txt §7 末段 "timer thread 不打 trace" 不冲突 — 那条是说不写 trace
 // char-stream (跑期密集 fprintf 干扰), 单点 stop 时一次 fprintf 不属于此范围。
 static void timer_log_stop(const char *reason) {
+#ifdef DEBUG_CLINT_TIMER_ON
     u64_t    now = atomic_load_explicit(&clint.mtime, memory_order_acquire);
     fprintf(stderr, "[clint timer] stopped (%s): mtime=%" PRIu64 "\n", reason, now);
+#else
+    (void)reason;
+#endif
 }
 
 static void *timer_run(void *arg) {

@@ -46,6 +46,17 @@ add_compile_options(
     $<$<CONFIG:Release>:-g>
 )
 
+# 调试打印编译标志 (gate trace / [perf] / CPU dump / [clint timer]; 见 src/debug.h)。
+# DEBUG_PERF_ON 所有配置都定义 —— Release 自动化 perf 套件要读 [perf] 的纯主循环
+# MIPS。trace / CPU dump / [clint timer] 仅非 Release 配置定义, 让 Release 够安静,
+# [perf] 计时不被 stderr 写入污染。
+add_compile_definitions(
+    DEBUG_PERF_ON
+    $<$<NOT:$<CONFIG:Release>>:DEBUG_TRACE_ON>
+    $<$<NOT:$<CONFIG:Release>>:DEBUG_CPU_DUMP_ON>
+    $<$<NOT:$<CONFIG:Release>>:DEBUG_CLINT_TIMER_ON>
+)
+
 include_directories(src)
 
 add_executable(riscv_jit_emulator

@@ -402,7 +402,7 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------------
-    // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → dump → 三 destroy
+    // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → 三 destroy
     //
     // clint_join_timer_thread 调用前置 (SDS=0) 在三条路径之一已做:
     //   1. 正常 path: while else 分支 set SDS=0 + break
@@ -416,75 +416,9 @@ int main(int argc, char **argv) {
     // glibc/musl 下返 ESRCH "No such process", fprintf 一行不 fatal。详
     // clint.h clint_join_timer_thread 顶段 doc。
     //
-    // dump 在 join 之后 / destroy 之前 (hart 字段仍可读, 让 fixture 肉眼对照期望值)。
+    // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。
     // ------------------------------------------------------------------------
     clint_join_timer_thread();
-
-    /* dump 格式:
-     *   - reg 分 [reg dec] + [reg hex] 两段, 每段 x1-x31 (x0 跳过, 占位 pc)
-     *   - ABI 标注 xN(abi), space padding 到 9 char 宽度对齐 (x8(s0/fp) 9 char 不单独优化)
-     *   - 每行 4 reg (decimal %11u / hex 0x%08x), 行头 \t
-     *   - pc 放 state dump 末行, hex 显示 */
-    fprintf(stderr,
-            "[main] reg dec:\n"
-            "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u\n"
-            "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u\n"
-            "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u\n"
-            "\tx13(a3)   = %11u  |  x14(a4)   = %11u  |  x15(a5)   = %11u  |  x16(a6)   = %11u\n"
-            "\tx17(a7)   = %11u  |  x18(s2)   = %11u  |  x19(s3)   = %11u  |  x20(s4)   = %11u\n"
-            "\tx21(s5)   = %11u  |  x22(s6)   = %11u  |  x23(s7)   = %11u  |  x24(s8)   = %11u\n"
-            "\tx25(s9)   = %11u  |  x26(s10)  = %11u  |  x27(s11)  = %11u  |  x28(t3)   = %11u\n"
-            "\tx29(t4)   = %11u  |  x30(t5)   = %11u  |  x31(t6)   = %11u\n",
-            hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
-            hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
-            hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
-            hart->regs[13], hart->regs[14], hart->regs[15], hart->regs[16],
-            hart->regs[17], hart->regs[18], hart->regs[19], hart->regs[20],
-            hart->regs[21], hart->regs[22], hart->regs[23], hart->regs[24],
-            hart->regs[25], hart->regs[26], hart->regs[27], hart->regs[28],
-            hart->regs[29], hart->regs[30], hart->regs[31]);
-
-    fprintf(stderr,
-            "[main] reg hex:\n"
-            "\tx1(ra)    = 0x%08x  |  x2(sp)    = 0x%08x  |  x3(gp)    = 0x%08x  |  x4(tp)    = 0x%08x\n"
-            "\tx5(t0)    = 0x%08x  |  x6(t1)    = 0x%08x  |  x7(t2)    = 0x%08x  |  x8(s0/fp) = 0x%08x\n"
-            "\tx9(s1)    = 0x%08x  |  x10(a0)   = 0x%08x  |  x11(a1)   = 0x%08x  |  x12(a2)   = 0x%08x\n"
-            "\tx13(a3)   = 0x%08x  |  x14(a4)   = 0x%08x  |  x15(a5)   = 0x%08x  |  x16(a6)   = 0x%08x\n"
-            "\tx17(a7)   = 0x%08x  |  x18(s2)   = 0x%08x  |  x19(s3)   = 0x%08x  |  x20(s4)   = 0x%08x\n"
-            "\tx21(s5)   = 0x%08x  |  x22(s6)   = 0x%08x  |  x23(s7)   = 0x%08x  |  x24(s8)   = 0x%08x\n"
-            "\tx25(s9)   = 0x%08x  |  x26(s10)  = 0x%08x  |  x27(s11)  = 0x%08x  |  x28(t3)   = 0x%08x\n"
-            "\tx29(t4)   = 0x%08x  |  x30(t5)   = 0x%08x  |  x31(t6)   = 0x%08x\n",
-            hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
-            hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
-            hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
-            hart->regs[13], hart->regs[14], hart->regs[15], hart->regs[16],
-            hart->regs[17], hart->regs[18], hart->regs[19], hart->regs[20],
-            hart->regs[21], hart->regs[22], hart->regs[23], hart->regs[24],
-            hart->regs[25], hart->regs[26], hart->regs[27], hart->regs[28],
-            hart->regs[29], hart->regs[30], hart->regs[31]);
-
-    // trap dump (M+S 两槽): in_trap=3 时字段保留 double fault 第二次状态作 root cause;
-    // S 槽用于 medeleg delegate 路径验证 (medeleg=1 → trap deliver S, M 槽不写)。
-    // 未来 reset 接入时, 这里换成"halt 原因分流 + reset hart" 逻辑。
-    fprintf(stderr,
-            "[main] trap dump (M): in_trap=%u mcause=%u mtval=0x%08x mepc=0x%08x mtvec=0x%08x\n",
-            hart->trap.in_trap,
-            hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
-            hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
-    fprintf(stderr,
-            "[main] trap dump (S): scause=%u stval=0x%08x sepc=0x%08x stvec=0x%08x\n",
-            hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
-            hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
-
-    // state dump: pc + priv + mstatus 低 32 位 (mstatush 当前全 0, 省略)。
-    // priv 当前为 hart->priv (mret 按 MPP 恢复, U/S-mode fixture 激活时 priv 才会切非 M)。
-    fprintf(stderr,
-            "[main] state dump: pc=0x%08x  priv=%u  mstatus=0x%08x\n",
-            hart->regs[0],
-            (uint32_t)hart->priv,
-            (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));
-    /* tohost / privrd 在 csr.c 内 csrw/csrr 时直接 fprintf 流式输出, 不缓存到 cpu_t,
-     * main.c 不需要 dump。 */
 
     // ------------------------------------------------------------------------
     // 程序总耗时 (main lifecycle scope; CLOCK_MONOTONIC delta)

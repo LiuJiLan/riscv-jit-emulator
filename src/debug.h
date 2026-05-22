@@ -43,12 +43,35 @@
 // "thread-local"分类策略改 atomic 或 per-hart 字段 (SMP 真做时确认)。
 extern uint32_t debug_cnt;
 
+// ----------------------------------------------------------------------------
+// 调试打印编译标志 (4 个; 由 CMakeLists.txt 按 build type 定义, 不在源码内 #define)
+//
+//   DEBUG_TRACE_ON       — DEBUG_TICK / DEBUG_XXX trace 字符流 + DEBUG_NEWLINE
+//                          (本文件下方; dispatcher / trap / interpreter 用)
+//   DEBUG_PERF_ON        — dispatcher [perf] 主循环计时行 (dispatcher.c 内 #ifdef)
+//   DEBUG_CPU_DUMP_ON    — cpu_destroy 内 CPU 寄存器/trap/state dump (cpu.c cpu_dump)
+//   DEBUG_CLINT_TIMER_ON — [clint timer] stopped 行 (clint.c timer_log_stop)
+//
+// 机制: CMakeLists.txt add_compile_definitions 按配置发 -D ——
+//   非 Release 配置 (Debug 等): 四个全开 (GUI build, 全打印, 给人工观察)。
+//   Release 配置: 只开 DEBUG_PERF_ON —— 自动化 perf 套件读 [perf] 的纯主循环 MIPS,
+//     trace / CPU dump / [clint timer] 关掉, stderr 写入不污染 [perf] 计时。
+//
+// 范围: 这些标志只 gate "调试打印"。不影响各模块报错 fprintf / [dispatcher] halted /
+//   [main] elapsed / [decode_test] —— 那些是诊断 / 报错输出, 常开。
+// ----------------------------------------------------------------------------
+
 // DEBUG_TICK_TH: trace 流自动换行阈值 (每 N 个事件后 fputc('\n'))。80 按经典终端
 // 宽度, 不强制; 改大改小看 fixture 密度调。
 #define DEBUG_TICK_TH  80
 
 // DEBUG_TICK(): 内部 tick — 累加 debug_cnt + 到阈值打 \n。各字符事件宏内部统一调
 // 它, 不作"用户事件"独立暴露。
+//
+// 下方 DEBUG_TICK / DEBUG_XXX / DEBUG_NEWLINE 全部受 DEBUG_TRACE_ON gate (见上方 doc):
+// 开 → 正常输出; 关 → 退化为 do {} while (0) no-op。
+#ifdef DEBUG_TRACE_ON
+
 #define DEBUG_TICK()   do {                                      \
     debug_cnt++;                                                 \
     if ((debug_cnt % DEBUG_TICK_TH) == 0) fputc('\n', stderr);   \
@@ -90,5 +113,23 @@ extern uint32_t debug_cnt;
 #define DEBUG_TIME_INTR()  do { fputc('t', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_SOFT_INTR()  do { fputc('s', stderr); DEBUG_TICK(); } while (0)
 #define DEBUG_EXT_INTR()   do { fputc('e', stderr); DEBUG_TICK(); } while (0)
+
+// DEBUG_NEWLINE(): trace 字符流尾部换行。dispatcher 退出前打一次, 把无换行的 trace
+// 字符流跟后面的 [dispatcher] halted 分开。不走 DEBUG_TICK (不是 trace 事件, 只是收尾
+// 分隔); 受 DEBUG_TRACE_ON gate — trace 关时没有字符流, 换行同步退化 no-op。
+#define DEBUG_NEWLINE()    do { fputc('\n', stderr); } while (0)
+
+#else  /* DEBUG_TRACE_ON 未定义 — trace 全部退化为 no-op (零开销, 不进 .text) */
+
+#define DEBUG_TICK()       do { } while (0)
+#define DEBUG_REFETCH()    do { } while (0)
+#define DEBUG_EXCEPTION()  do { } while (0)
+#define DEBUG_INT_CHECK()  do { } while (0)
+#define DEBUG_TIME_INTR()  do { } while (0)
+#define DEBUG_SOFT_INTR()  do { } while (0)
+#define DEBUG_EXT_INTR()   do { } while (0)
+#define DEBUG_NEWLINE()    do { } while (0)
+
+#endif /* DEBUG_TRACE_ON */
 
 #endif //DEBUG_H

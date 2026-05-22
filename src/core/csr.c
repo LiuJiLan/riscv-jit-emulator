@@ -628,12 +628,18 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
             trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
     }
 
-    // 算 new + write_back; switch on csr_op_t (3 case 全覆盖, -Wswitch-enum 强制)
+    // 算 new + write_back; switch on csr_op_t (3 case 全覆盖, -Wswitch-enum 强制)。
+    // default 走 __builtin_unreachable: op 必是 3 个 csr_op_t 之一 (decode 保证), 这句把
+    // 不变式断言给优化器 — 消 -O2 下 to_write "may be used uninitialized" 误报 (switch-
+    // on-enum 无 default 时编译器证不出 to_write 必被赋值; 内联 csr_*_write 后暴露)。加
+    // default 不影响 -Wswitch-enum: 它查枚举值有无显式 case, 跟 default 无关, 新增
+    // csr_op_t 值照样编译报错。
     uxlen_t to_write;
     switch (op) {
         case CSR_OP_RW: to_write = new_val;             break;
         case CSR_OP_RS: to_write = read_old |  new_val; break;
         case CSR_OP_RC: to_write = read_old & ~new_val; break;
+        default: __builtin_unreachable();
     }
 
     // RV spec §2.1.2: RS/RC + new_val=0 不写 (副作用不发生)。RW 总是写。
