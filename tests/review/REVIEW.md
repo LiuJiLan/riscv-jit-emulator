@@ -79,3 +79,109 @@ point-in-time 的全量"符合 / 不符"表 —— 那张表是当次产物,下�
 - 三个无 stub.S 的 loader reject 测试(a01_1/05、06、07)本次未整理。
 - 当次全量比对表在 `out/report.md`(gitignore,不入 repo)。
 - 本次整理见 session log `a_02_session_012.md`。
+
+---
+
+## 中断检查开销实验(a02_7 perf 套件)— 2026-05-23
+
+不是测试整理 pass,是一次 **perf 对照实验**(session `a_02_session_016.md`)。
+
+把 dispatcher 主循环顶的 `if (trap_check_interrupt(hart) != 0) continue;` 临时
+注释掉,跑 a02_7 全套,对照"中断检查 ON / OFF"的吞吐 —— 量化"每 block 一次
+中断检查"的开销。
+
+a02_7 **不依赖 CLINT**(11 个 fixture 的 guest 代码都不碰 mtime/mtimecmp/msip,
+也从不开中断),注释掉检查后行为完全不变(照常 triple-fault 收尾),只是省了每
+block 那次 poll。故此实验对 a02_7 安全。
+
+方法:编两个 release 二进制(ON / OFF),每 fixture off/on **交错** 6 对取 median
+(交错抵消热漂移,小 delta fixture 才不被两趟之间的漂移淹没)。环境同 a02_7 实验
+记录(release `-O2`,解释器,单 hart)。
+
+### 结果(median MIPS)
+
+```
+  fixture              ON(CLINT)   OFF     检查占 ON 运行
+  01_bare                180.8    200.7      9.9%
+  02_mmu_sv32            177.4    199.5     11.1%
+  03_csr_heavy            84.9    108.7     21.9%   <- 最重
+  04_mem_dense           161.4    178.7      9.7%
+  05_mem_tlbmiss         148.2    166.6     11.0%
+  06_bare_load           202.2    221.5      8.7%
+  07_bare_store          124.9    130.0      3.9%
+  08_mmu_dense_load      175.9    191.3      8.1%
+  09_mmu_dense_store     121.2    124.0      2.2%
+  10_mmu_sparse_load     101.4    106.0      4.4%
+  11_mmu_sparse_store     89.4     90.4      1.1%
+```
+
+### 结论
+
+- 中断检查是 **每 block 一次** 的固定开销(dispatcher 主循环顶,每次重派发都查)。
+  当前 CLINT-only 状态下,它占 dispatcher 运行时间的 **1% ~ 22%**。
+- **03_csr_heavy 最重(22%)**:csrr 是硬块边界(`decode.h is_block_boundary_inst`
+  对 6 个 `OP_CSR*` 全 return 1),csr 密集代码每轮 9 个 block → 中断检查的 dispatch
+  频率是别的 fixture(每轮 1 block)的约 9 倍。OS 内核的 trap handler / 上下文切换
+  csr 密集,这个数值有现实意义。
+- 其余 fixture(每轮 1 block)占比 1%~12%,规律 = **"block 越便宜,固定检查占比
+  越大"**:便宜 block(纯算术 / load fast path)9~12%;贵 block(store slow path /
+  稀疏 walk)1~4%(慢 block 把固定检查成本稀释了)。跟 load/store fast/slow 同一
+  个道理 —— fast path 对固定叠加开销最敏感。
+- 每 block 检查的绝对成本粗估 ~3-6 ns(大 delta fixture 较准;07/09/11 delta 小、
+  噪声占比大,不细抠)。
+
+### block 大小 sweep(12-16,bare 纯算术)
+
+把上面「block 越小,固定检查占比越大」直接画成曲线。加 5 个 bare 纯算术 fixture
+(`12`-`16`):循环体 = N 条 `add`(`.rept` 生成)+ addi + bnez,block 固定为
+2 / 8 / 16 / 32 / 64 指令。纯算术、不碰 load/store/csr,每指令成本恒定,唯一变量
+是 block 大小。同样交错 A/B(off/on 6 对取 median):
+
+```
+  block 大小   ON       OFF      检查占 ON 运行
+     2        129.2    162.3       20.4%
+     8        197.2    218.9        9.9%
+    16        183.9    197.5        6.9%
+    32        219.1    227.3        3.6%
+    64        226.5    234.1        3.2%
+```
+
+- 检查占比随 block 增大单调下降:block 2 的 20.4% → block 64 的 3.2%。中断检查是
+  每 block 一个固定开销,block 越大、摊到每条指令越少。
+- block 2 的 20.4% 跟 `03_csr_heavy` 的 21.9% 基本一致 —— 03 每轮 9 个 block / 10
+  条指令,平均 block ≈ 1.1,比 block 2 还小,落在曲线这一端。两个独立 fixture 互证。
+- block 8 的 9.9% 跟 `01_bare`(10-inst block)的 ~9.9% 吻合。
+- 注:ON 的绝对 MIPS 有跨 fixture 噪声(13>14 一处反序);但「检查占比」是每个
+  fixture 自己 OFF/ON 的比值、热漂移已被交错 A/B 抵消,这一列单调可信。
+
+### 4 次累积对照(perf trail)
+
+中断检查的 pending 判断会随 milestone 变重,这里留累积对照(以最敏感的
+03_csr_heavy 检查占比为风向标;每次用 `run_perf.py` + 本节交错 A/B 同法重测):
+
+```
+  # | milestone 状态       | 03_csr_heavy 检查占比 | 备注
+  1 | 中断检查 OFF(基线)  | 0%                    | 本次实验对照基线
+  2 | CLINT-only(当前)    | 21.9%                 | 本次实验
+  3 | + PLIC               | (待测)                | PLIC 落地后 pending 判断并入外部中断源,更重
+  4 | + AMO                | (待测)                | AMO milestone 后再测一次
+```
+
+注:PLIC milestone 落地后补第 3 行,AMO 后补第 4 行。a02_7 套件本身(11 个 fixture
++ `run_perf.py`)就是这个 perf trail 的固定标尺。
+
+### 后续 TODO(PLIC milestone 后做)
+
+PLIC 实装后,中断检查机制就齐了(CLINT + PLIC)。届时:
+
+1. 再做一次 **中断检查 ON / OFF × a02_7 全套** 的对照(同本节交错 A/B 方法),补上
+   "4 次累积对照"的第 3 行 —— 此时 check 的 pending 判断已并入 PLIC 外部中断源,
+   预期比 CLINT-only 明显更重。
+2. block 大小对照 —— **bare 纯算术版本本 session 已做**(见上方「block 大小
+   sweep」,fixture 12-16,曲线已测出)。PLIC 后可再扩展含 load/store/mmu 的 block
+   大小对照(此次 sweep 只覆盖纯算术 bare)。
+3. 据结果决定:**要不要用 `local_count` 把中断检查节流** —— 现在是每 block 查一次,
+   改成"累计够 N 条指令才查一次"(`local_count` 攒到阈值再 poll),让小块密集的代码
+   (csr 密集 / OS trap 路径)不必每个微型 block 都付一次 check。代价是中断投递最多
+   延迟 N 条指令(RV 不要求即时投递,可接受)。这个权衡等 PLIC 后 check 变重、收益
+   更明显时再定。
