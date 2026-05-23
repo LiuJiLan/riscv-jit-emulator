@@ -3,7 +3,9 @@
 // 入口。本文件按 reset 三层 lifecycle 组织:
 //
 //   POR (Power-On Reset) — 进程启动一次
-//     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) / cpu_create
+//     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) /
+//     plic_init (字段 + ctx_map 全 -1 + bus 注册, **不发线程** — PLIC 是"monitor
+//     但无线程"区分, 跟 clint 区分点; 详 plic.h 顶段) / cpu_create
 //     (内部已写硬件 reset 默认状态)
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
@@ -11,6 +13,7 @@
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
+//     plic_reset (device_line/claimed 清, plic_ctx_map 不动) /
 //     dispatcher(hart) / SR-vs-shutdown 判断 (当前简化恒 shutdown; if(0) 骨架
 //     占位预留真 SR 路径)
 //
@@ -26,6 +29,7 @@
 #include "core/dispatcher.h"
 #include "loader.h"
 #include "platform/clint.h"
+#include "platform/plic.h"
 #include "platform/ram.h"
 #include "riscv.h"
 #include "runtime.h"
@@ -297,6 +301,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // PLIC 注册到 bus (clint_init 之后)。**不发线程** — PLIC 是 "monitor 但无线程"
+    // 区分点 (跟 clint 区分; 详 plic.h 顶段)。T1 阶段 MMIO 骨架, read/write 只 fprintf
+    // 标识访问区, 不真改字段; T2 真接通仲裁 / 外设接通 / hart 侧合成读。
+    if (plic_init() != 0) {
+        fprintf(stderr, "plic_init failed\n");
+        return 1;
+    }
+
     // 文件后缀分发 (.bin / .elf / 猜): ELF 路径全部 stub 返回 -1 (内部 fprintf
     // "not implemented"), guess_is_elf stub 静默返回 0, 实际只走 .bin。
     int err = 0;
@@ -360,6 +372,7 @@ int main(int argc, char **argv) {
     while (atomic_load_explicit(&system_reset_signal, memory_order_acquire)) {
         cpu_reset(hart);
         (void)clint_reset();
+        (void)plic_reset();
 
         // ====================================================================
         // 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
@@ -442,6 +455,7 @@ int main(int argc, char **argv) {
             e_min, e_sec, total_s);
 
     clint_destroy();
+    plic_destroy();
     cpu_destroy(hart);
     ram_destroy();
     return 0;

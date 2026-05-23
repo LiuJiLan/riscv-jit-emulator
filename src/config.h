@@ -107,4 +107,35 @@
 // 互不绑定, 改其一不影响其二语义。
 #define TIMEBASE_PER_WAKE       (TIMEBASE_FREQ_HZ * TIMER_WAKE_INTERVAL_NS / 1000000000ULL)
 
+// ----------------------------------------------------------------------------
+// PLIC (Platform-Level Interrupt Controller) MMIO 地址布局
+// ----------------------------------------------------------------------------
+//
+// 跟 QEMU virt machine + SiFive PLIC 一致 (RV PLIC spec v1.0.0 兼容)。
+//
+//   +0x000000   priority[N]     4 byte/source       per-source priority
+//   +0x001000   pending[]       1 bit/source        per-source pending bit
+//                               (32 sources / 4-byte word; source 0 = word0.bit0 保留)
+//   +0x002000   enable[ctx][]   1 bit/source/ctx    per-ctx per-source enable
+//                               (0x80 = 128 B/ctx, 32 src/word, 32 word/ctx → 1024 src max)
+//   +0x200000   ctx[ctx]        0x1000 B/ctx        per-ctx control:
+//                                                     +0x000 threshold
+//                                                     +0x004 claim / complete
+//
+// source 0 永远保留 (RV PLIC spec: source_id 0 = no IRQ, 用 dtb interrupts 引用时
+// 跳过)。N_SOURCES 跟 QEMU virt 默认对齐 (96, 含 source 0; 实际可用 1..N_SOURCES-1)。
+//
+// N_CONTEXTS: 当前每 hart 2 context (M + S), 跟 dtb interrupts-extended 标准约定一致;
+// MU-only / MSU 等 misa-aware 动态 context 划法是 long-term TODO, v1 简化。
+#define PLIC_BASE            0x0C000000UL
+#define PLIC_SIZE            0x00600000UL              /* 6 MB; QEMU virt 标准 */
+#define PLIC_PRIORITY_OFF    0x000000UL
+#define PLIC_PENDING_OFF     0x001000UL
+#define PLIC_ENABLE_OFF      0x002000UL
+#define PLIC_ENABLE_STRIDE   0x80UL                    /* 128 B/ctx (1024 src max) */
+#define PLIC_CONTEXT_OFF     0x200000UL
+#define PLIC_CONTEXT_STRIDE  0x1000UL                  /* 4 KB/ctx; +0 threshold, +4 claim/complete */
+#define PLIC_N_SOURCES       96U                       /* 跟 QEMU virt 默认对齐; src 0 保留 */
+#define PLIC_N_CONTEXTS      (MAX_HARTS * 2U)          /* M + S 双 context per hart; v1 = 2 */
+
 #endif //CONFIG_H
