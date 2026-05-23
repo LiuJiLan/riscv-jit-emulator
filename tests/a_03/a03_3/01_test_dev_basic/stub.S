@@ -1,9 +1,9 @@
-# a03_2 / 01_plic_int_basic
+# a03_3 / 01_test_dev_basic
 #
 # ===== 测试目的 =====
-# PLIC 完整状态机端到端 (T2' 验收 fixture):
+# test_dev MMIO fanout 端到端 (T3 step A 验收 fixture):
 #   1. 配 PLIC: priority[3]=1, threshold[ctx0]=0, enable[ctx0][word0] bit3=1
-#   2. 经 test_dev MMIO 写: sw TEST_DEV_SET_OFF(t1), 3 → device_set_pending(3)
+#   2. 经 test_dev MMIO 写: sw TEST_DEV_SET_OFF(t1), value=3 → device_set_pending(3)
 #   3. PLIC 仲裁: ctx0 (= hart0 M ctx) 有可送 source → is_plic_meip_pending(0)=1
 #                  → csr_mip_read 合成 MEIP (bit 11) → trap_check_interrupt fire
 #   4. m_handler:
@@ -14,14 +14,17 @@
 #        - mret
 #   5. 主流程退 ecall → triple fault (mtvec 清后 ecall 走 0 取指 fault, 跟 a_02 halt 同)
 #
-# 触发源是 PLIC (经 device_set_pending 模拟外设拉线), 触发通道是 test_dev MMIO 写。
-# (a_03_3/01_test_dev_basic 是同体例 fixture, 跑通效果等价, 留 a_03 收尾 milestone
-# test review 时 dedupe)。
+# 跟 a_03_2/01 的本质同体例 (step B 切后 a_03_2/01 也用 test_dev MMIO); 此 fixture 是
+# step A 新建的 test_dev 验收入口, 跟 a_03_2/01 跑通效果等价, 留 a_03 收尾 milestone
+# test review 时 dedupe。
 #
 # ===== 思路 =====
 # RV I-type lw/sw 立即数 12-bit signed (-2048..+2047), test_dev SET/CLEAR off = 0x40/0x44
-# 在 imm 范围内 → 一条 li t1, TEST_DEV_BASE + sw t0, 0x40(t1) 够; 比 PLIC 大 offset
-# 还简单, 不用拆 lui+addi。
+# 在 imm 范围内 → 一条 li t1, TEST_DEV_BASE + sw t0, 0x40(t1) 够 (跟 PLIC 大 offset 不同,
+# 不用拆 lui+addi)。
+#
+# sw 不是 hard block boundary (跟 csrw 区分; a_03_2/01 用 csrw 必须把 li s0/a5 挪到
+# trigger 前), 这里 init 跟 trigger 顺序不严格, 但保留 "init 在 trigger 前" 风格更稳。
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -57,7 +60,7 @@ _start:
     li      t1, 0x8                 # bit 3 = source 3
     sw      t1, 0(t0)
 
-    # ---- s0/a5 初始化 (sw 不是 hard boundary, 顺序不严格, 保留 init-before-trigger 风格更稳) ----
+    # ---- s0/a5 初始化 (sw 不是 hard boundary, 顺序不严格, init-before-trigger 风格更稳) ----
     li      s0, 0
     li      a5, 0
 
@@ -112,6 +115,6 @@ m_handler:
 #   mcause  = 1                 (CAUSE_INST_ACCESS_FAULT)
 #
 # 不期望:
-#   - 任何 [bus] CAUSE_*_ACCESS_FAULT
+#   - 任何 [bus] CAUSE_*_ACCESS_FAULT (test_dev / plic 不该产 fault)
 #   - 程序崩溃 (ASan / UBSan 报错)
-#   - wait_loop 永不退 (说明 PLIC 仲裁 / mip 合成 / trap_check_interrupt 哪环断了)
+#   - wait_loop 永不退 (说明 test_dev fanout / PLIC 仲裁 / mip 合成 / trap_check_interrupt 哪环断了)

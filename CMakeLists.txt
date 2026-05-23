@@ -96,7 +96,11 @@ add_executable(riscv_jit_emulator
         src/runtime.c
         src/runtime.h
         src/platform/plic.c
-        src/platform/plic.h)
+        src/platform/plic.h
+        src/device/test_dev.c
+        src/device/test_dev.h
+        src/device/uart.c
+        src/device/uart.h)
 
 # Test
 enable_testing()

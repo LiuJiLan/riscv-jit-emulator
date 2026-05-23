@@ -327,8 +327,8 @@ int is_plic_seip_pending(uint32_t hartid) {
 // virtio-blk 等)。source_id 0 / 越界 silent ignore (设备树没分配的 source 走这里
 // 不该出问题 — 防御性)。
 //
-// T3 UART 接入前, fixture 通过 csr.c 的 CSR_TOHOST (0x800) 写改造路径触发 (bit31=
-// set/clear, 低 31 bits=source_id); T3 接 UART 后改造还原。
+// fixture 通过 test_dev MMIO 写 (sw TEST_DEV_SET_OFF / CLEAR_OFF) 触发; 详
+// src/device/test_dev.{h,c}。
 
 void device_set_pending(uint32_t source_id) {
     if (source_id == 0u || source_id >= PLIC_N_SOURCES) return;

@@ -1,6 +1,6 @@
-# a03_2 / 01_plic_int_basic
-# 产出 out.bin: PLIC 完整状态机端到端 — enable + priority + threshold 配好,
-# 经 test_dev MMIO 写触发 device_set_pending(3), 验 MEIP 合成 + claim/complete 全流程。
+# a03_3 / 05_sifive_test_pass
+# 产出 out.bin: sw 0x5555 → test_dev sifive_test FINISHER PASS magic → main return 0.
+# shell 验证: ./jit-emu out.bin; echo $? 应为 0.
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

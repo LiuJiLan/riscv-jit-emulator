@@ -1,6 +1,6 @@
-# a03_2 / 01_plic_int_basic
-# 产出 out.bin: PLIC 完整状态机端到端 — enable + priority + threshold 配好,
-# 经 test_dev MMIO 写触发 device_set_pending(3), 验 MEIP 合成 + claim/complete 全流程。
+# a03_3 / 01_test_dev_basic
+# 产出 out.bin: test_dev MMIO fanout 端到端 — 经 sw TEST_DEV_SET 触发
+# device_set_pending(3), 验 PLIC 仲裁 + MEIP 合成 + claim/complete 全流程。
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

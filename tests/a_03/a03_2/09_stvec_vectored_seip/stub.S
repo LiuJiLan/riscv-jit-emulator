@@ -13,6 +13,10 @@
 #   fail: timeout / 卡 fail_loop
 #   debug 下 GPR: s0=1 / s1=9 / s2=3 / s3=36
 
+.equ TEST_DEV_BASE,      0x00100000
+.equ TEST_DEV_SET_OFF,   0x40
+.equ TEST_DEV_CLEAR_OFF, 0x44
+
 .section .text
 .option norvc
 .globl _start
@@ -37,7 +41,8 @@ _start:
     li      s2, 0
     li      s3, 0
 
-    li      t0, 0x80000003;  csrw 0x800, t0
+    li      t1, TEST_DEV_BASE
+    li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
 
     li      t0, 0x800;  csrw mstatus, t0   # MPP=S
     la      t0, s_target;  csrw mepc, t0
@@ -80,7 +85,7 @@ s_vec_handler:
     li      t0, 0x0C201004
     lw      s2, 0(t0)
     sw      s2, 0(t0)
-    li      t0, 3;  csrw 0x800, t0
+    li      t0, 3;  li t1, TEST_DEV_BASE;  sw t0, TEST_DEV_CLEAR_OFF(t1)
 
     li      s0, 1
     sret

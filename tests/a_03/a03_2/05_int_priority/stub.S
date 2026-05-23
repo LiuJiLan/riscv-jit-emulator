@@ -11,14 +11,14 @@
 # + 加 MEIP/SEIP (PLIC + 软件 SEIP_sw 合成) 验顺序。
 #
 # 6 源 set 方式:
-#   - MEIP via PLIC: priority[3]=1, threshold=0, enable bit3, csrw 0x800 = 0x80000003
+#   - MEIP via PLIC: priority[3]=1, threshold=0, enable bit3, sw TEST_DEV_SET(t1) = 3
 #   - MSIP via CLINT: msip[0] = 1
 #   - MTIP via CLINT: mtimecmp[0] = 5 (timer thread 第 1 wake 即推过)
 #   - SEIP_sw / SSIP / STIP via csrw mip (走 csr_mip_write 的 MIP_SW_WRITABLE_MASK
 #     = SIP_MASK 子集; bit 1=SSIP, bit 5=STIP, bit 9=SEIP_sw)
 #
 # 6 源清法 (handler 内按 mcause dispatch):
-#   - clear MEIP: PLIC claim+complete + csrw 0x800 = 3
+#   - clear MEIP: PLIC claim+complete + sw TEST_DEV_CLEAR(t1) = 3
 #   - clear MSIP: msip[0] = 0
 #   - clear MTIP: mtimecmp[0] = UINT64_MAX
 #   - clear SEIP: csrw mip, (SSIP|STIP) = 0x22 (保留 SSIP STIP, 清 SEIP_sw)
@@ -35,7 +35,10 @@
 #   s3 = 6 (handler 进入次数)
 #   s0 = 1 (退出 wait_loop)
 
-.equ CSR_TOHOST, 0x800
+.equ TEST_DEV_BASE,      0x00100000
+.equ TEST_DEV_SET_OFF,   0x40
+.equ TEST_DEV_CLEAR_OFF, 0x44
+
 .section .text
 .option norvc
 .globl _start
@@ -69,8 +72,9 @@ _start:
     li      s8, 0
     li      s9, 0
 
-    # ---- set MEIP via CSR_TOHOST (PLIC src=3 device_set) ----
-    li      t0, 0x80000003;  csrw CSR_TOHOST, t0
+    # ---- set MEIP via test_dev (PLIC src=3 device_set) ----
+    li      t1, TEST_DEV_BASE
+    li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
 
     # ---- set SEIP_sw / SSIP / STIP 共 0x222 via csrw mip ----
     li      t0, 0x222;  csrw mip, t0
@@ -124,7 +128,7 @@ clear_meip:
     li      t2, 0x0C200004
     lw      t3, 0(t2)
     sw      t3, 0(t2)
-    li      t2, 3;  csrw CSR_TOHOST, t2
+    li      t2, 3;  li t3, TEST_DEV_BASE;  sw t2, TEST_DEV_CLEAR_OFF(t3)
     j       check_done
 
 clear_msip:

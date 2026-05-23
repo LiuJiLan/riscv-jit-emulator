@@ -5,15 +5,23 @@
 //   POR (Power-On Reset) — 进程启动一次
 //     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) /
 //     plic_init (字段 + ctx_map 全 -1 + bus 注册, **不发线程** — PLIC 是"monitor
-//     但无线程"区分, 跟 clint 区分点; 详 plic.h 顶段) / cpu_create
+//     但无线程"区分, 跟 clint 区分点; 详 plic.h 顶段) /
+//     test_dev_init (bus 注册; 无状态 + 无锁 + 无线程, fanout 调 plic.device_set/
+//     clear_pending; 详 device/test_dev.h 顶段) /
+//     uart_init (bus 注册 + mutex_init; **不发线程** — reader 线程由下方 uart_start_
+//     reader_thread 显式起, 跟 clint 同形态; 详 device/uart.h 顶段) / cpu_create
 //     (内部已写硬件 reset 默认状态)
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
-//     SDS 才退; dummy.txt §12 谁 spawn 谁 join)
+//     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
+//     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
+//     一直跑; 详 device/uart.h 顶段)
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
 //     plic_reset (device_line/claimed 清, plic_ctx_map 不动) /
+//     test_dev_reset (no-op, 无状态) /
+//     uart_reset (8 寄存器 + RX FIFO 清, lock + reader_thread 不动) /
 //     dispatcher(hart) / SR-vs-shutdown 判断 (当前简化恒 shutdown; if(0) 骨架
 //     占位预留真 SR 路径)
 //
@@ -24,6 +32,8 @@
 //
 
 #include "config.h"
+#include "device/test_dev.h"
+#include "device/uart.h"
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
@@ -279,6 +289,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // stdout unbuffered (进程级一次性): UART TX 走 stdout, 重定向到 pipe / 文件时
+    // glibc 默认全缓冲 (4 KB block flush), 字符会卡 libc buffer 看不到; 这里设
+    // _IONBF, UART 路径 putchar 不用每次 fflush. setvbuf 必须在向 stdout 写任何
+    // 字符之前调 (POSIX 要求), 放最早期。
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     // decode 单测先跑 (decode 是纯函数, 不依赖 ram/cpu/mmu); fail 直接 return 1 不让
     // fixture 跑 (test-driven 模式)。
     if (decode_test() != 0) {
@@ -306,6 +322,21 @@ int main(int argc, char **argv) {
     // 标识访问区, 不真改字段; T2 真接通仲裁 / 外设接通 / hart 侧合成读。
     if (plic_init() != 0) {
         fprintf(stderr, "plic_init failed\n");
+        return 1;
+    }
+
+    // test_dev 注册到 bus (plic_init 之后)。无内部状态 + 无锁; 写 TEST_DEV_SET_OFF /
+    // TEST_DEV_CLEAR_OFF 直 fanout 调 plic.device_set/clear_pending。详 device/test_dev.h。
+    if (test_dev_init() != 0) {
+        fprintf(stderr, "test_dev_init failed\n");
+        return 1;
+    }
+
+    // UART (ns16550a) 注册到 bus (test_dev_init 之后)。**不发线程** — reader 线程由
+    // 下方 uart_start_reader_thread 显式起 (谁 spawn 谁 join, dummy.txt §12)。
+    // 详 device/uart.h 顶段。
+    if (uart_init() != 0) {
+        fprintf(stderr, "uart_init failed\n");
         return 1;
     }
 
@@ -363,6 +394,12 @@ int main(int argc, char **argv) {
     // 不分 spawn-fail error path, destroy chain 只在 while 外写一次。
     clint_start_timer_thread();
 
+    // main 起 UART RX reader 辅助线程 (受 SDS 控制, 跟 clint timer 同形态; 内部
+    // blocking read(STDIN) + poll 100ms timeout cooperative shutdown)。错误处理跟
+    // clint_start_timer_thread 同 — fail 内部 fprintf + set SRS=0 + SDS=0; while
+    // 不进; cleanup 在外写一次。
+    uart_start_reader_thread();
+
     // ------------------------------------------------------------------------
     // 主 while: system reset 每 iter 进一次
     //
@@ -373,6 +410,8 @@ int main(int argc, char **argv) {
         cpu_reset(hart);
         (void)clint_reset();
         (void)plic_reset();
+        (void)test_dev_reset();
+        (void)uart_reset();
 
         // ====================================================================
         // 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
@@ -395,17 +434,16 @@ int main(int argc, char **argv) {
         // ====================================================================
         // 区分 system reset 重 iter vs shutdown 退出
         //
-        // 当前简化: "只需要 SR" 恒 0 — 因为 timer thread 受 SDS 控制, 必须有人
-        // 通知它停止才能干净退进程, 没真 "reset 重 iter" 路径。未来真做时:
-        //   - 区分条件: 某种状态判断 (例如 dispatcher 退出原因 / 外部 reset
-        //               trigger / hart 是否参与本轮 reset 等)
-        //   - SR 路径: continue (复位 SRS=1; timer 不重启, 跨 reset)
-        //   - shutdown 路径: 走 else (set SDS, join, 退)
+        // 真接通: test_dev sifive_test FINISHER 0x7777 RESET 命中时, test_dev_write
+        // 内 set reset_req=1 + SRS=0; 这里 consume reset_req — 1 走 SR continue
+        // (timer / uart reader thread 跨 reset 一直跑, SDS 不动), 0 走 shutdown break.
         //
-        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" 一致风格: 实装能跑的部分
-        // (else 分支) + if(0) 骨架表达未来扩展。
+        // dispatcher tri-fault 退出 (in_trap=3) 也走 SRS=0, 但 reset_req=0, 落 else
+        // 分支 — 跟 PASS/FAIL 路径同形态.
+        //
+        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" 一致风格.
         // ====================================================================
-        if (0 /* SR_only; 当前恒 0 — timer 需 SDS 通知, 没真 reset 重 iter */) {
+        if (test_dev_consume_reset_request()) {
             atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
             continue;
         } else {
@@ -432,6 +470,7 @@ int main(int argc, char **argv) {
     // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。
     // ------------------------------------------------------------------------
     clint_join_timer_thread();
+    uart_join_reader_thread();
 
     // ------------------------------------------------------------------------
     // 程序总耗时 (main lifecycle scope; CLOCK_MONOTONIC delta)
@@ -456,7 +495,14 @@ int main(int argc, char **argv) {
 
     clint_destroy();
     plic_destroy();
+    test_dev_destroy();
+    uart_destroy();
     cpu_destroy(hart);
     ram_destroy();
-    return 0;
+
+    // exit code 从 test_dev 拿 — sifive_test FINISHER PASS=0 / FAIL=arg; 其他 halt 路径
+    // (dispatcher tri-fault / decode_test PASS 走自然退出) 走默认 0.
+    // happens-before: test_dev_write 写 exit_code (plain) 后 atomic_store SRS=0 release;
+    // main while 读 SRS=0 acquire 退出, plain exit_code 通过 atomic 边界跨线程可见.
+    return test_dev_get_exit_code();
 }

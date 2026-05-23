@@ -106,9 +106,8 @@
 //   可送 source (priv 编码进函数名, 跟 is_clint_msip_pending 同体例)。
 //
 // device_set_pending / device_clear_pending — 外设侧通知 PLIC 拉高/拉低 device line
-//   (UART / virtio-blk 等); source_id 0 / 越界 silent ignore。T3 UART 接入前, fixture
-//   通过 CSR_TOHOST (0x800) 写改造路径触发 (bit31=set/clear, 低 31 bits=source_id;
-//   csr.c csr_tohost_write 改造, T3 后还原)。
+//   (UART / virtio-blk 等); source_id 0 / 越界 silent ignore。fixture 通过 test_dev
+//   MMIO 写 (sw TEST_DEV_SET_OFF / CLEAR_OFF) 触发, 详 src/device/test_dev.{h,c}。
 //
 
 #ifndef PLATFORM_PLIC_H

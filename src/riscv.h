@@ -16,7 +16,7 @@
 //   - CSR 编号: trap setup 7 (mstatus / mstatush / mtvec / mepc / mcause / mtval / mscratch)
 //             + delegation 2 (medeleg / mideleg) + RO Identity 5 (mhartid / misa /
 //             mvendorid / marchid / mimpid) + S-mode 7 (sstatus / sepc / sscratch / stvec /
-//             scause / stval) + satp + 临时 2 (tohost / privrd)
+//             scause / stval) + satp + 临时 1 (privrd)
 //   - mstatus 字段位段: MIE / MPIE / MPP + SIE / SPIE / SPP / SUM / MXR + SSTATUS_MASK +
 //                        future-proof SD / UXL / SXL
 //   - Exception Code (CAUSE_*) trap_raise_exception / mcause 字段值 完整集
@@ -211,24 +211,6 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 #define CSR_STVAL      0x143U          /* S-mode trap value (xtval[PRIV_S]) */
 
 // ----------------------------------------------------------------------------
-// Unprivileged and User-Level Custom CSRs (临时, 等 uart 实装后删除)
-//
-// 0x800-0x8FF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "Unprivileged and
-// User-Level Custom Read/Write" CSRs:
-//   bits[11:10] = 0b10 → Custom RW
-//   bits[9:8]   = 0b00 → U-level priv min (任何 priv 都能访问 — priv >= U=0 永远成立)
-//
-// CSR_TOHOST 用作 fixture 流式输出 (跟 spike tohost / qemu semihosting 风格类似):
-// fixture `csrw 0x800, x..` 立即触发 fprintf "[tohost] 0x..." 输出到 stderr (csr.c
-// csr_tohost_write 内直接 fprintf, 不缓存 cpu_t 字段; 跟 CSR_PRIVRD 同形态 "csrw 即输出")。
-// 不污染 guest GPR (避免 fixture 用 x10/x11 标记跟 fixture 内部计算冲突)。
-//
-// 删除时机: uart 实装 + ROM-based putchar 接入后, fixture 用 putchar 输出, 这条
-// CSR + csr.c csr_tohost_* helper 一起删。
-// ----------------------------------------------------------------------------
-#define CSR_TOHOST     0x800U
-
-// ----------------------------------------------------------------------------
 // CSR_PRIVRD (临时, 等 uart 实装后删除) —— "作弊" 寄存器, 读当前 priv
 //
 // 0xCC0-0xCFF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "User-level Custom
@@ -240,13 +222,13 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 // 写检查: csr_op 入口判 [11:10]=0b11 = RO → 写时 trap cause=2; csrr (RO 路径) OK.
 //
 // CSR_PRIVRD 真"作弊" 用途: csrr x.., 0xCC0 立即触发 fprintf "[priv] X" 输出 (X = M/S/H/U
-// 之一, csr.c csr_privrd_read 直接 fprintf 不缓存; 跟 CSR_TOHOST 同形态 "csrr 即输出"),
+// 之一, csr.c csr_privrd_read 直接 fprintf 不缓存; "csrr 即输出"),
 // 同时 return (uint32_t)hart->priv 让 GPR 也能拿到 (兼容性)。
 // RV spec 不允许 User-mode 知道当前 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换
 // 正确性 — 控制台直接看到 priv 字符比构造 ecall+trap+handler 路径验更直接。
 //
-// 删除时机: 跟 CSR_TOHOST 一起 (uart 实装后, fixture 用 putchar + 真 trap 路径验 priv
-// 状态, 不需要这个 backdoor)。
+// 删除时机: uart 实装后, fixture 用 putchar + 真 trap 路径验 priv
+// 状态, 不需要这个 backdoor。
 // ----------------------------------------------------------------------------
 #define CSR_PRIVRD     0xCC0U
 

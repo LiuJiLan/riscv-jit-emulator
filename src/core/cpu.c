@@ -151,11 +151,10 @@ void cpu_reset(cpu_t *hart) {
 // dump 格式:
 //   - reg 分 [reg dec] + [reg hex] 两段, 每段 x1-x31 (x0 跳过, 占位 pc)
 //   - ABI 标注 xN(abi), space padding 到 9 char 宽度对齐 (x8(s0/fp) 9 char 不单独优化)
-//   - 每行 4 reg (decimal %11u / hex 0x%08x), 行头 \t
+//   - 每行 4 reg (decimal %11u / hex 0x%08X), 行头 \t
 //   - pc 放 state dump 末行, hex 显示
 //
-// tohost / privrd 在 csr.c 内 csrw/csrr 时直接 fprintf 流式输出, 不缓存到 cpu_t,
-// 故 dump 不含这两项。
+// privrd 在 csr.c 内 csrr 时直接 fprintf 流式输出, 不缓存到 cpu_t, 故 dump 不含。
 // ----------------------------------------------------------------------------
 static void cpu_dump(const cpu_t *hart) {
 #ifdef DEBUG_CPU_DUMP_ON
@@ -180,14 +179,14 @@ static void cpu_dump(const cpu_t *hart) {
 
     fprintf(stderr,
             "[cpu] reg hex:\n"
-            "\tx1(ra)    = 0x%08x  |  x2(sp)    = 0x%08x  |  x3(gp)    = 0x%08x  |  x4(tp)    = 0x%08x\n"
-            "\tx5(t0)    = 0x%08x  |  x6(t1)    = 0x%08x  |  x7(t2)    = 0x%08x  |  x8(s0/fp) = 0x%08x\n"
-            "\tx9(s1)    = 0x%08x  |  x10(a0)   = 0x%08x  |  x11(a1)   = 0x%08x  |  x12(a2)   = 0x%08x\n"
-            "\tx13(a3)   = 0x%08x  |  x14(a4)   = 0x%08x  |  x15(a5)   = 0x%08x  |  x16(a6)   = 0x%08x\n"
-            "\tx17(a7)   = 0x%08x  |  x18(s2)   = 0x%08x  |  x19(s3)   = 0x%08x  |  x20(s4)   = 0x%08x\n"
-            "\tx21(s5)   = 0x%08x  |  x22(s6)   = 0x%08x  |  x23(s7)   = 0x%08x  |  x24(s8)   = 0x%08x\n"
-            "\tx25(s9)   = 0x%08x  |  x26(s10)  = 0x%08x  |  x27(s11)  = 0x%08x  |  x28(t3)   = 0x%08x\n"
-            "\tx29(t4)   = 0x%08x  |  x30(t5)   = 0x%08x  |  x31(t6)   = 0x%08x\n",
+            "\tx1(ra)    = 0x%08X  |  x2(sp)    = 0x%08X  |  x3(gp)    = 0x%08X  |  x4(tp)    = 0x%08X\n"
+            "\tx5(t0)    = 0x%08X  |  x6(t1)    = 0x%08X  |  x7(t2)    = 0x%08X  |  x8(s0/fp) = 0x%08X\n"
+            "\tx9(s1)    = 0x%08X  |  x10(a0)   = 0x%08X  |  x11(a1)   = 0x%08X  |  x12(a2)   = 0x%08X\n"
+            "\tx13(a3)   = 0x%08X  |  x14(a4)   = 0x%08X  |  x15(a5)   = 0x%08X  |  x16(a6)   = 0x%08X\n"
+            "\tx17(a7)   = 0x%08X  |  x18(s2)   = 0x%08X  |  x19(s3)   = 0x%08X  |  x20(s4)   = 0x%08X\n"
+            "\tx21(s5)   = 0x%08X  |  x22(s6)   = 0x%08X  |  x23(s7)   = 0x%08X  |  x24(s8)   = 0x%08X\n"
+            "\tx25(s9)   = 0x%08X  |  x26(s10)  = 0x%08X  |  x27(s11)  = 0x%08X  |  x28(t3)   = 0x%08X\n"
+            "\tx29(t4)   = 0x%08X  |  x30(t5)   = 0x%08X  |  x31(t6)   = 0x%08X\n",
             hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
             hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
             hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
@@ -200,18 +199,18 @@ static void cpu_dump(const cpu_t *hart) {
     // trap dump (M+S 两槽): in_trap=3 时字段保留 double fault 第二次状态作 root cause;
     // S 槽用于 medeleg delegate 路径验证 (medeleg=1 → trap deliver S, M 槽不写)。
     fprintf(stderr,
-            "[cpu] trap dump (M): in_trap=%u mcause=%u mtval=0x%08x mepc=0x%08x mtvec=0x%08x\n",
+            "[cpu] trap dump (M): in_trap=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X\n",
             hart->trap.in_trap,
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
     fprintf(stderr,
-            "[cpu] trap dump (S): scause=%u stval=0x%08x sepc=0x%08x stvec=0x%08x\n",
+            "[cpu] trap dump (S): scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X\n",
             hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
             hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
     // state dump: pc + priv + mstatus 低 32 位 (mstatush 当前全 0, 省略)。
     fprintf(stderr,
-            "[cpu] state dump: pc=0x%08x  priv=%u  mstatus=0x%08x\n",
+            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X\n",
             hart->regs[0],
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));

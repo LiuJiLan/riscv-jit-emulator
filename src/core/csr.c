@@ -35,8 +35,6 @@
 //   mvendorid(0xF11) → hart->shared_info->mvendorid (RO)
 //   marchid  (0xF12) → hart->shared_info->marchid (RO)
 //   mimpid   (0xF13) → hart->shared_info->mimpid (RO)
-//   tohost   (0x800) → 不存字段; write 解码 bit31=set/clear + 低 31 bits=source_id 调
-//                       device_set/clear_pending (a_03_02 T2' 改造; uart 实装后还原 + 删)
 //   privrd   (0xCC0) → 不存字段; read 直接 fprintf "[priv] X" + return hart->priv (临时 RO)
 //
 // 组织哲学:
@@ -58,9 +56,8 @@
 //          const cpu_info_shared_t *shared_info 指针; cpu.c static const cpu_info_shared_default
 //          一份, 所有 hart shared_info 指向它。这些是机器整体属性, 不区分 hart。
 //          csr.c csr_mvendorid/marchid/mimpid_read 读 hart->shared_info->xxx 解引用。
-//   类 5 — 临时调试 CSR (tohost / privrd): 字段不存 cpu_t; csr.c 内 read/write 直接 fprintf
-//          流式输出。uart 实装后删除整段 (csr.c 内 5 个 helper + csr_op 内 2 个 case +
-//          riscv.h 2 个宏)。
+//   类 5 — 临时调试 CSR (privrd): 字段不存 cpu_t; csr.c 内 read 直接 fprintf 流式输出。
+//          uart 实装后删除整段 (csr.c 内 helper + csr_op 内 case + riscv.h 宏)。
 //
 
 #include "csr.h"
@@ -68,7 +65,7 @@
 #include "config.h"            // IALIGN_MASK
 #include "cpu.h"
 #include "platform/clint.h"    // is_clint_msip_pending / is_clint_timer_pending (mip 合成读)
-#include "platform/plic.h"     // is_plic_meip/seip_pending (mip 合成读) + device_set/clear_pending (tohost 改造)
+#include "platform/plic.h"     // is_plic_meip/seip_pending (mip 合成读)
 #include "riscv.h"
 #include "trap.h"              // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
 
@@ -510,48 +507,10 @@ static uxlen_t csr_mimpid_read(cpu_t *hart) {
 // ============================================================================
 // 临时调试 CSR (类 5; uart 实装后删除整段)
 //
-// 含 tohost (0x800) + privrd (0xCC0) 共 2 个 csr; 字段不存 cpu_t (csr.c 内 read/write
-// 直接 fprintf 流式输出)。
-// 删除时机: uart + 真 trap 路径 (用 ecall + putchar) 替代后, 删本段 5 个 helper +
-// csr_op 内 2 个 case (read/write switch 各 2 处) + riscv.h 2 个宏 (CSR_TOHOST / CSR_PRIVRD)。
+// 含 privrd (0xCC0) 1 个 csr; 字段不存 cpu_t (csr.c 内 read 直接 fprintf 流式输出)。
+// 删除时机: uart + 真 trap 路径 (用 ecall + putchar) 替代后, 删本段 helper +
+// csr_op 内 case + riscv.h CSR_PRIVRD 宏。
 // ============================================================================
-
-// ---- tohost (临时 PLIC 触发通道; CSR 0x800) ----
-//
-// 设计意图 (a_03_02 T2' 改造): csrw 0x800, value → 解析 value:
-//   - bit 31 == 1: device_set_pending(value & 0x7FFFFFFF)
-//   - bit 31 == 0: device_clear_pending(value & 0x7FFFFFFF)
-// 用作 fixture 驱动 PLIC 状态机 (set / clear 是设备侧, guest 汇编正常路径驱动不到),
-// 跟 plic.c device_set/clear_pending 一对一。低 31 bits = source_id; source 0 / 越界
-// 由 plic.c 内部 silent ignore, 此处不再校验。csrr 0x800 仍返 0 不动 (RW CSR 入口判
-// 通过, 但读副作用没意义)。
-//
-// 改造历史: 原 csrw 0x800 是 "fprintf 流式输出" 通道 (跟 spike tohost / qemu
-// semihosting 风格类似), a01_8/03_msu_priv_chain fixture 在用 4 次. T2' 改造后该
-// fixture stderr 少了 4 行 [tohost] 输出 (期望进 REVIEW 待校准列表; 不主动修, 等 T3
-// UART 接入后改造还原 + 改 a01_8/03 用 UART 替代)。任何 priv 都能 csrw/csrr (priv >=
-// U=0; csr_op 入口判通过); 不影响 trap_csrs_t 任何字段.
-//
-// 删除时机 (跟 privrd 一起): T3 UART 接入 + a01_8/03 改用 UART 后, 删本 helper +
-// csr_op 内 case + riscv.h CSR_TOHOST 宏。csr_tohost_read 跟着删 (无独立用途)。
-
-static uxlen_t csr_tohost_read(cpu_t *hart) {
-    /* read 不缓存, 不存值; return 0 让 csrr 不 trap (csr_op 大 switch case 必须有
-     * read helper, 否则 default → fprintf+trap_raise illegal). fixture 不应 csrr 0x800. */
-    (void)hart;
-    return 0;
-}
-
-static void csr_tohost_write(cpu_t *hart, uxlen_t v) {
-    /* T2' 改造: bit31 set/clear, 低 31 bits source_id; 详顶段段 doc. */
-    (void)hart;
-    uint32_t source_id = (uint32_t)(v & 0x7FFFFFFFu);
-    if (v & 0x80000000u) {
-        device_set_pending(source_id);
-    } else {
-        device_clear_pending(source_id);
-    }
-}
 
 
 // ---- privrd (临时"作弊" CSR; 0xCC0; 等 uart 实装后删除) ----
@@ -642,7 +601,6 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
         case CSR_MVENDORID:read_old = csr_mvendorid_read(hart); break;  /* RO */
         case CSR_MARCHID:  read_old = csr_marchid_read (hart); break;   /* RO */
         case CSR_MIMPID:   read_old = csr_mimpid_read  (hart); break;   /* RO */
-        case CSR_TOHOST:   read_old = csr_tohost_read  (hart); break;   /* 临时; uart 实装后删 */
         case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* 临时 RO; RO 写 trap 由入口判 */
         default:
             fprintf(stderr,
@@ -691,7 +649,6 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
             case CSR_SIE:      csr_sie_write     (hart, to_write); break;
             case CSR_SIP:      csr_sip_write     (hart, to_write); break;
             case CSR_MISA:     csr_misa_write    (hart, to_write); break;   /* noop (WARL) */
-            case CSR_TOHOST:   csr_tohost_write  (hart, to_write); break;   /* 临时 */
             default:
                 // 上面 read 路径的 default 已 fprintf + trap_raise_exception
                 // (_Noreturn longjmp), 控制流到此不可达; 保留 default break 作 -Wswitch

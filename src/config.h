@@ -138,4 +138,65 @@
 #define PLIC_N_SOURCES       96U                       /* 跟 QEMU virt 默认对齐; src 0 保留 */
 #define PLIC_N_CONTEXTS      (MAX_HARTS * 2U)          /* M + S 双 context per hart; v1 = 2 */
 
+// ----------------------------------------------------------------------------
+// test_dev (sifive_test 兼容外设) MMIO 地址布局
+// ----------------------------------------------------------------------------
+//
+// 跟 QEMU virt machine + sifive_test 同 (base = 0x00100000, 4 KB region)。
+//
+//   +0x00      sifive_test FINISHER         (W: 三 magic 解析 PASS/FAIL/RESET; R 返 0)
+//                                            cmd = value & 0xFFFF; arg = (value >> 16) & 0xFFFF
+//                                            cmd=0x5555 PASS  → main return 0
+//                                            cmd=0x3333 FAIL  → main return arg
+//                                            cmd=0x7777 RESET → main while continue (跨 reset
+//                                                              timer/uart reader thread 跑)
+//   +0x40      TEST_DEV_SET                 (W value=source_id → device_set_pending)
+//   +0x44      TEST_DEV_CLEAR               (W value=source_id → device_clear_pending)
+//   其他 off   silent ignore                (R 返 0 / W 丢弃, 跟 plic 内 reserved 体例)
+//
+// fixture 端通过 sw TEST_DEV_SET_OFF / TEST_DEV_CLEAR_OFF 触发 PLIC fanout; sw
+// TEST_DEV_SIFIVE_OFF 上报 exit code / 触发 system reset.
+#define TEST_DEV_BASE             0x00100000UL
+#define TEST_DEV_SIZE             0x00001000UL          /* 4 KB */
+#define TEST_DEV_SIFIVE_OFF       0x00UL                /* finisher: PASS/FAIL/RESET 三 magic */
+#define TEST_DEV_SET_OFF          0x40UL                /* W → device_set_pending(value) */
+#define TEST_DEV_CLEAR_OFF        0x44UL                /* W → device_clear_pending(value) */
+
+/* sifive_test FINISHER cmd magic (low 16 bit of write value); QEMU virt sifive_test 兼容 */
+#define TEST_DEV_FINISHER_PASS    0x5555U
+#define TEST_DEV_FINISHER_FAIL    0x3333U
+#define TEST_DEV_FINISHER_RESET   0x7777U
+
+// ----------------------------------------------------------------------------
+// UART (ns16550a 兼容) MMIO 地址布局
+// ----------------------------------------------------------------------------
+//
+// 跟 QEMU virt machine + Linux earlycon=uart8250 + OpenSBI 默认 console 一致
+// (base 0x10000000, 8 寄存器 byte-access, size = 0x100 留 reg-shift 扩展空间)。
+//
+//   +0x0  RBR (R) / THR (W) / DLL (DLAB=1)
+//   +0x1  IER       / DLM (DLAB=1)
+//   +0x2  IIR (R)   / FCR (W)
+//   +0x3  LCR  (含 DLAB bit 7)
+//   +0x4  MCR
+//   +0x5  LSR  (R)
+//   +0x6  MSR  (R)
+//   +0x7  SCR
+//
+// 访问宽度: 1 byte only (8250 spec; size != 1 → CAUSE_*_ACCESS_FAULT)。
+// PLIC source_id: 跟 QEMU virt 一致 (UART0 = 10)。
+// RX FIFO 容量: 16 B (ns16550a spec; trigger level 简化 = 1)。
+#define UART_BASE        0x10000000UL
+#define UART_SIZE        0x00000100UL              /* 256 B 留 reg-shift 扩展 */
+#define UART_REG_RBR_THR 0x0UL                     /* RBR(R) / THR(W) / DLL(DLAB=1) */
+#define UART_REG_IER     0x1UL                     /* IER     / DLM(DLAB=1) */
+#define UART_REG_IIR_FCR 0x2UL                     /* IIR(R)  / FCR(W) */
+#define UART_REG_LCR     0x3UL                     /* LCR (bit 7 = DLAB) */
+#define UART_REG_MCR     0x4UL
+#define UART_REG_LSR     0x5UL                     /* LSR (R; THRE/TEMT/DR) */
+#define UART_REG_MSR     0x6UL                     /* MSR (R) */
+#define UART_REG_SCR     0x7UL
+#define UART_PLIC_IRQ    10U                       /* 跟 QEMU virt UART0 一致 */
+#define UART_RX_FIFO_CAP 16U                       /* ns16550a RX FIFO 16 B */
+
 #endif //CONFIG_H

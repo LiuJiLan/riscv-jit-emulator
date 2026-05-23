@@ -1,6 +1,6 @@
-# a03_2 / 01_plic_int_basic
-# 产出 out.bin: PLIC 完整状态机端到端 — enable + priority + threshold 配好,
-# 经 test_dev MMIO 写触发 device_set_pending(3), 验 MEIP 合成 + claim/complete 全流程。
+# a03_3 / 03_uart_hello
+# 产出 out.bin: hello world 纯 TX 轮询 — 不接 PLIC / 不接 trap, 单线 lb LSR 检 THRE +
+# sb THR 字符循环; 验 UART TX fast path + stdout 输出. milestone 顺手副产物.
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

@@ -14,7 +14,10 @@
 #   s3 = 2            (handler 进入次数, 期望 2)
 #   in_trap = 3 / pc = 0  (halt path triple fault)
 
-.equ CSR_TOHOST, 0x800
+.equ TEST_DEV_BASE,      0x00100000
+.equ TEST_DEV_SET_OFF,   0x40
+.equ TEST_DEV_CLEAR_OFF, 0x44
+
 .section .text
 .option norvc
 .globl _start
@@ -36,15 +39,16 @@ _start:
     # enable[ctx0][word0] = (1<<3) | (1<<5) = 0x28
     li      t0, 0x0C002000;  li t1, 0x28;  sw t1, 0(t0)
 
-    # init counters/flags 必须在 csrw 0x800 之前 (避免 mret 后被 reset)
+    # init counters/flags (sw 不是 hard boundary, 顺序不严格, 保留 init-before-trigger 风格更稳)
     li      s0, 0
     li      s1, 0
     li      s2, 0
     li      s3, 0
 
-    # set src=3 + src=5
-    li      t0, 0x80000003;  csrw CSR_TOHOST, t0
-    li      t0, 0x80000005;  csrw CSR_TOHOST, t0
+    # set src=3 + src=5 via test_dev MMIO
+    li      t1, TEST_DEV_BASE
+    li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
+    li      t0, 5;  sw t0, TEST_DEV_SET_OFF(t1)
 
     # 开 MIE → 下一 block trap_check fire MEIP
     csrrsi  x0, mstatus, 0x8
@@ -72,14 +76,14 @@ m_handler:
 first_claim:
     mv      s1, t1                          # 期望 s1 = 5
     # device_clear src=5 + complete 5
-    li      t0, 5;   csrw CSR_TOHOST, t0
+    li      t0, 5;  li t1, TEST_DEV_BASE;  sw t0, TEST_DEV_CLEAR_OFF(t1)
     li      t0, 0x0C200004
     sw      s1, 0(t0)
     mret                                    # 回 wait_loop; src=3 仍 pending → 再 fire
 
 second_claim:
     mv      s2, t1                          # 期望 s2 = 3
-    li      t0, 3;   csrw CSR_TOHOST, t0
+    li      t0, 3;  li t1, TEST_DEV_BASE;  sw t0, TEST_DEV_CLEAR_OFF(t1)
     li      t0, 0x0C200004
     sw      s2, 0(t0)
     li      s0, 1                           # 退出 wait_loop

@@ -12,7 +12,10 @@
 #   s2 = 3            (claim 返 src=3)
 #   s4 = 1            (handler 进入时 s1 snapshot, 必须 = 1 表示 phase 2 才 fire)
 
-.equ CSR_TOHOST, 0x800
+.equ TEST_DEV_BASE,      0x00100000
+.equ TEST_DEV_SET_OFF,   0x40
+.equ TEST_DEV_CLEAR_OFF, 0x44
+
 .section .text
 .option norvc
 .globl _start
@@ -32,8 +35,9 @@ _start:
     li      s2, 0
     li      s4, 0
 
-    # set src=3 (此时 priority=5, threshold=5, 5 ≤ 5 不送)
-    li      t0, 0x80000003;  csrw CSR_TOHOST, t0
+    # set src=3 via test_dev (此时 priority=5, threshold=5, 5 ≤ 5 不送)
+    li      t1, TEST_DEV_BASE
+    li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
 
     csrrsi  x0, mstatus, 0x8                # MIE=1, 但 mip.MEIP=0 不 fire
 
@@ -59,8 +63,8 @@ m_handler:
     li      t0, 0x0C200004
     lw      s2, 0(t0)                       # claim → 期望 s2 = 3
 
-    li      t0, 3;  csrw CSR_TOHOST, t0    # device_clear src=3
-    li      t0, 0x0C200004;  sw s2, 0(t0)  # complete
+    li      t0, 3;  li t1, TEST_DEV_BASE;  sw t0, TEST_DEV_CLEAR_OFF(t1)
+    li      t0, 0x0C200004;  sw s2, 0(t0)   # complete
 
     li      s0, 1
     mret

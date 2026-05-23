@@ -1,6 +1,7 @@
-# a03_2 / 01_plic_int_basic
-# 产出 out.bin: PLIC 完整状态机端到端 — enable + priority + threshold 配好,
-# 经 test_dev MMIO 写触发 device_set_pending(3), 验 MEIP 合成 + claim/complete 全流程。
+# a03_3 / 02_uart_tx_int
+# 产出 out.bin: UART TX 中断端到端 — 经 IER.ETBEI=1 触发 device_set_pending(10),
+# 验 PLIC 仲裁 + MEIP 合成 + handler 读 IIR ack THR empty + complete 全流程;
+# 顺手输出 "OK\n" 到 stdout (TX 路径走通验证).
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc

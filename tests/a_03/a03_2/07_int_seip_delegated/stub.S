@@ -14,7 +14,7 @@
 # fixture 流程:
 #   1. M setup: mtvec=m_halt, stvec=s_handler, mideleg.SEIP=1, mie.SEIE=1
 #   2. PLIC setup ctx 1: priority[3]=1, threshold[ctx1]=0, enable[ctx1][word0] bit3
-#   3. csrw 0x800, 0x80000003 → PLIC device_set src=3 → ctx 1 pending → SEIP=1
+#   3. sw TEST_DEV_SET(t1), 3 → PLIC device_set src=3 → ctx 1 pending → SEIP=1
 #   4. mret 切 S (mstatus.MPP=S)
 #   5. S 开 SIE → fire SEIP, deliver S (mideleg.SEIP=1), jump stvec
 #   6. s_handler: scause=0x80000009; PLIC claim @ ctx 1 + complete + device_clear; sret
@@ -25,6 +25,10 @@
 #   s1 = 0x80000009   (CAUSE_INTERRUPT_BIT | IRQ_S_EXT, 写 scause)
 #   s2 = 3            (PLIC claim @ ctx 1 返 src=3)
 #   in_trap = 3 / pc = 0
+
+.equ TEST_DEV_BASE,      0x00100000
+.equ TEST_DEV_SET_OFF,   0x40
+.equ TEST_DEV_CLEAR_OFF, 0x44
 
 .section .text
 .option norvc
@@ -54,8 +58,9 @@ _start:
     li      s1, 0
     li      s2, 0
 
-    # set PLIC src=3 → ctx 1 pending → mip.SEIP=1
-    li      t0, 0x80000003;  csrw 0x800, t0
+    # set PLIC src=3 via test_dev → ctx 1 pending → mip.SEIP=1
+    li      t1, TEST_DEV_BASE
+    li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
 
     # mret 切 S: mstatus.MPP=S (=0b01<<11 = 0x800)
     li      t0, 0x800;  csrw mstatus, t0
@@ -80,8 +85,8 @@ s_handler:
     li      t0, 0x0C201004
     lw      s2, 0(t0)                      # claim → 期望 s2=3
     sw      s2, 0(t0)                      # complete
-    # device_clear src=3 via CSR_TOHOST
-    li      t0, 3;  csrw 0x800, t0
+    # device_clear src=3 via test_dev MMIO
+    li      t0, 3;  li t1, TEST_DEV_BASE;  sw t0, TEST_DEV_CLEAR_OFF(t1)
 
     li      s0, 1
     sret
