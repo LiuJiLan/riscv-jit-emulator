@@ -17,7 +17,8 @@
 //   mideleg  (0x303) → trap.mideleg (类 3 单字段; trap_set_interrupt_state + trap_check_interrupt 真读)
 //   mie      (0x304) → trap._mie (类 (2a) 副本基本字段, sie 是 mask view; WARL 截 MIE_VALID_MASK)
 //   mip      (0x344) → 合成读: trap._mip_sw (类 (5) 软件可写子集) OR is_clint_msip_pending OR
-//                       is_clint_timer_pending OR (未来) PLIC; csrw 只动 _mip_sw, RO 位忽略
+//                       is_clint_timer_pending OR is_plic_meip_pending OR is_plic_seip_pending;
+//                       csrw 只动 _mip_sw, RO 位忽略
 //   satp     (0x180) → hart->satp (cpu_t 直接持有字段, 不在 trap_csrs_t — satp 不属于 trap-related
 //                       CSR 范畴; write WARL ASID 截断到 ASID_MASK 位, 见 dummy.txt §3)
 //   sstatus  (0x100) → trap._mstatus 低 32 位 ∩ SSTATUS_MASK (mask 视图; 物理共用 mstatus)
@@ -34,7 +35,8 @@
 //   mvendorid(0xF11) → hart->shared_info->mvendorid (RO)
 //   marchid  (0xF12) → hart->shared_info->marchid (RO)
 //   mimpid   (0xF13) → hart->shared_info->mimpid (RO)
-//   tohost   (0x800) → 不存字段; write 直接 fprintf 流式输出 (临时, uart 实装后删)
+//   tohost   (0x800) → 不存字段; write 解码 bit31=set/clear + 低 31 bits=source_id 调
+//                       device_set/clear_pending (a_03_02 T2' 改造; uart 实装后还原 + 删)
 //   privrd   (0xCC0) → 不存字段; read 直接 fprintf "[priv] X" + return hart->priv (临时 RO)
 //
 // 组织哲学:
@@ -66,6 +68,7 @@
 #include "config.h"            // IALIGN_MASK
 #include "cpu.h"
 #include "platform/clint.h"    // is_clint_msip_pending / is_clint_timer_pending (mip 合成读)
+#include "platform/plic.h"     // is_plic_meip/seip_pending (mip 合成读) + device_set/clear_pending (tohost 改造)
 #include "riscv.h"
 #include "trap.h"              // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
 
@@ -282,9 +285,12 @@ uxlen_t csr_mip_read(cpu_t *hart) {
     if (is_clint_timer_pending(hartid))
         mip_view |= (1U << IRQ_M_TIMER);
 
-    /* (未来) PLIC s_pending → IRQ_S_EXT 位 OR (跟 _mip_sw 已经 OR 的 sw_seip 合成);
-     * (未来) PLIC m_pending → IRQ_M_EXT 位 OR.
-     * v1 PLIC 未实装, 两位都 0, 占位不影响合成结果. */
+    /* PLIC 合成: MEIP / SEIP 位 OR (SEIP 跟 _mip_sw 已经 OR 的 sw_seip 共同合成视图,
+     * 跟 RV spec §3.1.9 SEIP "hardware OR software" 语义一致). */
+    if (is_plic_meip_pending(hartid))
+        mip_view |= (1U << IRQ_M_EXT);
+    if (is_plic_seip_pending(hartid))
+        mip_view |= (1U << IRQ_S_EXT);
 
     return mip_view;
 }
@@ -510,12 +516,24 @@ static uxlen_t csr_mimpid_read(cpu_t *hart) {
 // csr_op 内 2 个 case (read/write switch 各 2 处) + riscv.h 2 个宏 (CSR_TOHOST / CSR_PRIVRD)。
 // ============================================================================
 
-// ---- tohost (临时 fixture 流式输出; CSR 0x800) ----
+// ---- tohost (临时 PLIC 触发通道; CSR 0x800) ----
 //
-// 设计意图: csrw 0x800 立即 fprintf 输出到 stderr, 不存 cpu_t 字段; fixture 用作"流式
-// 调试输出" 不污染 GPR (跟 spike tohost / qemu semihosting 风格类似但 user-level)。
-// 跟 csr_privrd_read 同形态 — 都是"接 csr.c 入口直接 console 输出, 不缓存"。
-// 任何 priv 都能 csrw/csrr (priv >= U=0; csr_op 入口判通过); 不影响 trap_csrs_t 任何字段.
+// 设计意图 (a_03_02 T2' 改造): csrw 0x800, value → 解析 value:
+//   - bit 31 == 1: device_set_pending(value & 0x7FFFFFFF)
+//   - bit 31 == 0: device_clear_pending(value & 0x7FFFFFFF)
+// 用作 fixture 驱动 PLIC 状态机 (set / clear 是设备侧, guest 汇编正常路径驱动不到),
+// 跟 plic.c device_set/clear_pending 一对一。低 31 bits = source_id; source 0 / 越界
+// 由 plic.c 内部 silent ignore, 此处不再校验。csrr 0x800 仍返 0 不动 (RW CSR 入口判
+// 通过, 但读副作用没意义)。
+//
+// 改造历史: 原 csrw 0x800 是 "fprintf 流式输出" 通道 (跟 spike tohost / qemu
+// semihosting 风格类似), a01_8/03_msu_priv_chain fixture 在用 4 次. T2' 改造后该
+// fixture stderr 少了 4 行 [tohost] 输出 (期望进 REVIEW 待校准列表; 不主动修, 等 T3
+// UART 接入后改造还原 + 改 a01_8/03 用 UART 替代)。任何 priv 都能 csrw/csrr (priv >=
+// U=0; csr_op 入口判通过); 不影响 trap_csrs_t 任何字段.
+//
+// 删除时机 (跟 privrd 一起): T3 UART 接入 + a01_8/03 改用 UART 后, 删本 helper +
+// csr_op 内 case + riscv.h CSR_TOHOST 宏。csr_tohost_read 跟着删 (无独立用途)。
 
 static uxlen_t csr_tohost_read(cpu_t *hart) {
     /* read 不缓存, 不存值; return 0 让 csrr 不 trap (csr_op 大 switch case 必须有
@@ -525,9 +543,14 @@ static uxlen_t csr_tohost_read(cpu_t *hart) {
 }
 
 static void csr_tohost_write(cpu_t *hart, uxlen_t v) {
-    /* 直接 fprintf 流式输出, 不存字段 (cpu_t 内不缓存). */
+    /* T2' 改造: bit31 set/clear, 低 31 bits source_id; 详顶段段 doc. */
     (void)hart;
-    fprintf(stderr, "[tohost] 0x%08" PRIx32 "\n", v);
+    uint32_t source_id = (uint32_t)(v & 0x7FFFFFFFu);
+    if (v & 0x80000000u) {
+        device_set_pending(source_id);
+    } else {
+        device_clear_pending(source_id);
+    }
 }
 
 

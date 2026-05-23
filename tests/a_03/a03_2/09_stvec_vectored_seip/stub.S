@@ -1,0 +1,93 @@
+# a03_2 / 09_stvec_vectored_seip
+#
+# ===== 测试目的 =====
+# stvec vectored mode (mode=1): fire SEIP delegated → S handler vectored, cause_low=9
+# 期望跳 s_vec_base+36.
+#
+# ===== 验证手法 =====
+# 跟 08 同 — jal x5, handler 自动留 ra=entry+4; handler 算 cause_low compare
+# 期望 9, mismatch fail_loop 死循环; match 正常 PLIC ctx1 claim/complete + sret.
+#
+# ===== 期望结果 =====
+#   pass: in_trap=3 / pc=0
+#   fail: timeout / 卡 fail_loop
+#   debug 下 GPR: s0=1 / s1=9 / s2=3 / s3=36
+
+.section .text
+.option norvc
+.globl _start
+
+_start:
+    la      t0, m_halt;  csrw mtvec, t0
+
+    la      t0, s_vec_base
+    ori     t0, t0, 1                      # mode=1 vectored
+    csrw    stvec, t0
+
+    li      t0, 0x200;  csrw mideleg, t0   # SEIP delegated
+    li      t0, 0x200;  csrw mie, t0       # SEIE
+
+    # PLIC setup ctx 1: priority[3]=1, threshold=0, enable bit3
+    li      t0, 0x0C000000;  li t1, 1;  sw t1, 12(t0)
+    li      t0, 0x0C002080;  li t1, 0x8;  sw t1, 0(t0)
+    li      t0, 0x0C201000;  sw x0, 0(t0)
+
+    li      s0, 0
+    li      s1, 0
+    li      s2, 0
+    li      s3, 0
+
+    li      t0, 0x80000003;  csrw 0x800, t0
+
+    li      t0, 0x800;  csrw mstatus, t0   # MPP=S
+    la      t0, s_target;  csrw mepc, t0
+    mret
+
+s_target:
+    csrrsi  x0, sstatus, 0x2                # SIE=1 → fire SEIP vectored
+
+wait_loop:
+    beqz    s0, wait_loop
+    ecall                                   # S-ecall → m_halt
+
+# ============================================================================
+# s_vec_base — vectored jump table
+# ============================================================================
+.balign 4
+s_vec_base:
+    jal     x5, s_vec_handler              # +0
+    jal     x5, s_vec_handler              # +4   IRQ 1
+    jal     x5, s_vec_handler              # +8
+    jal     x5, s_vec_handler              # +12
+    jal     x5, s_vec_handler              # +16
+    jal     x5, s_vec_handler              # +20
+    jal     x5, s_vec_handler              # +24
+    jal     x5, s_vec_handler              # +28
+    jal     x5, s_vec_handler              # +32
+    jal     x5, s_vec_handler              # +36  IRQ 9 S_EXT (期望)
+
+s_vec_handler:
+    la      t1, s_vec_base
+    sub     t2, x5, t1
+    addi    t2, t2, -4
+    mv      s3, t2                          # 期望 36
+    srli    t1, t2, 2
+    mv      s1, t1                          # 期望 9
+
+    li      t2, 9
+    bne     t1, t2, fail_loop
+
+    li      t0, 0x0C201004
+    lw      s2, 0(t0)
+    sw      s2, 0(t0)
+    li      t0, 3;  csrw 0x800, t0
+
+    li      s0, 1
+    sret
+
+fail_loop:
+    j       fail_loop
+
+m_halt:
+    csrw    mtvec, x0
+    ecall

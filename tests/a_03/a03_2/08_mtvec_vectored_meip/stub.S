@@ -1,0 +1,91 @@
+# a03_2 / 08_mtvec_vectored_meip
+#
+# ===== 测试目的 =====
+# mtvec vectored mode (mode=1): fire async interrupt 时 pc = base + 4*cause_low.
+# 验 MEIP (cause_low=11) 跳 m_vec_base+44 这条 entry.
+#
+# ===== 验证手法 =====
+# vectored jump table 每个 entry = `jal x5, m_vec_handler` (x5=t0 当临时 ra; jal 后
+# x5 = entry_addr + 4 = base + 4*cause_low + 4). handler 内算 cause_low = (x5 - base
+# - 4) / 4, compare == 11, mismatch 走 fail_loop 死循环 (release timeout 暴露 fail);
+# match 才走 PLIC claim/complete + mret 正常路径 (release in_trap=3 ✓).
+#
+# 比用 `j entry / li sN=marker` 强: release 不 dump GPR, 用 in_trap=3 vs timeout
+# 区分 pass/fail, 不依赖 debug build GPR 验.
+#
+# ===== 期望结果 =====
+#   pass: in_trap=3 / pc=0 (release / debug 都看得到)
+#   fail (vectored 跳错 entry): timeout (release) / 卡 fail_loop (debug)
+#   debug 下 GPR: s0=1 / s1=11 (cause_low 实际命中) / s3=44 (offset)
+
+.section .text
+.option norvc
+.globl _start
+
+_start:
+    la      t0, m_vec_base
+    ori     t0, t0, 1                      # mode=1 vectored
+    csrw    mtvec, t0
+
+    li      t0, 0x800;  csrw mie, t0       # MEIE
+
+    # PLIC setup ctx 0: priority[3]=1, threshold=0, enable bit3
+    li      t0, 0x0C000000;  li t1, 1;  sw t1, 12(t0)
+    li      t0, 0x0C200000;  sw x0, 0(t0)
+    li      t0, 0x0C002000;  li t1, 0x8;  sw t1, 0(t0)
+
+    li      s0, 0
+    li      s1, 0
+    li      s3, 0
+
+    li      t0, 0x80000003;  csrw 0x800, t0
+    csrrsi  x0, mstatus, 0x8                # MIE=1 → fire MEIP → vectored
+
+wait_loop:
+    beqz    s0, wait_loop
+
+    csrw    mtvec, x0
+    ecall
+
+# ============================================================================
+# m_vec_base — vectored jump table; 每 entry = jal x5, handler (x5 = entry+4)
+# ============================================================================
+.balign 4
+m_vec_base:
+    jal     x5, m_vec_handler              # +0   sync (vectored 不影响)
+    jal     x5, m_vec_handler              # +4   IRQ 1
+    jal     x5, m_vec_handler              # +8
+    jal     x5, m_vec_handler              # +12  IRQ 3
+    jal     x5, m_vec_handler              # +16
+    jal     x5, m_vec_handler              # +20  IRQ 5
+    jal     x5, m_vec_handler              # +24
+    jal     x5, m_vec_handler              # +28  IRQ 7
+    jal     x5, m_vec_handler              # +32
+    jal     x5, m_vec_handler              # +36  IRQ 9
+    jal     x5, m_vec_handler              # +40
+    jal     x5, m_vec_handler              # +44  IRQ 11 M_EXT (期望)
+
+m_vec_handler:
+    # x5 = base + 4*cause_low + 4 (jal 之后); 算 cause_low
+    la      t1, m_vec_base
+    sub     t2, x5, t1                     # t2 = 4*cause_low + 4
+    addi    t2, t2, -4                     # t2 = 4*cause_low
+    mv      s3, t2                         # s3 = offset (debug 验: 期望 44)
+    srli    t1, t2, 2                      # t1 = cause_low
+    mv      s1, t1                         # s1 = cause_low (debug 验: 期望 11)
+
+    # mismatch (期望 11) → fail_loop 死循环
+    li      t2, 11
+    bne     t1, t2, fail_loop
+
+    # 跳对了 — 正常 PLIC claim/complete + mret
+    li      t0, 0x0C200004
+    lw      s2, 0(t0)
+    sw      s2, 0(t0)
+    li      t0, 3;  csrw 0x800, t0
+
+    li      s0, 1
+    mret
+
+fail_loop:
+    j       fail_loop                       # release timeout / debug 卡死, 都暴露 fail
