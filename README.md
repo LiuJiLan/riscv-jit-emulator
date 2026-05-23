@@ -17,6 +17,64 @@ virtio-blk + 端到端验证)。
 - 64 位接口预留,不实现
 
 
+## 信号层级 + 双向自治
+
+整套运行体是**一组对等器件在协同**。区分它们的不是"是不是 CPU",而是它们受
+哪一级停机信号支配。停机信号严格分三层:
+
+```mermaid
+graph TB
+    SDS["SDS — shutdown signal<br/>跨多次 system reset 长存<br/>(例: CLINT timer ≈ 振荡器类长存部件)"]
+    SRS["SRS — system reset signal<br/>一群对等 SRS 域器件随之起停<br/>(dispatcher / 中断控制器 / 外设 ...)"]
+    HR["in_trap — hart-reset 编码<br/>dispatcher 内部一级自治"]
+    SDS -. "强制 (自上而下)" .-> SRS
+    SRS -. "强制 (自上而下)" .-> HR
+    HR -. "上报 (自下而上, 自己消化不了才升级)" .-> SRS
+    SRS -. "上报 (自下而上)" .-> SDS
+```
+
+层级同时支持两个方向, 且两个方向自洽:
+
+- **强制方向 (自上而下)**: 高级信号一旦确立, 低级层次自然停止 —— 无需逐个
+  通知。要 shutdown, SRS 域与各 hart 自然随之停;要 system reset, 各 hart
+  的自处理自然中断。高压一来, 低压自动让位。
+- **上报方向 (自下而上)**: 每一层**先尝试自己消化, 消化不了才上报升级**。
+  hart 先尝试 hart-reset 自治, 不行才 SRS=0; system reset 这一层把所有 SRS
+  器件 join 回来后, 再判断"是否严重到要升级为 shutdown", 严重才停 SDS 域线程。
+
+这条"先自治、不足才升级"的链路, 使每一级都是**可以自我了断、也可以向上求援
+的自治单元**。
+
+### dispatcher 的双重身份
+
+dispatcher 在这套架构里是个特殊器件 —— 它同时承担两个角色:
+
+- **横向 (与其他器件对等)**: dispatcher 是 SRS 域里**一个**对等器件, 跟未来
+  的 PLIC / UART / virtio-blk 等并列, 都受 SRS 起停, 都按"谁 spawn 谁 join"
+  + atomic flag 协作式停机协议。它在这一维度上没有特殊地位。
+- **纵向 (hart 运行核心 + 其他外设服务于它)**: dispatcher 又是真正跑 guest
+  指令的那个 —— 其他外设 (CLINT / 未来 PLIC / UART / virtio-blk) 都是
+  monitor (Hoare/Hansen 范式), 通过 consumer / producer 接口**服务于**
+  dispatcher。dispatcher 读写本 hart 的 cpu_t (per-hart, 无需同步), 凡触及
+  共享状态都经 monitor 接口 —— 同步复杂度被关在 monitor 内, dispatcher 因此
+  保持纯单线程顺序语义。
+
+dispatcher 之所以拥有内部 hart-reset 自治 (上报方向 hart→SRS 那一级), 正是
+这个"hart 运行核心"身份的体现 —— hart 内部出问题先尝试自己重启, 真不行才
+升级为 system reset。
+
+### CLINT 在架构中的位置
+
+CLINT 在 README 里之所以单独大段, 仅因为它是当前接上的第一个 monitor 实例
+(也是 SDS 域里目前唯一一个外设); 这是实现顺序的偶然, **不是架构地位的体现**。
+后续 PLIC / UART / virtio-blk 等 SRS 域外设接进来后, 都按 monitor 同模板走
+(consumer / producer 接口 + 谁 spawn 谁 join + 协作式停机), CLINT 在 README
+里的篇幅占比会自然回落到与其他外设相称的位置。
+
+三层 reset lifecycle 是这套信号层级在时间轴上的展开, 详见「多线程 + reset
+lifecycle」节; monitor 模型 / 协作式停机协议同节。
+
+
 ## 架构概览
 
 模拟器的运行时结构可以从四个视角理解。本节给出概览,详细机制见后续各节,
@@ -32,11 +90,17 @@ virtio-blk + 端到端验证)。
 
 ### 线程模型与三层 reset lifecycle
 
-整体线程控制由三层 reset lifecycle(POR / System reset / HART reset)加 monitor
-模型组成。当前是单 hart(`dispatcher` 在 `main` 线程内直调)加一个 timer 辅助
-线程异步累加 `mtime`。monitor 模型(Hoare/Hansen 范式)把共享状态的 atomic 字段
-与 memory_order 封装在 consumer / producer 接口内,`dispatcher` 因此「看不到」
-多线程。详见「多线程 + reset lifecycle」。
+线程控制是「信号层级 + 双向自治」(见上节) 在时间轴上的展开:**POR**(进程
+启动一次, SDS 域线程上电)/ **System reset**(`main` while 每一轮, SRS 域
+器件 spawn → 运行 → join)/ **HART reset**(dispatcher 内部一级自治)。当前
+是单 hart(`dispatcher` 在 `main` 线程内直调)加一个 timer 辅助线程
+(SDS 域, CLINT 的 actor)异步累加 `mtime`。
+
+monitor 模型(Hoare/Hansen 范式)把共享状态的 atomic 字段与 memory_order 封装
+在 consumer / producer 接口内,`dispatcher` 读写本 hart 的 `cpu_t`(per-hart,
+无需同步), 凡触及共享状态都经 monitor 接口 —— **同步复杂度被关在 monitor
+内**, `dispatcher` 因此保持纯单线程顺序语义,「看不到」多线程。详见
+「多线程 + reset lifecycle」。
 
 ### dispatcher 主循环
 
@@ -47,14 +111,30 @@ virtio-blk + 端到端验证)。
 ### 实际运行块的内存模型
 
 实际运行段的访存分两条 regime:REGIME_BARE(M 态或 bare satp,bypass TLB,
-identity 偏移)与 REGIME_SV32(走叶 TLB + PTE 权限)—— 运行模型的分离本质上是
-内存模型导致的结果。访存内部还存在 load / store 快慢路径不对称:load 命中直接
-`*hva`,store 命中因 LR/SC reservation 等副作用必经 `store_helper`。详见
+identity 偏移)与 REGIME_SV32(走叶 TLB + PTE 权限)。运行模型的分离本质上是
+内存模型导致的结果。
+
+**运行模式 ↔ TLB 互为约束(快慢路径抽象成立的因果原因)**: 走翻译时, TLB
+不只是 GVA→HVA 缓存, 还充当"以叶 TLB 为粒度的运行模式派发表"。dispatcher
+按 `priv`/`satp.mode` 选定叶 TLB 指针交给运行块, 运行块只通过这个指针读写,
+**完全不在意此叶 TLB 来自哪个特权级**。由这对约束, **权级敏感这件事被整个
+挤出热路径, 挤进了 MMU walker 这个慢路径 helper** —— 所以快路径不是"省略了
+权级检查", 而是结构上根本没有需要检查的权级。这是设计换来的结构性简洁, 不是
+偷工。
+
+进一步, load / store 命中后的不对称: load 命中直接 `*hva`,store 命中因
+LR/SC reservation 等副作用必经 `store_helper`。真因果不是"性能 vs 副作用",
+而是"TLB 缓存 hva + MMIO 不进 TLB → 命中路径结构上不带 RAM/MMIO 分支 → load
+可直接 `*hva`; store 因 LR/SC + 未来 SMC 副作用强制走 helper"。详见
 「TLB 拓扑」。
 
 > JIT 子系统(Dispatcher / Translator / JitBackend 三层、jit_cache、SMC 检测)
 > 为计划设计,尚未实装(见「当前已落地」末的未实现清单),不在本 README 的
-> 当前进展范围内。
+> 当前进展范围内。关键设计点已锁定: **块缓存 key = PA**(不是 VA, 让 sfence.vma
+> 不 invalidate JIT 块、同段 PA 在 M/S 态翻译产物可复用);**所有块出口走
+> dispatch**,初版不做 block chaining;**SMC 整页失效 + lazy invalidation**
+> (write-protect + SIGSEGV handler 只置 atomic 标志, 真清理由 dispatcher 在
+> 执行块前检查标志, handler 受 async-signal-safety 约束不调 malloc/锁)。
 
 
 ## TLB 拓扑
@@ -134,11 +214,13 @@ graph TD
 
 ## 多线程 + reset lifecycle
 
-a_02 T5 落地后, 项目从单线程 (hart 线程独占 mtime 推进) 演化为多线程
-(hart 线程 + timer 辅助线程并发, atomic mtime + monitor 模型同步)。本节
-集中描述 main 流程 / 三层 reset / monitor 行为 / 错误处理统一走 signal
-通道的伪码。详细协议见 `src/dummy.txt §7` (monitor 模型) + `§12` (谁
-spawn 谁 join), 信号语义见 `src/runtime.h` 顶段 doc。
+本节是「信号层级 + 双向自治」(顶段) 在实装层面的展开 —— main 流程伪码 /
+三层 reset 时序 / monitor 行为 / 协作式停机协议, 落到当前 a_02 收尾的具体
+形态。a_02 T5 落地后, 项目从单线程 (hart 线程独占 mtime 推进) 演化为多线程
+(hart 线程 + timer 辅助线程并发, atomic mtime + monitor 模型同步)。错误处理
+统一走 SRS / SDS signal 通道, **不分 error path** —— 正常退出与各类失败因此
+形态一致。详细协议见 `src/dummy.txt §7` (monitor 模型) + `§12` (谁 spawn 谁
+join), 信号语义见 `src/runtime.h` 顶段 doc。
 
 ### 三层 reset lifecycle
 
@@ -233,6 +315,11 @@ cleanup 段写一次, 不在 spawn-fail / dispatcher-fail 路径重复。
 
 来自 Hoare/Hansen 并发 monitor 范式 — 每个共享状态模块封装内部 atomic 字段 +
 memory_order, 对外只暴露 consumer / producer 接口; 调用方不感知内部同步细节。
+
+> **位置说明** (跟顶段「CLINT 在架构中的位置」呼应): CLINT 是 SDS 域里目前
+> 唯一接上的外设, 在本节占大篇幅仅因它是第一个完整 monitor 实例; 后续 PLIC /
+> UART / virtio-blk 等 SRS 域外设接进来后, 都按下面这一套 (consumer/producer
+> 接口 + 谁 spawn 谁 join + 协作式停机) 同模板走, CLINT 的篇幅占比会自然回落。
 
 项目内两个实例:
 

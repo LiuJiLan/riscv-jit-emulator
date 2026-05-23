@@ -19,6 +19,81 @@ UART external interrupts + virtio-blk + end-to-end verification).
 - 64-bit interfaces are reserved but not implemented
 
 
+## Signal Hierarchy + Bidirectional Autonomy
+
+The entire runtime is **a cohort of peer devices cooperating**. What
+distinguishes them is not "is it the CPU", but **which level of stop signal
+they obey**. Stop signals are strictly three-layered:
+
+```mermaid
+graph TB
+    SDS["SDS — shutdown signal<br/>persists across multiple system resets<br/>(e.g. CLINT timer ≈ an oscillator-class always-on part)"]
+    SRS["SRS — system reset signal<br/>a cohort of peer SRS-domain devices start/stop together<br/>(dispatcher / interrupt controllers / peripherals ...)"]
+    HR["in_trap — hart-reset encoding<br/>dispatcher's internal level of autonomy"]
+    SDS -. "force (top-down)" .-> SRS
+    SRS -. "force (top-down)" .-> HR
+    HR -. "escalate (bottom-up, only after self-handling fails)" .-> SRS
+    SRS -. "escalate (bottom-up)" .-> SDS
+```
+
+The hierarchy supports two directions at once, and the two directions are
+self-consistent:
+
+- **Force direction (top-down)**: once a higher-level signal is asserted, lower
+  levels stop naturally — no individual notification is needed. When shutdown
+  comes, the SRS domain and every hart stop with it; when system reset comes,
+  the self-handling at each hart is naturally interrupted. High pressure
+  arrives, and low pressure yields automatically.
+- **Escalate direction (bottom-up)**: **each level first tries to handle the
+  situation itself, and only escalates when it cannot**. A hart first tries
+  hart-reset autonomy; only if that fails does it set SRS=0. The system-reset
+  layer first joins all SRS-domain devices back, then decides "is this severe
+  enough to escalate to shutdown" — only if so does it stop SDS-domain threads.
+
+This "self-first, escalate only when insufficient" link makes **every level an
+autonomous unit that can resolve itself or call upward for help**.
+
+### The Dispatcher's Dual Identity
+
+In this architecture, the dispatcher is a special device — it carries two roles
+at once:
+
+- **Horizontally (peer to other devices)**: the dispatcher is **one** peer
+  device in the SRS domain, alongside future PLIC / UART / virtio-blk and so
+  on. They are all started/stopped by SRS, and they all follow the "spawn /
+  join in pairs" + atomic-flag cooperative shutdown protocol. The dispatcher
+  has no special status on this axis.
+- **Vertically (the hart execution core, with other peripherals serving it)**:
+  the dispatcher is also the one that actually runs guest instructions — other
+  peripherals (CLINT / future PLIC / UART / virtio-blk) are all monitors
+  (Hoare/Brinch-Hansen paradigm) that **serve** the dispatcher through
+  consumer / producer interfaces. The dispatcher reads/writes its own hart's
+  `cpu_t` (per-hart, no synchronization needed); whenever it touches shared
+  state it goes through monitor interfaces — **synchronization complexity is
+  shut inside the monitors**, so the dispatcher keeps pure single-thread
+  sequential semantics.
+
+The reason the dispatcher owns the internal hart-reset autonomy (the
+hart → SRS escalation level) is precisely this "hart execution core" identity —
+when something goes wrong inside the hart, it first tries to restart itself;
+only if that truly fails does it escalate to system reset.
+
+### CLINT's Position in the Architecture
+
+CLINT occupies its own large section in this README only because it is the
+first monitor instance to be wired up (and currently the only peripheral in
+the SDS domain); this is an accident of implementation order, **not a
+reflection of its architectural status**. Once subsequent SRS-domain
+peripherals (PLIC / UART / virtio-blk and so on) are wired up — they all
+follow the same monitor template (consumer / producer interfaces + spawn/join
+in pairs + cooperative shutdown) — CLINT's share of the README will naturally
+settle back to a size commensurate with the other peripherals.
+
+The three-layer reset lifecycle is this signal hierarchy unfolded along the
+time axis, see "Multithreading + Reset Lifecycle"; the monitor model and
+cooperative shutdown protocol are in the same section.
+
+
 ## Architecture Overview
 
 The runtime structure can be understood from four viewpoints. This section gives
@@ -37,14 +112,22 @@ SMP, each hart owns one `cpu_t` and one dispatcher thread.
 
 ### Thread Model and the Three-Layer Reset Lifecycle
 
-Overall thread control is composed of a three-layer reset lifecycle (POR /
-System reset / HART reset) plus the monitor model. The current configuration is
-a single hart (`dispatcher` invoked directly on the `main` thread) plus one
-timer helper thread that asynchronously accumulates `mtime`. The monitor model
-(the Hoare/Brinch-Hansen paradigm) encapsulates the atomic fields and
-memory-order choices of shared state behind consumer / producer interfaces, so
-the `dispatcher` "does not see" multithreading. See "Multithreading + Reset
-Lifecycle".
+Thread control is "Signal Hierarchy + Bidirectional Autonomy" (top section)
+unfolded along the time axis: **POR** (one-shot at process start, SDS-domain
+threads power up) / **System reset** (every iteration of the `main` while
+loop — SRS-domain devices spawn → run → join) / **HART reset** (the
+dispatcher's internal level of autonomy). The current configuration is a
+single hart (`dispatcher` invoked directly on the `main` thread) plus one
+timer helper thread (SDS domain, the CLINT actor) that asynchronously
+accumulates `mtime`.
+
+The monitor model (the Hoare/Brinch-Hansen paradigm) encapsulates the atomic
+fields and memory-order choices of shared state behind consumer / producer
+interfaces. The `dispatcher` reads/writes its own hart's `cpu_t` (per-hart,
+no synchronization needed); whenever it touches shared state it goes through
+monitor interfaces — **synchronization complexity is shut inside the monitors**,
+so the `dispatcher` keeps pure single-thread sequential semantics and "does
+not see" multithreading. See "Multithreading + Reset Lifecycle".
 
 ### The Dispatcher Main Loop
 
@@ -58,16 +141,41 @@ encoding. See "Control-Flow Overview" and "in_trap Bit-Field Encoding".
 
 Memory access in the execution segment is split into two regimes: REGIME_BARE
 (M-mode or a bare satp; bypasses the TLB, identity offset) and REGIME_SV32 (goes
-through the leaf TLB + PTE permissions) — the separation of run models is
-fundamentally a consequence of the memory model. Within an access there is also
-a load / store fast/slow-path asymmetry: a load hit dereferences `*hva`
-directly, while a store hit must go through `store_helper` because of side
-effects such as the LR/SC reservation. See "TLB Topology".
+through the leaf TLB + PTE permissions). The separation of run models is
+fundamentally a consequence of the memory model.
+
+**Run regime ↔ TLB are mutual constraints (the causal reason the fast/slow path
+abstraction even works)**: when translation is in effect, the TLB is not just a
+GVA→HVA cache — it also doubles as a "run-regime dispatch table at the
+granularity of a leaf TLB". The dispatcher selects a leaf TLB pointer based on
+`priv` / `satp.mode` and hands it to the execution block; the execution block
+only reads / writes through that pointer and **does not care which privilege
+level this leaf TLB came from**. Through these mutual constraints,
+**privilege-sensitivity is pushed out of the hot path entirely, into the MMU
+walker slow-path helper** — so the fast path is not "skipping the privilege
+check"; structurally there is no privilege to check. This is structural
+simplicity earned by design, not corner-cutting.
+
+Going further, the asymmetry on a load / store hit: a load hit dereferences
+`*hva` directly, while a store hit must go through `store_helper` because of
+side effects such as the LR/SC reservation. The real causal chain is not
+"performance vs. side effects" but "TLB caches hva + MMIO doesn't enter the
+TLB → the hit path structurally has no RAM/MMIO branch → a load can return
+`*hva` directly; a store must go through the helper because LR/SC + future
+SMC side effects force it". See "TLB Topology".
 
 > The JIT subsystem (the three-layer Dispatcher / Translator / JitBackend, the
 > jit_cache, and SMC detection) is planned design, not yet implemented (see the
 > not-implemented list at the end of "Implemented So Far"); it is outside the
-> scope of this README's "current progress".
+> scope of this README's "current progress". Key design points are already
+> locked in: **the block cache key is PA** (not VA, so `sfence.vma` does not
+> invalidate JIT blocks, and the same PA segment's translation is reusable
+> across M / S modes); **all block exits go through dispatch**, no block
+> chaining in v1; **SMC integral-page invalidation + lazy invalidation**
+> (write-protect + the SIGSEGV handler only sets an atomic flag, the actual
+> cleanup is done by the dispatcher when it next enters the block, since the
+> handler is constrained by async-signal-safety and cannot call malloc / take
+> locks).
 
 
 ## TLB Topology
@@ -161,14 +269,18 @@ graph TD
 
 ## Multithreading + Reset Lifecycle
 
-After a_02 T5 landed, the project evolved from single-threaded (the hart thread
-solely advancing mtime) to multithreaded (the hart thread + a timer helper
-thread running concurrently, synchronized with an atomic mtime + the monitor
-model). This section gathers the pseudo-code for the `main` flow / the
-three-layer reset / monitor behavior / unified error handling through the signal
-channel. For the detailed protocols see `src/dummy.txt §7` (the monitor model) +
-`§12` (whoever spawns, joins); for signal semantics see the top-of-file doc in
-`src/runtime.h`.
+This section is "Signal Hierarchy + Bidirectional Autonomy" (top section)
+unfolded at the implementation level — the `main` flow pseudo-code / the
+three-layer reset timing / monitor behavior / the cooperative shutdown
+protocol, in the concrete form we have at a_02 close. After a_02 T5 landed,
+the project evolved from single-threaded (the hart thread solely advancing
+mtime) to multithreaded (the hart thread + a timer helper thread running
+concurrently, synchronized with an atomic mtime + the monitor model). Error
+handling is unified through the SRS / SDS signal channel, with **no separate
+error path** — normal exit and the various failure modes therefore have the
+same shape. For the detailed protocols see `src/dummy.txt §7` (the monitor
+model) + `§12` (whoever spawns, joins); for signal semantics see the
+top-of-file doc in `src/runtime.h`.
 
 ### Three-Layer Reset Lifecycle
 
@@ -276,6 +388,14 @@ From the Hoare/Brinch-Hansen concurrent-monitor paradigm — each shared-state
 module encapsulates its internal atomic fields + memory_order, exposing only
 consumer / producer interfaces; callers are not aware of the internal
 synchronization.
+
+> **Position note** (echoing "CLINT's Position in the Architecture" at the
+> top): CLINT is currently the only peripheral in the SDS domain; it takes up
+> a large share of this section only because it is the first complete monitor
+> instance. Once subsequent SRS-domain peripherals (PLIC / UART / virtio-blk
+> and so on) come online, they will all follow the same template below
+> (consumer / producer interfaces + spawn/join in pairs + cooperative
+> shutdown), and CLINT's share of the README will naturally settle back.
 
 The project has two instances:
 
