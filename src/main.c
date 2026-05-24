@@ -50,6 +50,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>     // strtoul (--load ADDR= 解析)
 #include <string.h>
 #include <time.h>       // clock_gettime / struct timespec (main lifecycle 总耗时)
 
@@ -287,9 +288,100 @@ int main(int argc, char **argv) {
     struct timespec t_start;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    // 命令行参数 ./jit-emu <bin-or-elf-path>
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <bin-or-elf-path>\n", argv[0]);
+    // ------------------------------------------------------------------------
+    // 命令行参数解析 (cmdline_decision.md, a_03_session_008 中段拍 候选 3 + B):
+    //
+    //   --bios FILE       简便 alias 后缀分发; .bin → load_bin GUEST_RAM_START
+    //                                          .elf → load_elf (按 p_paddr)
+    //   --load FILE       无 ADDR → guest_load_elf (按 ELF p_paddr 加载)
+    //   --load ADDR=FILE  有 ADDR → guest_load_bin (raw 到 ADDR, 不解 ELF 头)
+    //   --blk FILE        virtio-blk image; 本 session 仅解析存 blk_path 变量,
+    //                     不接 init (留 session_010 plan mode 接 virtio_blk_init)
+    //
+    // 语义跟 QEMU `-device loader,file=FILE[,addr=ADDR]` addr 有/无两路 1:1;
+    // 语法收敛双横不引 key=value 逗号分隔解析器 (workspace.xml python 脚本
+    // 以后真升 QEMU 单横语法也就是脚本的事).
+    //
+    // 解析顺序: argv 顺序攒 load_ops 列表 + blk_path; 实际加载推迟到 ram_init
+    // 之后. 后写覆盖按 QEMU loader device 同语义 (memcpy 不查冲突).
+    //
+    // backward compat: 不留无前缀 argv[1]; 一刀切要求 --bios / --load 显式
+    // (workspace.xml 由 user python 脚本批量改).
+    // ------------------------------------------------------------------------
+    enum { LOAD_OP_MAX = 8 };  /* 典型 fixture 1-2 个 load; 8 富余 */
+    struct { uint64_t addr; const char *file; int as_elf; } load_ops[LOAD_OP_MAX];
+    int load_count = 0;
+    const char *blk_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+
+        if (strcmp(arg, "--bios") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--bios needs FILE\n");
+                return 1;
+            }
+            if (load_count >= LOAD_OP_MAX) {
+                fprintf(stderr, "too many load ops (max %d)\n", LOAD_OP_MAX);
+                return 1;
+            }
+            const char *file = argv[i];
+            load_ops[load_count].file = file;
+            if (has_suffix(file, ".elf")) {
+                load_ops[load_count].as_elf = 1;
+                load_ops[load_count].addr = 0;
+            } else {
+                load_ops[load_count].as_elf = 0;
+                load_ops[load_count].addr = GUEST_RAM_START;
+            }
+            load_count++;
+
+        } else if (strcmp(arg, "--load") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--load needs FILE or ADDR=FILE\n");
+                return 1;
+            }
+            if (load_count >= LOAD_OP_MAX) {
+                fprintf(stderr, "too many load ops (max %d)\n", LOAD_OP_MAX);
+                return 1;
+            }
+            const char *spec = argv[i];
+            const char *eq = strchr(spec, '=');
+            if (eq == NULL) {
+                /* 无 ADDR → ELF 路径 */
+                load_ops[load_count].file = spec;
+                load_ops[load_count].as_elf = 1;
+                load_ops[load_count].addr = 0;
+            } else {
+                /* ADDR=FILE → raw 路径; strtoul base=0 自动识别 0x / 10 进制 */
+                char *end = NULL;
+                unsigned long addr = strtoul(spec, &end, 0);
+                if (end != eq || end == spec) {
+                    fprintf(stderr, "--load: bad ADDR in '%s'\n", spec);
+                    return 1;
+                }
+                load_ops[load_count].file = eq + 1;
+                load_ops[load_count].as_elf = 0;
+                load_ops[load_count].addr = (uint64_t)addr;
+            }
+            load_count++;
+
+        } else if (strcmp(arg, "--blk") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--blk needs FILE\n");
+                return 1;
+            }
+            blk_path = argv[i];
+
+        } else {
+            fprintf(stderr, "unknown arg: %s\n", arg);
+            fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (load_count == 0) {
+        fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]\n", argv[0]);
         return 1;
     }
 
@@ -344,26 +436,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 文件后缀分发 (.bin / .elf / 猜): ELF 路径全部 stub 返回 -1 (内部 fprintf
-    // "not implemented"), guess_is_elf stub 静默返回 0, 实际只走 .bin。
-    int err = 0;
-    const char *path = argv[1];
-    if (has_suffix(path, ".bin")) {
-        // 后续如果有起点参数, 用起点参数, 否则用 GUEST_RAM_START。
-        err = guest_load_bin(path, GUEST_RAM_START);
-    } else if (has_suffix(path, ".elf")) {
-        err = guest_load_elf(path);
-    } else {
-        if (guest_is_elf(path)) {
-            err = guest_load_elf(path);
+    // 执行所有加载操作 (argv 顺序攒的 load_ops 列表). 推迟到此处而不是 argv
+    // 解析时直接调 — loader 写 RAM 需要 ram_init 已 mapped。后写覆盖按 QEMU
+    // loader device 同语义, memcpy 不查冲突。
+    for (int li = 0; li < load_count; li++) {
+        int err;
+        if (load_ops[li].as_elf) {
+            err = guest_load_elf(load_ops[li].file);
         } else {
-            err = guest_load_bin(path, GUEST_RAM_START);
+            err = guest_load_bin(load_ops[li].file, load_ops[li].addr);
+        }
+        if (err != 0) {  // loader 内部已 fprintf "why"
+            fprintf(stderr, "load failed: %s\n", load_ops[li].file);
+            return 1;
         }
     }
-    if (err != 0) {  // loader 内部已 fprintf "why"
-        fprintf(stderr, "load failed\n");
-        return 1;
-    }
+
+    /* blk_path 留 session_010 virtio_blk_init 入参; 当前未使用. */
+    (void)blk_path;
 
     // hart 构造: misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
     // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的
