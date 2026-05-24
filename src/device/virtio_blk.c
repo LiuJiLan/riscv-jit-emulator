@@ -5,11 +5,10 @@
 // device_line.
 //
 // 接口形态 + monitor 模型 + 字段对应 spec + 五函数 lifecycle 见 virtio_blk.h
-// 顶段 doc. 地址布局 / 容量参数 见 config.h VIRTIO_BLK_* 宏. 决策权威见
-// notes/context/virtio_blk_decision.md Q1-Q8. 异步默认体例转折段见
-// notes/context/a_03_session_008.md 末段. 报错风格见 dummy.txt §5;
-// "0=成功 / 非0=cause" 接口约定见 dummy.txt §9. thread spawn/join 协议
-// (谁 spawn 谁 join) 见 dummy.txt §12.
+// 顶段 doc. 地址布局 / 容量参数 见 config.h VIRTIO_BLK_* 宏. 报错风格见
+// dummy.txt §5; "0=成功 / 非0=cause" 接口约定见 dummy.txt §9. thread spawn/join
+// 协议 (谁 spawn 谁 join) 见 dummy.txt §12. 异步默认体例 (hart fast path 不阻塞
+// → blocking syscall 必走异步 worker) 见 trade_off_log §T.7.
 //
 
 #define _POSIX_C_SOURCE 200809L   // pread / pwrite / clock_gettime CLOCK_REALTIME
@@ -89,7 +88,7 @@
 
 // ----------------------------------------------------------------------------
 // 内部状态 (单例 file-static; worker thread + hart 主帧跨线程读写; 锁形态见
-// virtio_blk.h 顶段 + decision.md Q8)
+// virtio_blk.h 顶段)
 // ----------------------------------------------------------------------------
 //
 // 字段 NOT _Atomic — 走 pthread_mutex_t (state_mutex + queue_mutex 包装); 锁
@@ -100,7 +99,7 @@
 // 返 ESRCH 一行 fprintf 不 fatal (跟 clint/uart/plic 同体例; dummy.txt §12)。
 
 static struct {
-    /* image backing — pread/pwrite, decision.md Q2 */
+    /* image backing — pread/pwrite (host file 后端, 不 fsync 不 mmap) */
     int       image_fd;                /* -1 = no image (整个模块退化) */
     uint64_t  capacity_sectors;        /* st_size / VIRTIO_BLK_SECTOR_SIZE */
 
@@ -118,7 +117,7 @@ static struct {
     uint32_t  interrupt_status;        /* bit0 = used buffer notification */
     uint16_t  last_avail_idx;          /* worker drain 进度; queue_pfn=0 时清 0 */
 
-    /* work queue — hart enqueue / worker dequeue; cap=8 (decision.md Q7) */
+    /* work queue — hart enqueue / worker dequeue; cap=8 */
     pthread_mutex_t queue_mutex;
     pthread_cond_t  cond_not_empty;
     pthread_cond_t  cond_not_full;
@@ -481,7 +480,7 @@ static void vblk_enqueue_work_token(void) {
 //
 // 锁顺序: mmio 顶层不持锁; 各 case 按需 lock (state_mutex 短临界区或
 // queue_mutex 单独路径). QueueNotify case **只持 queue_mutex**, 不碰
-// state_mutex (decision.md Q8). InterruptACK case 持 state_mutex 改完
+// state_mutex (锁顺序硬约束, 详 virtio_blk.h). InterruptACK case 持 state_mutex 改完
 // unlock 后调 device_clear_pending (PLIC 自有并发安全, 不嵌套)。
 
 static int virtio_blk_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
@@ -579,7 +578,7 @@ static int virtio_blk_write(void *ctx, uint32_t off, const void *buf, uint32_t s
 
       case VBLK_REG_QUEUE_NOTIFY: {
         /* 热路径: 只持 queue_mutex 入 work queue, 不碰 state_mutex (锁顺序硬
-           约束, decision.md Q8). v1 单 queue, value 应为 0; 不强校验. */
+           约束, 详 virtio_blk.h). v1 单 queue, value 应为 0; 不强校验. */
         (void)value;
         vblk_enqueue_work_token();
         break;

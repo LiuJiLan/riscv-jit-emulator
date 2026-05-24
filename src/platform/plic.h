@@ -17,12 +17,11 @@
 // 实现 — wrlock 路径内 producer 同步设置 atomic, hart 主帧 csr_mip_read 走
 // atomic_load 直返, 零 lock 零 scan.
 //
-// 演进 trail (a_03 milestone): T6.2 (a_03_007 末 ~ a_03_009) 曾引入 refresh queue
-// + refresh thread 把 device_line 改异步, 但在 a_03_009 撞到 handler 同步 ACK +
-// 异步 CLEAR race 引起的 spurious re-fire, 最终回退同步形态. hot path 优化的本质
-// 是 atomic 字段而非异步 queue. 详 notes/context/plic_evolution_report.md.
+// 设计 trail (异步刷新方案曾试过, 因 handler 同步 ACK + 异步 CLEAR race 引起
+// spurious re-fire 回退同步; hot path 优化的本质 = atomic 字段, 跟异步 queue
+// 无关): 详 trade_off_log §T.6.
 //
-// monitor 范式三态 (a_03 末):
+// monitor 范式四态:
 //   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
 //   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin, blocking read)
 //   virtio-blk = "monitor + io_worker 辅助线程" (异步 pread/pwrite + IRQ)

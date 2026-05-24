@@ -6,7 +6,7 @@
 //        mtime 由独立 timer 辅助线程 (clint.c file-static timer_run) 异步累加;
 //        dispatcher / interpreter 主帧只读, 不写。
 //
-// 地址布局 / 寄存器形态 见 config.h CLINT_* 宏 + notes/bus_decision.md §2.8。
+// 地址布局 / 寄存器形态 见 config.h CLINT_* 宏。
 // 接口形态 (read/write 返 cause / 0=成功) 见 platform/bus.h + dummy.txt §9。
 // 多线程语义 (atomic 字段 / shared 数据 + monitor 模型) 见 dummy.txt §7。
 // timer thread spawn / join 协议 (谁 spawn 谁 join) 见 dummy.txt §12。

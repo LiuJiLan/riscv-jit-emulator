@@ -79,7 +79,6 @@
 // ----------------------------------------------------------------------------
 //
 // 跟 QEMU virt machine + SiFive E31/U54 Core Complex Manual 一致 (不跟 ACLINT spec)。
-// 详 notes/bus_decision.md §2.7 §2.8。
 //
 //   +0x0000   msip[hart]      4 byte/hart   M-mode software interrupt (仅低 1 位有效)
 //   +0x4000   mtimecmp[hart]  8 byte/hart   per-hart timer compare value
@@ -205,7 +204,7 @@
 //
 // 跟 QEMU virt machine virtio-mmio.0 对齐 (base 0x10001000 紧邻 UART, IRQ 1)。
 // legacy v1.0 寄存器布局 (Version=1, 单 QueuePFN 单 queue_align); modern v1.1
-// 三 PFN 形态属未来工作。详 notes/context/virtio_blk_decision.md Q1/Q3。
+// 三 PFN 形态属未来工作。
 //
 // 访问宽度: 4 byte only (含 Config space; legacy 推荐 4B align; size != 4 →
 // CAUSE_*_ACCESS_FAULT, 跟 PLIC/test_dev 同形态)。
@@ -213,8 +212,7 @@
 // 后端 = host file (pread/pwrite + image_fd; mmap/fsync 都属未来工作);
 // IO 路径 = 异步 worker thread + work queue (hart 写 QueueNotify 入队即返;
 // io_worker_run drain avail ring + 真做 pread/pwrite + 写 used ring + 触发
-// IRQ)。详 decision.md Q2/Q6/Q7/Q8 + notes/context/a_03_session_008.md
-// "## Insight: 异步默认体例转折"。
+// IRQ)。异步默认体例 (hart fast path 不阻塞) 见 trade_off_log §T.7。
 #define VIRTIO_BLK_BASE             0x10001000UL
 #define VIRTIO_BLK_SIZE             0x00001000UL    /* 4 KB MMIO (含 Config space @ +0x100) */
 #define VIRTIO_BLK_PLIC_IRQ         1U              /* QEMU virt virtio-mmio.0 惯例 */

@@ -5,7 +5,7 @@
 //
 // 跟 QEMU virt machine virtio-mmio.0 对齐 (base 0x10001000 紧邻 UART, IRQ 1);
 // legacy v1.0 寄存器布局 (Version=1, 单 QueuePFN 单 queue_align). modern v1.1
-// 三 PFN 形态属未来工作. 详 notes/context/virtio_blk_decision.md Q1/Q3.
+// 三 PFN 形态属未来工作.
 //
 // 访问宽度 4 byte only (含 Config space @ +0x100); size != 4 → CAUSE_*_ACCESS_FAULT
 // (跟 PLIC/test_dev 同形态).
@@ -14,26 +14,25 @@
 // monitor 模型 (dummy.txt §7) — virtio-blk 是 "monitor + io_worker 辅助线程"
 // ----------------------------------------------------------------------------
 //
-// 四种 monitor 范式 (a_03 milestone 集齐):
+// monitor 范式四态:
 //   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
-//   PLIC       = "monitor + refresh 辅助线程"   (T6.2 后异步刷新 device_line)
 //   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin)
 //   virtio-blk = "monitor + io_worker 辅助线程" (异步执行 pread/pwrite + 触发 IRQ)
-//   test_dev   = **不是 monitor**               (无内部状态, 纯 fanout)
+//   PLIC       = "monitor 但无辅助线程"         (atomic 字段直接做 hot path 优化)
+//   test_dev   = 不是 monitor                   (无内部状态, 纯 fanout)
 //
 // io_worker 辅助线程职责 (io_worker_run, 实装在 virtio_blk.c):
 //   - hart 写 QueueNotify 时 enqueue token (work queue cap=8; 通知"该 queue 有
 //     新 avail entry"); hart 在 queue 满时 cond_timedwait(not_full, 100ms) +
-//     SDS 检 (跟 PLIC refresh queue producer 同 cooperative shutdown 体例)
+//     SDS 检 (cooperative shutdown 体例, dummy.txt §12)
 //   - worker 循环 cond_timedwait(not_empty, 100ms) + SDS 检 → 拉 1 token →
 //     drain avail ring (按 QueueNum 上限循环) → 解析 desc 链 → pread/pwrite
 //     → 写 used ring → 设 InterruptStatus.bit0 → device_set_pending(
 //     VIRTIO_BLK_PLIC_IRQ)
-//   - shutdown_signal=0 自然退出 (跟 plic_pending_refresh_run / uart_reader_run
-//     同体例)
+//   - shutdown_signal=0 自然退出 (跟 uart_reader_run 同体例)
 //
-// 异步默认体例 (decision.md Q6 + a_03_session_008 "Insight: 异步默认体例转折"):
-// hart fast path 不阻塞优先, pread/pwrite blocking syscall 必走异步 worker.
+// 异步默认体例: hart fast path 不阻塞优先, pread/pwrite blocking syscall 必走
+// 异步 worker. 详 dummy.txt §7 (monitor 模型) + trade_off_log §T.7 (异步默认体例).
 //
 // ----------------------------------------------------------------------------
 // 读写抽象 (monitor + 双 pthread_mutex_t)
@@ -43,7 +42,8 @@
 //   state_mutex — 寄存器 + InterruptStatus + ring 解析 + pread/pwrite (worker 长持锁)
 //   queue_mutex — work queue ring (hart 入队短持锁) + cond_not_empty / cond_not_full
 //
-// 锁顺序硬约束: queue_mutex 永不嵌套 state_mutex (decision.md Q8).
+// 锁顺序硬约束: queue_mutex 永不嵌套 state_mutex (避免 hart drain ring 长持锁
+// 挡 worker enqueue; 单向无 deadlock 风险).
 //   - hart 写 QueueNotify 只持 queue_mutex, 不碰 state_mutex
 //   - 写其他寄存器 (Status/QueueSel/etc) 只持 state_mutex, 不碰 queue_mutex
 //   - worker dequeue 时只持 queue_mutex, unlock 后再 lock state_mutex drain ring
@@ -82,7 +82,7 @@
 //   0x104 Config:cap_hi     R = (uint32_t)(capacity_sectors >> 32)
 //   其他 off: 读 silent 返 0 / 写 silent 吞 (跟 PLIC reserved 区体例)
 //
-// 后端 = host file (pread/pwrite; 不 fsync 不 mmap, decision.md Q2):
+// 后端 = host file (pread/pwrite; 不 fsync 不 mmap):
 //   - virtio_blk_init(path) 时 open(O_RDWR) + fstat 取 capacity (st_size/512)
 //   - 完成 IO 不 fsync (write-back 默认; durable IO 留 TODO)
 //   - st_size 必须 512 对齐 (否则 init 返 -1)

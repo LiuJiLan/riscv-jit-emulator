@@ -4,12 +4,9 @@
 // enable bitmap> + plic_ctx_map + bus 注册 + 完整 claim/complete 仲裁 + hart 侧
 // is_plic_*_pending 合成 view + 外设侧 device_set/clear_pending 接口。
 //
-// 演进 (a_03 milestone): T6.2 引入过 refresh thread + queue 把"pending → MEIP"
-// 改异步, 但在 a_03_009 撞到 spurious re-fire bug (handler 同步 ACK + 异步
-// CLEAR race window 让 PLIC complete recompute 时看到 stale device_line, 立即
-// re-fire). 最终决策回退: device_set/clear_pending 改同步 wrlock + recompute,
-// plic_ctx_eip atomic 字段保留 (hot path 优化的本质 = atomic 字段而非异步
-// queue). 详 notes/context/plic_evolution_report.md.
+// 设计 trail (异步刷新方案曾试过, 因 handler 同步 ACK + 异步 CLEAR race 引起
+// spurious re-fire 回退同步; hot path 优化的本质 = atomic 字段, 跟异步 queue
+// 无关): 详 trade_off_log §T.6.
 //
 // 设计形态:
 //   - 主路径 (hart 主帧 csr_mip_read → is_plic_*_pending) 走 atomic_load
@@ -103,7 +100,7 @@ static struct {
 
 
 // ----------------------------------------------------------------------------
-// plic_ctx_eip — per-ctx external interrupt pending atomic 子集 (T6.2 新加)
+// plic_ctx_eip — per-ctx external interrupt pending atomic 子集
 // ----------------------------------------------------------------------------
 //
 // 独立 file-static, NOT 进 plic struct; 跟 CLINT 全 atomic monitor 体例对偶
@@ -133,7 +130,7 @@ static _Atomic int plic_ctx_eip[PLIC_N_CONTEXTS];
 
 
 // ----------------------------------------------------------------------------
-// plic_pending_bitmap_cache — MMIO pending bitmap 区 atomic cache (T6.2 post-EIP)
+// plic_pending_bitmap_cache — MMIO pending bitmap 区 atomic cache
 // ----------------------------------------------------------------------------
 //
 // 独立 file-static, NOT 进 plic struct; 跟 plic_ctx_eip 同性质 (PLIC "atomic 子集"
@@ -464,9 +461,8 @@ static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
 // producer 在 wrlock 路径 (device_set/clear_pending / MMIO 写 / claim / complete)
 // 内同步更新 plic_ctx_eip atomic_store(release), 主帧不感知锁.
 //
-// 演进 trail: T6.2 前是 rdlock + plic_ctx_has_pending_locked scan (~10x 拖累
-// 03_csr_heavy 等 fixture); T6.2 引入 atomic 字段 + 异步 refresh thread; a_03_009
-// 撤异步保留 atomic 字段 — hot path 优化的本质是 atomic 而非异步.
+// hot path 优化的本质 = atomic 字段 (跟此前曾试的异步 refresh queue 无关; 演进
+// trail 详 trade_off_log §T.6).
 //
 // memory_order_acquire 跟 producer 的 atomic_store_explicit(release) 配对, 建立
 // happens-before (consumer 看到 producer 的最新更新; dummy.txt §7 monitor 模型
@@ -499,17 +495,16 @@ int is_plic_seip_pending(uint32_t hartid) {
 // virtio-blk 等)。source_id 0 / 越界 silent ignore (设备树没分配的 source 走这里
 // 不该出问题 — 防御性)。
 //
-// 形态 (a_03_009 同步重构后): wrlock + 改 sources[id].device_line + 重算
-// plic_ctx_eip atomic_store + 重算 plic_pending_bitmap_cache atomic_store +
-// unlock. 调用方同帧完成, 不阻塞主路径 (hot path 仍是 atomic_load).
+// 形态: wrlock + 改 sources[id].device_line + 重算 plic_ctx_eip atomic_store +
+// 重算 plic_pending_bitmap_cache atomic_store + unlock. 调用方同帧完成, 不阻塞
+// 主路径 (hot path 仍是 atomic_load).
 //
 // 跨线程调用 (worker / reader thread → device_set_pending) 同步吃 wrlock,
 // 短临界区 (~几百 ns recompute 96 source); 跟真硬件 wire 信号传播 (几 cycle
-// ns 级) 量级一致, 跟真硬件 PLIC 模型对齐. 详 演进 report.
+// ns 级) 量级一致, 跟真硬件 PLIC 模型对齐.
 //
-// 演进 trail: T6.2 (a_03_007 末 ~ a_03_009) 曾改异步 (refresh queue + thread),
-// 但在 a_03_009 撞到 handler 同步 ACK + 异步 CLEAR race 引起的 spurious re-fire,
-// 最终回退同步. 详 notes/context/plic_evolution_report.md.
+// 同步形态 vs 曾试过的异步 refresh queue 的取舍 — 见 trade_off_log §T.6 (handler
+// 同步 ACK + 异步 CLEAR race 引起 spurious re-fire 是回退原因).
 //
 // fixture 通过 test_dev MMIO 写 (sw TEST_DEV_SET_OFF / CLEAR_OFF) 触发; 详
 // src/device/test_dev.{h,c}.
@@ -613,7 +608,7 @@ int plic_reset(void) {
 
 void plic_destroy(void) {
     /* 纯模块 cleanup — 跟 clint_destroy / cpu_destroy 同 lifecycle 对称.
-       a_03_009 同步重构后 PLIC 无辅助线程, 只 rwlock 一把锁需清.
+       PLIC 无辅助线程, 只 rwlock 一把锁需清.
        pthread_rwlock_destroy 在 glibc 下基本零开销; 但 valgrind/ASan 在意
        内部 leak, 显式 destroy 干净. */
     (void)pthread_rwlock_destroy(&plic.lock);

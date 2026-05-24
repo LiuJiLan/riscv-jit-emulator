@@ -6,8 +6,8 @@
 //     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) /
 //     plic_init (字段 + ctx_map 全 -1 + plic_ctx_eip / plic_pending_bitmap_cache
 //     atomic 清 0 + rwlock_init + bus 注册; PLIC 是 "monitor 但无辅助线程",
-//     hot path 走 atomic 字段, set/clear 同步 wrlock; 详 plic.h 顶段 + 演进 trail
-//     notes/context/plic_evolution_report.md) /
+//     hot path 走 atomic 字段, set/clear 同步 wrlock; 详 plic.h 顶段 +
+//     trade_off_log §T.6 演进 trail) /
 //     test_dev_init (bus 注册; 无状态 + 无锁 + 无线程, fanout 调 plic.device_set/
 //     clear_pending; 详 device/test_dev.h 顶段) /
 //     uart_init (bus 注册 + mutex_init; **不发线程** — reader 线程由下方 uart_start_
@@ -21,8 +21,8 @@
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
 //     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
 //     一直跑; 详 device/uart.h 顶段) /
-//     virtio_blk_start_io_worker_thread (a_03 T5; --blk 路径下 spawn worker 异步
-//     drain avail ring + pread/pwrite; 退化路径不 spawn)
+//     virtio_blk_start_io_worker_thread (--blk 路径下 spawn worker 异步 drain
+//     avail ring + pread/pwrite; 退化路径不 spawn)
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
@@ -295,14 +295,13 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     // ------------------------------------------------------------------------
-    // 命令行参数解析 (cmdline_decision.md, a_03_session_008 中段拍 候选 3 + B):
+    // 命令行参数解析:
     //
     //   --bios FILE       简便 alias 后缀分发; .bin → load_bin GUEST_RAM_START
     //                                          .elf → load_elf (按 p_paddr)
     //   --load FILE       无 ADDR → guest_load_elf (按 ELF p_paddr 加载)
     //   --load ADDR=FILE  有 ADDR → guest_load_bin (raw 到 ADDR, 不解 ELF 头)
-    //   --blk FILE        virtio-blk image; 本 session 仅解析存 blk_path 变量,
-    //                     不接 init (留 session_010 plan mode 接 virtio_blk_init)
+    //   --blk FILE        virtio-blk image (空 = 模块退化为不存在)
     //
     // 语义跟 QEMU `-device loader,file=FILE[,addr=ADDR]` addr 有/无两路 1:1;
     // 语法收敛双横不引 key=value 逗号分隔解析器 (workspace.xml python 脚本
@@ -421,8 +420,7 @@ int main(int argc, char **argv) {
 
     // PLIC 注册到 bus (clint_init 之后)。PLIC 是 "monitor 但无辅助线程" —
     // hot path 通过 atomic 字段优化 (plic_ctx_eip / plic_pending_bitmap_cache),
-    // set/clear 走同步 wrlock; 演进 trail (T6.2 异步刷新 → a_03_009 撞 spurious
-    // re-fire 回退同步) 见 notes/context/plic_evolution_report.md.
+    // set/clear 走同步 wrlock; 演进 trail 详 trade_off_log §T.6.
     if (plic_init() != 0) {
         fprintf(stderr, "plic_init failed\n");
         return 1;

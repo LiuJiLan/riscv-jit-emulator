@@ -3,9 +3,10 @@
 [English](./README.en.md) | 简体中文
 
 研究生级别的 RISC-V 用户态 JIT 模拟器,目标支持 RV32 G + 标准压缩扩展 C,跑通
-OpenSBI / 小型 OS / FreeRTOS-with-MMU。milestone a_02(interpreter + bus/MMIO
-阶段)已收口,子任务 T1~T6 全部落地;当前进入 a_03(PLIC + UART 外部中断 +
-virtio-blk + 端到端验证)。
+OpenSBI / 小型 OS / FreeRTOS-with-MMU。milestone a_03(PLIC + UART 外部中断 +
+virtio-blk + 端到端验证)已收口,T1~T6 全部落地, monitor 范式集齐四态 (CLINT
+timer / UART reader / virtio-blk io_worker / PLIC 无线程纯 atomic);下一
+milestone 待启动。
 
 
 ## 设计目标
@@ -656,6 +657,55 @@ CLINT (Core-Local Interruptor) MMIO 设备 —— mtime / mtimecmp[N] / msip[N],
 / offset 越界 都 access fault。
 
 
+#### plic.{c,h}
+
+PLIC (Platform-Level Interrupt Controller) MMIO 设备 —— per-source <device_line,
+claimed, priority> + per-ctx <threshold, enable bitmap> + plic_ctx_map (hart_priv
+→ ctx_id 反向映射, index = (hartid<<2)+priv 复用 cpu_t.tlb_table priv encoding)。
+完整 claim/complete 仲裁 (priority > threshold, 同 priority 选 source_id 小者)。
+布局跟 QEMU virt + RV PLIC spec v1.0.0 一致。
+
+monitor 模型 "monitor 但无辅助线程" — 所有路径 (device_set/clear_pending 外设侧
++ hart MMIO) 都是同步 wrlock 调用; hot path 优化通过 `plic_ctx_eip` /
+`plic_pending_bitmap_cache` 两 atomic 字段实现 (hart 主帧 `is_plic_*_pending` 走
+atomic_load 零 lock 零 scan)。pthread_rwlock_t 单锁简化。
+
+
+#### test_dev.{c,h}
+
+测试用 fanout 设备 (不是 monitor, 无内部状态) —— fixture 写 `TEST_DEV_SET_OFF` /
+`TEST_DEV_CLEAR_OFF` 直接驱动 `plic.device_set/clear_pending`, 模拟外设拉线行为。
+开发 PLIC 用; 真实 OS 跑起来后由 UART / virtio-blk 取代。
+
+
+### 设备 (`src/device/`)
+
+
+#### uart.{c,h}
+
+ns16550a 兼容 UART —— TX → host stdout / RX ← host stdin。`uart_reader_run` 辅助
+线程周期 poll stdin (100 ms timeout 给 cooperative shutdown), 命中 POLLIN → read 1
+byte → 加锁 push RX FIFO + 重算 device_line → device_set/clear_pending。接 PLIC
+source 10 (跟 QEMU virt UART0 一致)。
+
+单 pthread_mutex_t (不 rwlock — UART 状态写改占比高, 没有"高频纯读"路径)。当前
+stdin 是 line-buffered (回车后才进; raw 模式留长期 TODO)。
+
+
+#### virtio_blk.{c,h}
+
+virtio-mmio block device (legacy v1.0, DeviceID=2) —— host file 后端 (pread/pwrite),
+io_worker 辅助线程异步 drain avail ring。寄存器子集跟 QEMU virt virtio-mmio.0 + IRQ 1
+对齐 (base 0x10001000)。
+
+双 mutex 双 cond 锁结构 (跟 UART 单锁 / PLIC rwlock 区分): `state_mutex` (寄存器
++ ring 解析 + pread/pwrite 长持锁) + `queue_mutex` (work queue ring + 双 cond)。
+锁顺序硬约束: `queue_mutex` 永不嵌套 `state_mutex`。
+
+异步默认体例: hart fast path 不阻塞优先, pread/pwrite blocking syscall 必走异步
+worker (详 dummy.txt §7 monitor 模型 + file_plan §T 异步默认体例)。
+
+
 
 ## 当前已落地
 
@@ -684,15 +734,30 @@ CLINT (Core-Local Interruptor) MMIO 设备 —— mtime / mtimecmp[N] / msip[N],
 - timer 辅助线程异步推进 atomic `mtime`(clock_nanosleep ABSTIME,方案 C)+ 三层
   reset lifecycle + runtime degenerate monitor(SRS/SDS 两 atomic flag)+ 谁 spawn
   谁 join 协议
+- **PLIC**(完整 claim/complete 仲裁 + per-source <device_line, claimed, priority>
+  + per-ctx <threshold, enable bitmap> + plic_ctx_map 反向映射 + atomic 字段做
+  hot path 优化 — hart 主帧 `is_plic_*_pending` 走 atomic_load 零 lock 零 scan;
+  set/clear 走同步 wrlock)
+- **UART**(ns16550a 兼容 — TX → host stdout / RX ← host stdin + reader 辅助线程
+  poll + RX FIFO + 接 PLIC source 10)
+- **virtio-blk**(legacy v1.0 + host file 后端 pread/pwrite + io_worker 辅助线程
+  异步 drain avail ring + 双 mutex 双 cond + 接 PLIC source 1)
+- **test_dev**(无内部状态 fanout 设备 — 给 fixture 写 MMIO 直接驱动 PLIC
+  device_set/clear_pending,测试 PLIC 用)
+- 命令行参数(`--bios FILE` / `--load [ADDR=]FILE` / `--blk FILE`;后缀分发 +
+  按 ELF p_paddr 或 raw ADDR 加载)
 - 寄存器宽度 typedef family(`uxlen_t` / `ixlen_t` / `u32_t` / `u64_t`;RV64 切换
   grep trail,dummy.txt §13)
 - debug 字符 trace (`_` refetch / `E` exception / `t/s/e` time/soft/ext intr;
   stderr 上, DEBUG_TICK 阈值 80 自动换行)
+- monitor 范式四态集齐(CLINT/UART/virtio-blk 都接辅助线程, PLIC 无线程纯 atomic,
+  test_dev 不是 monitor — 体例统一在 dummy.txt §7)
 
 未实现(后续 milestone):JIT 子系统(Translator / IR / jit_cache / code_cache /
-SMC,a_05+)/ PLIC / UART / virtio-blk / boot ROM(a_03+)/ A 扩展 LR/SC/AMO /
-F/D 扩展浮点 / a_02_end 端到端 hello world(依赖 a_03 的 UART + PLIC)/ 长期
-TODO:Ctrl+C 优雅中断、mstatus.TSR/TVM 控制位 trap、WFI 实装。
+SMC,a_05+)/ boot ROM / A 扩展 LR/SC/AMO / F/D 扩展浮点 / 长期 TODO:
+Ctrl+C 优雅中断、mstatus.TSR/TVM 控制位 trap、WFI 实装、virtio-blk fsync /
+mmap backend / multi-queue / modern v1.1 三 PFN 形态、UART stdin raw 模式
+(line-buffered → char-by-char)。
 
 
 ## 构建 + 运行

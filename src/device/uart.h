@@ -11,11 +11,12 @@
 // monitor 模型 (dummy.txt §7) — UART 是 "monitor + reader 辅助线程"
 // ----------------------------------------------------------------------------
 //
-// 三种 monitor 范式 (a_03 milestone 集齐):
-//   CLINT    = "monitor + timer 辅助线程"  (mtime 由 host wall clock 推进, 后台线程必须)
-//   PLIC     = "monitor 但无线程"          (所有路径都是同步调用, 无后台推进需求)
-//   UART     = "monitor + reader 辅助线程" (RX 源 = host stdin, blocking read 必须后台跑)
-//   test_dev = **不是 monitor**            (无内部状态, 纯 fanout)
+// monitor 范式四态:
+//   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
+//   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin, blocking read)
+//   virtio-blk = "monitor + io_worker 辅助线程" (异步 pread/pwrite + 触发 IRQ)
+//   PLIC       = "monitor 但无辅助线程"         (atomic 字段直接做 hot path 优化)
+//   test_dev   = 不是 monitor                   (无内部状态, 纯 fanout)
 //
 // reader 辅助线程职责 (uart_reader_run, 实装在 uart.c):
 //   - 周期 poll(STDIN_FILENO, POLLIN, 100ms) — 100ms timeout 用于 cooperative shutdown
