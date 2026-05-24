@@ -22,11 +22,16 @@
 //     PLIC_REFRESH_OP_SET/CLEAR event 到 plic_refresh_queue (file-static ring,
 //     16 slot; producer 满则 cond_timedwait not_full 100ms 心跳检 SDS)
 //   - plic_pending_refresh_thread (consumer, single) 异步消费 event, 持 wrlock
-//     改 sources[].device_line + 重算 plic_ctx_eip atomic 子集
+//     改 sources[].device_line + 重算 plic_ctx_eip atomic 子集 + 重算 MMIO
+//     pending bitmap atomic cache (跟 ctx_eip 同时间点 refresh)
 //   - is_plic_meip/seip_pending 改 atomic_load(plic_ctx_eip[ctx_id]) 直返,
 //     零 lock + 零 scan (signs 透明, csr_mip_read 调用点零侵入)
+//   - plic_read pending 区 (off [0x1000, 0x2000)) 改 atomic_load 直返
+//     plic_pending_bitmap_cache[word_idx], 零 lock 零 scan (跟 ctx_eip 同
+//     hot path 形态; guest 读 PLIC pending bitmap 跟 ctx_eip 同异步可见性)
 //   - claim/complete 慢路径不动: 仍 wrlock 改 sources[].claimed; 释放锁前顺手
-//     调 plic_recompute_ctx_eip_locked(ctx_id) 保持 plic_ctx_eip 反映最新
+//     调 plic_recompute_ctx_eip_locked(ctx_id) + plic_recompute_pending_bitmap_locked()
+//     保持 atomic cache 反映最新
 //
 // 三 monitor 范式 (a_03 末集齐):
 //   CLINT = "monitor + timer 辅助线程"   (mtime 由 host wall clock 推进, 后台线程必须)

@@ -96,5 +96,6 @@ spin2:
 #   - 主帧死锁 (run-config timeout 10s 命中 = producer block 路径 cond_timedwait
 #     协议 bug; 三返回 rc=0 / ETIMEDOUT / 其他错没正确重检 queue_full / 没正确唤醒)
 #   - s0 ≠ 0x2 (consumer 没 drain 完 / device_line 状态错)
-#   - 任何 [bus] CAUSE_*_ACCESS_FAULT
+#   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径
+#     trap_raise_exception longjmp, 不打 fprintf — src/ 内无 [bus] tag)
 #   - 程序崩溃 (ASan / UBSan; mutex / cond 死锁路径报错)

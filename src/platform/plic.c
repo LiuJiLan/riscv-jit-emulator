@@ -127,6 +127,64 @@ static _Atomic int plic_ctx_eip[PLIC_N_CONTEXTS];
 
 
 // ----------------------------------------------------------------------------
+// plic_pending_bitmap_cache — MMIO pending bitmap 区 atomic cache (T6.2 post-EIP)
+// ----------------------------------------------------------------------------
+//
+// 独立 file-static, NOT 进 plic struct; 跟 plic_ctx_eip 同性质 (PLIC "atomic 子集"
+// — atomic 自带 ordering, 不持 lock)。本是 EIP 异步后顺手把 MMIO pending bitmap 区
+// 也异步化 — guest 读 PLIC pending bitmap (off [0x1000, 0x2000)) 从原 rdlock + scan
+// 96 source 降到 atomic_load 32-bit 一次。
+//
+// 语义: 1 bit/source, 32 src/word, 总 (PLIC_N_SOURCES+31)/32 = 3 word
+// (PLIC_N_SOURCES=96). 每 word 缓存 32 source 的 (device_line && !claimed) view.
+// source 0 (word 0 bit 0) 永远 0 (保留)。
+//
+// producer 路径 (所有写都持 plic.lock wrlock; atomic_store_explicit release):
+//   - plic_pending_refresh_thread 消费 SET/CLEAR event 后 (device_line 改)
+//   - plic_read 命中 claim 副作用 (set claimed 后)
+//   - plic_write 命中 complete (清 claimed 后)
+//   - plic_reset 清 0
+//   - plic_init 清 0
+//
+// **不在 priority/threshold/enable 写路径调** — 这三个不影响 pending bitmap (pending
+// = device_line && !claimed, 不含 priority/threshold/enable). 区分点跟 plic_ctx_eip
+// 调用点矩阵不同 (后者 priority/threshold/enable 都影响 — 因为仲裁结果变).
+//
+// consumer 路径 (plic_read pending 区 lw): atomic_load_explicit(acquire) 直返;
+// 不持锁不 scan, 跟 is_plic_*_pending 同 hot path 形态.
+//
+// 为什么 pending bitmap 可以异步刷新 (跟 ctx_eip 同时间点 refresh 合理)
+// — 三条独立支持 (a_03_session_007 末 user 拍 + 实装时讨论):
+//
+// (1) **频率论点 — pending bitmap 不在 hot path 上**: RV PLIC 真正的 hot path 是
+//     hart 主帧 csr_mip_read → is_plic_*_pending (每 block 末调一次), 走 ctx_eip
+//     atomic_load 已经异步化. guest OS 决定"处理哪个 source"是通过 PLIC claim
+//     寄存器读 (PLIC 仲裁返单个 source_id), **不通过 pending bitmap**. pending
+//     bitmap 主要是 debug / 全局查询用, 调用频率低. 跟 ctx_eip 同时间点 refresh
+//     不放在 hot path 上, 不构成额外成本.
+//
+// (2) **语义论点 — pending bitmap 不要求严格同步**: RV PLIC v1.0.0 spec 没要求
+//     "MMIO pending bitmap 必须在 device 拉线后立即可见" 这种严格同步语义 (level
+//     型只要求最终一致). 跟 ctx_eip 同时间点 refresh 即"一次 wrlock 内 device_line
+//     改 + ctx_eip 重算 + pending bitmap 重算 + 释放锁" 三件事原子完成, 一致性
+//     等级跟 ctx_eip 相同, 跟 device_line 异步可见性也对齐, 没有"pending bitmap
+//     比 ctx_eip 更新, 但 EIP 已经触发" 之类的不一致窗口.
+//
+// (3) **"不引入新 trade" 论点 — device_line 本来已异步**: T6.2 EIP 引入后 device_
+//     line 改本来就异步 (consumer thread 拉 event 后才改). MMIO pending bitmap
+//     是 (device_line && !claimed) derived view; 加 cache 后**异步性质完全没变**,
+//     只是把读路径从"rdlock + scan 96 source" 优化成 "atomic_load 32-bit 一次".
+//     延迟性质相同 (都是 ms 量级 device_line 异步可见), 但读路径 perf 跟 monitor
+//     模型一致性显著提升.
+//
+// 综合: 加这层 atomic cache 是 net win — perf 显著提升 (零 lock 零 scan), monitor
+// 模型一致性 (PLIC "atomic 子集" 统一), SMP 友好 (未来 contention 下读路径不持锁),
+// 不增加新延迟语义 (跟 device_line 已有异步保持一致). 唯一"代价"是多 3 word atomic
+// 字段 + 几个调用点同步更新, 复杂度增量 ~0.
+static _Atomic uint32_t plic_pending_bitmap_cache[(PLIC_N_SOURCES + 31u) / 32u];
+
+
+// ----------------------------------------------------------------------------
 // plic_refresh_queue — 单 consumer + 多 producer ring buffer (T6.2 新加)
 // ----------------------------------------------------------------------------
 //
@@ -261,6 +319,32 @@ static void plic_recompute_ctx_eip_locked(uint32_t ctx_id) {
 static void plic_recompute_all_ctx_eip_locked(void) {
     for (uint32_t c = 0; c < PLIC_N_CONTEXTS; c++) {
         plic_recompute_ctx_eip_locked(c);
+    }
+}
+
+
+// ----------------------------------------------------------------------------
+// plic_pending_bitmap_cache 重算 helper (file-static; 调用方持 wrlock; "_locked")
+// ----------------------------------------------------------------------------
+//
+// 重算所有 word (3 word for PLIC_N_SOURCES=96), 跟 plic_recompute_all_ctx_eip_locked
+// 一样全 scan — 单调用成本 ~96 source 比较 + 3 atomic_store, 可忽略。简化避免"算
+// 哪些 word 受 source X 影响"的精确性维护。
+//
+// 写 plic_pending_bitmap_cache 用 atomic_store_explicit(release), 跟 plic_read
+// pending 区的 atomic_load_explicit(acquire) 配对建立 happens-before。
+
+static void plic_recompute_pending_bitmap_locked(void) {
+    for (uint32_t w = 0; w < (PLIC_N_SOURCES + 31u) / 32u; w++) {
+        uint32_t v = 0;
+        for (uint32_t i = 0; i < 32u && (w * 32u + i) < PLIC_N_SOURCES; i++) {
+            uint32_t src = w * 32u + i;
+            if (src == 0u) continue;          /* source 0 保留 */
+            if (plic.sources[src].device_line && !plic.sources[src].claimed) {
+                v |= (1u << i);
+            }
+        }
+        atomic_store_explicit(&plic_pending_bitmap_cache[w], v, memory_order_release);
     }
 }
 
@@ -403,12 +487,14 @@ static void *plic_pending_refresh_run(void *arg) {
 
         if (!have_ev) continue;   /* SDS=0 退路: 上面 while 退出后 queue 仍空 */
 
-        /* 应用 event: 持 wrlock 改 sources[].device_line + 重算所有 ctx eip */
+        /* 应用 event: 持 wrlock 改 sources[].device_line + 重算所有 ctx eip +
+           重算 pending bitmap cache (device_line 改影响 pending bitmap) */
         plic_wrlock();
         if (ev.source_id > 0u && ev.source_id < PLIC_N_SOURCES) {
             plic.sources[ev.source_id].device_line =
                 (ev.op == (uint8_t)PLIC_REFRESH_OP_SET) ? 1 : 0;
             plic_recompute_all_ctx_eip_locked();
+            plic_recompute_pending_bitmap_locked();
         }
         plic_unlock();
     }
@@ -461,19 +547,14 @@ static int plic_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
         }
 
     } else if (off < (uint32_t)PLIC_ENABLE_OFF) {
-        /* pending 区: [0x1000, 0x2000); 1 bit/source, 32 src/word */
-        uint32_t word_idx  = (off - (uint32_t)PLIC_PENDING_OFF) / 4u;
-        uint32_t src_base  = word_idx * 32u;
-        if (src_base < PLIC_N_SOURCES) {
-            plic_rdlock();
-            for (uint32_t i = 0; i < 32u && (src_base + i) < PLIC_N_SOURCES; i++) {
-                uint32_t src = src_base + i;
-                if (src == 0u) continue;          /* source 0 保留 */
-                if (plic.sources[src].device_line && !plic.sources[src].claimed) {
-                    value |= (1u << i);
-                }
-            }
-            plic_unlock();
+        /* pending 区: [0x1000, 0x2000); 1 bit/source, 32 src/word.
+           T6.2 post-EIP 改 atomic_load(plic_pending_bitmap_cache[word_idx], acquire)
+           直返, 零 lock 零 scan. cache 由 device_line/claimed 改路径 wrlock 内
+           recompute_pending_bitmap_locked 更新; 异步可见, 跟 device_line 一致. */
+        uint32_t word_idx = (off - (uint32_t)PLIC_PENDING_OFF) / 4u;
+        if (word_idx < (PLIC_N_SOURCES + 31u) / 32u) {
+            value = atomic_load_explicit(&plic_pending_bitmap_cache[word_idx],
+                                         memory_order_acquire);
         }
 
     } else if (off < (uint32_t)PLIC_CONTEXT_OFF) {
@@ -508,6 +589,7 @@ static int plic_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
                 }
                 value = id;
                 plic_recompute_ctx_eip_locked(ctx_id);   /* claimed 改 → ctx eip 可能变 0 */
+                plic_recompute_pending_bitmap_locked();  /* claimed 改 → pending bitmap 也变 */
                 plic_unlock();
             }
             /* reserved (off_in_ctx 非 0/4): silent 返 0 */
@@ -575,6 +657,7 @@ static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
                     if (plic.sources[value].claimed == ctx_id + 1u) {
                         plic.sources[value].claimed = 0;
                         plic_recompute_ctx_eip_locked(ctx_id); /* 清 claimed → 该 ctx 可能重新有 pending */
+                        plic_recompute_pending_bitmap_locked(); /* claimed 改 → pending bitmap 也变 */
                     }
                     plic_unlock();
                 }
@@ -678,6 +761,11 @@ int plic_init(void) {
         atomic_store_explicit(&plic_ctx_eip[c], 0, memory_order_release);
     }
 
+    /* plic_pending_bitmap_cache 全 0 init (跟 plic_ctx_eip 同体例)。 */
+    for (uint32_t w = 0; w < (PLIC_N_SOURCES + 31u) / 32u; w++) {
+        atomic_store_explicit(&plic_pending_bitmap_cache[w], 0, memory_order_release);
+    }
+
     /* plic_refresh_queue init: 字段 0 + mutex + 双 cond. refresh_thread 句柄不在此处
        写 — plic_start_pending_refresh_thread 才 pthread_create (dummy.txt §12)。 */
     plic_refresh_queue.head = 0;
@@ -747,7 +835,7 @@ int plic_reset(void) {
     pthread_cond_broadcast(&plic_refresh_queue.not_empty);
     pthread_mutex_unlock(&plic_refresh_queue.lock);
 
-    /* 2) wrlock 清 sources/contexts + plic_ctx_eip */
+    /* 2) wrlock 清 sources/contexts + plic_ctx_eip + plic_pending_bitmap_cache */
     plic_wrlock();
     for (uint32_t i = 0; i < PLIC_N_SOURCES; i++) {
         plic.sources[i].device_line = 0;
@@ -760,6 +848,9 @@ int plic_reset(void) {
             plic.contexts[c].enable[w] = 0;
         }
         atomic_store_explicit(&plic_ctx_eip[c], 0, memory_order_release);
+    }
+    for (uint32_t w = 0; w < (PLIC_N_SOURCES + 31u) / 32u; w++) {
+        atomic_store_explicit(&plic_pending_bitmap_cache[w], 0, memory_order_release);
     }
     plic_unlock();
 

@@ -112,6 +112,7 @@ m_handler:
 #   mcause  = 1                 (CAUSE_INST_ACCESS_FAULT)
 #
 # 不期望:
-#   - 任何 [bus] CAUSE_*_ACCESS_FAULT
+#   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径
+#     trap_raise_exception longjmp, 不打 fprintf — src/ 内无 [bus] tag)
 #   - 程序崩溃 (ASan / UBSan 报错)
 #   - wait_loop 永不退 (说明 PLIC 仲裁 / mip 合成 / trap_check_interrupt 哪环断了)

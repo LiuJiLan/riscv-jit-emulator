@@ -109,7 +109,8 @@ spin2:
 #   mcause  = 1                (CAUSE_INST_ACCESS_FAULT; ecall + mtvec=0 → 取指 fault)
 #
 # 不期望:
-#   - 任何 [bus] CAUSE_*_ACCESS_FAULT
+#   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径
+#     trap_raise_exception longjmp, 不打 fprintf — src/ 内无 [bus] tag)
 #   - 程序崩溃 (ASan / UBSan)
 #   - spin loop 死等 (mtime 不涨 = timer thread 没跑 = 退化)
 #   - s0 ≠ 0x1E (consumer 没 drain 完 / 多 source recompute_all 没反映)

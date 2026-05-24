@@ -190,6 +190,9 @@ PLIC 实装后,中断检查机制就齐了(CLINT + PLIC)。届时:
 
 ## a_03 末 PLIC + UART 落地后 中断检查开销实验 — 2026-05-24
 
+source 状态: commit `0e840a9` (PLIC 同步实装 baseline; 4 binary patch 从此 commit
+派生编出, 后 git checkout revert).
+
 体例扩自 a_02_session_016 OFF/ON 两 binary 对照实验 (上文 "## 中断检查开销实验
 (a02_7 perf 套件) — 2026-05-23" 段), 扩到 4 binary (ALL_OFF / CLINT_ONLY /
 PLIC_ONLY / ALL_ON) — 量化 a_03 末 csr_mip_read 内 5 源 OR 中 CLINT 跟 PLIC 各自
@@ -335,12 +338,21 @@ milestone 风向标.
 
 ## T6.2 PLIC 优化实装后对照 — 2026-05-24
 
+source 状态: commit `6f72d85` (PLIC EIP 异步实装; 4 binary patch 从此 commit 派生
+编出, 后 git checkout revert).
+
 T6.2 实装 (`a_03_session_007`) 后跟 T6.1 同 4 binary 体例 + 同 a02_7 16 fixture +
 同 ABCDABCD 6 轮交错 (= 384 跑) 重测, 量化 PLIC refresh thread 异步化 +
 `plic_ctx_eip` atomic 直返路径的实际 ROI.
 
 跑批方法 / patch 体例完全跟上文 T6.1 段相同, src/ 是 T6.2 后状态 (新加 plic refresh
 ring + consumer 线程 + atomic plic_ctx_eip); 不重述。
+
+注: T6.2 后续 commit (`a_03_session_007` 末: 改 MMIO pending bitmap 也 atomic
+cache, 跟 ctx_eip 同时间点 refresh) **不重新跑 perf** — pending bitmap 读不在
+csr_mip_read hot path 上 (csr_mip_read 调 is_plic_*_pending 走 ctx_eip atomic;
+pending bitmap 是 guest MMIO 读用, 调用频率低), 速度影响不显著, REVIEW 不需要补
+第 3 行对照.
 
 ### 结果 (median MIPS, 6 轮)
 

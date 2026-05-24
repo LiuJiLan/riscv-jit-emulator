@@ -1049,19 +1049,28 @@ memory_order 选择。
 
   plic = 完整 monitor + refresh 辅助线程 (T6.2 升级; a_03 末)
     内部状态: pthread_rwlock_t 保护的 plic struct (sources/contexts/plic_ctx_map) +
-              独立 file-static _Atomic int plic_ctx_eip[PLIC_N_CONTEXTS] (per-ctx
-              visible-pending boolean, atomic 子集跟 rwlock 区) + 独立 file-static
+              独立 file-static atomic 子集 2 个 (跟 rwlock 区, atomic 自带 ordering 不
+              持 lock): _Atomic int plic_ctx_eip[PLIC_N_CONTEXTS] (per-ctx visible-
+              pending boolean, csr_mip_read hot path 用) + _Atomic uint32_t
+              plic_pending_bitmap_cache[(PLIC_N_SOURCES+31)/32] (MMIO pending bitmap
+              区 word cache, guest lw 0x0C00_1000 用) + 独立 file-static
               plic_refresh_queue (ring buffer 16 slot + pthread_mutex_t lock +
               pthread_cond_t not_full/not_empty + pthread_t refresh_thread)
     内部 actor: file-static plic_pending_refresh_run routine (consumer; mutex 拉 event
-                → 释放 mutex → wrlock 改 sources[].device_line + 重算 plic_ctx_eip)
+                → 释放 mutex → wrlock 改 sources[].device_line + 重算 plic_ctx_eip +
+                重算 plic_pending_bitmap_cache)
     对外 consumer: is_plic_meip_pending / is_plic_seip_pending (热路径
                    atomic_load(plic_ctx_eip[ctx_id], acquire) 直返, 零 lock) /
-                   plic_read (bus MMIO; 仍持 rdlock/wrlock)
+                   plic_read (bus MMIO; pending 区 atomic_load(plic_pending_bitmap_
+                   cache[word_idx], acquire) 直返零 lock; priority/threshold/enable
+                   仍持 rdlock; claim 持 wrlock)
     对外 producer: device_set_pending / device_clear_pending (异步入队 plic_refresh_
                    queue + cond_signal not_empty; 接口签名不变, 调用方零侵入) /
                    plic_write (bus MMIO; wrlock 内顺手 plic_recompute_ctx_eip_locked
-                   保持 plic_ctx_eip 反映最新 effective)
+                   + claim/complete 路径还顺手 plic_recompute_pending_bitmap_locked
+                   保持两个 atomic cache 反映最新 effective; priority/threshold/enable
+                   写只调 recompute_ctx_eip 不调 recompute_pending_bitmap — 后者不
+                   含这三字段)
     lifecycle:    plic_init / plic_reset / plic_destroy (reset 加锁顺序: 先 mutex 清
                    queue 释放, 再 wrlock 清 plic 字段 释放; 从不同时持两个锁避
                    deadlock; well-define 进 plic.c 模块顶段)
