@@ -4,8 +4,10 @@
 //
 //   POR (Power-On Reset) — 进程启动一次
 //     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) /
-//     plic_init (字段 + ctx_map 全 -1 + bus 注册, **不发线程** — PLIC 是"monitor
-//     但无线程"区分, 跟 clint 区分点; 详 plic.h 顶段) /
+//     plic_init (字段 + ctx_map 全 -1 + plic_ctx_eip atomic 清 0 +
+//     refresh_queue mutex/双 cond init + rwlock_init + bus 注册, **不发线程** —
+//     refresh 线程由下方 plic_start_pending_refresh_thread 显式起; T6.2 升级
+//     PLIC 成 "完整 monitor + refresh 辅助线程", 详 plic.h 顶段) /
 //     test_dev_init (bus 注册; 无状态 + 无锁 + 无线程, fanout 调 plic.device_set/
 //     clear_pending; 详 device/test_dev.h 顶段) /
 //     uart_init (bus 注册 + mutex_init; **不发线程** — reader 线程由下方 uart_start_
@@ -14,6 +16,8 @@
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
+//     plic_start_pending_refresh_thread (T6.2 新加; main 起 PLIC refresh 辅助线程,
+//     消费 plic_refresh_queue event 异步更新 plic_ctx_eip; 跟 clint timer 同形态) /
 //     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
 //     一直跑; 详 device/uart.h 顶段)
 //
@@ -317,9 +321,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // PLIC 注册到 bus (clint_init 之后)。**不发线程** — PLIC 是 "monitor 但无线程"
-    // 区分点 (跟 clint 区分; 详 plic.h 顶段)。T1 阶段 MMIO 骨架, read/write 只 fprintf
-    // 标识访问区, 不真改字段; T2 真接通仲裁 / 外设接通 / hart 侧合成读。
+    // PLIC 注册到 bus (clint_init 之后)。**不发线程** — refresh 线程由下方
+    // plic_start_pending_refresh_thread 显式起 (T6.2 升级跟 clint/uart 同体例;
+    // 详 plic.h 顶段)。
     if (plic_init() != 0) {
         fprintf(stderr, "plic_init failed\n");
         return 1;
@@ -393,6 +397,12 @@ int main(int argc, char **argv) {
     // SDS=0 (release); 下面 while 因 SRS=0 自然不进, 直接走 cleanup 路径。
     // 不分 spawn-fail error path, destroy chain 只在 while 外写一次。
     clint_start_timer_thread();
+
+    // main 起 PLIC refresh 辅助线程 (T6.2 新加, 跟 clint timer 同形态; 内部消费
+    // plic_refresh_queue event + cond_timedwait 100ms 心跳检 SDS; cooperative
+    // shutdown)。错误处理跟 clint_start_timer_thread 同 — fail 内部 fprintf + set
+    // SRS=0 + SDS=0; while 不进; cleanup 在外写一次。
+    plic_start_pending_refresh_thread();
 
     // main 起 UART RX reader 辅助线程 (受 SDS 控制, 跟 clint timer 同形态; 内部
     // blocking read(STDIN) + poll 100ms timeout cooperative shutdown)。错误处理跟
@@ -470,6 +480,7 @@ int main(int argc, char **argv) {
     // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。
     // ------------------------------------------------------------------------
     clint_join_timer_thread();
+    plic_join_pending_refresh_thread();
     uart_join_reader_thread();
 
     // ------------------------------------------------------------------------

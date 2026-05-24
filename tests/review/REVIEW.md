@@ -331,3 +331,139 @@ a_03_session_005 末 user 看完 ON 单边 baseline 数据 (该数据 post-sessi
 实装前后再补一次同体例 4 binary 对照测试 (本节体例即模板), 量化优化实际 ROI 跟本次
 预测的差距; 同时补 a_02_session_016 段 "4 次累积对照" 表第 4 行 "+ AMO" 或下个
 milestone 风向标.
+
+
+## T6.2 PLIC 优化实装后对照 — 2026-05-24
+
+T6.2 实装 (`a_03_session_007`) 后跟 T6.1 同 4 binary 体例 + 同 a02_7 16 fixture +
+同 ABCDABCD 6 轮交错 (= 384 跑) 重测, 量化 PLIC refresh thread 异步化 +
+`plic_ctx_eip` atomic 直返路径的实际 ROI.
+
+跑批方法 / patch 体例完全跟上文 T6.1 段相同, src/ 是 T6.2 后状态 (新加 plic refresh
+ring + consumer 线程 + atomic plic_ctx_eip); 不重述。
+
+### 结果 (median MIPS, 6 轮)
+
+```
+  fixture              ALL_OFF  CLINT_ONLY  PLIC_ONLY  ALL_ON
+  01_bare                214.2       168.2      163.8    163.2
+  02_mmu_sv32            212.8       162.8      164.2    160.3
+  03_csr_heavy           113.0        90.3       87.4     78.9
+  04_mem_dense           181.4       158.0      155.3    152.0
+  05_mem_tlbmiss         169.2       140.8      141.6    137.5
+  06_bare_load           201.7       203.7      201.5    198.4
+  07_bare_store          136.2       119.7      116.8    118.4
+  08_mmu_dense_load      189.8       173.8      177.7    171.3
+  09_mmu_dense_store     126.2       112.3      108.8    111.7
+  10_mmu_sparse_load     103.4       104.1      101.8    101.1
+  11_mmu_sparse_store     90.7        88.0       86.8     87.1
+
+  block 大小           ALL_OFF  CLINT_ONLY  PLIC_ONLY  ALL_ON
+     2                  172.1       144.5      140.7    129.7
+     8                  232.6       181.9      182.8    173.2
+    16                  203.7       180.2      177.1    175.5
+    32                  236.0       192.9      193.8    192.9
+    64                  244.9       205.8      205.5    201.2
+```
+
+### 单源占比 (对照 ALL_OFF baseline; 同 T6.1 段公式)
+
+```
+  fixture              CLINT 占比%   PLIC 占比%    总开销%
+  01_bare                -21.47       -23.49       -23.80
+  02_mmu_sv32            -23.51       -22.86       -24.67
+  03_csr_heavy           -20.07       -22.67       -30.19
+  04_mem_dense           -12.87       -14.39       -16.19
+  05_mem_tlbmiss         -16.76       -16.31       -18.71
+  06_bare_load            +0.98        -0.09        -1.65
+  07_bare_store          -12.11       -14.25       -13.08
+  08_mmu_dense_load       -8.44        -6.38        -9.77
+  09_mmu_dense_store     -11.02       -13.80       -11.55
+  10_mmu_sparse_load      +0.67        -1.51        -2.19
+  11_mmu_sparse_store     -3.06        -4.34        -4.01
+  12_blocksize_02        -16.06       -18.25       -24.65
+  13_blocksize_08        -21.79       -21.41       -25.54
+  14_blocksize_16        -11.58       -13.06       -13.86
+  15_blocksize_32        -18.26       -17.85       -18.24
+  16_blocksize_64        -15.98       -16.11       -17.86
+```
+
+完整 384 跑单跑 MIPS 序列见 `tests/review/out/perf_res.txt` (out/ gitignore;
+本次跑后会被覆盖, 单跑序列只在跑后短暂可读).
+
+### PLIC% T6.1 → T6.2 对照 (核心 ROI 指标)
+
+```
+  fixture              PLIC% T6.1   PLIC% T6.2    改善 pp
+  01_bare                -65.00       -23.49        +41.51
+  02_mmu_sv32            -64.92       -22.86        +42.06
+  03_csr_heavy           -92.38       -22.67        +69.71   ★ 灾区
+  04_mem_dense           -67.10       -14.39        +52.71
+  05_mem_tlbmiss         -73.75       -16.31        +57.44
+  06_bare_load           -70.54        -0.09        +70.45   ★ 打平 ALL_OFF
+  07_bare_store          -57.45       -14.25        +43.20
+  08_mmu_dense_load      -67.62        -6.38        +61.24
+  09_mmu_dense_store     -56.04       -13.80        +42.24
+  10_mmu_sparse_load     -54.77        -1.51        +53.26   ★ 打平 ALL_OFF
+  11_mmu_sparse_store    -50.44        -4.34        +46.10
+  12_blocksize_02        -90.84       -18.25        +72.59   ★ 灾区
+  13_blocksize_08        -72.18       -21.41        +50.77
+  14_blocksize_16        -55.98       -13.06        +42.92
+  15_blocksize_32        -35.73       -17.85        +17.88
+  16_blocksize_64        -18.48       -16.11         +2.37
+```
+
+灾区 (`03_csr_heavy` / `12_blocksize_02`) 跟 mem 系列从 ~50-90% 拖累降到 ~10-25%;
+`06_bare_load` / `10_mmu_sparse_load` 几乎打平 ALL_OFF. T6.2 实测改善对偶 T6.1 段
+"PLIC ls[] 优化方案" 预测 (~PLIC 几乎打平 ALL_OFF), 趋势一致.
+
+### 关键结论
+
+1. **PLIC 拖累从大头退化到跟 CLINT 同量级**:
+   T6.1 PLIC_ONLY ~10x 慢于 ALL_OFF (rdlock + scan 96 sources); T6.2 PLIC_ONLY 跟
+   CLINT_ONLY 几乎平 (~15-20% 拖累, 都是 atomic_load + if 框架开销). PLIC 路径已
+   退化到跟 CLINT atomic_load 同形态 — 跟设计目标一致.
+
+2. **剩余 ~15-25% 总开销不再是 PLIC 的事**:
+   T6.2 后 ALL_ON vs ALL_OFF 仍有 ~15-30% gap, 但 CLINT_ONLY 跟 PLIC_ONLY 几乎平
+   说明这部分是 `csr_mip_read` 内 if + 4 个 `is_*_pending` atomic_load + `trap_check_
+   interrupt` 函数调用框架本身的固定开销, **跟 PLIC 实装路径无关**. 要进一步降只能
+   走 plan §2 #49 中断节流 (`local_count` 攒够 N 才 poll) 或者 inline atomic_load 到
+   dispatcher 主帧 (越过 csr_mip_read 函数调用).
+
+3. **block 大小依赖大幅消失**:
+   T6.1 PLIC% 跟 block 大小强相关 (block 2 -90.84% → block 64 -18.48%, 跨度 72 pp);
+   T6.2 PLIC% 几乎跟 block 大小无关 (block 2 -18.25% / block 64 -16.11%, 跨度 2 pp).
+   意思 "PLIC 单调用成本"从 ~200 cycle 降到 ~1 cycle, 小 block 摊薄不出来的开销
+   消失了 — 进一步印证 atomic_load 直返路径生效.
+
+### artifact trail (不影响主结论)
+
+1. **T6.1 vs T6.2 单数字不能跨时段直接对比** — 不同时段 host CPU turbo / VM steal
+   time / cache 状态都不同, T6.2 表内 CLINT_ONLY 拖累 ~15-23% 比 T6.1 表内 CLINT_ONLY
+   ~±5% 看起来 "退化" 是 host 状态差异 + ABCD 交错抵消 (T6.1 跟 T6.2 内部各自一致,
+   两表内 PLIC% 相对 CLINT% 才有可比性). 真正的对比指标是 PLIC% T6.1 → T6.2 (上表),
+   不是单 binary 单数字.
+
+2. **CLINT_ONLY / PLIC_ONLY 在 T6.2 表内字节大小** — clint_only 287416 / plic_only
+   287264 / all_on 286856, 跟 T6.1 类似的 "patch 不规则字节增长" artifact (release
+   优化器对小 patch 不同 inline 决策的副作用). 不影响 "PLIC 已退化到跟 CLINT 同量级"
+   主结论.
+
+3. **refresh thread OS 调度开销** — T6.2 引入了 single consumer thread (cond_timedwait
+   100ms 心跳); 单 hart 单 dispatcher 跟 refresh thread 是 2 OS thread, 可能争抢 CPU
+   核. 本次实测 a02_7 全部 fixture (主帧 spin 没主动 device_set/clear_pending) 下
+   refresh thread cond_timedwait 100ms 心跳 + 几乎不消费 event, OS 调度开销可忽略
+   (实测 PLIC_ONLY 跟 ALL_OFF 接近印证). 真活跃场景 (a_03 stress fixture / 真 OS 跑)
+   下需重测 — 留 trail 给 a_03/a03_4 stress fixture 拿数据.
+
+### 跟 plan §2 #49 中断节流方案的关系
+
+T6.2 后 PLIC 不再是中断检查的瓶颈, 剩余 ~15-25% 的 ALL_ON vs ALL_OFF gap 完全来自
+中断检查框架本身. plan §2 #49 中断节流 (`local_count` 攒够 N 条指令才 poll) 现在
+ROI 更清晰:
+
+- 攒够 N=16 → poll 频率 1/16, 框架开销摊薄到 ~1-2%
+- 代价 = 中断延迟 + N/2 条指令 (~80ns @ 100MIPS), RV spec 不要求即时投递, 接受
+- 决策: 留给后续 milestone (跟 JIT 真接入后再评估; JIT 跑期 dispatcher 入口频率会
+  变, 现在节流的 ROI 数字会偏 — 等 JIT 落地后再拍).

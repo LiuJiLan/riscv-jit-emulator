@@ -409,6 +409,30 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 #define CSR_SIE     0x104U          /* S-mode 中断 enable;  _mie 的 mask view */
 #define CSR_SIP     0x144U          /* S-mode 中断 pending; mip 合成的 mask view */
 
+// ----------------------------------------------------------------------------
+// Unprivileged Counter/Timer CSRs (RV Unpriv Spec Ch 10)
+// ----------------------------------------------------------------------------
+//
+//   time     0xC01 — wall-clock cycle counter (mtime CSR view, RV32 低 32 位)
+//   timeh    0xC81 — wall-clock cycle counter 高 32 位 (RV32 only)
+//
+// 项目实装 = clint.mtime 副本 (clint_read_mtime() 取完整 u64, csr.c 截 lo/hi 进
+// 两个 RO CSR 入口)。lo/hi 跨 csrr 之间 mtime 涨可能高低不一致 (RV spec 已知 race,
+// software 用 "read timeh / read time / read timeh again / compare" 协议解决);
+// 接口形态走单 u64 (clint_read_mtime), 不 split, RV64 切换时 timeh 删 case 即可。
+//
+// 编码位段 (csr_addr 自带的权限位段, riscv.h CSR_ADDR_*):
+//   0xC01 → bits[11:10] = 11 (RO), bits[9:8] = 00 (U-min) → 三 priv 都可读
+//   0xC81 → bits[11:10] = 11 (RO), bits[9:8] = 00 (U-min) → 同上
+//
+// TODO: mcounteren / scounteren 未实装 — RV spec 规定 U-mode 访问 time 受
+// mcounteren.TM (bit 1) 控制, S-mode 受 scounteren.TM 控制; v1 简化 U/S-mode 永远
+// 可访问 (跟 OpenSBI / Linux default mcounteren=0xFFFFFFFF 配置等效, 不违 spec)。
+// 真需要严控时改 csr_time/timeh_read 入口加 mcounteren bit check + cause 2 trap。
+// ----------------------------------------------------------------------------
+#define CSR_TIME    0xC01U          /* U/S/M RO; clint.mtime 低 32 位 */
+#define CSR_TIMEH   0xC81U          /* U/S/M RO; clint.mtime 高 32 位 (RV32 only) */
+
 #define IRQ_S_SOFT    1U            /* SSIP / SSIE bit; 也是 S-software cause 低位 */
 #define IRQ_M_SOFT    3U            /* MSIP / MSIE bit; 也是 M-software cause 低位 */
 #define IRQ_S_TIMER   5U            /* STIP / STIE bit; 也是 S-timer    cause 低位 */

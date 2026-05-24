@@ -358,3 +358,9 @@ int is_clint_timer_pending(uint32_t hartid) {
     u64_t    cmp = atomic_load_explicit(&clint.mtimecmps[hartid], memory_order_acquire);
     return (now >= cmp) ? 1 : 0;
 }
+
+// csr.c csr_time/timeh_read 调; consumer 接口对偶 is_clint_*_pending (acquire 跟
+// timer thread release-fetch_add mtime 配对; dummy.txt §7 monitor 模型)。
+uint64_t clint_read_mtime(void) {
+    return atomic_load_explicit(&clint.mtime, memory_order_acquire);
+}

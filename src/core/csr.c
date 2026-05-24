@@ -35,6 +35,8 @@
 //   mvendorid(0xF11) → hart->shared_info->mvendorid (RO)
 //   marchid  (0xF12) → hart->shared_info->marchid (RO)
 //   mimpid   (0xF13) → hart->shared_info->mimpid (RO)
+//   time     (0xC01) → clint_read_mtime() 低 32 位 (RV Unpriv Spec Ch 10; RO)
+//   timeh    (0xC81) → clint_read_mtime() 高 32 位 (RV32 only; RO)
 //   privrd   (0xCC0) → 不存字段; read 直接 fprintf "[priv] X" + return hart->priv (临时 RO)
 //
 // 组织哲学:
@@ -65,6 +67,7 @@
 #include "config.h"            // IALIGN_MASK
 #include "cpu.h"
 #include "platform/clint.h"    // is_clint_msip_pending / is_clint_timer_pending (mip 合成读)
+                                // + clint_read_mtime (time / timeh CSR view)
 #include "platform/plic.h"     // is_plic_meip/seip_pending (mip 合成读)
 #include "riscv.h"
 #include "trap.h"              // trap_raise_exception (csr_op 入口判 priv/RO 失败时长跳)
@@ -505,6 +508,36 @@ static uxlen_t csr_mimpid_read(cpu_t *hart) {
 
 
 // ============================================================================
+// Unprivileged Counter/Timer CSR (类 5 派生合成读; RV Unpriv Spec Ch 10)
+//
+// 含 time (0xC01) + timeh (0xC81), 都是 clint.mtime 的副本 view:
+//   - time  返 mtime 低 32 位
+//   - timeh 返 mtime 高 32 位 (RV32 only; RV64 切换时直接删 timeh case + read helper)
+//
+// 接口拿 clint_read_mtime() (完整 u64), csr.c 截 lo/hi — 单 mtime read 跨 lo/hi 截
+// 不会跨 atomic 边界 (lo/hi 来自同一 atomic_load), 不存在"半字段 stale" race。但
+// software 跨两次 csrr time/timeh 间 mtime 涨可能高低不一致 (RV spec 已知 race);
+// 标准协议 "read timeh / read time / read timeh again / 比对" 由 software 解决,
+// 项目不在 CSR 层补救。
+//
+// TODO: mcounteren / scounteren 未实装 — U-mode 访问 time 在 spec 受 mcounteren.TM
+// (bit 1) 控制, S-mode 受 scounteren.TM 控制; v1 简化让 U/S/M 三 priv 都可访问
+// (跟 OpenSBI / Linux default mcounteren=0xFFFFFFFF 配置等效, 不违 spec)。真需要
+// 严控时改本段 helper 入口加 mcounteren bit check + cause 2 illegal trap。
+// ============================================================================
+
+static uxlen_t csr_time_read(cpu_t *hart) {
+    (void)hart;
+    return (uint32_t)(clint_read_mtime() & 0xFFFFFFFFu);
+}
+
+static uxlen_t csr_timeh_read(cpu_t *hart) {
+    (void)hart;
+    return (uint32_t)((clint_read_mtime() >> 32) & 0xFFFFFFFFu);
+}
+
+
+// ============================================================================
 // 临时调试 CSR (类 5; uart 实装后删除整段)
 //
 // 含 privrd (0xCC0) 1 个 csr; 字段不存 cpu_t (csr.c 内 read 直接 fprintf 流式输出)。
@@ -601,6 +634,8 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
         case CSR_MVENDORID:read_old = csr_mvendorid_read(hart); break;  /* RO */
         case CSR_MARCHID:  read_old = csr_marchid_read (hart); break;   /* RO */
         case CSR_MIMPID:   read_old = csr_mimpid_read  (hart); break;   /* RO */
+        case CSR_TIME:     read_old = csr_time_read    (hart); break;   /* RO; clint.mtime low  */
+        case CSR_TIMEH:    read_old = csr_timeh_read   (hart); break;   /* RO; clint.mtime high (RV32) */
         case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* 临时 RO; RO 写 trap 由入口判 */
         default:
             fprintf(stderr,

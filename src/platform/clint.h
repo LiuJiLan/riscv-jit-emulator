@@ -100,4 +100,15 @@ void clint_join_timer_thread(void);
 int is_clint_msip_pending (uint32_t hartid);    /* 0/1; = !!atomic_load(msip[hartid]) */
 int is_clint_timer_pending(uint32_t hartid);    /* 0/1; = (mtime ≥ mtimecmp[hartid]) */
 
+
+// ----------------------------------------------------------------------------
+// mtime 直读接口 — csr.c csr_time/timeh_read 用 (RV Unpriv Spec time/timeh CSR view)
+//
+// 跟 is_clint_*_pending 同 monitor consumer 接口体例 (dummy.txt §7); caller 不
+// 直接 atomic_load extern clint.mtime, 走本接口拿完整 u64 (release/acquire 配对
+// 在模块内部封装)。csr.c 按 RV32 拆 lo/hi 进两个 CSR 入口; 不 split 接口形态,
+// RV64 切换时 csr.c 直接返完整 u64, clint 接口不变。
+// ----------------------------------------------------------------------------
+uint64_t clint_read_mtime(void);                /* 完整 64 位 mtime (acquire) */
+
 #endif //PLATFORM_CLINT_H
