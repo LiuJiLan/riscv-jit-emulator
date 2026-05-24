@@ -163,7 +163,7 @@ block 那次 poll。故此实验对 a02_7 安全。
   # | milestone 状态       | 03_csr_heavy 检查占比 | 备注
   1 | 中断检查 OFF(基线)  | 0%                    | 本次实验对照基线
   2 | CLINT-only(当前)    | 21.9%                 | 本次实验
-  3 | + PLIC               | (待测)                | PLIC 落地后 pending 判断并入外部中断源,更重
+  3 | + PLIC               | 90.5%                 | csr_heavy 跃升 21.9% → 90.5%; PLIC rwlock+scan 主导 (详见下方 "## a_03 末 PLIC + UART 落地后" 段)
   4 | + AMO                | (待测)                | AMO milestone 后再测一次
 ```
 
@@ -185,3 +185,149 @@ PLIC 实装后,中断检查机制就齐了(CLINT + PLIC)。届时:
    (csr 密集 / OS trap 路径)不必每个微型 block 都付一次 check。代价是中断投递最多
    延迟 N 条指令(RV 不要求即时投递,可接受)。这个权衡等 PLIC 后 check 变重、收益
    更明显时再定。
+
+---
+
+## a_03 末 PLIC + UART 落地后 中断检查开销实验 — 2026-05-24
+
+体例扩自 a_02_session_016 OFF/ON 两 binary 对照实验 (上文 "## 中断检查开销实验
+(a02_7 perf 套件) — 2026-05-23" 段), 扩到 4 binary (ALL_OFF / CLINT_ONLY /
+PLIC_ONLY / ALL_ON) — 量化 a_03 末 csr_mip_read 内 5 源 OR 中 CLINT 跟 PLIC 各自
+单独占比, 为 PLIC ls[] 优化方案 (T6.2 待实装) 提供 ROI 直接数据. session log:
+`a_03_session_006.md`.
+
+### 4 binary patch 体例
+
+跟 a_02_session_016 临时注释 + 编完 revert 同体例 (不引入 macro gate), 编 4 个
+release binary 到 /tmp:
+
+- **ALL_OFF**:    `src/core/dispatcher.c` L158 `if (trap_check_interrupt(hart) != 0) continue;` 整行注释 (跟 a_02 OFF 同)
+- **CLINT_ONLY**: `src/core/csr.c` `csr_mip_read` 内 `mip_view = hart->trap._mip_sw;` 改 `= 0;` + 注释 PLIC 2 个 if; 留 CLINT 2 个 if
+- **PLIC_ONLY**:  `src/core/csr.c` `csr_mip_read` 内 `mip_view = hart->trap._mip_sw;` 改 `= 0;` + 注释 CLINT 2 个 if; 留 PLIC 2 个 if
+- **ALL_ON**:     无 patch (跟 a_02 ON 同)
+
+每个 binary 编完 `git checkout` revert, `cp` 到 `/tmp/jit-emu-rel-{all_off,clint_only,plic_only,all_on}`;
+4 binary 编出在同一 git state, 跨 binary 性能可比.
+
+### 跑批方法
+
+`tests/review/run_perf.py` 加 `--compare BIN1,BIN2,...` 模式 (跟原 single-binary
+模式并存, a_02 测法不破坏). 单 fixture 上严格 ABCDABCD... 交错 6 轮 = 24 跑/fixture;
+16 fixture × 4 binary × 6 轮 = **384 跑**. 交错抵消 turbo 降频 / cache 热漂移 / VM
+steal time, 跟 a_02 OFF/ON 交错 6 对体例一致.
+
+环境同 a_02_session_016: release `-O2`, 解释器, 单 hart.
+
+### 结果 (median MIPS, 6 轮)
+
+```
+  fixture              ALL_OFF  CLINT_ONLY  PLIC_ONLY  ALL_ON
+  01_bare                175.9      194.9       61.6     75.2
+  02_mmu_sv32            176.0      190.9       61.7     74.8
+  03_csr_heavy           113.6       83.5        8.7     10.8
+  04_mem_dense           166.7      168.6       54.8     67.0
+  05_mem_tlbmiss         152.6      154.9       40.1     49.3
+  06_bare_load           213.5      211.0       62.9     75.8
+  07_bare_store          125.4      128.7       53.4     62.7
+  08_mmu_dense_load      185.9      183.5       60.2     71.7
+  09_mmu_dense_store     117.9      123.3       51.8     59.8
+  10_mmu_sparse_load     107.5      104.8       48.6     54.8
+  11_mmu_sparse_store     90.1       89.4       44.7     50.2
+
+  block 大小           ALL_OFF  CLINT_ONLY  PLIC_ONLY  ALL_ON
+     2                  174.2      141.0       16.0     20.3
+     8                  194.2      211.3       54.0     65.1
+    16                  190.5      196.9       83.9     97.4
+    32                  201.7      233.8      129.6    144.9
+    64                  210.2      243.6      171.4    182.3
+```
+
+### 单源占比 (对照 ALL_OFF baseline)
+
+CLINT 占比 = (ALL_OFF - CLINT_ONLY) / ALL_OFF × 100 (负值 = CLINT 拖累);
+PLIC 占比  = (ALL_OFF - PLIC_ONLY)  / ALL_OFF × 100 (负值 = PLIC 拖累);
+总开销     = (ALL_OFF - ALL_ON)     / ALL_OFF × 100.
+
+```
+  fixture              CLINT 占比%   PLIC 占比%    总开销%
+  01_bare                +10.83       -65.00       -57.24
+  02_mmu_sv32             +8.48       -64.92       -57.52
+  03_csr_heavy           -26.51       -92.38       -90.49
+  04_mem_dense            +1.15       -67.10       -59.83
+  05_mem_tlbmiss          +1.47       -73.75       -67.70
+  06_bare_load            -1.18       -70.54       -64.48
+  07_bare_store           +2.61       -57.45       -50.03
+  08_mmu_dense_load       -1.27       -67.62       -61.45
+  09_mmu_dense_store      +4.57       -56.04       -49.27
+  10_mmu_sparse_load      -2.53       -54.77       -49.03
+  11_mmu_sparse_store     -0.76       -50.44       -44.26
+  12_blocksize_02        -19.04       -90.84       -88.36
+  13_blocksize_08         +8.82       -72.18       -66.47
+  14_blocksize_16         +3.36       -55.98       -48.85
+  15_blocksize_32        +15.89       -35.73       -28.15
+  16_blocksize_64        +15.88       -18.48       -13.28
+```
+
+完整 384 跑单跑 MIPS 序列见 `tests/review/out/perf_res.txt` (out/ gitignore).
+
+### 关键结论
+
+1. **PLIC 占整个中断检查开销 ~99%, CLINT 几乎 noise** —
+   CLINT_ONLY ≈ ALL_OFF (一般 ±5% 噪声, 仅 csr_heavy / blocksize_02 才显出 -19% ~ -26%
+   拖累 — 这俩 fixture dispatcher 入口频率最高); PLIC_ONLY 跟 ALL_ON 同一数量级
+   (PLIC `rwlock + scan` 双调用是绝对大头). 即: 优化 PLIC 路径可逼近 ALL_OFF
+   baseline (~55% 平均 MIPS 回升).
+
+2. **PLIC 单独拖累 ~50-90% MIPS, 跟 fixture 形态强相关**:
+   - 极端高: `03_csr_heavy` -92.38% (csrr/csrw mip 让 csr_mip_read 调用频率倍增);
+     `12_blocksize_02` -90.84% (小 block dispatcher 入口高频).
+   - 中段:   `01_bare` / `02_mmu_sv32` / `04`-`09` mem/mmu 系列 -55% ~ -70%.
+   - 极端低: `16_blocksize_64` -18.48% (大 block 摊薄 PLIC 单次调用).
+
+3. **block 大小依赖**: PLIC 拖累跟 block 大小负相关 (block 2 -90.84%, block 64 -18.48%);
+   跟 a_02_session_016 "block 越小, 固定检查占比越大" 趋势一致, 但 a_03 末 PLIC
+   引入后绝对值显著更陡 — PLIC 单调用 ~200 cycle 在小 block 时占整个 dispatch 周期
+   ~80%+, 大 block 摊到 ~15%.
+
+### artifact trail (不影响主结论)
+
+实验设计本身的两个 microbenchmark gotcha, 记下来避免归零误读:
+
+1. **PLIC_ONLY 16/16 fixture 一致比 ALL_ON 慢 ~15-22%** — 语义上 PLIC_ONLY ⊂ ALL_ON
+   应当 ≥ ALL_ON, 实测一致更慢; 不是噪声 (16/16 一致 + 排除热漂移交错). binary size
+   印证: `plic_only` 274976 字节 vs `all_on` 274568 字节, +408 字节. 解释: patch
+   `mip_view = 0` + 砍 CLINT 触发编译器不同 inline / register 分配, 反生成更差代码.
+   不影响"PLIC 是大头"主结论 (PLIC_ONLY 跟 ALL_ON 同数量级, 远低于 CLINT_ONLY / ALL_OFF).
+
+2. **CLINT_ONLY 在 `15_blocksize_32` / `16_blocksize_64` 反而 +15.89% / +15.88% 快于
+   ALL_OFF** — 大 block 下 dispatcher 入口稀, CLINT 2 atomic_load 实际开销几乎检测
+   不出; release 6 sample median 噪声 + 编译器副作用. 落在 ±15% 噪声范围内, 不视为
+   真实 "CLINT 加速".
+
+### PLIC ls[] 优化方案 (a_03_session_005 末 user 拍, 本次实验直接印证 ROI)
+
+a_03_session_005 末 user 看完 ON 单边 baseline 数据 (该数据 post-session_006 已被
+本节正经 4 binary 测试替换), 拍方案 + 决定 T6 PLIC 优化提前 (排到 T5 virtio-blk
+之前). 本 session 4 binary 实验给出 ROI 的直接量化:
+
+- PLIC 占整个中断检查 ~99% → 砍 PLIC 几乎 100% 收回中断检查开销;
+- 实施后预期 MIPS 量级 = ALL_OFF baseline; 极端 fixture 如 `12_blocksize_02` 从 20.3
+  → ~170 MIPS (~8x), `16_blocksize_64` 从 182.3 → ~210 MIPS (~15%).
+
+方案 trail 留底 (实装在 T6.2, 跟 `start_plan_a_03` [4.x] §2 同步):
+
+- PLIC 加后台仲裁线程 (受 SDS 控制, 跟 CLINT timer / UART reader 同体例; main spawn/join
+  对偶; system reset 时清队列残留)
+- producer = `device_set/clear_pending`; consumer = PLIC 仲裁线程 (`cond_timedwait`
+  100ms)
+- MPSC 消息队列: 16 slot ring + `pthread_mutex_t` + 双 cond (not_full / not_empty);
+  满时 producer block 等空位 (RV PLIC level 型不允许丢)
+- 仲裁线程拉消息后持 wrlock 改 device_line + 重算所有 ctx 的 `ls[ctx_id]`; release
+  锁前 `atomic_store ls[ctx_id]`
+- dispatcher 主帧 `is_plic_*_pending` 改 `atomic_load ls[ctx_id]` (acquire) ~1 cycle
+- claim/complete 同步路径 (慢路径, hart 主帧 wrlock 内改 claimed + 重算 ls)
+- MTIP / MSIP / SEIP_sw 不动 (continuous condition / 单原子 / 已最轻)
+
+实装前后再补一次同体例 4 binary 对照测试 (本节体例即模板), 量化优化实际 ROI 跟本次
+预测的差距; 同时补 a_02_session_016 段 "4 次累积对照" 表第 4 行 "+ AMO" 或下个
+milestone 风向标.

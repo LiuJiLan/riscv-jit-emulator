@@ -148,6 +148,7 @@ Temporary Items
 cmake-build-*/
 
 CLAUDE.md
+.claude/
 notes/*
 refs/*
 
@@ -157,3 +158,4 @@ tests/**/out.*
 # milestone 测试整理 pass 的一次性产物(冻结二进制 / 跑批结果 / 报告),不跟踪;
 # tests/review/ 下的 run_tests.py / reorg_spec.md / REVIEW.md 仍跟踪
 tests/review/out/
+
