@@ -9,38 +9,24 @@
 // 一致)。bus 接口形态 (read/write 返 cause / 0=成功) 见 platform/bus.h + dummy.txt §9。
 //
 // ----------------------------------------------------------------------------
-// monitor 模型 (dummy.txt §7) — T6.2 升级成"完整 monitor + refresh 辅助线程"
+// monitor 模型 (dummy.txt §7) — "monitor 但无辅助线程"
 // ----------------------------------------------------------------------------
 //
-// T6.2 前: PLIC 是 "monitor 但无线程" — 所有路径都是外设 device_set/clear_pending
-// 或 hart MMIO 触发的同步调用, 无后台推进需求。但 a_03 末性能实测发现 dispatcher
-// 主帧 csr_mip_read 调 is_plic_*_pending 走 rdlock + scan, 中断检查路径拖累
-// 03_csr_heavy 等 fixture ~10x。
+// 所有路径都是外设 device_set/clear_pending 或 hart MMIO 触发的同步调用, 无后台
+// 推进需求。hot path 优化通过 atomic 字段 (plic_ctx_eip + plic_pending_bitmap_cache)
+// 实现 — wrlock 路径内 producer 同步设置 atomic, hart 主帧 csr_mip_read 走
+// atomic_load 直返, 零 lock 零 scan.
 //
-// T6.2 后: PLIC 升级成"完整 monitor + refresh 辅助线程":
-//   - device_set/clear_pending 不再同步改 sources[].device_line, 改成入队
-//     PLIC_REFRESH_OP_SET/CLEAR event 到 plic_refresh_queue (file-static ring,
-//     16 slot; producer 满则 cond_timedwait not_full 100ms 心跳检 SDS)
-//   - plic_pending_refresh_thread (consumer, single) 异步消费 event, 持 wrlock
-//     改 sources[].device_line + 重算 plic_ctx_eip atomic 子集 + 重算 MMIO
-//     pending bitmap atomic cache (跟 ctx_eip 同时间点 refresh)
-//   - is_plic_meip/seip_pending 改 atomic_load(plic_ctx_eip[ctx_id]) 直返,
-//     零 lock + 零 scan (signs 透明, csr_mip_read 调用点零侵入)
-//   - plic_read pending 区 (off [0x1000, 0x2000)) 改 atomic_load 直返
-//     plic_pending_bitmap_cache[word_idx], 零 lock 零 scan (跟 ctx_eip 同
-//     hot path 形态; guest 读 PLIC pending bitmap 跟 ctx_eip 同异步可见性)
-//   - claim/complete 慢路径不动: 仍 wrlock 改 sources[].claimed; 释放锁前顺手
-//     调 plic_recompute_ctx_eip_locked(ctx_id) + plic_recompute_pending_bitmap_locked()
-//     保持 atomic cache 反映最新
+// 演进 trail (a_03 milestone): T6.2 (a_03_007 末 ~ a_03_009) 曾引入 refresh queue
+// + refresh thread 把 device_line 改异步, 但在 a_03_009 撞到 handler 同步 ACK +
+// 异步 CLEAR race 引起的 spurious re-fire, 最终回退同步形态. hot path 优化的本质
+// 是 atomic 字段而非异步 queue. 详 notes/context/plic_evolution_report.md.
 //
-// 三 monitor 范式 (a_03 末集齐):
-//   CLINT = "monitor + timer 辅助线程"   (mtime 由 host wall clock 推进, 后台线程必须)
-//   UART  = "monitor + reader 辅助线程"  (RX 源 = host stdin, blocking read 必须后台)
-//   PLIC  = "monitor + refresh 辅助线程" (T6.2 后; 中断检查热路径要 atomic_load 直返)
-//
-// dummy.txt §12 "谁 spawn 谁 join" 协议适用 — plic_start_pending_refresh_thread /
-// plic_join_pending_refresh_thread 暴露给 main, 跟 clint/uart 同形态; 受 SDS 控制
-// 跨 system reset 一直跑。
+// monitor 范式三态 (a_03 末):
+//   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
+//   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin, blocking read)
+//   virtio-blk = "monitor + io_worker 辅助线程" (异步 pread/pwrite + IRQ)
+//   PLIC       = "monitor 但无辅助线程"         (atomic 字段直接做 hot path 优化)
 //
 // ----------------------------------------------------------------------------
 // 读写抽象 (monitor RW; pthread_rwlock_t 实装)
@@ -51,13 +37,19 @@
 //
 // 路径分配 (按字段访问是读是写, 跟 MMIO 入口形态无关 — claim "读寄存器" 但 set
 // claimed 字段, 走 wrlock):
-//   - rdlock: is_plic_*_pending / plic_read 命中纯读寄存器 (priority/threshold/enable/pending)
-//   - wrlock: device_set/clear_pending / plic_read 命中 claim / plic_write 命中
-//             complete/priority/threshold/enable
+//   - 不持锁: is_plic_*_pending (atomic_load plic_ctx_eip) /
+//             plic_read pending 区 (atomic_load plic_pending_bitmap_cache)
+//   - rdlock: plic_read 命中纯读寄存器 (priority/threshold/enable)
+//   - wrlock: device_set/clear_pending (跨线程同步) / plic_read 命中 claim /
+//             plic_write 命中 complete/priority/threshold/enable
 //
-// SMP 单 hart 下 contention=0; 多 hart 真起来时 N reader + 1 writer 是 pthread_rwlock_t
-// 的语义本职。公平性走默认 (reader 优先), 真撞 writer starvation 再调
-// PTHREAD_RWLOCK_PREFER_WRITER_NP attr。
+// wrlock 路径都 "进锁 → 改字段 → recompute_ctx_eip atomic_store(eip) →
+// recompute_pending_bitmap atomic_store(cache) → 出锁" 模式, 保 atomic cache 反映
+// 最新有效 view.
+//
+// SMP 单 hart 下 contention=0; 多 hart 真起来时 N reader + 1 writer 是
+// pthread_rwlock_t 的语义本职。公平性走默认 (reader 优先), 真撞 writer starvation
+// 再调 PTHREAD_RWLOCK_PREFER_WRITER_NP attr。
 //
 // ----------------------------------------------------------------------------
 // 字段模型 vs RV PLIC spec — per-source 简化 + per-ctx 全实装
@@ -109,53 +101,34 @@
 // ----------------------------------------------------------------------------
 //
 // plic_init    — POR 一次性 (main 入口, clint_init 之后): 字段 0 init + plic_ctx_map
-//                hardcoded 填充 (v1 全 MSU) + plic_ctx_eip atomic 清 0 +
-//                plic_refresh_queue mutex/双 cond init + pthread_rwlock_init +
-//                bus 注册。失败 -1 (跟 ram_init / clint_init 同形态; dummy.txt §5)。
-//                **不发线程** (跟 clint_init 同体例 — spawn 由专门函数)。
+//                hardcoded 填充 (v1 全 MSU) + plic_ctx_eip / plic_pending_bitmap_cache
+//                atomic 清 0 + pthread_rwlock_init + bus 注册。失败 -1 (跟
+//                ram_init / clint_init 同形态; dummy.txt §5)。
 //
-// plic_reset   — system reset 每 iter (main while 顶段): 清 device_line / claimed /
-//                priority / threshold / enable bitmap + plic_refresh_queue (head=tail=0
-//                + broadcast cond) + plic_ctx_eip 全 atomic_store 0; plic_ctx_map
-//                不动 (硬件 wired 状态不掉电不停, 跟 mtime 不动同性质); 锁不动
-//                (基础设施); refresh_thread 不动 (受 SDS 跨 reset 一直跑, 跟 CLINT
-//                timer / UART reader 同形态)。锁顺序 (避 deadlock): 先 mutex 清
-//                queue 释放, 再 wrlock 清 plic 字段释放; 从不同时持两个锁。
+// plic_reset   — system reset 每 iter (main while 顶段): wrlock 清 sources / contexts
+//                字段 + plic_ctx_eip atomic 清 0 + plic_pending_bitmap_cache atomic
+//                清 0; plic_ctx_map 不动 (硬件 wired 状态不掉电不停)。
 //
-// plic_destroy — POR 收尾 (main 末段): pthread_rwlock_destroy +
-//                pthread_cond_destroy(both) + pthread_mutex_destroy; refresh thread
-//                已由 plic_join_pending_refresh_thread 收回, 这里只清同步原语。
+// plic_destroy — POR 收尾 (main 末段): pthread_rwlock_destroy. PLIC 无辅助线程,
+//                无 cond/mutex 清理.
 //
 // ----------------------------------------------------------------------------
-// thread lifecycle (dummy.txt §12 谁 spawn 谁 join; T6.2 新加, 跟 clint/uart 同体例)
-// ----------------------------------------------------------------------------
-//
-// plic_start_pending_refresh_thread — main POR spawn (clint_start_timer_thread /
-//   uart_start_reader_thread 同位置, 进 while 之前): pthread_create refresh thread,
-//   routine 跨 system reset 一直跑 (受 SDS 控制起停)。错误走 runtime signal 通道
-//   (fprintf + set SRS=0+SDS=0; 跟 clint_start_timer_thread 同形态), 不分 error path
-//   destroy chain 只在 while 外写一次。
-//
-// plic_join_pending_refresh_thread  — POR 退出段 (main while 外, 跟 clint_join_timer_
-//   thread / uart_join_reader_thread 同位置): SDS=0 之后调; refresh loop 自然退出 →
-//   pthread_join 不永远 block。spawn fail path 防御 (refresh_thread 字段 BSS 0,
-//   pthread_join(0) glibc 下返 ESRCH 一行 fprintf 不 fatal)。
-//
-// ----------------------------------------------------------------------------
-// 外部接口 (T2' 暴露 + T6.2 改 atomic 路径)
+// 外部接口
 // ----------------------------------------------------------------------------
 //
 // is_plic_meip_pending / is_plic_seip_pending — hart 侧合成 mip 用 (csr_mip_read +
 //   trap_check_interrupt 入口); 内部查 plic_ctx_map 拿 ctx_id, 然后
-//   atomic_load_explicit(plic_ctx_eip[ctx_id], acquire) 直返 (T6.2 改; 之前是
-//   rdlock + scan)。priv 编码进函数名, 跟 is_clint_msip_pending 同体例; 函数签名
-//   透明, csr_mip_read 调用点零侵入。
+//   atomic_load_explicit(plic_ctx_eip[ctx_id], acquire) 直返, 零 lock 零 scan.
+//   priv 编码进函数名, 跟 is_clint_msip_pending 同体例; 函数签名透明, csr_mip_read
+//   调用点零侵入。
 //
 // device_set_pending / device_clear_pending — 外设侧通知 PLIC 拉高/拉低 device line
-//   (UART / virtio-blk 等); source_id 0 / 越界 silent ignore。T6.2 后内部改异步
-//   入队 plic_refresh_queue + cond_signal not_empty, plic_pending_refresh_thread
-//   异步消费 (接口签名不变, 调用方零侵入)。fixture 通过 test_dev MMIO 写 (sw
-//   TEST_DEV_SET_OFF / CLEAR_OFF) 触发, 详 src/device/test_dev.{h,c}。
+//   (UART / virtio-blk 等); source_id 0 / 越界 silent ignore。内部 wrlock + 改
+//   device_line + recompute_ctx_eip atomic_store + recompute_pending_bitmap
+//   atomic_store + unlock, 同步完成. 跨线程调用 (worker / reader thread) 跟
+//   hart 主帧调用走同一把 wrlock, 短临界区 (~几百 ns), 跟真硬件 wire 信号传播
+//   量级一致. fixture 通过 test_dev MMIO 写 (sw TEST_DEV_SET_OFF / CLEAR_OFF) 触发,
+//   详 src/device/test_dev.{h,c}。
 //
 
 #ifndef PLATFORM_PLIC_H
@@ -166,9 +139,6 @@
 int  plic_init(void);
 int  plic_reset(void);
 void plic_destroy(void);
-
-void plic_start_pending_refresh_thread(void);
-void plic_join_pending_refresh_thread (void);
 
 int  is_plic_meip_pending(uint32_t hartid);
 int  is_plic_seip_pending(uint32_t hartid);

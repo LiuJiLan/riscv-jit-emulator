@@ -4,10 +4,10 @@
 //
 //   POR (Power-On Reset) — 进程启动一次
 //     ram_init / clint_init (atomic 字段 + bus 注册, **不发线程**) /
-//     plic_init (字段 + ctx_map 全 -1 + plic_ctx_eip atomic 清 0 +
-//     refresh_queue mutex/双 cond init + rwlock_init + bus 注册, **不发线程** —
-//     refresh 线程由下方 plic_start_pending_refresh_thread 显式起; T6.2 升级
-//     PLIC 成 "完整 monitor + refresh 辅助线程", 详 plic.h 顶段) /
+//     plic_init (字段 + ctx_map 全 -1 + plic_ctx_eip / plic_pending_bitmap_cache
+//     atomic 清 0 + rwlock_init + bus 注册; PLIC 是 "monitor 但无辅助线程",
+//     hot path 走 atomic 字段, set/clear 同步 wrlock; 详 plic.h 顶段 + 演进 trail
+//     notes/context/plic_evolution_report.md) /
 //     test_dev_init (bus 注册; 无状态 + 无锁 + 无线程, fanout 调 plic.device_set/
 //     clear_pending; 详 device/test_dev.h 顶段) /
 //     uart_init (bus 注册 + mutex_init; **不发线程** — reader 线程由下方 uart_start_
@@ -19,12 +19,10 @@
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
-//     plic_start_pending_refresh_thread (T6.2 新加; main 起 PLIC refresh 辅助线程,
-//     消费 plic_refresh_queue event 异步更新 plic_ctx_eip; 跟 clint timer 同形态) /
 //     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
 //     一直跑; 详 device/uart.h 顶段) /
 //     virtio_blk_start_io_worker_thread (a_03 T5; --blk 路径下 spawn worker 异步
-//     drain avail ring + pread/pwrite; 退化路径不 spawn; 跟 plic refresh 同形态)
+//     drain avail ring + pread/pwrite; 退化路径不 spawn)
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
@@ -421,9 +419,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // PLIC 注册到 bus (clint_init 之后)。**不发线程** — refresh 线程由下方
-    // plic_start_pending_refresh_thread 显式起 (T6.2 升级跟 clint/uart 同体例;
-    // 详 plic.h 顶段)。
+    // PLIC 注册到 bus (clint_init 之后)。PLIC 是 "monitor 但无辅助线程" —
+    // hot path 通过 atomic 字段优化 (plic_ctx_eip / plic_pending_bitmap_cache),
+    // set/clear 走同步 wrlock; 演进 trail (T6.2 异步刷新 → a_03_009 撞 spurious
+    // re-fire 回退同步) 见 notes/context/plic_evolution_report.md.
     if (plic_init() != 0) {
         fprintf(stderr, "plic_init failed\n");
         return 1;
@@ -502,12 +501,6 @@ int main(int argc, char **argv) {
     // SDS=0 (release); 下面 while 因 SRS=0 自然不进, 直接走 cleanup 路径。
     // 不分 spawn-fail error path, destroy chain 只在 while 外写一次。
     clint_start_timer_thread();
-
-    // main 起 PLIC refresh 辅助线程 (T6.2 新加, 跟 clint timer 同形态; 内部消费
-    // plic_refresh_queue event + cond_timedwait 100ms 心跳检 SDS; cooperative
-    // shutdown)。错误处理跟 clint_start_timer_thread 同 — fail 内部 fprintf + set
-    // SRS=0 + SDS=0; while 不进; cleanup 在外写一次。
-    plic_start_pending_refresh_thread();
 
     // main 起 UART RX reader 辅助线程 (受 SDS 控制, 跟 clint timer 同形态; 内部
     // blocking read(STDIN) + poll 100ms timeout cooperative shutdown)。错误处理跟
@@ -592,7 +585,6 @@ int main(int argc, char **argv) {
     // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。
     // ------------------------------------------------------------------------
     clint_join_timer_thread();
-    plic_join_pending_refresh_thread();
     uart_join_reader_thread();
     virtio_blk_join_io_worker_thread();
 

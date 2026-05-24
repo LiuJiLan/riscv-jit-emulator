@@ -1,14 +1,5 @@
 # a03_5 / 02_virtio_blk_write_sector
 #
-# ===== ★★★ 当前 commit KNOWN BROKEN — DO NOT RUN MANUALLY ★★★ =====
-# T6.2 PLIC 异步 refresh queue + handler 同步 ACK 之间的 race window 导致
-# spurious re-fire: handler 第一次 mret 后立即第二次重入, s0 从 1 累加到 2,
-# 让主帧 wait_phase1 (期望 s0 == 1) 永远等不到 → fixture hang.
-#
-# 跑此 fixture 会卡死 (CLion Run 永不退). 不要手动跑.
-# 详 notes/context/tmp.md; commit B (PLIC 同步重构) fix 后才能 pass.
-# fixture 主体 + virtio_blk 实装正确性已由 fixture 01 端到端证明 (trace).
-#
 # ===== 测试目的 =====
 # virtio-blk 写后读自闭环 — 两笔 IO 验落盘:
 #   阶段 1: header.type=OUT + data buf 填 0xa5a5a5a5 (头 16 B) + sector=0

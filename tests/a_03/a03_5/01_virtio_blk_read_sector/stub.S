@@ -209,25 +209,7 @@ m_handler:
     li      s0, 1
     mret
 
-# ===== ★ 当前 commit known-bug (PLIC 同步重构前) ★ =====
-# T6.2 PLIC 异步 refresh queue + handler 同步 ACK 之间的 race window 导致
-# spurious re-fire — handler mret 后 PLIC complete recompute_ctx_eip 时
-# device_line CLEAR event 还在 refresh queue 没生效, plic_ctx_eip 错误地
-# set 1, dispatcher 立即第二次 trap 进 handler. 第二次 handler 把 s3/s4
-# 覆写成 0, s0 累加成 2.
-#
-# 实际 dump (commit A, PLIC fix 之前):
-#   s3 = 0 (覆写期望的 1)
-#   s4 = 0 (覆写期望的 1)
-#   s0 = 2 (累加越过期望的 1)
-#
-# halt 路径仍走完 (wait_loop 用 beqz s0 不敏感具体值); 其他寄存器
-# (a0..a3 / a6 / a7 / s2 / t6) 全部期望值正确 = virtio_blk worker
-# drain / pread / used ring / interrupt_status / MMIO read 实装无 bug.
-#
-# 详 notes/context/tmp.md; commit B (PLIC 同步重构) fix 后回头校真值.
-#
-# ===== 期望结果 (commit B PLIC fix 之后) =====
+# ===== 期望结果 =====
 # 寄存器:
 #   a0 = 0x74726976 (MAGIC = "virt")
 #   a1 = 1          (VERSION = legacy)
@@ -237,7 +219,7 @@ m_handler:
 #   a6 = 1          (used.idx; worker drain 1 笔后推进)
 #   a7 = 0xdeadbeef (sector 0 头 4 byte; disk.img Makefile 写入)
 #   t6 = 0          (status byte = VIRTIO_BLK_S_OK; worker 写入)
-#   s0 = 1          (handler 跑过, 只一次)
+#   s0 = 1          (handler 跑过)
 #   s2 = 0x8000000B (mcause = INT_BIT | IRQ_M_EXT=11)
 #   s3 = 1          (PLIC claim → virtio-blk source_id)
 #   s4 = 1          (InterruptStatus bit0 = used buffer notification)

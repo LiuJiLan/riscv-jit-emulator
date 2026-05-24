@@ -138,12 +138,6 @@
 #define PLIC_N_SOURCES       96U                       /* 跟 QEMU virt 默认对齐; src 0 保留 */
 #define PLIC_N_CONTEXTS      (MAX_HARTS * 2U)          /* M + S 双 context per hart; v1 = 2 */
 
-// PLIC refresh ring 容量 (跟 UART_RX_FIFO_CAP 体例对偶)。
-// device_set/clear_pending 异步入队事件, plic_pending_refresh_thread 单 consumer 拉空。
-// 16 slot 对当前 test_dev + UART 两设备够; 后续加 virtio-blk 等设备时按设备数量扩,
-// 空间换时间。详 src/platform/plic.c 内 plic_refresh_queue 顶段 doc。
-#define PLIC_REFRESH_QUEUE_CAP  16U
-
 // ----------------------------------------------------------------------------
 // test_dev (sifive_test 兼容外设) MMIO 地址布局
 // ----------------------------------------------------------------------------
