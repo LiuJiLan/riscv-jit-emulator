@@ -100,7 +100,9 @@ add_executable(riscv_jit_emulator
         src/device/test_dev.c
         src/device/test_dev.h
         src/device/uart.c
-        src/device/uart.h)
+        src/device/uart.h
+        src/device/virtio_blk.c
+        src/device/virtio_blk.h)
 
 # Test
 enable_testing()

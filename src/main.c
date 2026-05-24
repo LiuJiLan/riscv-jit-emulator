@@ -11,21 +11,28 @@
 //     test_dev_init (bus 注册; 无状态 + 无锁 + 无线程, fanout 调 plic.device_set/
 //     clear_pending; 详 device/test_dev.h 顶段) /
 //     uart_init (bus 注册 + mutex_init; **不发线程** — reader 线程由下方 uart_start_
-//     reader_thread 显式起, 跟 clint 同形态; 详 device/uart.h 顶段) / cpu_create
-//     (内部已写硬件 reset 默认状态)
+//     reader_thread 显式起, 跟 clint 同形态; 详 device/uart.h 顶段) /
+//     virtio_blk_init (--blk 路径下 open image + 双 mutex/双 cond_init + bus 注册;
+//     blk_path==NULL 时退化为不存在; **不发线程** — io_worker 由下方
+//     virtio_blk_start_io_worker_thread 显式起; 详 device/virtio_blk.h 顶段) /
+//     cpu_create (内部已写硬件 reset 默认状态)
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
 //     plic_start_pending_refresh_thread (T6.2 新加; main 起 PLIC refresh 辅助线程,
 //     消费 plic_refresh_queue event 异步更新 plic_ctx_eip; 跟 clint timer 同形态) /
 //     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
-//     一直跑; 详 device/uart.h 顶段)
+//     一直跑; 详 device/uart.h 顶段) /
+//     virtio_blk_start_io_worker_thread (a_03 T5; --blk 路径下 spawn worker 异步
+//     drain avail ring + pread/pwrite; 退化路径不 spawn; 跟 plic refresh 同形态)
 //
 //   System reset — main while 每 iter
 //     cpu_reset / clint_reset (mtimecmp/msip 清, mtime/timer 不动) /
 //     plic_reset (device_line/claimed 清, plic_ctx_map 不动) /
 //     test_dev_reset (no-op, 无状态) /
 //     uart_reset (8 寄存器 + RX FIFO 清, lock + reader_thread 不动) /
+//     virtio_blk_reset (寄存器 + InterruptStatus 清, image_fd + work queue +
+//                       io_worker_thread 不动; 退化路径 no-op) /
 //     dispatcher(hart) / SR-vs-shutdown 判断 (当前简化恒 shutdown; if(0) 骨架
 //     占位预留真 SR 路径)
 //
@@ -38,6 +45,7 @@
 #include "config.h"
 #include "device/test_dev.h"
 #include "device/uart.h"
+#include "device/virtio_blk.h"
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
@@ -436,6 +444,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // virtio-blk (legacy v1.0) 注册到 bus (uart_init 之后)。blk_path==NULL 时模块
+    // 退化 (不 bus 注册, lifecycle 各函数 no-op); 否则 open image_fd + 双 mutex/
+    // 双 cond_init + bus 注册。**不发线程** — io_worker 由下方
+    // virtio_blk_start_io_worker_thread 显式起 (跟 uart/plic/clint 同形态)。
+    // 详 device/virtio_blk.h 顶段。
+    if (virtio_blk_init(blk_path) != 0) {
+        fprintf(stderr, "virtio_blk_init failed\n");
+        return 1;
+    }
+
     // 执行所有加载操作 (argv 顺序攒的 load_ops 列表). 推迟到此处而不是 argv
     // 解析时直接调 — loader 写 RAM 需要 ram_init 已 mapped。后写覆盖按 QEMU
     // loader device 同语义, memcpy 不查冲突。
@@ -451,9 +469,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-
-    /* blk_path 留 session_010 virtio_blk_init 入参; 当前未使用. */
-    (void)blk_path;
 
     // hart 构造: misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
     // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的
@@ -500,6 +515,12 @@ int main(int argc, char **argv) {
     // 不进; cleanup 在外写一次。
     uart_start_reader_thread();
 
+    // main 起 virtio-blk io_worker 辅助线程 (受 SDS 控制, 跟 plic refresh / uart
+    // reader 同形态; 内部 cond_timedwait(not_empty, 100ms) + SDS 检 cooperative
+    // shutdown; drain avail ring + pread/pwrite + 写 used + device_set_pending)。
+    // blk_path==NULL 时 image_fd<0, 函数直接 return 不 spawn (跟 init 的退化对偶)。
+    virtio_blk_start_io_worker_thread();
+
     // ------------------------------------------------------------------------
     // 主 while: system reset 每 iter 进一次
     //
@@ -512,6 +533,7 @@ int main(int argc, char **argv) {
         (void)plic_reset();
         (void)test_dev_reset();
         (void)uart_reset();
+        (void)virtio_blk_reset();
 
         // ====================================================================
         // 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
@@ -572,6 +594,7 @@ int main(int argc, char **argv) {
     clint_join_timer_thread();
     plic_join_pending_refresh_thread();
     uart_join_reader_thread();
+    virtio_blk_join_io_worker_thread();
 
     // ------------------------------------------------------------------------
     // 程序总耗时 (main lifecycle scope; CLOCK_MONOTONIC delta)
@@ -598,6 +621,7 @@ int main(int argc, char **argv) {
     plic_destroy();
     test_dev_destroy();
     uart_destroy();
+    virtio_blk_destroy();
     cpu_destroy(hart);
     ram_destroy();
 
