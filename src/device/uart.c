@@ -280,7 +280,7 @@ static int uart_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
 //
 // 周期 poll(STDIN, POLLIN, 100ms): 100 ms timeout 用于 cooperative shutdown 检测
 // (CLAUDE.md "Do not suggest pthread_cancel/pthread_kill" — 否决积极取消,
-// shutdown_signal=0 + 短 poll timeout 是合规路径)。
+// shutdown_signal 非 0 + 短 poll timeout 是合规路径)。
 //
 // 命中 POLLIN → read 1 byte → 加锁 push RX FIFO + 重算 device_line. FIFO 满则 silent
 // 丢字节 (不真模 ns16550a overrun LSR.OE; 留 long-term TODO).
@@ -292,7 +292,7 @@ static int uart_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
 static void *uart_reader_run(void *arg) {
     (void)arg;
 
-    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire)) {
+    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0u) {
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
         int rc = poll(&pfd, 1, 100);            /* 100 ms timeout cooperative shutdown */
         if (rc < 0) {
@@ -394,7 +394,7 @@ void uart_destroy(void) {
 //     不 fatal (跟 clint.timer_thread 字段同形态)
 
 void uart_start_reader_thread(void) {
-    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0) {
+    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) != 0u) {
         return;
     }
 
@@ -402,13 +402,12 @@ void uart_start_reader_thread(void) {
     if (rc != 0) {
         fprintf(stderr, "uart_start_reader_thread: pthread_create failed: %s\n",
                 strerror(rc));
-        atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-        atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+        shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
     }
 }
 
 void uart_join_reader_thread(void) {
-    /* 调用前置: main 已 atomic_store(&shutdown_signal, 0); reader loop 自然退出.
+    /* 调用前置: main 已 shutdown_signal_set_bit(NORMAL_EXIT); reader loop 自然退出.
        spawn fail case: uart.reader_thread 保持 BSS 0, pthread_join 返 ESRCH, fprintf
        一行不 fatal (跟 clint_join_timer_thread 同形态). */
     int rc = pthread_join(uart.reader_thread, NULL);

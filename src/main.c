@@ -34,7 +34,8 @@
 //     dispatcher(hart) / SR-vs-shutdown 判断 (当前简化恒 shutdown; if(0) 骨架
 //     占位预留真 SR 路径)
 //
-//   HART reset — dispatcher 内部 per-hart 重启 (future; dispatcher.c 末段注释占位)
+// (取消 "HART reset" 项目自定义概念: spec 只规定 reset 后状态, 不规定何时 reset
+// hart; 所有 hart-internal 不可恢复路径都归并为 system reset, 受 SRS 控制。)
 //
 // 顶上 decode_test() 是 main 内嵌单测 (52 case, 纯函数 sanity), 每跑一次顺手过一遍,
 // fail 立即 return 1; tests/unit/ 框架待 unit runner 真做时迁出。
@@ -481,16 +482,15 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     // POR runtime lifecycle 初始化 (cpu_create 之后, while 之前)
     //
-    // SRS / SDS 极性: 1=继续, 0=触发 (runtime.h doc 段)。runtime.c 定义时已初值
-    // 1 兜底, 这里再显式 set 1 表达"程序 lifecycle 显式可读" (跟 user 伪码顺序
-    // 一致 — 进 while 之前明确把两个 flag 设到允许状态)。
+    // SRS / SDS 极性: 0=允许执行, 非0=触发对应停机路径 (bitmap, 详 runtime.h)。
+    // runtime.c 定义时已初值 0 兜底, 这里显式 store 0 表达 lifecycle 可读 (进
+    // while 前明确把两个 bitmap 设到允许状态)。
     //
-    // 顺序: SRS 先 / SDS 后 — 因为 CLINT timer 等不受 SRS 控制的辅助线程可能
-    // 中途出错主动 set SDS=0 (同时 set SRS=0 跟随; "SDS 蕴含 SRS" 协议); SRS
-    // 必须在 timer 线程发出前已置 1, 否则线程错路径 set SRS 后被这里覆盖。
+    // 顺序无关 — 写 0 是"清空所有 bit", 不存在 race 路径 (此时辅助线程未 spawn)。
+    // 不调 set_bit 接口 (那是 set 路径, 写非 0 bit)。
     // ------------------------------------------------------------------------
-    atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
-    atomic_store_explicit(&shutdown_signal,     1, memory_order_release);
+    atomic_store_explicit(&system_reset_signal, 0u, memory_order_release);
+    atomic_store_explicit(&shutdown_signal,     0u, memory_order_release);
 
     // main 起 timer 辅助线程 (受 SDS 控制, 跨 system reset 一直跑; 见 dummy.txt
     // §12 谁 spawn 谁 join + clint.h 顶段 doc)。
@@ -518,7 +518,7 @@ int main(int argc, char **argv) {
     // 当前单 hart 直调 dispatcher; 未来多 hart 这里 pthread_create per hart +
     // join (受 SRS 控制的线程 spawn / join 占位见下方注释段)。
     // ------------------------------------------------------------------------
-    while (atomic_load_explicit(&system_reset_signal, memory_order_acquire)) {
+    while (atomic_load_explicit(&system_reset_signal, memory_order_acquire) == 0u) {
         cpu_reset(hart);
         (void)clint_reset();
         (void)plic_reset();
@@ -545,39 +545,49 @@ int main(int argc, char **argv) {
         // ====================================================================
 
         // ====================================================================
-        // 区分 system reset 重 iter vs shutdown 退出
+        // 区分 system reset 重 iter vs cleanup-and-exit
         //
-        // 真接通: test_dev sifive_test FINISHER 0x7777 RESET 命中时, test_dev_write
-        // 内 set reset_req=1 + SRS=0; 这里 consume reset_req — 1 走 SR continue
-        // (timer / uart reader thread 跨 reset 一直跑, SDS 不动), 0 走 shutdown break.
+        // dispatcher 退出后 system_reset_signal 非 0, 其 bit 编码退出原因 (详
+        // runtime.h)。规则:
+        //   - SRS & ABORT_MASK 命中 (SHUTDOWN_TRIGGER / DEVICE_FAIL / HART_MDT)
+        //     → cleanup + return exit_code (按 sifive_test 写的 exit_code, 其他
+        //     fatal 路径默认 0)
+        //   - 仅 SYSRESET_BIT_TEST_RESET 命中 (0x7777 sifive_test reset)
+        //     → try_clear_if_shutdown_zero CAS; 清成功 → continue 进下一 iter
+        //       (timer/uart/io_worker 跨 reset 一直跑); 清失败 (shutdown 非 0,
+        //        即同时发生设备 fail 等) → 走 cleanup
         //
-        // dispatcher tri-fault 退出 (in_trap=3) 也走 SRS=0, 但 reset_req=0, 落 else
-        // 分支 — 跟 PASS/FAIL 路径同形态.
-        //
-        // 跟 dispatcher.c 末段 "未来 reset 扩展占位" 一致风格.
+        // 取消 test_dev_consume_reset_request — reset 触发改用 SRS bit TEST_RESET
+        // 表达; main while 直接读 SRS bit (acquire 顺路同步 release-store)。
         // ====================================================================
-        if (test_dev_consume_reset_request()) {
-            atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
-            continue;
-        } else {
-            atomic_store_explicit(&shutdown_signal, 0, memory_order_release);
-            break;
+        {
+            uint32_t srs_state = atomic_load_explicit(&system_reset_signal,
+                                                     memory_order_acquire);
+            if ((srs_state & SYSRESET_BIT_TEST_RESET) &&
+                !(srs_state & SYSRESET_ABORT_MASK) &&
+                system_reset_signal_try_clear_if_shutdown_zero()) {
+                continue;
+            }
         }
+        break;
     }
+
+    // ------------------------------------------------------------------------
+    // POR 退出段统一通知 SDS-controlled 线程退出: shutdown_signal_set_bit
+    // (NORMAL_EXIT) — 若 shutdown bit 已被别人设 (e.g. timer fail 设
+    // DEVICE_FAIL / test_dev PASS/FAIL 设 NORMAL_EXIT), 这步 fetch_or 不丢已设
+    // bit; 若是 ABORT_MASK 路径 (HART_MDT / 设备 fail 通过 SRS bit 触发)
+    // shutdown 还是 0, 这步是 main 顶层决定退出主动设 NORMAL_EXIT 让 thread 退。
+    // 调用前置 dummy.txt §12 谁 spawn 谁 join — set 完才 join, 否则 join 死等。
+    // ------------------------------------------------------------------------
+    shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
 
     // ------------------------------------------------------------------------
     // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → 三 destroy
     //
-    // clint_join_timer_thread 调用前置 (SDS=0) 在三条路径之一已做:
-    //   1. 正常 path: while else 分支 set SDS=0 + break
-    //   2. spawn fail path: clint_start_timer_thread 内部 set SRS=0 + SDS=0
-    //      (while 因 SRS=0 不进, SDS=0 已生效)
-    //   3. dispatcher tri-fault path: dispatcher 函数末 set SRS=0 → while 退 →
-    //      else 分支 set SDS=0 + break
-    // pthread_join 不会永远 block。
-    //
-    // 注: spawn fail path 下 clint.timer_thread 是 BSS 0 init, pthread_join 在
-    // glibc/musl 下返 ESRCH "No such process", fprintf 一行不 fatal。详
+    // clint_join_timer_thread 调用前置 (SDS 非 0) 已由上方 shutdown_signal_set_bit
+    // (NORMAL_EXIT) 保证; spawn fail path 下 thread handle 是 BSS 0, pthread_join
+    // 在 glibc/musl 下返 ESRCH "No such process", fprintf 一行不 fatal。详
     // clint.h clint_join_timer_thread 顶段 doc。
     //
     // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。

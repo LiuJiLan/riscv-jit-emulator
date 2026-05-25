@@ -22,19 +22,21 @@
 
 
 // ----------------------------------------------------------------------------
-// file-static state — sifive_test FINISHER 解析后的两个 main-readable 字段
+// file-static state — sifive_test FINISHER 解析后的单个 main-readable 字段
 // ----------------------------------------------------------------------------
 //
 // plain int 不 _Atomic — 跨线程可见性靠 SRS/SDS 的 atomic release-acquire 同步:
-//   - test_dev_write 内先写 exit_code / reset_req (plain), 然后 atomic_store SRS/SDS
-//     (release); main while 读 SRS (acquire) 退出后再读 exit_code / reset_req, plain
-//     字段通过 atomic release-acquire 边界跨线程可见 (dummy.txt §7 monitor 模型)
+//   - test_dev_write 内先写 exit_code (plain), 然后 shutdown_signal_set_bit 内
+//     atomic_fetch_or release; main while 读 SRS (acquire) 退出后再读 exit_code,
+//     plain 字段通过 atomic release-acquire 边界跨线程可见 (dummy.txt §7 monitor 模型)
 //   - 唯一写入点 = test_dev_write (hart 主线程); 唯一读入点 = main while 之后 (同线程,
 //     但跨 atomic 边界); 不存在并发写
 //
-// 默认 0 (BSS) — PASS exit_code=0 是恒等, FAIL/RESET 路径写入新值.
+// 默认 0 (BSS) — PASS exit_code=0 是恒等, FAIL 路径写入新值。RESET 路径不写 exit_code
+// (返 0 默认, 因为 RESET 是 reset-and-continue, 真退出时按当时是否还有 PASS/FAIL 决定)。
+//
+// reset_req 字段已废除 — reset 触发改用 SRS bit SYSRESET_BIT_TEST_RESET 表达。
 static int test_dev_exit_code = 0;
-static int test_dev_reset_req = 0;
 
 
 // ----------------------------------------------------------------------------
@@ -76,29 +78,26 @@ static int test_dev_write(void *ctx, uint32_t off, const void *buf, uint32_t siz
         device_clear_pending(value);
     } else if (off == (uint32_t)TEST_DEV_SIFIVE_OFF) {
         /* sifive_test FINISHER: cmd = low 16; arg = high 16 (FAIL exit code).
-           PASS/FAIL 设 SRS=0 + SDS=0 → main while 退 → cleanup → return exit_code.
-           RESET 设 SRS=0 + reset_req=1, SDS 不动 (跨 reset 一直跑) → main 判
-           reset_req 走 SR continue.
-           注意写入顺序: 先 plain 字段 (exit_code/reset_req), 后 atomic SRS/SDS (release) —
-           release-acquire 跟 main while 读取建立 happens-before, 让 plain 字段可见. */
+           PASS/FAIL → shutdown_signal_set_bit(NORMAL_EXIT) (顺序 B 蕴含 SRS
+           BIT_SHUTDOWN_TRIGGER; ABORT_MASK 命中, main cleanup + return exit_code).
+           RESET → system_reset_signal_set_bit(TEST_RESET) (非 ABORT, main try_clear
+           continue, SDS 不动 — timer / uart reader 跨 reset 一直跑, 跟真硬件 RTC
+           oscillator + UART pin always-on 一致).
+           写入顺序: 先 plain 字段 (exit_code), 后 set_bit 内 atomic_fetch_or release —
+           release-acquire 跟 main while 读取建立 happens-before, plain 字段可见. */
         uint32_t cmd = value & 0xFFFFu;
         uint32_t arg = (value >> 16) & 0xFFFFu;
         switch (cmd) {
           case TEST_DEV_FINISHER_PASS:
             test_dev_exit_code = 0;
-            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-            atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+            shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
             break;
           case TEST_DEV_FINISHER_FAIL:
             test_dev_exit_code = (int)arg;
-            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-            atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+            shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
             break;
           case TEST_DEV_FINISHER_RESET:
-            test_dev_reset_req = 1;
-            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-            /* SDS 不动 — RESET 是 warm reset 语义, timer / uart reader thread 跨 reset
-               一直跑 (跟真硬件 RTC oscillator + UART pin always-on 一致). */
+            system_reset_signal_set_bit(SYSRESET_BIT_TEST_RESET);
             break;
           /* 其他 cmd: silent (兼容未来扩展) */
         }
@@ -129,11 +128,10 @@ int test_dev_init(void) {
 }
 
 int test_dev_reset(void) {
-    /* system reset 每 iter (含 RESET cmd 触发的 continue path): exit_code / reset_req 清.
+    /* system reset 每 iter (含 RESET cmd 触发的 continue path): exit_code 清.
        不持锁 — 跟 plic_reset / uart_reset 内"system reset 时 dispatcher 主帧停, 无并发"
        同前提. */
     test_dev_exit_code = 0;
-    test_dev_reset_req = 0;
     return 0;
 }
 
@@ -143,19 +141,15 @@ void test_dev_destroy(void) {
 
 
 // ----------------------------------------------------------------------------
-// 外部接口: main 端读取 exit_code / consume reset_request
+// 外部接口: main 端读取 exit_code
 // ----------------------------------------------------------------------------
 //
-// 调用约束: main 在 while 退出之后 (atomic_load SRS=0 acquire 之后) 调用; 单次读取,
-// 无并发. consume_reset 读后清字段 — 避免如果 main while 再进 (RESET continue 之后
-// dispatcher 再 tri-fault 退) 把上次 RESET 的残留误当作新 reset.
+// 调用约束: main 在 while 退出之后 (atomic_load SRS 非 0 acquire 之后) 调用; 单次
+// 读取, 无并发。
+//
+// reset_req 字段 + test_dev_consume_reset_request 已废除 — reset 触发改用 SRS bit
+// SYSRESET_BIT_TEST_RESET 表达, main 直接读 SRS bit, 不需要 consume 式接口。
 
 int test_dev_get_exit_code(void) {
     return test_dev_exit_code;
-}
-
-int test_dev_consume_reset_request(void) {
-    int r = test_dev_reset_req;
-    test_dev_reset_req = 0;
-    return r;
 }

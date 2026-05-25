@@ -19,7 +19,7 @@
 //                 clint_destroy (POR 收尾纯 cleanup; **不含 pthread_join**)
 //   thread lifecycle (跟 lifecycle 解耦, dummy.txt §12 谁 spawn 谁 join):
 //                 clint_start_timer_thread (main 调; pthread_create timer 辅助线程)
-//                 clint_join_timer_thread  (main 调; 等 SDS=0 后 pthread_join)
+//                 clint_join_timer_thread  (main 调; 等 SDS 非 0 后 pthread_join)
 //
 
 #ifndef PLATFORM_CLINT_H
@@ -61,21 +61,21 @@ void clint_destroy(void);
 // clint.mtime + TIMEBASE_PER_WAKE 每 TIMER_WAKE_INTERVAL_NS。
 //
 // 错误走 runtime signal 通道, 不走 return value:
-//   - 前置 check: SDS 已 0 (前面有别的 init 失败) → 直接 return 不 spawn
-//   - pthread_create 失败 → fprintf + atomic_store SRS=0 + SDS=0 release;
-//     后续 main while 因 SRS=0 自然不进, 走 cleanup 路径; pthread_create
-//     POSIX 7.2 规范 "fail 不修改 thread 参数", clint.timer_thread 保持
-//     BSS 0 init
+//   - 前置 check: SDS 已非 0 (前面有别的 init 失败) → 直接 return 不 spawn
+//   - pthread_create 失败 → fprintf + shutdown_signal_set_bit(DEVICE_FAIL) (内部
+//     按顺序 B 蕴含 SRS BIT_SHUTDOWN_TRIGGER); 后续 main while 因 SRS 非 0 自然
+//     不进, 走 cleanup 路径; pthread_create POSIX 7.2 规范 "fail 不修改 thread
+//     参数", clint.timer_thread 保持 BSS 0 init
 //
 // pthread_t 句柄存 clint.c file-static struct clint 内部, 供 clint_join_timer_
 // thread 用。
 void clint_start_timer_thread(void);
 
 // main 调一次 (while 退出后, clint_destroy 之前): 等 timer 辅助线程看到
-// SDS=0 自然退后 pthread_join 回收。
+// SDS 非 0 自然退后 pthread_join 回收。
 //
-// 调用前置: main 已 atomic_store(&shutdown_signal, 0) 通知 timer thread 退;
-// 否则 pthread_join 永远 block (timer thread 在 while(SDS) 内永不退)。
+// 调用前置: main 已 shutdown_signal_set_bit(NORMAL_EXIT) 通知 timer thread 退;
+// 否则 pthread_join 永远 block (timer thread 在 while(SDS==0) 内永不退)。
 //
 // 错误处理: pthread_join 失败 fprintf 不 fatal (已在退出路径)。
 //

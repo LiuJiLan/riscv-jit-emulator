@@ -80,7 +80,8 @@
 //     regs[0]=xtvec[deliver_priv]), 不长跳 (调用栈浅, 直接 return 给 dispatcher 接管即可)。
 //     return 值仅是 0/非0 的状态信号:
 //       0  = fetch OK, pa_out / hva_out 已填, dispatcher 进 block 3
-//       非0 = trap 已 deliver, dispatcher continue 让 while(in_trap < 3) 接管退出判断
+//       非0 = trap 已 deliver (或 M-mode critical-error 已 set HART_MDT),
+//             dispatcher continue 让 while(system_reset_signal == 0) 接管退出判断
 //     fetch 失败的 cause 集 (mmu_translate_pc 内部填给 trap_set_exception_state):
 //       1  = Instruction Access Fault   (PA 落在不可执行物理区域: MMIO / 不存在内存 / PMP 拒绝)
 //       12 = Instruction Page Fault     (Sv32 walker 翻译失败: PTE 无效 / X 位 / U 位等)
@@ -109,11 +110,11 @@
 // trap.h 暴露两层 helper:
 //
 //   trap_set_exception_state(hart, cause, tval) —— 架构语义层 (不长跳)
-//     in_trap++; >= 3 早 return (候选 A: 不 deliver, 字段保留第二次状态作 root cause)
-//     否则: 选 deliver_priv (medeleg-driven; M-mode caller 总 M, 否则按 medeleg.bit(cause))
-//           写 xcause/xtval/xepc[deliver_priv]; 切 priv (mstatus/sstatus 字段按 deliver_priv
-//           分流); regs[0] = xtvec[deliver_priv]
-//     返回 in_trap 当前值 (mmu_translate_pc 透传给 dispatcher 当 0/非0 状态信号)。
+//     算 deliver_priv (medeleg-driven; M-mode caller 总 M, 否则按 medeleg.bit(cause));
+//     检 sstatus.SDT (S-trap 时 SDT=1 → 升级 M cause=DOUBLE_TRAP mtval2=原 tval) +
+//     检 mstatus.MDT (M-trap 时 MDT=1 → critical-error: set HART_MDT, return 1);
+//     正常 deliver: 写 xcause/xtval/xepc[deliver_priv]; 切 priv; set 对应 xDT=1;
+//     regs[0] = xtvec[deliver_priv]。返非 0 = "已设状态, dispatcher continue 接管"。
 //
 //   trap_raise_exception(hart, cause, tval) —— interpreter / JIT 长跳入口
 //     _Noreturn, 内部 trap_set_exception_state + siglongjmp(*hart->jmp_buf_ptr, 1) 跳回 dispatcher
@@ -121,7 +122,7 @@
 //
 // mmu_translate_pc 调路径 (1) trap_set_exception_state, dispatcher 通过 return rc 接管;
 // mmu_walker_* / interpreter case 调路径 (2) trap_raise_exception, 经 longjmp 跳回 dispatcher。
-// 两路最终都靠 dispatcher 的 while(in_trap < 3) 退出判断。
+// 两路最终都靠 dispatcher 的 while(system_reset_signal == 0) 退出判断。
 //
 // ============================================================================
 // PA 落 MMIO 时的行为差异
@@ -332,8 +333,9 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 //
 // 返回值 (0/非0 状态信号, 不返回 cause):
 //   0   = OK,  pa_out / hva_out 已填, dispatcher 进 block 3
-//   非0 = trap 已 deliver (内部已调 trap_set_exception_state 写 xcause/xtval/xepc/regs[0]=xtvec),
-//          dispatcher continue 让 while(in_trap < 3) 接管退出判断
+//   非0 = trap 已 deliver (内部已调 trap_set_exception_state 写 xcause/xtval/xepc/regs[0]=xtvec,
+//          或 M-mode critical-error 已 set HART_MDT), dispatcher continue 让
+//          while(system_reset_signal == 0) 接管退出判断
 //
 // 失败时不填 pa_out / hva_out (不需要, dispatcher continue 跳过本轮 block; 下一轮 fetch
 // 从 xtvec 开始)。dispatcher 不需要自己填 mtval — mmu_translate_pc 自己调 trap_set_exception_state
@@ -343,7 +345,7 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 // dispatcher 的预期使用形态 (见 dispatcher.c)
 // ============================================================================
 //
-//   while (hart->trap.in_trap < 3) {
+//   while (atomic_load(&system_reset_signal) == 0) {
 //       /* block 1: regime / current_tlb */
 //       ...
 //       int rc = mmu_translate_pc(hart, current_tlb, &pa, &hva);
@@ -352,7 +354,7 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 //       /* block 3: interpret / JIT */
 //       interpret_one_block(hart, current_tlb, hva, &local_count);
 //   }
-//   /* dispatcher 退出: in_trap == 3, main 端 fprintf 表 halt + 未来 reset */
+//   /* dispatcher 退出: SRS 非 0 (任一 bit, 详 runtime.h), main 按 ABORT_MASK 处理 */
 //
 // ----------------------------------------------------------------------------
 int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,

@@ -403,7 +403,10 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //          - mstatus.MPIE = 1                          (RV spec 要求)
             //          - mstatus.MPP  = PRIV_U                     (RV spec least-priv reset)
             //          - hart->regs[0] = hart->trap.xepc[PRIV_M]   (从 mepc 恢复 PC)
-            //          - hart->trap.in_trap = 0                    (复位嵌套链)
+            //          - mstatus.MDT = 0                           (Smdbltrp §3.1.6.2 MRET 清 MDT)
+            //          - 若新 priv ∈ {U, VS, VU}: sstatus.SDT = 0  (§3.1.6.2 末段
+            //                                                       Ssdbltrp 联动; 项目无 H,
+            //                                                       仅 PRIV_U 触发)
             //
             //          case 末 break (不 goto out): fetch loop 末 += PC_STEP_NONE (=0, NOP),
             //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
@@ -445,7 +448,14 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                                     | (uint64_t)mstatus_lo;
 
-                hart->trap.in_trap = 0;
+                /* Smdbltrp §3.1.6.2: MRET 清 mstatus.MDT = 0 (在 _mstatus bit 42).
+                 * Ssdbltrp §4.1.1.5 联动: 若新 priv ∈ {U, VS, VU}, sstatus.SDT
+                 * 也清 0 (项目无 H 扩展, 仅 PRIV_U 触发)。 */
+                hart->trap._mstatus &= ~MSTATUS_MDT_BIT64;
+                if (hart->priv == PRIV_U) {
+                    hart->trap._mstatus &= ~(uint64_t)MSTATUS_SDT;
+                }
+
                 hart->regs[0]      = hart->trap.xepc[PRIV_M];
                 break;
             }
@@ -458,7 +468,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             //   SPIE = 1
             //   SPP  = PRIV_U = 0 (least-priv reset)
             //   pc   = sepc (= trap.xepc[PRIV_S])
-            //   in_trap = 0 (项目复位嵌套链, 跟 MRET 同)
+            //   sstatus.SDT = 0 (Ssdbltrp §4.1.1.5 SRET 清 SDT)
             //
             // 权限要求 (跟 OP_MRET 同形态):
             //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction,
@@ -483,10 +493,12 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 /* mstatus.SPP = PRIV_U = 0 (RV spec least-priv reset; SPP 是 1-bit, 清 0) */
                 mstatus_lo &= ~MSTATUS_SPP;
 
+                /* Ssdbltrp §4.1.1.5: SRET 清 sstatus.SDT = 0 (regardless of new priv) */
+                mstatus_lo &= ~MSTATUS_SDT;
+
                 hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                                     | (uint64_t)mstatus_lo;
 
-                hart->trap.in_trap = 0;
                 hart->regs[0]      = hart->trap.xepc[PRIV_S];   /* sepc */
                 break;
             }

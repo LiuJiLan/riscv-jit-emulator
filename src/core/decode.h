@@ -158,8 +158,9 @@ typedef enum {
     // ---- I-type SYSTEM SRET ----
     // opcode 0x73, funct3=0, imm[11:0]=0x102 (= inst[31:20]); rd=0, rs1=0 (RV spec)。
     // 跟 OP_MRET 同形态, 不同点:
-    //   - MRET: priv=MPP; MIE=MPIE; MPIE=1; MPP=U; pc=mepc; in_trap=0
-    //   - SRET: priv=SPP; SIE=SPIE; SPIE=1; SPP=U; pc=sepc; in_trap=0
+    //   - MRET: priv=MPP; MIE=MPIE; MPIE=1; MPP=U; pc=mepc; mstatus.MDT=0
+    //           (+ 若新 priv ∈ {U/VS/VU}: sstatus.SDT=0; Smdbltrp/Ssdbltrp 联动)
+    //   - SRET: priv=SPP; SIE=SPIE; SPIE=1; SPP=U; pc=sepc; sstatus.SDT=0
     //   操作的是 _mstatus 的不同位段 (M-mode 段 vs S-mode 段); pc 来源不同
     //   (mepc=trap.xepc[PRIV_M] vs sepc=trap.xepc[PRIV_S])
     //

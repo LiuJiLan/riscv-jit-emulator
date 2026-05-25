@@ -29,7 +29,7 @@
 //     drain avail ring (按 QueueNum 上限循环) → 解析 desc 链 → pread/pwrite
 //     → 写 used ring → 设 InterruptStatus.bit0 → device_set_pending(
 //     VIRTIO_BLK_PLIC_IRQ)
-//   - shutdown_signal=0 自然退出 (跟 uart_reader_run 同体例)
+//   - shutdown_signal 非 0 自然退出 (跟 uart_reader_run 同体例)
 //
 // 异步默认体例: hart fast path 不阻塞优先, pread/pwrite blocking syscall 必走
 // 异步 worker. 详 dummy.txt §7 (monitor 模型) + trade_off_log §T.7 (异步默认体例).
@@ -110,12 +110,13 @@
 //   - image_fd==-1 时 no-op.
 //
 // virtio_blk_start_io_worker_thread()
-//   - POR spawn (uart_start_reader_thread 之后); SDS=0 或 image_fd==-1 时 skip;
-//     spawn fail fprintf + SRS=0 + SDS=0 (跟 UART/PLIC 同形态).
+//   - POR spawn (uart_start_reader_thread 之后); SDS 已非 0 或 image_fd==-1 时 skip;
+//     spawn fail fprintf + shutdown_signal_set_bit(DEVICE_FAIL) (跟 UART/CLINT 同形态).
 //
 // virtio_blk_join_io_worker_thread()
-//   - POR 退出段 (uart_join_reader_thread 之后); SDS=0 之后调; pthread_join +
-//     ESRCH 容错 (BSS 0 init, spawn skip / fail 路径下 join 返 ESRCH).
+//   - POR 退出段 (uart_join_reader_thread 之后); main 已 shutdown_signal_set_bit
+//     (NORMAL_EXIT) 之后调; pthread_join + ESRCH 容错 (BSS 0 init, spawn skip / fail
+//     路径下 join 返 ESRCH).
 //   - image_fd==-1 时 no-op (没 spawn 也不 join).
 //
 

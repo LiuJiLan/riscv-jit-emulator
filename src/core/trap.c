@@ -18,37 +18,38 @@
 #include "csr.h"        // csr_mip_read (trap_check_interrupt 合成读 mip)
 #include "debug.h"      // DEBUG_EXCEPTION / DEBUG_INT_CHECK / DEBUG_TIME/SOFT/EXT_INTR
 #include "riscv.h"      // PRIV_M / CAUSE_INTERRUPT_BIT / IRQ_* / MIE_VALID_MASK / SIE_MASK / MSTATUS_*
+#include "runtime.h"    // system_reset_signal_set_bit (M-mode double trap critical-error)
 
 #include <setjmp.h>     // siglongjmp
 #include <stdint.h>
 
 
 // ----------------------------------------------------------------------------
-// trap_set_exception_state —— 架构语义层 (sync exception 路径), 不长跳; 详见 trap.h doc
+// trap_set_exception_state —— 架构语义层 (sync exception 路径), 不长跳
+//
+// in_trap 字段废除 (a_03_session_011), 改走 spec-defined MDT/SDT 路径:
+//   S-trap entry: 若 sstatus.SDT=1, unexpected trap (Ssdbltrp §4.1.1.5) →
+//                 升级到 M-mode, cause=CAUSE_DOUBLE_TRAP, mtval2=原 tval, tval=0
+//   M-trap entry: 若 mstatus.MDT=1, unexpected trap (Smdbltrp §3.1.6.2) →
+//                 critical-error state (项目无 NMI, abort): set HART_MDT, return 1
+//                 不更新 architectural state (per spec)
+//   正常 deliver: set 对应 xstatus.xDT=1 (MDT 在 _mstatus bit 42 / SDT 在 bit 24)
+// 返值: 0 = 没操作 (当前不存在, 总会 deliver 或升级或停机); 非 0 = "已设状态,
+//       dispatcher continue 重 fetch"。caller (mmu_translate_pc / dispatcher IALIGN
+//       兜底 / trap_raise_exception) 一律 rc != 0 → continue 或 longjmp.
 // ----------------------------------------------------------------------------
-uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
+int trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
     // DEBUG trace 'E'. 三条调用路径都是 sync exception:
     //   (a) trap_raise_exception 内部长跳 (interpreter / JIT helper 走 dummy.txt §1 路径 2a)
     //   (b) mmu_translate_pc fetch fault 非长跳 (dispatcher 主帧, 路径 2b)
     //   (c) dispatcher 循环顶 pc IALIGN 兜底非长跳 (cause 0, 跟 (b) 同形态; 见 §9)
-    // 在 in_trap++ 后, early return 之前打 — triple fault 那次也算 trace 发生 ('EEE' 数嵌套深度).
     DEBUG_EXCEPTION();
-
-    hart->trap.in_trap++;
-
-    // 候选 A: 第三次 (含) 进 set_state 早 return, 不 deliver. 字段保留第二次状态作 root cause.
-    // 跟 RV Smdbltrp 扩展无关 (项目不实现; 见 trap.h doc).
-    if (hart->trap.in_trap >= 3) {
-        return hart->trap.in_trap;
-    }
 
     // ------------------------------------------------------------------------
     // deliver_priv 按 _medeleg 真生效 (RV Privileged Spec §3.1.8)
     //   - M-mode trap (caller priv = M): 总 deliver M
     //   - U/S-mode trap + _medeleg.bit(cause) = 1: deliver S
     //   - U/S-mode trap + _medeleg.bit(cause) = 0: deliver M
-    // medeleg bit 11 (CAUSE_ECALL_FROM_M) 由 csr_medeleg_write WARL hardwire 0.
-    // cause < 64 边界检查: _medeleg uint64_t (类 1 future-proof RV64).
     // ------------------------------------------------------------------------
     uint8_t deliver_priv;
     if (hart->priv == PRIV_M) {
@@ -59,18 +60,47 @@ uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
         deliver_priv = PRIV_M;
     }
 
+    // ------------------------------------------------------------------------
+    // Ssdbltrp §4.1.1.5: S-trap entry 检 SDT — SDT=1 时 unexpected, 升级到 M
+    // cause=CAUSE_DOUBLE_TRAP (16); mtval2 = 原本要写 stval 的 tval; 新 tval=0.
+    // (spec: "writes registers, except mcause and mtval2, with the same info
+    //  that the unexpected trap would have written if it was taken into M-mode.
+    //  The mtval2 register is then set to what would be otherwise written into
+    //  the [stval]")
+    // ------------------------------------------------------------------------
+    if (deliver_priv == PRIV_S &&
+        (hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u) {
+        hart->trap.mtval2 = tval;
+        cause = CAUSE_DOUBLE_TRAP;
+        tval = 0u;
+        deliver_priv = PRIV_M;
+    }
+
+    // ------------------------------------------------------------------------
+    // Smdbltrp §3.1.6.2: M-trap entry 检 MDT — MDT=1 时 unexpected, hart 进
+    // critical-error state. 项目无 NMI (Smrnmi 未实装), 按 QEMU 实践 abort:
+    // set system_reset_signal HART_MDT, dispatcher 退出走 ABORT_MASK cleanup.
+    // 不更新 architectural state (per spec "without updating any architectural
+    // state, including the pc"); xcause/xtval/xepc/mstatus 保留 root-cause 状态。
+    // ------------------------------------------------------------------------
+    if (deliver_priv == PRIV_M &&
+        (hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u) {
+        system_reset_signal_set_bit(SYSRESET_BIT_HART_MDT);
+        return 1;
+    }
+
     hart->trap.xcause[deliver_priv] = cause;                  /* cause < 32, 不含 CAUSE_INTERRUPT_BIT */
     hart->trap.xtval [deliver_priv] = tval;
     hart->trap.xepc  [deliver_priv] = hart->regs[0];          /* 当前指令 PC */
 
     // ------------------------------------------------------------------------
-    // 切 priv mode + 保存 mstatus / sstatus 字段 (按 deliver_priv 分流)
-    //   deliver M (§3.1.6.1): MPP=caller, MPIE=MIE, MIE=0
-    //   deliver S (§5.1.1):   SPP=caller(1bit), SPIE=SIE, SIE=0
-    // 操作 _mstatus 低 32 位 (跟 sstatus 入口共字段, mask 不同); 高 32 位 (mstatush) 不动.
+    // 切 priv mode + 保存 mstatus 字段 + set xDT=1 (按 deliver_priv 分流)
+    //   deliver M (§3.1.6.1): MPP=caller, MPIE=MIE, MIE=0, MDT=1
+    //   deliver S (§5.1.1):   SPP=caller(1bit), SPIE=SIE, SIE=0, SDT=1
     // ------------------------------------------------------------------------
     {
-        uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+        uint64_t ms = hart->trap._mstatus;
+        uint32_t mstatus_lo = (uint32_t)(ms & 0xFFFFFFFFu);
 
         if (deliver_priv == PRIV_M) {
             mstatus_lo &= ~MSTATUS_MPP;
@@ -78,6 +108,7 @@ uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
             if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
             else                          mstatus_lo &= ~MSTATUS_MPIE;
             mstatus_lo &= ~MSTATUS_MIE;
+            ms |= MSTATUS_MDT_BIT64;                          /* M-trap entry: MDT=1 */
         } else {
             /* deliver_priv == PRIV_S; caller 必为 U/S */
             if (hart->priv == PRIV_S) mstatus_lo |=  MSTATUS_SPP;
@@ -85,34 +116,30 @@ uint8_t trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
             if (mstatus_lo & MSTATUS_SIE) mstatus_lo |=  MSTATUS_SPIE;
             else                          mstatus_lo &= ~MSTATUS_SPIE;
             mstatus_lo &= ~MSTATUS_SIE;
+            mstatus_lo |= MSTATUS_SDT;                        /* S-trap entry: SDT=1 */
         }
 
-        hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+        hart->trap._mstatus = (ms & 0xFFFFFFFF00000000ULL)
                             | (uint64_t)mstatus_lo;
     }
 
     hart->priv    = deliver_priv;
-    /* Exception 永走 BASE (mode bit mask 掉); D9 解绑 csr_*tvec_write 后 xtvec 低 2 bit 可能
-     * 是 mode=1 vectored, exception 函数自己 mask 保证跳到 4-byte 对齐 base. */
+    /* Exception 永走 BASE (mode bit mask 掉) */
     hart->regs[0] = hart->trap.xtvec[deliver_priv] & ~0x3u;
 
-    return hart->trap.in_trap;
+    return 1;
 }
 
 
 // ----------------------------------------------------------------------------
-// trap_set_interrupt_state —— 架构语义层 (async interrupt 路径), 不长跳; 详见 trap.h doc
+// trap_set_interrupt_state —— 架构语义层 (async interrupt 路径), 不长跳
 //
-// 跟 trap_set_exception_state 共用 mstatus 翻转 30 行 (重复 by design; 详 trap.h doc 段
-// "跟 trap_set_exception_state 的分歧"). 分歧 5 点全在本函数体现:
-//   1. cause_low ∈ [0,32); xcause = cause_low | CAUSE_INTERRUPT_BIT (高位本函数加)
-//   2. 查 mideleg (替 _medeleg)
-//   3. tval = 0 (RV spec §3.1.16 interrupt tval 永远 0)
-//   4. jump-to 处理 vectored mode (mode==1 时 base + 4*cause_low)
-//   5. DEBUG 按 cause_low 分流 't'/'s'/'e'
+// 跟 trap_set_exception_state 共用 mstatus 翻转 + MDT/SDT 检查 (重复 by design;
+// 5 点分歧: cause_low 加 INTERRUPT_BIT / mideleg / tval=0 / vectored / DEBUG 分流).
+// MDT/SDT 路径同 exception (interrupt 也是 trap, spec 不区分).
 // ----------------------------------------------------------------------------
-uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
-    /* DEBUG trace: cause_low 分流; 在 in_trap++ 后 early return 前打, triple fault 也 trace. */
+int trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
+    /* DEBUG trace: cause_low 分流 't/s/e'. */
     switch (cause_low) {
         case IRQ_M_TIMER: case IRQ_S_TIMER: DEBUG_TIME_INTR(); break;
         case IRQ_M_SOFT:  case IRQ_S_SOFT:  DEBUG_SOFT_INTR(); break;
@@ -120,19 +147,8 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
         default: break;  /* 不应到 (trap_check_interrupt 内 priority encoder 只产 6 个合法 IRQ) */
     }
 
-    hart->trap.in_trap++;
-
-    if (hart->trap.in_trap >= 3) {
-        return hart->trap.in_trap;
-    }
-
     // ------------------------------------------------------------------------
     // deliver_priv 按 mideleg 真生效 (RV Privileged Spec §3.1.8 跟 medeleg 对偶)
-    //   - M-mode trap (caller priv = M): 总 deliver M
-    //   - U/S-mode trap + mideleg.bit(cause_low) = 1: deliver S
-    //   - U/S-mode trap + mideleg.bit(cause_low) = 0: deliver M
-    // cause_low < 32 (IRQ_* 位号最大 11), bit shift 安全; 不需要 < 64 边界检查 (mideleg
-    // 是 uint32_t, 跟 _medeleg uint64_t 不同, 见 dummy.txt §6 类 3 vs 类 1).
     // ------------------------------------------------------------------------
     uint8_t deliver_priv;
     if (hart->priv == PRIV_M) {
@@ -143,15 +159,45 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
         deliver_priv = PRIV_M;
     }
 
-    hart->trap.xcause[deliver_priv] = cause_low | CAUSE_INTERRUPT_BIT;  /* 函数内 OR 高位 */
+    // ------------------------------------------------------------------------
+    // Ssdbltrp §4.1.1.5: S-trap entry 检 SDT → unexpected 升级 M, cause=DOUBLE_TRAP.
+    // interrupt 的 mtval2 也按 spec 设原本要写的 stval 值 (interrupt tval 是 0,
+    // 所以 mtval2 也写 0)。
+    // ------------------------------------------------------------------------
+    uint32_t final_cause = cause_low;
+    int      delivered_as_double = 0;
+    if (deliver_priv == PRIV_S &&
+        (hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u) {
+        hart->trap.mtval2 = 0u;        /* interrupt tval=0 */
+        final_cause = CAUSE_DOUBLE_TRAP;
+        deliver_priv = PRIV_M;
+        delivered_as_double = 1;
+    }
+
+    // ------------------------------------------------------------------------
+    // Smdbltrp §3.1.6.2: M-trap entry 检 MDT → critical-error. 不更新 architectural state.
+    // ------------------------------------------------------------------------
+    if (deliver_priv == PRIV_M &&
+        (hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u) {
+        system_reset_signal_set_bit(SYSRESET_BIT_HART_MDT);
+        return 1;
+    }
+
+    /* xcause: interrupt 走 cause_low | INTERRUPT_BIT; double_trap 升级路径走 sync cause (无 INT bit). */
+    if (delivered_as_double) {
+        hart->trap.xcause[deliver_priv] = final_cause;
+    } else {
+        hart->trap.xcause[deliver_priv] = final_cause | CAUSE_INTERRUPT_BIT;
+    }
     hart->trap.xtval [deliver_priv] = 0u;                                /* RV spec interrupt tval=0 */
     hart->trap.xepc  [deliver_priv] = hart->regs[0];
 
     // ------------------------------------------------------------------------
-    // 切 priv mode + mstatus 翻转 (跟 exception 函数完全同 30 行, 不抽 common helper)
+    // 切 priv mode + mstatus 翻转 + set xDT=1
     // ------------------------------------------------------------------------
     {
-        uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+        uint64_t ms = hart->trap._mstatus;
+        uint32_t mstatus_lo = (uint32_t)(ms & 0xFFFFFFFFu);
 
         if (deliver_priv == PRIV_M) {
             mstatus_lo &= ~MSTATUS_MPP;
@@ -159,35 +205,38 @@ uint8_t trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
             if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
             else                          mstatus_lo &= ~MSTATUS_MPIE;
             mstatus_lo &= ~MSTATUS_MIE;
+            ms |= MSTATUS_MDT_BIT64;                          /* M-trap entry: MDT=1 */
         } else {
             if (hart->priv == PRIV_S) mstatus_lo |=  MSTATUS_SPP;
             else                      mstatus_lo &= ~MSTATUS_SPP;
             if (mstatus_lo & MSTATUS_SIE) mstatus_lo |=  MSTATUS_SPIE;
             else                          mstatus_lo &= ~MSTATUS_SPIE;
             mstatus_lo &= ~MSTATUS_SIE;
+            mstatus_lo |= MSTATUS_SDT;                        /* S-trap entry: SDT=1 */
         }
 
-        hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+        hart->trap._mstatus = (ms & 0xFFFFFFFF00000000ULL)
                             | (uint64_t)mstatus_lo;
     }
 
     hart->priv = deliver_priv;
 
     // ------------------------------------------------------------------------
-    // jump-to: vectored mode 处理
-    //   mtvec/stvec bit[1:0] = MODE (csr_*tvec_write WARL 接 0/1, reserved 落 0; D9)
-    //     mode == 0 direct  : pc = base (所有 interrupt 跳同一入口, handler 自己判 cause)
-    //     mode == 1 vectored: pc = base + 4 * cause_low (interrupt 按 IRQ 号跳分散入口)
-    //     mode == 2/3       : WARL 已落 0, 不会到这条
+    // jump-to: vectored mode 处理。注意 double_trap 升级路径走 sync exception 语义,
+    // 永走 BASE (跟 exception 同), 不走 vectored.
     // ------------------------------------------------------------------------
     {
         uxlen_t  tvec = hart->trap.xtvec[deliver_priv];
         uint32_t mode = tvec & 0x3u;
         uxlen_t  base = tvec & ~0x3u;
-        hart->regs[0] = (mode == 1u) ? (base + 4u * cause_low) : base;
+        if (delivered_as_double) {
+            hart->regs[0] = base;                                  /* exception 永走 BASE */
+        } else {
+            hart->regs[0] = (mode == 1u) ? (base + 4u * cause_low) : base;
+        }
     }
 
-    return hart->trap.in_trap;
+    return 1;
 }
 
 
@@ -234,10 +283,20 @@ int trap_check_interrupt(cpu_t *hart) {
     else if (ready & (1u << IRQ_S_SOFT))  irq = IRQ_S_SOFT;
     else                                  irq = IRQ_S_TIMER;
 
-    (void)trap_set_interrupt_state(hart, irq);
-    /* 返非 0 = dispatcher 应 continue. 返 set_interrupt_state 当前 in_trap, 跟
-     * trap_set_exception_state 形态一致 (mmu_translate_pc 透传机制). */
-    return (int)hart->trap.in_trap;
+    // [TODO] a_03_session_011 in_trap 字段废除后, trap_check_interrupt 返值从
+    // "透传 in_trap 当前值" 退化为常量 1. 当前 trap_set_interrupt_state 也总返
+    // 1 (deliver-OK / critical-error 同值), caller (dispatcher) 也不区分 —
+    // 都 continue 让 while(SRS==0) 接管。
+    //
+    // 是否要改:
+    //   - 现状已满足 caller 需求 (二值 0/非0 就够 — 跟 mmu_translate_pc 接口
+    //     约定一致), 不改也行。
+    //   - 透传 trap_set_*_state 返值比 (void)cast + return 1 略直观 (表达"返
+    //     值来自下层 helper"); 实际值仍是 1, 没行为差异。
+    //   - 未来若 trap_set_*_state 引入多状态值 (e.g. 2=critical-error 区分
+    //     deliver-OK), 透传自然受益; 当前二值无差异。
+    // 当前选透传 (轻微改善), 未来视需求再细分状态码。
+    return trap_set_interrupt_state(hart, irq);
 }
 
 

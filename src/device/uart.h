@@ -23,7 +23,7 @@
 //     (CLAUDE.md "Do not pthread_cancel/pthread_kill" 禁; shutdown_signal 检测路径)
 //   - 命中 POLLIN → read 1 byte → 加锁 push RX FIFO + 重算 device_line
 //   - FIFO 满则 silent 丢字节 (跟 ns16550a overrun 简化, 不真模 LSR.OE)
-//   - EOF / shutdown_signal=0 → 自然退出
+//   - EOF / shutdown_signal 非 0 → 自然退出
 //
 // dummy.txt §12 "谁 spawn 谁 join" 协议适用 — uart_start_reader_thread /
 // uart_join_reader_thread 暴露给 main, 跟 clint_start_timer_thread /
@@ -83,14 +83,16 @@
 //                            已由 uart_join_reader_thread 收回, 这里只清 mutex.
 //
 // uart_start_reader_thread — main POR spawn (clint_start_timer_thread 之后, 进 while
-//                            之前); SDS 必须已 set 1 (跟 clint_start_timer_thread 同前提).
-//                            spawn 失败按 dummy.txt §5 fprintf + set SRS=0 + SDS=0 让
-//                            while 不进; 不分 error path, destroy chain 在 while 外写一次.
+//                            之前); SDS 必须 = 0 (允许执行, 跟 clint_start_timer_thread
+//                            同前提). spawn 失败按 dummy.txt §5 fprintf + shutdown_signal_
+//                            set_bit(DEVICE_FAIL) 让 while 不进; 不分 error path, destroy
+//                            chain 在 while 外写一次.
 //
 // uart_join_reader_thread  — POR 退出段 (main while 外, 跟 clint_join_timer_thread 同
-//                            位置): SDS=0 之后调; reader loop 自然退出 → pthread_join
-//                            不永远 block. spawn fail path 防御 (reader_thread_started=0
-//                            时 fprintf 一行 skip 不 fatal).
+//                            位置): main 已 shutdown_signal_set_bit(NORMAL_EXIT) 之后调;
+//                            reader loop 自然退出 → pthread_join 不永远 block. spawn fail
+//                            path 防御 (reader_thread BSS 0 时 pthread_join 返 ESRCH 一行
+//                            fprintf 不 fatal).
 //
 
 #ifndef DEVICE_UART_H

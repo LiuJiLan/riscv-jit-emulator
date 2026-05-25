@@ -72,6 +72,13 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     hart->priv      = PRIV_M;               // M 模式 (启动)
     hart->satp      = 0;                    // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
 
+    // mstatus.MDT (Smdbltrp) + sstatus.SDT (Ssdbltrp) reset 初值 = 1 — spec
+    // §3.1.6.2 / §4.1.1.5 明确要求 "Upon reset, the MDT/SDT field is set to 1".
+    // 其他 _mstatus 字段 memset 0 已覆盖。意味着 reset 后:
+    //   - mstatus.MIE/SIE 默认 0 (MDT/SDT=1 时硬件不允许 MIE/SIE=1)
+    //   - 第一次 trap 之前, boot ROM / SBI 要 csrw mstatush 清 MDT, 才能开 MIE
+    hart->trap._mstatus |= MSTATUS_MDT_BIT64 | (u64_t)MSTATUS_SDT;
+
     // ------------------------------------------------------------------------
     // tlb_table[4] 装载 (Trust regime bypass TLB; 当前默认 MSU)
     //
@@ -128,9 +135,13 @@ void cpu_reset(cpu_t *hart) {
     hart->satp = 0;
 
     // trap_csrs_t 全 memset 0 — xcause/xtval/xepc/xtvec/xscratch 各 [4] +
-    // _mstatus/_medeleg/mideleg/_mie/_mip_sw/in_trap 等所有字段一次清。
+    // _mstatus/_medeleg/mideleg/_mie/_mip_sw/mtval2 等所有字段一次清。
     // jmp_buf_ptr / per_hart_info / shared_info 不在 trap 内, 不影响。
     memset(&hart->trap, 0, sizeof(hart->trap));
+
+    // mstatus.MDT + sstatus.SDT reset 初值 = 1 (Smdbltrp/Ssdbltrp 扩展; spec
+    // §3.1.6.2 / §4.1.1.5)。跟 cpu_create 同序; memset 0 之后单独 OR 设置。
+    hart->trap._mstatus |= MSTATUS_MDT_BIT64 | (u64_t)MSTATUS_SDT;
 
     // tlb_table 容器不动 (跟 sfence 形态一致); entries 全清 (跨地址空间防 PTE
     // 残留撞 hash 命中)。详 tlb.h tlb_table_reset doc 段。
@@ -196,24 +207,29 @@ static void cpu_dump(const cpu_t *hart) {
             hart->regs[25], hart->regs[26], hart->regs[27], hart->regs[28],
             hart->regs[29], hart->regs[30], hart->regs[31]);
 
-    // trap dump (M+S 两槽): in_trap=3 时字段保留 double fault 第二次状态作 root cause;
-    // S 槽用于 medeleg delegate 路径验证 (medeleg=1 → trap deliver S, M 槽不写)。
+    // trap dump (M+S 两槽): MDT=1 / SDT=1 表示 hart 在对应 priv trap handler 内
+    // 还没退 (mret/sret 清); MDT/SDT 同时 1 + 再来 trap 就触发 critical-error /
+    // double-trap 升级 (Smdbltrp/Ssdbltrp). S 槽 mtval2 显示 double-trap 升级时
+    // 原本要写 stval 的值 (S-trap unexpected 路径).
     fprintf(stderr,
-            "[cpu] trap dump (M): in_trap=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X\n",
-            hart->trap.in_trap,
+            "[cpu] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X\n",
+            (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
-            hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M]);
+            hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M],
+            hart->trap.mtval2);
     fprintf(stderr,
-            "[cpu] trap dump (S): scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X\n",
+            "[cpu] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X\n",
+            (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
             hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
-    // state dump: pc + priv + mstatus 低 32 位 (mstatush 当前全 0, 省略)。
+    // state dump: pc + priv + mstatus 低 32 位 + mstatush (含 MDT bit10)。
     fprintf(stderr,
-            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X\n",
+            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X\n",
             hart->regs[0],
             (uint32_t)hart->priv,
-            (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu));
+            (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu),
+            (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu));
 #else
     (void)hart;
 #endif

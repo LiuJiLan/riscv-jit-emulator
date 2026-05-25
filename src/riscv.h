@@ -138,12 +138,15 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //     是 mstatus 的 masked view (见下方 S-mode CSR 段)。
 #define CSR_MSTATUS    0x300U          /* mstatus 低 32 位 (MIE/MPIE/MPP/SUM/MXR/...) */
 #define CSR_MTVEC      0x305U          /* M-mode trap vector base (+ MODE 低 2 位) */
-#define CSR_MSTATUSH   0x310U          /* mstatus 高 32 位 (RV32 only; SBE/MBE 等大端控制) */
+#define CSR_MSTATUSH   0x310U          /* mstatus 高 32 位 (RV32 only; MDT/SBE/MBE/...) */
 #define CSR_MEPC       0x341U          /* M-mode 异常 / 中断的"返回 PC" */
 #define CSR_MCAUSE     0x342U          /* M-mode 触发 trap 的 cause code */
 #define CSR_MTVAL      0x343U          /* M-mode trap 附属信息 (cause-specific) */
+#define CSR_MTVAL2     0x34BU          /* M-mode trap value 2 (Ssdbltrp: S-trap unexpected
+                                          时存原本要写 stval 的值; H 扩展用作 GPA, 项目无 H) */
 #define CSR_MSCRATCH   0x340U          /* M-mode scratch (xscratch[PRIV_M]) */
 #define CSR_MEDELEG    0x302U          /* M-mode 同步异常 trap delegation; bit 11 hardwire 0 */
+#define CSR_MEDELEGH   0x312U          /* medeleg 高 32 位 (RV32 only); _medeleg 拆访问 */
 #define CSR_MIDELEG    0x303U          /* M-mode 中断 delegation; 字段就位, 中断机制真做时启用 */
 
 // ----------------------------------------------------------------------------
@@ -293,7 +296,10 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //   - SSTATUS_MASK                    (sstatus = mstatus 的 masked view)
 //   - SD (RV32 真启用 + RV64 #if 0)   (future-proof; FS/XS 真做时联动)
 //   - UXL/SXL (RV64 #if 0)            (future-proof; 切 RV64 时启用)
-// 其余 (UBE / MPRV / TVM / TW / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP/MDT 等) 真用时再加。
+// MDT / SDT (Smdbltrp / Ssdbltrp 扩展, 项目已实装 a_03_session_011 起): 见上方
+// MSTATUS_SDT / MSTATUSH_MDT 段; 写规则 + trap 行为详 csr.c / trap.c.
+//
+// 其余 (UBE / MPRV / TVM / TW / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP 等) 真用时再加。
 //
 // 命名风格:
 //   单 bit 字段: <field>_SHIFT + <field>            (single-bit mask)
@@ -336,6 +342,24 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 #define MSTATUS_MXR_SHIFT   19U
 #define MSTATUS_MXR         (1U << MSTATUS_MXR_SHIFT)        /* = 0x00080000 */
 
+// SDT (Supervisor Double-Trap, Ssdbltrp 扩展; mstatus[24] = sstatus[24]):
+//   csrw 时 SDT=1 强制 SIE=0 (regardless of write SIE value); SIE=1 只在 SDT 已 0
+//   或 同写 SDT=0 时允许. S-trap entry SDT=0→1 deliver 正常; SDT=1→unexpected →
+//   double-trap exception 升级到 M-mode (cause=CAUSE_DOUBLE_TRAP). SRET 清 SDT=0.
+//   reset 后 SDT=1 (跟 MDT 同, spec §4.1.1.5 / §3.1.6.2)。详 csr.c / trap.c。
+#define MSTATUS_SDT_SHIFT   24U
+#define MSTATUS_SDT         (1U << MSTATUS_SDT_SHIFT)        /* = 0x01000000 */
+
+// MDT (Machine Double-Trap, Smdbltrp; _mstatus[42] = mstatush[10], RV32 拆访问):
+//   csrw mstatush 时 MDT=1 强制 mstatus.MIE=0; mstatus.MIE=1 只在 MDT 已 0 时允许.
+//   M-trap entry MDT=0→1 deliver 正常; MDT=1→unexpected → 无 NMI 时 hart 进
+//   critical-error state, set system_reset_signal SYSRESET_BIT_HART_MDT (项目走
+//   abort cleanup + return 非 0). MRET 清 MDT=0; 若新 priv ≠ M, 顺便清 SDT=0.
+//   reset 后 MDT=1 (spec §3.1.6.2)。
+#define MSTATUSH_MDT_SHIFT  10U                              /* mstatush bit 10 */
+#define MSTATUSH_MDT        (1U << MSTATUSH_MDT_SHIFT)       /* = 0x00000400 (mstatush) */
+#define MSTATUS_MDT_BIT64   (1ULL << (32U + MSTATUSH_MDT_SHIFT))  /* _mstatus bit 42 */
+
 // ----------------------------------------------------------------------------
 // SSTATUS_MASK —— sstatus 是 mstatus 的 masked view
 //
@@ -349,7 +373,7 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //
 // 注: SD 是 read-only derived from FS/VS/XS dirty 状态 (RV spec); 严格说 sstatus 应能 read
 // 到 SD 但 write 时 ignore — 项目不实现 FS/VS/XS, SD 永远 0, 不进 mask 也不影响行为。
-#define SSTATUS_MASK   (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR)
+#define SSTATUS_MASK   (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_SDT)
 
 // ----------------------------------------------------------------------------
 // future-proof 字段宏 (RV64 切换 / F/D 扩展接入时启用)

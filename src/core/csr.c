@@ -85,7 +85,7 @@
 // 命名规则 (与 trap.h 一致):
 //   - mstatus / mstatush 操作 _mstatus (uint64_t) 的低/高 半边
 //   - mtvec / mepc / mcause / mtval / mscratch 操作 xxx[PRIV_M] (priv-indexed, x 前缀)
-//   - medeleg 操作 _medeleg (uint64_t) 的低 32 位 (RV32 csr 入口拆访问; medelegh 未实装)
+//   - medeleg / medelegh 操作 _medeleg (uint64_t) 的低/高 32 位 (RV32 拆访问, 跟 mstatus/mstatush 同体例)
 //   - mideleg 操作 mideleg (uint32_t, 类 3 MXLEN-bit 单字段; spec 无 midelegh)
 // ============================================================================
 
@@ -127,6 +127,14 @@ static void csr_mstatus_write(cpu_t *hart, uxlen_t v) {
     // 未来加 F/V 时 SD 仍不允许 csrw 直接写, 由 FS/XS 写时硬件联动设。
     v &= ~MSTATUS_SD_RV32;
 
+    // Smdbltrp §3.1.6.2: "The MIE bit can only be set to 1 by an explicit CSR write
+    // if the MDT bit is already 0". RV32 下 MDT 在 mstatush (_mstatus bit 42),
+    // 跨 csr 不能同写, 仅看当前 _mstatus.MDT 状态: MDT=1 时 csrw mstatus 写 MIE=1
+    // 被强制清 0 (regardless of v 内 MIE 值).
+    if ((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u) {
+        v &= ~MSTATUS_MIE;
+    }
+
     hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
                         | (uint64_t)v;
 }
@@ -136,11 +144,21 @@ static uxlen_t csr_mstatush_read(cpu_t *hart) {
 }
 
 static void csr_mstatush_write(cpu_t *hart, uxlen_t v) {
-    // 高 32 位 WARL 强制 0 — mstatush 字段 (SBE bit 4 / MBE bit 5 / GVA / MPV / 其余 WPRI)
-    // 项目当前都不实现 (无大端切换 / 无 H 扩展); 任何写入被忽略, 读回保持 0。
-    // 未来真做 H 扩展或大端时改这里 (按合法字段加 mask)。
-    (void)v;
-    hart->trap._mstatus = hart->trap._mstatus & 0x00000000FFFFFFFFULL;
+    // 高 32 位 WARL: 仅 MDT (mstatush bit 10, Smdbltrp 扩展) 真实装; 其他字段
+    // (SBE bit 4 / MBE bit 5 / GVA / MPV / MPELP / 其余 WPRI) 项目不实现, 强制 0。
+    // 未来真做 H 扩展或大端时按合法字段扩 mask。
+    uint32_t v_high = v & MSTATUSH_MDT;
+
+    // Smdbltrp §3.1.6.2: "When the MDT bit is set to 1 by an explicit CSR write,
+    // the MIE bit is cleared to 0. ... this clearing occurs regardless of the value
+    // written, if any, to the MIE bit by the same write" (RV64 视角同写; RV32 跨
+    // csr 写, 这里在 csrw mstatush 写 MDT=1 时强制清 _mstatus 低 32 位 MIE bit)。
+    if (v_high & MSTATUSH_MDT) {
+        hart->trap._mstatus &= ~(uint64_t)MSTATUS_MIE;
+    }
+
+    hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFFu)
+                        | ((uint64_t)v_high << 32);
 }
 
 // ---- mtvec / mepc / mcause / mtval (映射到 hart->trap.{xtvec,xepc,xcause,xtval}[PRIV_M]) ----
@@ -203,6 +221,17 @@ static void csr_mtval_write(cpu_t *hart, uxlen_t v) {
     hart->trap.xtval[PRIV_M] = v;
 }
 
+/* mtval2 (0x34B, Ssdbltrp/H 扩展): S-trap unexpected 升级 M 时, trap.c 把原本要写
+ * stval 的 tval 写到 mtval2, 让 M-handler 拿到 root-cause 信息 (spec §4.1.1.5)。
+ * 项目无 H 扩展, mtval2 不复用为 GPA。RV spec 无特殊 WARL, 接受任意值 */
+static uxlen_t csr_mtval2_read(cpu_t *hart) {
+    return hart->trap.mtval2;
+}
+
+static void csr_mtval2_write(cpu_t *hart, uxlen_t v) {
+    hart->trap.mtval2 = v;
+}
+
 // ---- mscratch (xscratch[PRIV_M], 类 3) ----
 
 static uxlen_t csr_mscratch_read(cpu_t *hart) {
@@ -216,11 +245,11 @@ static void csr_mscratch_write(cpu_t *hart, uxlen_t v) {
 
 // ---- medeleg / mideleg (medeleg 拆访问类 1, mideleg 单字段类 3) ----
 //
-// medeleg (0x302): 类 1 (_medeleg uint64_t 拆访问)。M-mode 同步异常 trap delegation
-//   bitmask, per-cause bit (bit N = cause N delegate 到 S-mode); bit 11 (ecall_from_M)
-//   WARL hardwire 0 — M can't delegate to less-privileged (SiFive U74-MC 同此); 其他
-//   位项目当前接受全 32 位写。priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位
-//   入口 (项目当前未实装, 跟 mstatush 平行 future); 字段类型 uint64_t 已 RV64-ready。
+// medeleg (0x302) + medelegh (0x312): 类 1 (_medeleg uint64_t 拆访问)。M-mode 同步
+//   异常 trap delegation bitmask, per-cause bit (bit N = cause N delegate 到 S-mode);
+//   bit 11 (ecall_from_M) WARL hardwire 0 — M can't delegate to less-privileged
+//   (SiFive U74-MC 同此); 其他位接受全 32 位写。priv spec 1.12 定义 medelegh 为
+//   RV32 高 32 位入口 (cause 32-63), 跟 mstatus / mstatush 同体例拆访问。
 //   trap_set_exception_state 按 _medeleg.bit(cause) 真生效 (U/S-mode trap + bit=1 → deliver S)。
 // mideleg (0x303): 类 3 (mideleg uint32_t 单字段)。M-mode 中断 delegation, MXLEN-bit
 //   (spec 未定义 midelegh, 中断 cause 不会超 32 位)。trap_set_interrupt_state 按
@@ -233,8 +262,20 @@ static uxlen_t csr_medeleg_read(cpu_t *hart) {
 static void csr_medeleg_write(cpu_t *hart, uxlen_t v) {
     /* WARL: bit 11 (ecall_from_M) hardwire 0 — M 不能 delegate ecall_from_M 给 S */
     v &= ~(1u << CAUSE_ECALL_FROM_M);
-    /* 低 32 位换成 v, 高 32 位 (medelegh 未来占位) 保留 — 跟 _mstatus 拆访问同形态 */
+    /* 低 32 位换成 v, 高 32 位 (medelegh 入口) 保留 — 跟 _mstatus 拆访问同形态 */
     hart->trap._medeleg = (hart->trap._medeleg & 0xFFFFFFFF00000000ULL) | (uint64_t)v;
+}
+
+/* medelegh (0x312): _medeleg 高 32 位 (cause 32-63 delegation bitmap)。RV spec
+ * priv 1.12 不强制特殊 WARL — ecall_from_M bit 11 在低 32 位, 跟本入口无关; 接受
+ * 全 32 位写入。跟 mstatush 平行 (拆访问 future-proof) */
+static uxlen_t csr_medelegh_read(cpu_t *hart) {
+    return (uint32_t)((hart->trap._medeleg >> 32) & 0xFFFFFFFFu);
+}
+
+static void csr_medelegh_write(cpu_t *hart, uxlen_t v) {
+    hart->trap._medeleg = (hart->trap._medeleg & 0xFFFFFFFFu)
+                        | ((uint64_t)v << 32);
 }
 
 static uxlen_t csr_mideleg_read(cpu_t *hart) {
@@ -372,9 +413,21 @@ static uxlen_t csr_sstatus_read(cpu_t *hart) {
 }
 
 static void csr_sstatus_write(cpu_t *hart, uxlen_t v) {
-    /* 只改 sstatus mask 内的位; 保留 _mstatus 其余字段 (M-mode-only + 高 32 位) */
+    /* 只改 sstatus mask 内的位; 保留 _mstatus 其余字段 (M-mode-only + 高 32 位)。
+     * Ssdbltrp §4.1.1.5: "When the SDT bit is set to 1 by an explicit CSR write,
+     * the SIE bit is cleared to 0. This clearing occurs regardless of the value
+     * written, if any, to the SIE bit by the same write. The SIE bit can only be
+     * set to 1 by an explicit CSR write if the SDT bit is being set to 0 by the
+     * same write or is already 0."
+     * sstatus 入口可同写 SDT + SIE, 实装: 计算写入的 v_masked (mask 内字段); 若
+     * v_masked 内 SDT=1 (即写后 SDT 必然 1), 强制清 SIE; 等价于 "SDT=0 时 SIE 随便,
+     * SDT=1 时 SIE 必清". */
+    uint32_t v_masked = (uint32_t)v & SSTATUS_MASK;
+    if (v_masked & MSTATUS_SDT) {
+        v_masked &= ~MSTATUS_SIE;
+    }
     const u64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;
-    const u64_t set  = (uint64_t)(v & SSTATUS_MASK);
+    const u64_t set  = (uint64_t)v_masked;
     hart->trap._mstatus = keep | set;
 }
 
@@ -615,8 +668,10 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
         case CSR_MEPC:     read_old = csr_mepc_read    (hart); break;
         case CSR_MCAUSE:   read_old = csr_mcause_read  (hart); break;
         case CSR_MTVAL:    read_old = csr_mtval_read   (hart); break;
+        case CSR_MTVAL2:   read_old = csr_mtval2_read  (hart); break;
         case CSR_MSCRATCH: read_old = csr_mscratch_read(hart); break;
         case CSR_MEDELEG:  read_old = csr_medeleg_read (hart); break;
+        case CSR_MEDELEGH: read_old = csr_medelegh_read(hart); break;
         case CSR_MIDELEG:  read_old = csr_mideleg_read (hart); break;
         case CSR_MIE:      read_old = csr_mie_read     (hart); break;
         case CSR_MIP:      read_old = csr_mip_read     (hart); break;
@@ -669,8 +724,10 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
             case CSR_MEPC:     csr_mepc_write    (hart, to_write); break;
             case CSR_MCAUSE:   csr_mcause_write  (hart, to_write); break;
             case CSR_MTVAL:    csr_mtval_write   (hart, to_write); break;
+            case CSR_MTVAL2:   csr_mtval2_write  (hart, to_write); break;
             case CSR_MSCRATCH: csr_mscratch_write(hart, to_write); break;
             case CSR_MEDELEG:  csr_medeleg_write (hart, to_write); break;
+            case CSR_MEDELEGH: csr_medelegh_write(hart, to_write); break;
             case CSR_MIDELEG:  csr_mideleg_write (hart, to_write); break;
             case CSR_MIE:      csr_mie_write     (hart, to_write); break;
             case CSR_MIP:      csr_mip_write     (hart, to_write); break;

@@ -5,9 +5,11 @@
 // 职责: 三个 MMIO 入口:
 //   - TEST_DEV_SIFIVE_OFF (off 0x00) — sifive_test FINISHER; W 解析三 magic (PASS=
 //     0x5555 / FAIL=0x3333 / RESET=0x7777), cmd = value & 0xFFFF, arg = (value >> 16)。
-//     PASS/FAIL 设 SDS=0 + SRS=0 让 main while 退 + cleanup chain + return exit_code;
-//     RESET 设 SRS=0 + reset_req=1, main while 退后判 reset_req 走 continue (SR path),
-//     timer / uart reader thread 跨 reset 一直跑 (受 SDS, 不动)。
+//     PASS/FAIL → shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT) (内部按顺序 B
+//     蕴含 SRS BIT_SHUTDOWN_TRIGGER; ABORT_MASK 命中, main 走 cleanup + return
+//     exit_code)。
+//     RESET → system_reset_signal_set_bit(SYSRESET_BIT_TEST_RESET) (非 ABORT, main
+//     走 try_clear continue, timer / uart reader 跨 reset 一直跑)。
 //   - TEST_DEV_SET_OFF / TEST_DEV_CLEAR_OFF (off 0x40 / 0x44) — fixture 通过 sw
 //     触发 device_set/clear_pending fanout, 走 PLIC 完整路径。
 //
@@ -22,9 +24,11 @@
 // CLINT    = "monitor + timer 辅助线程"
 // PLIC     = "monitor 但无线程"
 // UART     = "monitor + reader 辅助线程"
-// test_dev = **退化 monitor** — exit_code / reset_req 只由 hart 主线程通过 MMIO 写;
-//            main 读取走 SRS/SDS atomic happens-before 边界 (release-acquire 同步,
-//            plain int 跨线程仍可见); 不持锁; SET/CLEAR fanout 透传 plic 内 rwlock。
+// test_dev = **退化 monitor** — exit_code 只由 hart 主线程通过 MMIO 写; main 读取
+//            走 SRS/SDS atomic happens-before 边界 (release-acquire 同步, plain int
+//            跨线程仍可见); 不持锁; SET/CLEAR fanout 透传 plic 内 rwlock。
+//            (reset_req 字段 + consume_reset_request 入口已废除 — reset 触发改用
+//            SRS bit SYSRESET_BIT_TEST_RESET 表达, main 直接读 SRS bit。)
 //
 // dummy.txt §12 "谁 spawn 谁 join" 协议**不适用** (无线程); §7 monitor 范式只用
 // happens-before 边界 (SRS/SDS atomic) 而非完整 monitor 锁。
@@ -57,9 +61,5 @@ void test_dev_destroy(void);
 /* main 端读取入口 — 返 exit code (PASS=0 / FAIL=arg / 默认 0).
    main return 时用; SRS/SDS atomic release-acquire 同步, 跟 main while 退出顺序对齐. */
 int  test_dev_get_exit_code(void);
-
-/* main while 退出后判 RESET 路径 — 返 1 = 0x7777 fire 过, main 走 SR continue;
-   返 0 = 走 shutdown break. 消费式读取 (读后清字段, 避免下一轮重复触发). */
-int  test_dev_consume_reset_request(void);
 
 #endif //DEVICE_TEST_DEV_H

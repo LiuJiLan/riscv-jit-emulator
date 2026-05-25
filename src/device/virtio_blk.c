@@ -354,14 +354,14 @@ static void drain_one_avail_round_locked(void) {
 static void *io_worker_run(void *arg) {
     (void)arg;
 
-    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire)) {
+    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0u) {
         int have_token = 0;
 
         vblk_queue_lock();
 
         /* 等 not_empty 或 timeout; while 重检防 spurious wakeup + SDS 退 */
         while (g_vblk.work_head == g_vblk.work_tail &&
-               atomic_load_explicit(&shutdown_signal, memory_order_acquire)) {
+               atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0u) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 100000000L;   /* 100 ms */
@@ -376,8 +376,7 @@ static void *io_worker_run(void *arg) {
                 fprintf(stderr, "[virtio_blk worker] cond_timedwait failed: %s\n",
                         strerror(rc));
                 vblk_queue_unlock();
-                atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-                atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+                shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
                 return NULL;
             }
             /* rc == 0: signaled or spurious; while 重检 */
@@ -444,18 +443,17 @@ static void vblk_enqueue_work_token(void) {
         int rc = pthread_cond_timedwait(&g_vblk.cond_not_full,
                                         &g_vblk.queue_mutex, &ts);
         if (rc == ETIMEDOUT) {
-            if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0) {
+            if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) != 0u) {
                 vblk_queue_unlock();
                 return;
             }
-            continue;   /* SDS up, 再 wait 一轮 */
+            continue;   /* SDS 仍 0 (允许执行), 再 wait 一轮 */
         }
         if (rc != 0) {
             fprintf(stderr, "[virtio_blk] enqueue cond_timedwait failed: %s\n",
                     strerror(rc));
             vblk_queue_unlock();
-            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-            atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+            shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
             return;
         }
         /* rc == 0: signaled, while 重检 */
@@ -766,7 +764,7 @@ void virtio_blk_start_io_worker_thread(void) {
     if (g_vblk.image_fd < 0) {
         return;
     }
-    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0) {
+    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) != 0u) {
         return;
     }
 
@@ -774,8 +772,7 @@ void virtio_blk_start_io_worker_thread(void) {
     if (rc != 0) {
         fprintf(stderr, "virtio_blk_start_io_worker_thread: pthread_create failed: %s\n",
                 strerror(rc));
-        atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-        atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+        shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
     }
 }
 

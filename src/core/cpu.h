@@ -78,9 +78,10 @@ typedef struct cpu_s {
     uxlen_t               satp;             // Sv32 satp; 当前 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
-    trap_csrs_t              trap;             // trap-related CSR 镜像 + host trap 流程状态
-                                                // (in_trap 计数器), 内嵌后置, ~80 B; 设计意图
-                                                // 见 trap.h 顶部 doc + dummy.txt §1
+    trap_csrs_t              trap;             // trap-related CSR 镜像 (mstatus/medeleg/mideleg/
+                                                // mie/mip_sw/mtval2/xcause/xtval/xepc/xtvec/xscratch
+                                                // 各项); MDT/SDT spec 路径 (Smdbltrp/Ssdbltrp) 替代
+                                                // 早期 in_trap 字段, 详 trap.h 顶部 + trap.c
     cpu_info_per_hart_t      per_hart_info;     // per-hart 私有 RO CSR (mhartid + misa);
                                                 //   嵌入 (非指针, 跟 cpu_t 走); cpu_create
                                                 //   入参 mhartid + misa 写入
@@ -115,8 +116,10 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid);
 //   regs[11] = 0                 (a1 = dtb 占位, 未来)
 //   priv    = PRIV_M
 //   satp    = 0                  (bare; dispatcher 再选 leaf TLB)
-//   trap    全 memset 0          (xcause/xtval/xepc/xtvec/xscratch 各 [4] +
-//                                 _mstatus/_medeleg/mideleg/_mie/_mip_sw/in_trap)
+//   trap    memset 0 后写 MDT/SDT reset state (spec §3.1.6.2 / §4.1.1.5 要求
+//             reset 后 mstatus.MDT=1 + sstatus.SDT=1; 其余字段 0); 其他字段
+//             (xcause/xtval/xepc/xtvec/xscratch/mtval2 各项, _medeleg/mideleg/
+//              _mie/_mip_sw) memset 0 覆盖
 //   tlb_table 容器 不动, entries 调 tlb_table_reset(hart) 清
 //
 // 保留 (硬件 ID 类, 真硬件 reset 后不变):

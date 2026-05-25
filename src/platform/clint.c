@@ -158,14 +158,14 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 // ----------------------------------------------------------------------------
 //
 // 跨 system reset 一直跑 (跟真硬件 RTC oscillator 不掉电不停一致); 随 SDS 起停
-// (shutdown_signal=0 自然退)。clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)
+// (shutdown_signal 非 0 自然退)。clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)
 // 绝对时间唤醒避免 nanosleep 相对时间累积 drift。
 //
 // 错误处理 (跟 dummy.txt §5 报错风格一致):
 //   - EINTR: while-retry (Linux 习惯; TIMER_ABSTIME 下极罕见)
-//   - 其他 errno: fprintf + cooperative 退出 (set system_reset_signal=0 +
-//                  shutdown_signal=0 → main 走 cleanup 路径退出 + 此 routine
-//                  return NULL); 不 abort, 让 main 有机会 dump
+//   - 其他 errno: fprintf + cooperative 退出 (shutdown_signal_set_bit(DEVICE_FAIL),
+//                  内部按顺序 B 蕴含 SRS BIT_SHUTDOWN_TRIGGER → main 走 cleanup
+//                  路径退出 + 此 routine return NULL); 不 abort, 让 main 有机会 dump
 //
 // trace: timer thread 不打 trace (dummy.txt §7 末段; debug 真要打是临时 fprintf
 // 用完删, 不动 debug 模块)。
@@ -191,15 +191,14 @@ static void *timer_run(void *arg) {
     if (clock_gettime(CLOCK_MONOTONIC, &next_wake) != 0) {
         fprintf(stderr, "[clint timer] clock_gettime(CLOCK_MONOTONIC) failed: %s\n",
                 strerror(errno));
-        atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-        atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+        shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
         timer_log_stop("clock_gettime fail");
         return NULL;
     }
 
     // 主循环: SDS=1 继续, SDS=0 退。acquire 跟 main 端 atomic_store(&SDS, 0,
     // release) 配对 (consumer/producer; dummy.txt §7 monitor 模型 memory_order)。
-    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire)) {
+    while (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0u) {
         // 累加 TIMER_WAKE_INTERVAL_NS 到 next_wake (normalize tv_sec / tv_nsec)。
         next_wake.tv_nsec += (long)TIMER_WAKE_INTERVAL_NS;
         if (next_wake.tv_nsec >= 1000000000L) {
@@ -212,8 +211,7 @@ static void *timer_run(void *arg) {
         if (rc != 0) {
             fprintf(stderr, "[clint timer] clock_nanosleep failed: %s\n",
                     strerror(rc));
-            atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-            atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+            shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
             timer_log_stop("clock_nanosleep fail");
             return NULL;
         }
@@ -225,7 +223,7 @@ static void *timer_run(void *arg) {
                                   memory_order_release);
     }
 
-    timer_log_stop("SDS=0");
+    timer_log_stop("SDS!=0");
     return NULL;
 }
 
@@ -297,11 +295,11 @@ void clint_destroy(void) {
 // ----------------------------------------------------------------------------
 
 void clint_start_timer_thread(void) {
-    // 前置 check: 若 SDS 已 0 (前面有别的 init 失败, 通过 runtime signal 通道
+    // 前置 check: 若 SDS 已非 0 (前面有别的 init 失败, 通过 runtime signal 通道
     // 提前通知"别再 spawn"), 跳过 pthread_create。当前 main flow 下 spawn 时
-    // SDS 必=1, check 是死代码; 但跟"错误处理统一走 SRS/SDS 通道"原则一致,
-    // 给未来"前面有别的 init 失败也 set SDS=0" 场景留路。
-    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) == 0) {
+    // SDS 必=0, check 是死代码; 但跟"错误处理统一走 SRS/SDS 通道"原则一致,
+    // 给未来"前面有别的 init 失败也 set SDS bit" 场景留路。
+    if (atomic_load_explicit(&shutdown_signal, memory_order_acquire) != 0u) {
         return;
     }
 
@@ -309,11 +307,10 @@ void clint_start_timer_thread(void) {
     if (rc != 0) {
         fprintf(stderr, "clint_start_timer_thread: pthread_create failed: %s\n",
                 strerror(rc));
-        // 错误走 runtime signal 通道 — 一次 set 两 flag, 让后续 main while
-        // 因 SRS=0 自然不进, 走 cleanup 路径。"SDS 蕴含 SRS" 触发关系契约
-        // (runtime.h doc + dummy.txt §12)。
-        atomic_store_explicit(&system_reset_signal, 0, memory_order_release);
-        atomic_store_explicit(&shutdown_signal,     0, memory_order_release);
+        // 错误走 runtime signal 通道 — shutdown_signal_set_bit 内部按顺序 B 蕴含
+        // SRS BIT_SHUTDOWN_TRIGGER, main while 因 SRS 非 0 自然不进, 走 cleanup
+        // 路径 (runtime.h doc + dummy.txt §12 "SDS 蕴含 SRS")。
+        shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
         // clint.timer_thread 保持 BSS 0 init (POSIX 7.2 pthread_create fail 不
         // 修改 thread 参数); clint_join_timer_thread 内 pthread_join(0, NULL)
         // glibc 下返 ESRCH 容错 — 不需要额外 track "是否 spawn 成功"。
@@ -321,7 +318,7 @@ void clint_start_timer_thread(void) {
 }
 
 void clint_join_timer_thread(void) {
-    // 调用前置: main 已 atomic_store(&shutdown_signal, 0); 否则 pthread_join
+    // 调用前置: main 已 shutdown_signal_set_bit(NORMAL_EXIT); 否则 pthread_join
     // 永远 block (timer thread 在 while(SDS) 内永不退)。
     //
     // 两种 case 都安全 fprintf 不 fatal:
