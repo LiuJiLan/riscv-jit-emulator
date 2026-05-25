@@ -17,6 +17,9 @@
 //     virtio_blk_start_io_worker_thread 显式起; 详 device/virtio_blk.h 顶段) /
 //     cpu_create (内部已写硬件 reset 默认状态)
 //     SRS=1 / SDS=1 (runtime.c 定义初值兜底 + 这里显式重设, lifecycle 可读)
+//     runtime_install_signal_handlers (SIGINT/SIGTERM/SIGHUP sigaction; handler 内
+//     atomic 写 external_signal_no + SDS bit EXTERNAL_SIGNAL; 装在 atomic_store
+//     SRS/SDS=0 之后, 线程 spawn 之前; 详 runtime.h "external signal handler" 节) /
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
 //     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
@@ -492,6 +495,15 @@ int main(int argc, char **argv) {
     atomic_store_explicit(&system_reset_signal, 0u, memory_order_release);
     atomic_store_explicit(&shutdown_signal,     0u, memory_order_release);
 
+    // host signal handler 安装 (SIGINT / SIGTERM / SIGHUP → shutdown_signal_set_bit
+    // (EXTERNAL_SIGNAL) + external_signal_no signum)。装在 atomic_store SRS/SDS=0
+    // 之后, 线程 spawn 之前 — 这样 handler 装好时 atomic 字段已显式 0, 接到信号
+    // 才正确写 bit; 也保证 spawn 线程之前 handler 已就位 (线程内 100ms poll 走
+    // SDS 协同退出). 详 runtime.h 顶段 "external signal handler" 一节。
+    if (runtime_install_signal_handlers() != 0) {
+        return 1;
+    }
+
     // main 起 timer 辅助线程 (受 SDS 控制, 跨 system reset 一直跑; 见 dummy.txt
     // §12 谁 spawn 谁 join + clint.h 顶段 doc)。
     //
@@ -625,9 +637,30 @@ int main(int argc, char **argv) {
     cpu_destroy(hart);
     ram_destroy();
 
-    // exit code 从 test_dev 拿 — sifive_test FINISHER PASS=0 / FAIL=arg; 其他 halt 路径
-    // (dispatcher tri-fault / decode_test PASS 走自然退出) 走默认 0.
-    // happens-before: test_dev_write 写 exit_code (plain) 后 atomic_store SRS=0 release;
-    // main while 读 SRS=0 acquire 退出, plain exit_code 通过 atomic 边界跨线程可见.
+    // 还原 SIG_DFL — main 退出后子进程 / 后续 process state 干净。
+    runtime_restore_signal_handlers();
+
+    // exit code 分支:
+    //   - EXTERNAL_SIGNAL (SIGINT/SIGTERM/SIGHUP) 命中: 按 POSIX 惯例返 128 + signum
+    //     (130 / 143 / 129); stderr 顺手打印 test_dev_exit_code (默认 0 = "还没跑
+    //     到 FINISHER", 非 0 = test_dev 已设的 FAIL arg), 给 fixture 自动化/人工
+    //     debug 留 trail (session_012 chat 拍 EXTERNAL_SIGNAL > NORMAL_EXIT 优先;
+    //     "user 硬意图退出 不应被 test_dev 抢先写的 0 盖过")
+    //   - 否则 (NORMAL_EXIT 命中 / DEVICE_FAIL 命中 / HART_MDT 命中): 沿用旧路径
+    //     返 test_dev_get_exit_code() — sifive_test FINISHER PASS=0 / FAIL=arg;
+    //     DEVICE_FAIL / HART_MDT 路径下 test_dev_exit_code 默认 0
+    // happens-before: test_dev_write 写 exit_code (plain) 后 atomic_store SDS=...
+    // release; main while 读 SRS!=0 acquire 退出后再读 exit_code, plain 字段通过
+    // atomic release-acquire 边界跨线程可见。
+    uint32_t sds_state = atomic_load_explicit(&shutdown_signal, memory_order_acquire);
+    if (sds_state & SHUTDOWN_BIT_EXTERNAL_SIGNAL) {
+        uint32_t sig = atomic_load_explicit(&external_signal_no, memory_order_acquire);
+        int test_code = test_dev_get_exit_code();
+        fprintf(stderr,
+                "[main] external signal %u -> exit %d; "
+                "test_dev exit code at interrupt: %d\n",
+                sig, 128 + (int)sig, test_code);
+        return 128 + (int)sig;
+    }
     return test_dev_get_exit_code();
 }

@@ -398,6 +398,12 @@ void uart_start_reader_thread(void) {
         return;
     }
 
+    /* host stdin raw mode 委托 runtime — termios 是 process 唯一资源, 归
+       runtime 管 (跟 SDS/SRS / signal handler 同 host-side process 级生命周期).
+       runtime_stdin_enter_raw 内 silent 退化 (isatty=0 / tcsetattr fail 一律
+       fprintf 不 fatal), 不 propagate 给 reader thread 的 spawn fail 路径. */
+    runtime_stdin_enter_raw();
+
     int rc = pthread_create(&uart.reader_thread, NULL, uart_reader_run, NULL);
     if (rc != 0) {
         fprintf(stderr, "uart_start_reader_thread: pthread_create failed: %s\n",
@@ -415,4 +421,8 @@ void uart_join_reader_thread(void) {
         fprintf(stderr, "uart_join_reader_thread: pthread_join failed: %s\n",
                 strerror(rc));
     }
+
+    /* host stdin termios restore 委托 runtime (跟 spawn 前 enter_raw 对偶).
+       enter 退化路径 (isatty=0 / tcsetattr fail) 内部 tio_saved=0, exit 自然 no-op. */
+    runtime_stdin_exit_raw();
 }

@@ -67,6 +67,22 @@
 //   - 跟前值不同时, 调 plic.device_set/clear_pending(UART_PLIC_IRQ)
 //
 // ----------------------------------------------------------------------------
+// host-side stdin raw mode (line-buffered → char-by-char)
+// ----------------------------------------------------------------------------
+//
+// UART 不持有 host stdin termios 状态 — termios 是 process 唯一资源, 归
+// runtime 管理 (跟 SDS/SRS / signal handler 同 host-side process 级生命周期;
+// 详 runtime.h 顶段 "host-side stdin raw mode" 节). UART 只是 raw 字节流的
+// 消费方, 在 reader thread spawn / join 时各调一次 runtime 接口.
+//
+// 切入点:
+//   - uart_start_reader_thread spawn 前 → runtime_stdin_enter_raw()
+//   - uart_join_reader_thread  join 后 → runtime_stdin_exit_raw()
+//
+// 退化路径 (isatty=0 / tcsetattr fail) 由 runtime 端内部 silent 处理, UART
+// 不分支 — reader thread 拿到的字节流仍能跑 (只是 line-buffered 体验降级).
+//
+// ----------------------------------------------------------------------------
 // 五函数 lifecycle
 // ----------------------------------------------------------------------------
 //
