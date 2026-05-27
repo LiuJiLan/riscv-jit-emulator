@@ -30,8 +30,10 @@
 // 项目全 0 (RV spec: 0 = no JEDEC vendor / no architecture ID / no impl ID, 合法值)。
 // 异构 SMP 时这里加多份 cpu_info_shared_default_a/b 给不同 hart 组; 项目当前同构, 单份。
 //
-// 注: misa 不在这里 (per-hart 私有, 进 cpu_info_per_hart_t — 异构 SMP 时不同 hart 的扩展
-// 字段不同; mhartid 同理)。
+// 注: misa 跟 mhartid 不在这里 (per-hart 私有, 进 cpu_info_per_hart_t — 异构 SMP 时
+// 不同 hart 的字段值不同; mhartid 显然 per-hart 不同, misa 也可能 per-hart 不同)。
+// 015 dual storage: hart->per_hart_info.mhartid (CSR 镜像) + cpu_t.hartid (index 用),
+// 都由 cpu_create 入参 mhartid 写; 详 cpu.h cpu_t.hartid 字段注释。
 static const cpu_info_shared_t cpu_info_shared_default = {
     .mvendorid = 0,
     .marchid   = 0,
@@ -50,10 +52,21 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     }
     memset(hart, 0, sizeof(*hart));
 
-    // per-hart 私有 RO CSR 数据 (mhartid + misa); cpu_create 入参直接写入
-    // cpu_t.per_hart_info 字段。misa 入参当前仅作为 csr_misa_read 返回值 (不按 misa 派发
-    // lifecycle, 例如 F/D 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
+    // dual storage of hartid (015):
+    //   per_hart_info.mhartid (uxlen_t) — CSR 镜像; csr_mhartid_read 直读;
+    //                                      跟 misa 同 per_hart_info container 走 RV spec
+    //                                      §3.1.5 MXLEN-bit 体例 (dummy.txt §13).
+    //   cpu_t.hartid (uint32_t)         — index 用; clint_per_hart[hartid] /
+    //                                      wfi_slots[hartid] / wfi_kick(hartid) /
+    //                                      is_clint_*_pending(hartid) 等高频 index
+    //                                      入参直读不 cast (§13 index 非目标 uint32_t).
+    // 同时写, lifetime 内都不变 (mhartid RO + hartid 硬件 wired), 不会不同步。
     hart->per_hart_info.mhartid = mhartid;
+    hart->hartid                = (uint32_t)mhartid;
+
+    // per-hart 私有 RO CSR 数据 (misa); cpu_create 入参直接写入 cpu_t.per_hart_info。
+    // misa 入参当前仅作为 csr_misa_read 返回值 (不按 misa 派发 lifecycle, 例如 F/D
+    // 扩展按 misa.fdv 决定 fcsr alloc — 那是未来)。
     hart->per_hart_info.misa    = misa;
 
     // 多 hart 共享 RO CSR 数据 (mvendorid/marchid/mimpid); 指针指向全局 static const default。
@@ -67,7 +80,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     // 启动状态参考 https://docs.kernel.org/arch/riscv/boot.html
     // ------------------------------------------------------------------------
     hart->regs[0]   = GUEST_RAM_START;      // pc = 程序起点 (reset vector)
-    hart->regs[10]  = mhartid;              // a0 = hartid (Linux RV boot 协议)
+    hart->regs[10]  = mhartid;              // a0 = mhartid (Linux RV boot 协议; uxlen_t 入参直传)
     // regs[11] = 0 (a1 = dtb 占位, 未来; memset 已置 0)
     hart->priv      = PRIV_M;               // M 模式 (启动)
     hart->satp      = 0;                    // bare 模式 (MODE=0, ASID=0, PPN=0 全 0)
@@ -127,7 +140,7 @@ void cpu_reset(cpu_t *hart) {
     // (顺序: 先 memset, 再写需要非 0 的 — regs[0]=pc / regs[10]=a0)
     memset(hart->regs, 0, sizeof(hart->regs));
     hart->regs[0]  = GUEST_RAM_START;            // pc = reset vector
-    hart->regs[10] = hart->per_hart_info.mhartid; // a0 = hartid (Linux RV boot 协议)
+    hart->regs[10] = hart->per_hart_info.mhartid; // a0 = mhartid (Linux RV boot 协议; uxlen_t 直传)
     // regs[11] = 0  (a1 = dtb 占位, memset 已 0)
 
     // 控制状态: priv = M / satp = 0 (bare)
@@ -148,8 +161,8 @@ void cpu_reset(cpu_t *hart) {
     tlb_table_reset(hart);
 
     // 保留 (硬件 ID 类, 真硬件 reset 后不变):
-    //   per_hart_info (mhartid / misa); shared_info 指针 (mvendorid 等)
-    //   jmp_buf_ptr (dispatcher 进入时重设永久落点, reset 时不动也无害)
+    //   hartid (顶层 uint32_t) + per_hart_info (mhartid + misa); shared_info 指针
+    //   (mvendorid 等); jmp_buf_ptr (dispatcher 进入时重设永久落点, reset 时不动也无害)
 }
 
 // ----------------------------------------------------------------------------

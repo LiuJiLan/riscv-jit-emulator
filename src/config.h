@@ -100,6 +100,12 @@
 #define TIMEBASE_FREQ_HZ        10000000UL   /* guest 视角: mtime tick 频率 (10 MHz, 100ns/tick) */
 #define TIMER_WAKE_INTERVAL_NS  1000000UL    /* host 实现: timer 辅助线程 nanosleep 周期 (1 ms) */
 
+// WFI cond_timedwait 兜底周期 (015; core/wfi.c). 防 wfi_kick 漏调时永睡 + 兜底
+// SRS 传播 (signal handler 路径不能 kick, 走 SRS+timeout 自愈)。500ms 是 wfi 私有
+// 数 (比 UART_TX_DRAIN_INTERVAL_MS=10ms 长得多 — wfi 真在睡, 不需要 IO 那种快响应);
+// kick 工作正常时基本不触发, 误漏时人感知前自愈。
+#define WFI_TIMEOUT_NS          500000000UL  /* 500 ms */
+
 // 一次唤醒 fetch_add 量 (编译期常量; 当前配置 = 10000)。
 // TIMEBASE_FREQ_HZ * TIMER_WAKE_INTERVAL_NS / 1e9, 解耦 guest 视角频率 vs host
 // 调度周期: guest 看到 mtime tick 单位 (100ns) 跟 host nanosleep 周期 (1ms)

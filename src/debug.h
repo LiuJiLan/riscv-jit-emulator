@@ -44,18 +44,25 @@
 extern uint32_t debug_cnt;
 
 // ----------------------------------------------------------------------------
-// 调试打印编译标志 (4 个; 由 CMakeLists.txt 按 build type 定义, 不在源码内 #define)
+// 调试打印编译标志 (5 个; 由 CMakeLists.txt 按 build type 定义, 不在源码内 #define)
 //
-//   DEBUG_TRACE_ON       — DEBUG_TICK / DEBUG_XXX trace 字符流 + DEBUG_NEWLINE
-//                          (本文件下方; dispatcher / trap / interpreter 用)
+//   DEBUG_TRACE_ON       — DEBUG_TICK / DEBUG_REFETCH / DEBUG_EXCEPTION /
+//                          DEBUG_INT_CHECK / DEBUG_TIME/SOFT/EXT_INTR / DEBUG_NEWLINE
+//                          (instruction-level fetch / interrupt fire trace 字符流;
+//                           dispatcher / trap 用; 密集, 跟主循环每 iter 同频)
+//   DEBUG_TRACE_WFI_ON   — DEBUG_WFI_ISSUE / DEBUG_WFI_SLEEP / DEBUG_WFI_WAKE
+//                          (WFI 事件 trace 字符 'w' / 'S' / 'W'; interpreter / wfi 用;
+//                           独立 gate — 跟 DEBUG_TRACE_ON 解耦, 因 WFI 事件粒度稀疏,
+//                           fixture 测试时可单开 WFI trace 不要全 instruction trace,
+//                           或反过来全开 trace 但关 WFI; 015 拆出独立 gate)
 //   DEBUG_PERF_ON        — dispatcher [perf] 主循环计时行 (dispatcher.c 内 #ifdef)
 //   DEBUG_CPU_DUMP_ON    — cpu_destroy 内 CPU 寄存器/trap/state dump (cpu.c cpu_dump)
 //   DEBUG_CLINT_TIMER_ON — [clint timer] stopped 行 (clint.c timer_log_stop)
 //
 // 机制: CMakeLists.txt add_compile_definitions 按配置发 -D ——
-//   非 Release 配置 (Debug 等): 四个全开 (GUI build, 全打印, 给人工观察)。
+//   非 Release 配置 (Debug 等): 五个全开 (GUI build, 全打印, 给人工观察)。
 //   Release 配置: 只开 DEBUG_PERF_ON —— 自动化 perf 套件读 [perf] 的纯主循环 MIPS,
-//     trace / CPU dump / [clint timer] 关掉, stderr 写入不污染 [perf] 计时。
+//     trace / WFI / CPU dump / [clint timer] 关掉, stderr 写入不污染 [perf] 计时。
 //
 // 范围: 这些标志只 gate "调试打印"。不影响各模块报错 fprintf / [dispatcher] halted /
 //   [main] elapsed / [decode_test] —— 那些是诊断 / 报错输出, 常开。
@@ -88,6 +95,9 @@ extern uint32_t debug_cnt;
 //   timer ('t')               — timer interrupt fire
 //   soft ('s')                — software interrupt fire
 //   external ('e')            — external interrupt fire
+//
+// (WFI trace 字符 'w' / 'S' / 'W' 由 DEBUG_TRACE_WFI_ON gate 控制, 见下方独立段;
+//  跟本组 trace 解耦.)
 //
 // 字符选取依据 (调整时考虑视觉密度):
 //   - fetch 是真"做事" (块执行), 给粗字符 ('_') 让动作可见
@@ -131,5 +141,50 @@ extern uint32_t debug_cnt;
 #define DEBUG_NEWLINE()    do { } while (0)
 
 #endif /* DEBUG_TRACE_ON */
+
+
+// ----------------------------------------------------------------------------
+// DEBUG_TRACE_WFI_ON gate — WFI 事件 trace 字符 (独立于 DEBUG_TRACE_ON)
+// ----------------------------------------------------------------------------
+//
+// 015 拆出独立 gate, 因 WFI 事件 (case OP_WFI 入口 / 进 cond_wait / wfi_wait 返回)
+// 是 hart-coarse 事件 (单 fixture 通常只几次), 跟 dispatcher fetch/check 字符的
+// 粒度差几个数量级。独立 gate 让 fixture 测试可以:
+//   - 只开 WFI trace, 不打 fetch/check 海量字符 — 验 WFI 行为不被噪声淹
+//   - 反过来开全 trace 但关 WFI — 调 dispatcher 主路径不被 WFI 字符干扰
+//
+// 字符语义:
+//   wfi issue ('w') — case OP_WFI 入口 (interpreter.c, 任何 WFI 指令到达就打,
+//                      包括 TW illegal 短路的; 表 "wfi 指令发出, 想 wfi")
+//   wfi sleep ('S') — 真进 cond_wait 之前 (wfi.c, 在 while loop body 内, predicate
+//                      进入即 true 时不打; 表 "真睡了"); spurious wake + 仍 false
+//                      再 cond_wait → 多打 'S'
+//   wfi wake  ('W') — wfi_wait 返回后 (interpreter.c, 不纠结这个唤醒真不真都打)
+//
+// 3-char 组合解读:
+//   'wW'    = wfi 指令但 predicate 进入即真, 没睡 (fixture 03/04 模式)
+//   'wSW'   = wfi 指令 + 真睡一次 + 醒 (fixture 01/05 模式)
+//   'wSSW'+ = spurious wake / timeout 重 check predicate 多睡几次, 最终 true 退出
+//   'wE'    = wfi 指令 + TW illegal 短路 (没进 wfi_wait, 没 W; 'E' 是 DEBUG_EXCEPTION
+//             — 需 DEBUG_TRACE_ON 也开才看见)
+//   'w' 后无 W 出现 = 真 bug (wfi_wait 永没返回)
+//
+// 实装: 不走 DEBUG_TICK (WFI 事件稀疏, 不需要 80-char 换行; 也避免对 debug_cnt
+// 的依赖, 让 WFI trace 真独立). 跟 DEBUG_TRACE_ON 都开时, WFI 字符夹在 fetch/check
+// 字符流里但不计入 tick counter — line 长度略超 80 可接受 (WFI 事件每行至多几个).
+#ifdef DEBUG_TRACE_WFI_ON
+
+#define DEBUG_WFI_ISSUE()  do { fputc('w', stderr); } while (0)
+#define DEBUG_WFI_SLEEP()  do { fputc('S', stderr); } while (0)
+#define DEBUG_WFI_WAKE()   do { fputc('W', stderr); } while (0)
+
+#else  /* DEBUG_TRACE_WFI_ON 未定义 — WFI trace no-op */
+
+#define DEBUG_WFI_ISSUE()  do { } while (0)
+#define DEBUG_WFI_SLEEP()  do { } while (0)
+#define DEBUG_WFI_WAKE()   do { } while (0)
+
+#endif /* DEBUG_TRACE_WFI_ON */
+
 
 #endif //DEBUG_H

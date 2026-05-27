@@ -134,7 +134,8 @@ typedef enum {
     //   imm[11:0] = 0x302 → MRET     (Machine-mode Return; 从 trap handler 回归)
     //   imm[11:0] = 0x102 → SRET     (Supervisor-mode Return; 见下方 SRET 段)
     //   funct7=0x09       → SFENCE.VMA (见下方 SFENCE.VMA 段)
-    //   其他 (WFI / FENCE.I / 等) 仍归 OP_UNSUPPORTED, 真做时再加
+    //   imm[11:0] = 0x105 → WFI         (Wait For Interrupt; 见下方 WFI 段)
+    //   其他 (FENCE.I / 等) 仍归 OP_UNSUPPORTED, 真做时再加
     //
     // 字段约定:
     //   d.imm = 0 (ECALL/EBREAK 的 imm[11:0] 已用于区分 op_kind, interpreter case 不读此字段;
@@ -262,6 +263,30 @@ typedef enum {
     // interpreter case 入口 (或 sfence helper 入口) 加。
     OP_SFENCE_VMA,
 
+    // ---- I-type SYSTEM WFI ----
+    // opcode 0x73, funct3=0, imm[11:0]=0x105; rd=0, rs1=0 (RV spec)。
+    //
+    // RV Privileged Spec §3.3.2: WFI 是一条 hint — 实现可挂起 hart 等中断, 也可直接当 NOP。
+    // 唤醒条件 (跟 mstatus.MIE 无关): (mie & mip) != 0 任何 enabled-by-mie 的中断 pending。
+    // 唤醒后:
+    //   - mstatus.MIE=1 → 走 trap 入向量 (xtvec)
+    //   - mstatus.MIE=0 → 继续 PC+4 (典型用法: 关中断 WFI 等事件, 软件醒后 poll mip)
+    //
+    // mstatus.TW (Timeout Wait): TW=1 + priv<M 时 WFI 必须 trap illegal (RV spec §3.1.6.5);
+    // interpreter case 入口检查; 当前实现 TW 触发立即 illegal (timeout=0 合法)。
+    //
+    // 字段约定:
+    //   d.rd = d.rs1 = 0 (RV spec; decode 顶部统一提取 = 0)
+    //   d.imm = 0x105 (decode 顶部提取所得; interpreter case 不读)
+    //   d.pc_step = PC_STEP_NONE (case 末尾自写 pc += 4 也行, 但 NONE 是 "case 必自写 pc"
+    //                              的明确表态; 跟 MRET/SRET 同体例 — 它们也走 case 自写 pc 路径)
+    //   注: NONE 跟实际行为 (醒来后 PC+4 或 trap 跳 xtvec) 兼容: trap 路径不到 fetch loop
+    //   末段; PC+4 路径 case 内 hart->regs[0] += 4 显式做
+    //
+    // 是块边界 (硬边界): WFI 必须块尾 — 唤醒可能触发 trap (pc 跳 xtvec) 或继续 (pc+=4),
+    // 块内后续指令无法静态译码 (路径不定); dispatcher 重派发时按新 pc 走 block 1。
+    OP_WFI,
+
     // ---- 兜底 ----
     // 不在当前范围的 opcode (fence 0x0F / amo 0x2F / 真非法 opcode / 真非法 funct3 子段)
     // 全部归这里。interpreter 走 trap_raise_exception(cause=2 Illegal Instruction,
@@ -328,7 +353,7 @@ decoded_inst_t decode(u32_t inst);
 //   非 boundary: 算术 / 逻辑 / 立即数 (LUI/AUIPC + 9 OP-IMM + 10 OP) + LOAD/STORE 8 个;
 //                OP_UNSUPPORTED (走 trap_raise + longjmp, 不经"块边界"路径)
 //   boundary:    控制流 8 个 (6 branch + JAL + JALR) + CSR 6 变体 + SYSTEM 4 (ECALL/
-//                EBREAK/MRET/SRET) + SFENCE.VMA 1
+//                EBREAK/MRET/SRET) + SFENCE.VMA 1 + WFI 1
 //
 // CSR 一刀切策略: 6 变体全视为硬边界 (plan §1.6 简化策略 "过度刷新允许")。实际上 CSRRS
 // rd, csr, x0 = 纯读不写, 不一定要 boundary; 但保险起见统一视为 boundary, 未来真细化时
@@ -395,6 +420,12 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         // 改 TLB 状态; 块内后续指令译码假设 (current_tlb 路径) 失效, 必须块尾。dispatcher
         // 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
         case OP_SFENCE_VMA:
+            return 1;
+
+        // ---- WFI (硬边界) ----
+        // 唤醒可能 trap (mstatus.MIE=1 + 中断 pending → 跳 xtvec) 或继续 (MIE=0 → PC+4),
+        // 块内后续指令静态译码假设不成立, 必须块尾。
+        case OP_WFI:
             return 1;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法

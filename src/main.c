@@ -51,6 +51,7 @@
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
+#include "core/wfi.h"          // wfi_init / wfi_destroy / wfi_kick_all (015 WFI 唤醒框架)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -472,11 +473,23 @@ int main(int argc, char **argv) {
     // hart 构造: misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
     // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的
     // entries 由 dispatcher 懒分配。cpu_create 内部已写入硬件 reset 后默认状态
-    // (regs[0]=GUEST_RAM_START / priv=PRIV_M / satp=0 / regs[10]=mhartid),
+    // (regs[0]=GUEST_RAM_START / priv=PRIV_M / satp=0 / regs[10]=hartid),
     // 跟 cpu_reset 序列一致, 不需要 main 端再写 hart 字段。
-    cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/0);
+    cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/(uxlen_t)0);
     if (hart == NULL) {  // cpu_create 内部已 fprintf "why"
         fprintf(stderr, "cpu_create failed\n");
+        return 1;
+    }
+
+    // 015 加: WFI 唤醒框架 init (core/wfi.h; 每 hart 一 pthread_mutex + cond)。
+    // 必须在 clint_start_timer_thread 之前 — timer thread 一旦开始 tick 就会
+    // 调 clint_recompute_all_mtip → 可能 wfi_kick(i), 那时 wfi_slots 必须已 init。
+    // 同理 plic 任何 device_set_pending 路径会调 plic_recompute_ctx_eip_locked →
+    // wfi_kick; 当前 PLIC 不在 init 时 set pending (都是 guest 写或 device 后续调),
+    // 但保险起见也放在 plic_init 之后。
+    if (wfi_init() != 0) {
+        fprintf(stderr, "wfi_init failed\n");
+        cpu_destroy(hart);
         return 1;
     }
 
@@ -598,6 +611,13 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
 
+    // 015 加: 非 signal handler 上下文路径主动 kick 所有可能在 WFI cond_wait 的 hart;
+    // shutdown_signal_set_bit 自动设 SRS (内部传播), hart predicate 看到 SRS 非 0 退出。
+    // 但 hart 可能正在 cond_timedwait 内, 不主动 kick 要等 timeout (500ms) 才唤;
+    // 这里显式 kick 加快退出。signal handler 路径走的 shutdown_signal_set_bit 不调
+    // 此函数 (async-signal-safe 约束), 那条路径接受 500ms tail latency。
+    wfi_kick_all();
+
     // ------------------------------------------------------------------------
     // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → 三 destroy
     //
@@ -639,6 +659,10 @@ int main(int argc, char **argv) {
     test_dev_destroy();
     uart_destroy();
     virtio_blk_destroy();
+    // 015 加: WFI 框架 destroy (各 hart pthread_mutex_destroy + cond_destroy)。
+    // 必须在所有 wfi_kick 来源 (timer thread / io workers 已 join + clint/plic destroy
+    // 也已 atomic 清字段) 之后 — clint_destroy / plic_destroy 都不再调 wfi_kick。
+    wfi_destroy();
     cpu_destroy(hart);
     ram_destroy();
 

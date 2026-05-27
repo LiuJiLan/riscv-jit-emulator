@@ -31,6 +31,7 @@
 #include <string.h>
 
 #include "config.h"          // PLIC_* / MAX_HARTS
+#include "core/wfi.h"        // wfi_kick (ctx_eip 0→1 翻转唤醒 WFI hart)
 #include "platform/bus.h"    // mmio_dev_t / bus_register_mmio
 #include "riscv.h"           // CAUSE_LOAD/STORE_ACCESS_FAULT / PRIV_M / PRIV_S
 
@@ -95,6 +96,8 @@ static struct {
         uint32_t  enable[(PLIC_N_SOURCES + 31u) / 32u];   /* bitmap */
     } contexts[PLIC_N_CONTEXTS];
     int8_t            plic_ctx_map[MAX_HARTS * 4];        /* index = hartid<<2+priv; -1 = 没连线 */
+    int8_t            plic_ctx_to_hartid[PLIC_N_CONTEXTS]; /* 反查: ctx_id → hartid; -1 = 未绑定;
+                                                              015 加, 服务 wfi_kick on eip 0→1 */
     pthread_rwlock_t  lock;
 } plic;
 
@@ -247,8 +250,27 @@ static int plic_ctx_has_pending_locked(uint32_t ctx_id) {
 // dummy.txt §7 monitor 模型 memory_order 配对规则)。
 
 static void plic_recompute_ctx_eip_locked(uint32_t ctx_id) {
-    int v = plic_ctx_has_pending_locked(ctx_id);
-    atomic_store_explicit(&plic_ctx_eip[ctx_id], v, memory_order_release);
+    int v_new = plic_ctx_has_pending_locked(ctx_id);
+    int v_old = atomic_load_explicit(&plic_ctx_eip[ctx_id], memory_order_relaxed);
+    atomic_store_explicit(&plic_ctx_eip[ctx_id], v_new, memory_order_release);
+    // 015 加: ctx eip 0→1 翻转 → 唤醒该 ctx 对应 hart (可能在 WFI cond_wait)。
+    //
+    // ctx → hartid 走 plic_ctx_to_hartid[] 反查表 (plic_init 跟 plic_ctx_map 同处填);
+    // 未绑定 (-1) 跳过 (合法状态, 例如 U/VS 槽当前都 -1)。
+    //
+    // ctx_id 顺序: plic_init 体例 ctx 2h = hart h M-mode, ctx 2h+1 = hart h S-mode
+    // (即 ctx_id 越小 priv 越高); plic_recompute_all_ctx_eip_locked 按 ctx_id 升序
+    // 遍历 → 同一 hart 的 M ctx 必先于 S ctx 被 recompute, 即 M kick 必先于 S kick。
+    // 这是安全的:
+    //   (a) wfi_kick 幂等, 多次 kick 同 hart 只多醒一次, hart predicate re-check 决定睡或继续
+    //   (b) MEIP > SEIP 优先级跟 kick 顺序一致, hart 醒来后 mip 两位都 set 时
+    //       trap_check_interrupt 也是先选 MEIP, 跟 kick 顺序自然对齐
+    if (v_old == 0 && v_new != 0) {
+        int8_t h = plic.plic_ctx_to_hartid[ctx_id];
+        if (h >= 0) {
+            wfi_kick((uint32_t)h);
+        }
+    }
 }
 
 static void plic_recompute_all_ctx_eip_locked(void) {
@@ -542,9 +564,16 @@ int plic_init(void) {
     for (uint32_t i = 0; i < MAX_HARTS * 4u; i++) {
         plic.plic_ctx_map[i] = -1;
     }
+    /* 015 加: 反查表 plic_ctx_to_hartid 全 -1 init, 服务 wfi_kick on eip 0→1 */
+    for (uint32_t c = 0; c < PLIC_N_CONTEXTS; c++) {
+        plic.plic_ctx_to_hartid[c] = -1;
+    }
     for (uint32_t h = 0; h < MAX_HARTS; h++) {
         plic.plic_ctx_map[(h << 2) | PRIV_M] = (int8_t)(2u * h);
         plic.plic_ctx_map[(h << 2) | PRIV_S] = (int8_t)(2u * h + 1u);
+        /* 反查表同处填: ctx 2h ↔ hart h (M), ctx 2h+1 ↔ hart h (S) */
+        plic.plic_ctx_to_hartid[2u * h]      = (int8_t)h;
+        plic.plic_ctx_to_hartid[2u * h + 1u] = (int8_t)h;
     }
 
     /* plic_ctx_eip 全 0 init (BSS 已 0, 显式 atomic_store lifecycle 可读 +

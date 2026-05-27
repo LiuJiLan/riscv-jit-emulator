@@ -1698,3 +1698,86 @@ bug。注: -Wconversion 当前不在项目 build flag 内, 此收益要等真加
   - 不规定 mask 宏类型 (IRQ_* / CAUSE_* / SIP_MASK 等是 bit pattern 无类型,
     caller 用时按 caller 字段类型 promote)。
 
+
+================================================================================
+## §14. per-hart cache-aligned slot 协议
+================================================================================
+
+涉及文件:
+  - core/wfi.c        (wfi_slot_t = pthread_mutex_t + pthread_cond_t; WFI 唤醒框架)
+  - platform/clint.c  (clint_per_hart_slot_t = _Atomic u32_t mtip + pthread_mutex_t
+                       mtip_lock; MTIP 异步 cache)
+  - 未来: Sstc stip / F·D fcsr per-hart 缓存等同形态扩展时按本协议
+
+
+--------------------------------------------------------------------------------
+背景与目的
+--------------------------------------------------------------------------------
+
+015 引入 WFI cond_wait 唤醒框架 + CLINT MTIP atomic cache, 项目第一次出现
+"每 hart 一份 atomic 字段 + 同步原语 + 高频跨 hart 读" 的 pattern。两个模块
+独立 typedef + 自管数组, 但行为约束一致, 本节钉死跨模块共用体例 — 防 SMP
+后 false sharing 性能塌方, 防之后第三个实例 (Sstc) 走偏。
+
+跟 §7 monitor 体例兼容: monitor 是 "模块持 atomic + 锁封状态" 顶层语义, 本节
+是其中 "状态按 hart 分槽" 的具体落地形态。
+
+
+--------------------------------------------------------------------------------
+体例 (5 条)
+--------------------------------------------------------------------------------
+
+  1. slot struct 末段加 `char _pad[64];`, 整体 `_Alignas(64)`; 保证
+     sizeof(slot) ≥ 64B 且按 cache line 对齐, hart i 改自己槽不 invalidate
+     hart j 的 reader L1 line (假共享防御)。pthread_mutex_t + pthread_cond_t
+     已超 64B → 整体常 ~128B, _pad 仍写但作用退化为"对齐边界"明示。
+
+  2. slot 数组 file-static, 不暴露指针; 接口按 hartid 索引 (uint32_t)。
+     cpu_t 不持 slot 指针, 模块自管 (clint_per_hart[hartid] 风格), 跟 §7
+     monitor "不暴露内部" 一致。
+
+  3. mutex/cond 在模块 init 时一一 pthread_*_init, destroy 时一一
+     pthread_*_destroy; 跟 §12 spawn/join 配对原则同类 (init/destroy 配对)。
+     init 失败走 shutdown_signal_set_bit(DEVICE_FAIL) (CLAUDE.md 体例)。
+
+  4. atomic 字段用 _Atomic + atomic_load/store_explicit 显式 memory_order:
+     writer release / reader acquire 配对 (跨 hart 写的可见性靠这层, 锁只
+     保 reader-side 一致性, 不替代 ordering)。
+
+  5. lock-protected "recompute → atomic_store → 必要时唤醒" 模式跟 PLIC
+     rwlock + atomic cache 体例同形 (见 §7 trade_off_log §T.6):
+       lock(slot_lock)
+       new_val = compute(原子读 inputs)
+       old_val = atomic_load(slot.cache, relaxed)
+       if old_val != new_val:
+           atomic_store(slot.cache, new_val, release)
+           if 边沿条件 (0→1 等): wfi_kick(hartid) 或同类副作用
+       unlock(slot_lock)
+
+
+--------------------------------------------------------------------------------
+未来扩展
+--------------------------------------------------------------------------------
+
+  - Sstc stimecmp: clint 内复制 mtip 路径, 加 _Atomic u8 stip[MAX_HARTS] +
+    stip_lock[MAX_HARTS]; 跟 mtip 同处 recompute + kick (推 plan §2 deferred)
+  - F/D fcsr per-hart 缓存: 真需要 cross-hart 观察时按本节体例落地, 否则
+    fcsr 是单 hart 私有字段直存 cpu_t 即可
+  - SMP 真激活时 PLIC ctx_eip 数组应该补 padding (当前是 _Atomic u8 紧凑
+    数组, MAX_HARTS=1 时不重要; SMP 上线时回头 sweep)
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 不抽 per_hart_t<T> 泛型 / 不开公共 core/per_hart.h 模板。各模块独立
+    typedef 保持本地化, 跟 PLIC ctx_eip + rwlock 同等体例 (没有"PLIC slot
+    模板"也活得好)。真出现第 3 个实例 (Sstc) 再评估是否提抽公共模板。
+  - 不暴露 slot 指针给外部模块。所有访问走模块接口函数 (wfi_wait /
+    wfi_kick / is_clint_timer_pending 等)。
+  - cache line 大小不抽 BUILD_CACHE_LINE_SIZE 宏。当前 hardcode 64
+    (x86_64 / aarch64 主流值); 真上 Apple M (128) / 老 ARM (32) 需要切换
+    时再加, 不预测。
+
+

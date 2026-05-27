@@ -46,13 +46,17 @@ add_compile_options(
     $<$<CONFIG:Release>:-g>
 )
 
-# 调试打印编译标志 (gate trace / [perf] / CPU dump / [clint timer]; 见 src/debug.h)。
-# DEBUG_PERF_ON 所有配置都定义 —— Release 自动化 perf 套件要读 [perf] 的纯主循环
-# MIPS。trace / CPU dump / [clint timer] 仅非 Release 配置定义, 让 Release 够安静,
-# [perf] 计时不被 stderr 写入污染。
+# 调试打印编译标志 (5 个 gate; 见 src/debug.h 顶段 doc):
+#   DEBUG_PERF_ON         — 所有配置开 (Release perf MIPS 读)
+#   DEBUG_TRACE_ON        — 非 Release 开 (dispatcher fetch/check 字符流, 密集)
+#   DEBUG_TRACE_WFI_ON    — 非 Release 开 (WFI w/S/W 字符, 独立 gate, 015 拆出)
+#   DEBUG_CPU_DUMP_ON     — 非 Release 开 (cpu_destroy 寄存器/trap dump)
+#   DEBUG_CLINT_TIMER_ON  — 非 Release 开 ([clint timer] stopped 行)
+# Release 配置只开 DEBUG_PERF_ON, 其它关掉, 让 stderr 不污染 perf 计时。
 add_compile_definitions(
     DEBUG_PERF_ON
     $<$<NOT:$<CONFIG:Release>>:DEBUG_TRACE_ON>
+    $<$<NOT:$<CONFIG:Release>>:DEBUG_TRACE_WFI_ON>
     $<$<NOT:$<CONFIG:Release>>:DEBUG_CPU_DUMP_ON>
     $<$<NOT:$<CONFIG:Release>>:DEBUG_CLINT_TIMER_ON>
 )
@@ -83,6 +87,8 @@ add_executable(riscv_jit_emulator
         src/core/trap.h
         src/core/csr.c
         src/core/csr.h
+        src/core/wfi.c
+        src/core/wfi.h
         src/isa/lsu.c
         src/isa/lsu.h
         src/isa/sfence.c
@@ -102,7 +108,9 @@ add_executable(riscv_jit_emulator
         src/device/uart.c
         src/device/uart.h
         src/device/virtio_blk.c
-        src/device/virtio_blk.h)
+        src/device/virtio_blk.h
+        src/core/wfi.c
+        src/core/wfi.h)
 
 # Test
 enable_testing()

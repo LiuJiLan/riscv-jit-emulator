@@ -48,8 +48,18 @@
 // cpu_info_per_hart_t (类 4: per-hart 私有 RO CSR 数据; 见 dummy.txt §6)
 //
 // per-hart 私有 — 异构 SMP (e.g. 1×MU + 4×MSU) 时不同 hart 的字段值不同, 不能共享。
-// mhartid: hartid 编号; misa: 该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
+// misa: 该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
 // 嵌入 cpu_t 字段 (非指针; per-hart 私有就跟着 cpu_t 走, 不需要外部 alloc)。
+//
+// per-hart 私有 — 异构 SMP (e.g. 1×MU + 4×MSU) 时不同 hart 的字段值不同, 不能共享。
+// mhartid: hartid 编号 (RV spec §3.1.5 mhartid CSR 镜像; MXLEN-bit uxlen_t, dummy.txt §13);
+// misa:    该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
+// 嵌入 cpu_t 字段 (非指针; per-hart 私有就跟着 cpu_t 走, 不需要外部 alloc)。
+//
+// 015 dual storage: mhartid (此处, CSR 语义) 跟 cpu_t.hartid (顶层, uint32_t index 语义)
+// 都在 cpu_create 同时写, 持平 cpu_t 整个 lifetime (mhartid CSR 是 RO + hartid index 是
+// 硬件 wired, 都不变); 不会出现两字段不同步。csr_mhartid_read 走本字段 (uxlen_t 直读);
+// clint/plic/wfi 数组下标走 cpu_t.hartid (uint32_t 直读, 无 cast)。
 typedef struct cpu_info_per_hart_s {
     uxlen_t mhartid;      // RV spec §3.1.5; MXLEN-bit; per-hart 不同; csr_mhartid_read 直读
     uxlen_t misa;         // RV spec §3.1.1; MXLEN-bit; bit 30 = MXL (RV32 = 1); bits[25:0] =
@@ -75,6 +85,20 @@ typedef struct cpu_s {
     // regs[1..31] = x1..x31, offset(reg N) = N * 4
     _Alignas(64) uxlen_t  regs[32];
     uint8_t               priv;             // RV privilege encoding (riscv.h PRIV_*); 当前启动 PRIV_M
+    uint32_t              hartid;           // hart 线程编号 (index 用; dummy.txt §13 index
+                                                //   非目标用 uint32_t). 015 提层 — 多模块按
+                                                //   数组下标用 (clint_per_hart[hartid] /
+                                                //   wfi_slots[hartid] / wfi_kick(hartid) /
+                                                //   is_clint_*_pending(hartid) 等). dual storage
+                                                //   跟 per_hart_info.mhartid 同步 (cpu_create
+                                                //   同时写, lifetime 内都不变 — mhartid RO 硬件
+                                                //   wired). 选 uint32_t 不 uxlen_t 的理由:
+                                                //   (1) 跟 §13 index 非目标体例一致;
+                                                //   (2) clint/plic/wfi 接口入参都已 uint32_t,
+                                                //       直读避免 cast 或 implicit conversion;
+                                                //   (3) RV spec 当前 hart 数 << 2^32 安全.
+                                                //   CSR 读 mhartid 走 per_hart_info.mhartid
+                                                //   (uxlen_t), 不走本字段.
     uxlen_t               satp;             // Sv32 satp; 当前 0 (bare; MODE=0, ASID=0, PPN=0)
     sigjmp_buf           *jmp_buf_ptr;      // 实体在 dispatcher 栈, 见 dummy.txt §1
     tlb_t               **tlb_table[4];     // 4 槽派发数组, 语义见 tlb.h 顶部
@@ -84,7 +108,9 @@ typedef struct cpu_s {
                                                 // 早期 in_trap 字段, 详 trap.h 顶部 + trap.c
     cpu_info_per_hart_t      per_hart_info;     // per-hart 私有 RO CSR (mhartid + misa);
                                                 //   嵌入 (非指针, 跟 cpu_t 走); cpu_create
-                                                //   入参 mhartid + misa 写入
+                                                //   入参 mhartid + misa 写入. mhartid 同时
+                                                //   也用 (uint32_t) 窄化写顶层 hartid 字段
+                                                //   服务 index 用 — 详 hartid 字段注释.
     const cpu_info_shared_t *shared_info;       // 多 hart 共享 RO CSR (mvendorid + marchid +
                                                 //   mimpid); 指向 cpu.c static const
                                                 //   cpu_info_shared_default
@@ -94,7 +120,7 @@ typedef struct cpu_s {
 // 失败返回 NULL, 内部已 fprintf。
 //
 // 内部含 RV "硬件 reset 后默认状态" 写入 (regs[0]=GUEST_RAM_START / priv=PRIV_M /
-// satp=0 / regs[10]=mhartid 等; 跟 cpu_reset 一致), 所以 main 拿到 cpu_t 直接
+// satp=0 / regs[10]=hartid 等; 跟 cpu_reset 一致), 所以 main 拿到 cpu_t 直接
 // 可进 dispatcher, 不需要 main 端再写 hart 字段。
 //
 // TODO future: 按 misa 派发 cpu_t 子结构 alloc — F/D 扩展按 misa.fdv 决定 fcsr
@@ -104,7 +130,11 @@ typedef struct cpu_s {
 // 入参:
 //   misa    — 写入 hart->per_hart_info.misa (csr_misa_read 直读); per-hart 私有, 异构 SMP
 //             时不同 hart 可不同 (例如某些 hart 不带 S-mode 扩展位)。
-//   mhartid — 写入 hart->per_hart_info.mhartid (csr_mhartid_read 直读); per-hart 不同。
+//   mhartid — RV spec §3.1.5 mhartid CSR 值 (MXLEN-bit, dummy.txt §13 uxlen_t);
+//             直接写 hart->per_hart_info.mhartid (CSR 镜像, uxlen_t) + 窄化写
+//             hart->hartid (index 用, uint32_t) + regs[10]=a0 (RV Linux boot 协议).
+//             dual storage (mhartid + hartid) 让 csr_mhartid_read 跟 clint/plic/wfi
+//             index 入参都直读不 cast.
 cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid);
 
 // system reset 每 iter 调 (main while 顶段): 重置 RV-spec reset-state 字段, 让
@@ -112,7 +142,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid);
 //
 // 重置:
 //   regs[0] = GUEST_RAM_START   (pc 启动点 / reset vector)
-//   regs[1..31] = 0; 但 regs[10] = mhartid (a0; RV Linux boot 协议)
+//   regs[1..31] = 0; 但 regs[10] = hart->hartid (a0; RV Linux boot 协议)
 //   regs[11] = 0                 (a1 = dtb 占位, 未来)
 //   priv    = PRIV_M
 //   satp    = 0                  (bare; dispatcher 再选 leaf TLB)
@@ -123,7 +153,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid);
 //   tlb_table 容器 不动, entries 调 tlb_table_reset(hart) 清
 //
 // 保留 (硬件 ID 类, 真硬件 reset 后不变):
-//   per_hart_info (mhartid / misa); shared_info 指针 (mvendorid/marchid/mimpid)
+//   hartid (顶层 uint32_t); per_hart_info (mhartid + misa); shared_info 指针 (mvendorid/marchid/mimpid)
 //   jmp_buf_ptr (dispatcher 进入时重设, reset 时不动 NULL 也 OK)
 //
 // TODO future: 按 hart 内部 misa 派发 (运行时 misa 切换决定哪些 CSR 字段要清零;

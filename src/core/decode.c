@@ -636,8 +636,8 @@ decoded_inst_t decode(u32_t inst) {
                     // 为什么 sfence.vma 不能用 imm[11:0] switch 识别: imm[4:0] = rs2 是变量
                     // (寄存器号 0..31), imm[11:0] 不固定值, 32 种变种。所以先看 funct7。
                     //
-                    // 其他 funct7 + funct3=0 的指令 (WFI=imm 0x105 / FENCE.I 等):
-                    // 走 imm switch 末 default → OP_UNSUPPORTED, 真做时再加 op_kind + case。
+                    // 其他 funct7 + funct3=0 的指令 (WFI=imm 0x105 已实装; FENCE.I 等):
+                    // 走 imm switch 走自己的 case, 不识别的归 default → OP_UNSUPPORTED。
                     if (funct7 == 0x09u) {
                         // SFENCE.VMA rs1, rs2
                         // d.rs1, d.rs2 已由 decode 顶部统一提取 (rs1=vaddr 寄存器, rs2=asid 寄存器);
@@ -663,6 +663,12 @@ decoded_inst_t decode(u32_t inst) {
                             break;
                         case 0x102:
                             d.kind    = OP_SRET;        /* 跟 MRET 同形态, 走 _mstatus 的 S 段 */
+                            d.pc_step = PC_STEP_NONE;
+                            break;
+                        case 0x105:
+                            /* WFI: Wait For Interrupt. case 内自写 pc (醒来 PC+=4 或走 trap),
+                             * NONE 跟 MRET/SRET 同体例; 块边界 (is_block_boundary_inst 返 1)。 */
+                            d.kind    = OP_WFI;
                             d.pc_step = PC_STEP_NONE;
                             break;
                         default:

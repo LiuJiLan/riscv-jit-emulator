@@ -10,16 +10,44 @@
 
 #include "config.h"     // BLOCK_INST_LIMIT, IALIGN_MASK
 #include "cpu.h"
-#include "csr.h"        // csr_op + csr_op_t
+#include "csr.h"        // csr_op + csr_op_t + csr_mip_read (wfi_should_wake)
+#include "debug.h"      // DEBUG_WFI ('w' trace; WFI 进 cond_wait 标记)
 #include "decode.h"
 #include "isa/lsu.h"    // lsu_load_helper / lsu_store_helper (inline 顶层) + store_helper (extern, HVA-based)
 #include "isa/sfence.h" // sfence_vma_helper (extern)
-#include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M])
+#include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M]) / MSTATUS_TW (WFI 检查)
+#include "runtime.h"    // system_reset_signal (wfi_should_wake predicate 内读)
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception (_Noreturn longjmp)
+#include "wfi.h"        // wfi_wait / wfi_predicate_fn (015 WFI 唤醒框架)
 
+#include <stdatomic.h>  // atomic_load_explicit (wfi_should_wake 读 SRS)
+#include <stdbool.h>    // wfi_predicate_fn 返 bool
 #include <stdint.h>
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing
+
+
+// ----------------------------------------------------------------------------
+// wfi_should_wake — WFI cond_wait predicate (file-static; 传给 wfi_wait 当 callback)
+//
+// closure = cpu_t * (caller 传 hart 进去); 返 true 时 wfi_wait 内 cond_wait 退出。
+//
+// 唤醒条件 (RV spec §3.3.2 + 015 设计):
+//   1. SRS 非 0 (system reset 信号; HART 只看 SRS 不看 SDS, dummy.txt 体例) — 退出 hart loop
+//   2. (mie & csr_mip_read(hart)) != 0 — 任何 enabled-by-mie 的中断 pending; 跟 mstatus.MIE
+//      无关 (WFI 唤醒不要求 global IE; spec 明确规定)
+//
+// 锁与可见性: predicate 在 wfi_wait 内 mutex hold 下被调; atomic_load(SRS, acquire)
+// 跟 SRS-setter 端 release 配对; csr_mip_read 内部走 atomic_load (CLINT mtip cache /
+// PLIC ctx_eip cache 都 acquire), 不需要额外锁。
+// ----------------------------------------------------------------------------
+static bool wfi_should_wake(void *closure) {
+    cpu_t *h = (cpu_t *)closure;
+    if (atomic_load_explicit(&system_reset_signal, memory_order_acquire) != 0u) {
+        return true;
+    }
+    return (csr_mip_read(h) & h->trap._mie) != 0u;
+}
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint64_t *count_out) {
@@ -151,7 +179,9 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //   不适用 (任何 priv OK / 由其他机制判):
     //   - ECALL / EBREAK (任何 priv OK; ECALL 按 priv 分流 cause 8/9/11)
     //   - CSR 6 case CSRRW/RS/RC/WI/SI/CI (csr_op 入口判 priv: csr_addr[9:8] vs hart->priv)
-    //   - WFI 未实装 (实装时按 priv >= S + mstatus.TW 控制位; 补宏调用)
+    //   - WFI (015 实装; 走 priv<M + mstatus.TW=1 → illegal 路径, case 入口 if 直
+    //          inline 不复用 PRIV_CHECK_OR_TRAP 宏 — priv check 条件不一样: PRIV_CHECK_OR_TRAP
+    //          是"priv 太低 trap", WFI 是"priv 不够 且 TW=1 才 trap", 复用反而绕)
     //
     // may-trap 边界 (跟 LOAD/STORE_MISALIGN_CHECK 同形态): 调用前必须 SYNC_COUNT(),
     // 否则 dispatcher 收到旧 count_out, 违反 RV precise trap "触发指令本身不算入" 语义。
@@ -637,6 +667,31 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 sfence_vma_helper(hart,
                                   READ_REG(d.rs1), READ_REG(d.rs2),
                                   d.rs1,           d.rs2);
+                break;
+
+            // ---- WFI (015 实装; RV spec §3.3.2 + §3.1.6.5 TW) ----
+            // priv<M + mstatus.TW=1 → trap illegal instruction (timeout=0 实装, spec 允许);
+            // 否则 wfi_wait 挂起直到 SRS 或 (mie & mip) 非 0 (predicate wfi_should_wake)。
+            // 醒来后 pc+=4 自推进 (PC_STEP_NONE 表态 "case 自写 pc"); break 让 fetch loop
+            // 末 count++ + boundary check → goto out, dispatcher 重派发后下一轮
+            // trap_check_interrupt 自动按 mip & mie 派发中断 (若 mstatus.MIE=1) 或继续
+            // (mstatus.MIE=0 → 软件 poll mip 自行处理)。
+            case OP_WFI:
+                DEBUG_WFI_ISSUE();              /* trace 'w' — wfi 指令到达 (TW 短路前打,
+                                                   illegal 路径也算 wfi 被发出过) */
+                if (hart->priv < PRIV_M &&
+                    (hart->trap._mstatus & (u64_t)MSTATUS_TW) != 0u) {
+                    SYNC_COUNT();
+                    trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION,
+                                         /*tval*/d.raw_inst);
+                    /* _Noreturn longjmp; 下面代码不可达 (trace 序: 'wE') */
+                }
+                SYNC_COUNT();
+                wfi_wait(hart->hartid, wfi_should_wake, hart);
+                DEBUG_WFI_WAKE();               /* trace 'W' — wfi_wait 返回后打 (不管真假醒).
+                                                   'wW' = predicate 即真没睡; 'wSW' = 真睡过
+                                                   一次; 'wSSW'+ = spurious/timeout 多睡几次. */
+                hart->regs[0] += 4u;            /* PC_STEP_NONE → 自推进 */
                 break;
 
             // ---- 兜底 ----
