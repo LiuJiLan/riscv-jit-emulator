@@ -8,15 +8,15 @@
 // platform/bus.h + dummy.txt §9。
 //
 // ----------------------------------------------------------------------------
-// monitor 模型 (dummy.txt §7) — UART 是 "monitor + reader 辅助线程"
+// monitor 模型 (dummy.txt §7) — UART 是 "monitor + reader + tx_drain 双辅助线程"
 // ----------------------------------------------------------------------------
 //
 // monitor 范式四态:
-//   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
-//   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin, blocking read)
-//   virtio-blk = "monitor + io_worker 辅助线程" (异步 pread/pwrite + 触发 IRQ)
-//   PLIC       = "monitor 但无辅助线程"         (atomic 字段直接做 hot path 优化)
-//   test_dev   = 不是 monitor                   (无内部状态, 纯 fanout)
+//   CLINT      = "monitor + timer 辅助线程"            (mtime 由 host wall clock 推进)
+//   UART       = "monitor + reader + tx_drain 双线程"   (RX stdin / TX stdout 都异步)
+//   virtio-blk = "monitor + io_worker 辅助线程"         (异步 pread/pwrite + 触发 IRQ)
+//   PLIC       = "monitor 但无辅助线程"                 (atomic 字段做 hot path 优化)
+//   test_dev   = 不是 monitor                          (无内部状态, 纯 fanout + CAS exit_code)
 //
 // reader 辅助线程职责 (uart_reader_run, 实装在 uart.c):
 //   - 周期 poll(STDIN_FILENO, POLLIN, 100ms) — 100ms timeout 用于 cooperative shutdown
@@ -25,9 +25,22 @@
 //   - FIFO 满则 silent 丢字节 (跟 ns16550a overrun 简化, 不真模 LSR.OE)
 //   - EOF / shutdown_signal 非 0 → 自然退出
 //
-// dummy.txt §12 "谁 spawn 谁 join" 协议适用 — uart_start_reader_thread /
-// uart_join_reader_thread 暴露给 main, 跟 clint_start_timer_thread /
-// clint_join_timer_thread 同形态; 受 SDS 控制跨 system reset 一直跑。
+// tx_drain 辅助线程职责 (uart_tx_drain_run, 实装在 uart.c):
+//   - cond_timedwait(tx_not_empty, UART_TX_DRAIN_INTERVAL_MS=10ms 兜底) cooperative
+//     shutdown 模型; hart 写 THR cond_signal 立即 wake (主路径), 10ms 是 SDS check 节奏
+//   - wake 后锁内拷整 FIFO 到 stack buf + reset tx_count=0 + 清 acked + 重算
+//     device_line (让 ETBEI 中断 fire); 释放锁 → 锁外 write(STDOUT_FILENO, buf, n)
+//     一次 batch (跟 _IONBF 每字节 syscall 比 syscall 数量级降)
+//   - 高吞吐 (hart 高频写) 自然 batch (write syscall 间隙 hart 灌满 FIFO);
+//     低吞吐 (interactive typing) 退化一字节一 write (可预料可接受, 延迟近 0)
+//   - shutdown drain 协议: 主循环退出后 (SDS != 0) 进残余 drain 段, 不丢字节
+//     (保 [perf] / [main] 末段输出完整 — 跟 virtio_blk worker 丢残余请求语义不同)
+//   - uart_join_tx_thread 入口 cond_broadcast 唤醒立即跳出 timeout (不等 10ms)
+//
+// dummy.txt §12 "谁 spawn 谁 join" 协议适用 — uart_start_rx_thread /
+// uart_join_rx_thread + uart_start_tx_thread / uart_join_tx_thread
+// 两对接口暴露给 main, 跟 clint_start_timer_thread / clint_join_timer_thread 同
+// 形态; 都受 SDS 控制跨 system reset 一直跑。
 //
 // ----------------------------------------------------------------------------
 // 读写抽象 (monitor + pthread_mutex_t)
@@ -44,13 +57,15 @@
 // 字段模型 vs ns16550a spec — 简化点 + 真实装点
 // ----------------------------------------------------------------------------
 //
-// TX 简化 (host stdout/pipe 已自带 buffer; FIFO 模拟 ROI 低):
-//   - LSR.THRE = 1 永远 (THR 永远 empty; 写 THR 直接 putchar)
-//   - LSR.TEMT = 1 永远 (shift register 永远 empty; host stdout 瞬间消化)
-//   - 写 THR 副作用: 若 IER.ETBEI=1, device_line 仍维持 (THRE 没变); 读 IIR 后才清
+// TX 真 FIFO 反压 (UART_FIFO_SIZE 默认 128, ≥ 16550A baseline 16 — 软件按 DTS
+// fifo-size batch, 不告知 emulator 容量软件按 16 走 dead capacity 不影响行为):
+//   - LSR.THRE = (tx_count < UART_FIFO_SIZE) 真反映 (FIFO 未满)
+//   - LSR.TEMT = (tx_count == 0) 真反映 (FIFO 空)
+//   - hart 写 THR: 入 tx_fifo ring + cond_signal(tx_not_empty); 满则 silent drop
+//     字节 (跟真 16550A FIFO 满写 THR 字节丢一致, 跟 RX silent drop 同体例).
+//     drain thread 异步消费 (锁外 write(STDOUT_FILENO, batch)).
 //
-// RX 真实装 (源 = stdin reader thread, 真异步 buffer 需求):
-//   - 16 B RX FIFO (circular buffer, head/tail/cnt)
+// RX 真 FIFO (源 = stdin reader thread, 真异步 buffer 需求, 容量同 TX):
 //   - LSR.DR = (rx_cnt > 0)
 //   - RX trigger level 简化 = 1 (FCR bit 7:6 写入 silent accept; 不真模 1/4/8/14)
 //   - 读 RBR pop 一字节; 空时返 0 (无 LSR.OE overrun 真模 — 简化丢字节)
@@ -62,9 +77,11 @@
 //   - MCR / MSR (modem 全 0) / SCR (scratch pad) 直接 store/load
 //
 // device_line 拉法 (同步驱动, 跟 PLIC 套契约):
-//   - 任何修改 IER 或 rx_cnt 的路径调完调 uart_compute_device_line_locked
-//   - 计算 (ier.ERBFI && rx_cnt > 0) || (ier.ETBEI && THRE永远=1)
+//   - 任何修改 IER / rx_cnt / tx_count / acked 的路径调完调 uart_compute_device_line_locked
+//   - 计算 (ier.ERBFI && rx_cnt > 0) || (ier.ETBEI && tx_count == 0 && !acked)
 //   - 跟前值不同时, 调 plic.device_set/clear_pending(UART_PLIC_IRQ)
+//   - TX drain thread drain 完 tx_count → 0 后清 acked + compute, 让 ETBEI 中断
+//     重新 fire 给 hart (软件 IRQ-driven driver "buffer drained 可续写" 路径)
 //
 // ----------------------------------------------------------------------------
 // host-side stdin raw mode (line-buffered → char-by-char)
@@ -76,8 +93,8 @@
 // 消费方, 在 reader thread spawn / join 时各调一次 runtime 接口.
 //
 // 切入点:
-//   - uart_start_reader_thread spawn 前 → runtime_stdin_enter_raw()
-//   - uart_join_reader_thread  join 后 → runtime_stdin_exit_raw()
+//   - uart_start_rx_thread spawn 前 → runtime_stdin_enter_raw()
+//   - uart_join_rx_thread  join 后 → runtime_stdin_exit_raw()
 //
 // 退化路径 (isatty=0 / tcsetattr fail) 由 runtime 端内部 silent 处理, UART
 // 不分支 — reader thread 拿到的字节流仍能跑 (只是 line-buffered 体验降级).
@@ -96,19 +113,21 @@
 //                            同形态; dummy.txt §12).
 //
 // uart_destroy             — POR 收尾 (main 末段): pthread_mutex_destroy; reader thread
-//                            已由 uart_join_reader_thread 收回, 这里只清 mutex.
+//                            已由 uart_join_rx_thread 收回, 这里只清 mutex.
 //
-// uart_start_reader_thread — main POR spawn (clint_start_timer_thread 之后, 进 while
-//                            之前); SDS 必须 = 0 (允许执行, 跟 clint_start_timer_thread
-//                            同前提). spawn 失败按 dummy.txt §5 fprintf + shutdown_signal_
-//                            set_bit(DEVICE_FAIL) 让 while 不进; 不分 error path, destroy
-//                            chain 在 while 外写一次.
+// uart_start_rx_thread     — main POR spawn (clint_start_timer_thread 之后, 进 while
+//                                之前); SDS 必须 = 0; spawn fail set DEVICE_FAIL 让 while 不进.
 //
-// uart_join_reader_thread  — POR 退出段 (main while 外, 跟 clint_join_timer_thread 同
-//                            位置): main 已 shutdown_signal_set_bit(NORMAL_EXIT) 之后调;
-//                            reader loop 自然退出 → pthread_join 不永远 block. spawn fail
-//                            path 防御 (reader_thread BSS 0 时 pthread_join 返 ESRCH 一行
-//                            fprintf 不 fatal).
+// uart_join_rx_thread      — POR 退出段 (main while 外, 跟 clint_join_timer_thread 同
+//                                位置): main 已 shutdown_signal_set_bit(NORMAL_EXIT) 之后调;
+//                                reader loop 自然退出 → pthread_join 不永远 block.
+//
+// uart_start_tx_thread   — main POR spawn (uart_start_rx_thread 之后);
+//                                体例同 reader (SDS check + spawn fail set DEVICE_FAIL).
+//
+// uart_join_tx_thread    — POR 退出段 (uart_join_rx_thread 之后); 入口
+//                                cond_broadcast(tx_not_empty) 唤醒 drain thread 立即跳出
+//                                cond_timedwait (不等 10ms tail timeout) 后再 pthread_join.
 //
 
 #ifndef DEVICE_UART_H
@@ -118,7 +137,10 @@ int  uart_init(void);
 int  uart_reset(void);
 void uart_destroy(void);
 
-void uart_start_reader_thread(void);
-void uart_join_reader_thread (void);
+void uart_start_rx_thread  (void);
+void uart_join_rx_thread   (void);
+
+void uart_start_tx_thread(void);
+void uart_join_tx_thread (void);
 
 #endif //DEVICE_UART_H

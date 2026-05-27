@@ -110,11 +110,11 @@
 //   - image_fd==-1 时 no-op.
 //
 // virtio_blk_start_io_worker_thread()
-//   - POR spawn (uart_start_reader_thread 之后); SDS 已非 0 或 image_fd==-1 时 skip;
+//   - POR spawn (uart_start_rx_thread 之后); SDS 已非 0 或 image_fd==-1 时 skip;
 //     spawn fail fprintf + shutdown_signal_set_bit(DEVICE_FAIL) (跟 UART/CLINT 同形态).
 //
 // virtio_blk_join_io_worker_thread()
-//   - POR 退出段 (uart_join_reader_thread 之后); main 已 shutdown_signal_set_bit
+//   - POR 退出段 (uart_join_rx_thread 之后); main 已 shutdown_signal_set_bit
 //     (NORMAL_EXIT) 之后调; pthread_join + ESRCH 容错 (BSS 0 init, spawn skip / fail
 //     路径下 join 返 ESRCH).
 //   - image_fd==-1 时 no-op (没 spawn 也不 join).

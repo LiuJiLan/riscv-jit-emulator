@@ -99,7 +99,7 @@
 // 返 ESRCH 一行 fprintf 不 fatal (跟 clint/uart/plic 同体例; dummy.txt §12)。
 
 static struct {
-    /* image backing — pread/pwrite (host file 后端, 不 fsync 不 mmap) */
+    /* image backing — pread/pwrite (host file 后端; destroy 时 fsync 一次防丢盘) */
     int       image_fd;                /* -1 = no image (整个模块退化) */
     uint64_t  capacity_sectors;        /* st_size / VIRTIO_BLK_SECTOR_SIZE */
 
@@ -742,6 +742,13 @@ int virtio_blk_reset(void) {
 
 void virtio_blk_destroy(void) {
     if (g_vblk.image_fd < 0) return;
+
+    /* 关 fd 前 fsync 一次 — pwrite 后内核 page cache 没刷盘, 极端情况 (host 强杀
+       / 断电) 可能丢最近 sector write. fsync fail 仅 log 不 fatal (destroy 在
+       shutdown 末段无 fallback; 真 fail 也 close 走). 不做 per-IO fsync (太慢). */
+    if (fsync(g_vblk.image_fd) != 0) {
+        fprintf(stderr, "[virtio_blk] destroy: fsync failed: %s\n", strerror(errno));
+    }
 
     (void)close(g_vblk.image_fd);
     g_vblk.image_fd = -1;

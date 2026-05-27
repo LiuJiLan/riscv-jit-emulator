@@ -132,6 +132,20 @@ static void csr_mstatus_write(cpu_t *hart, uxlen_t v) {
     // 跨 csr 不能同写, 仅看当前 _mstatus.MDT 状态: MDT=1 时 csrw mstatus 写 MIE=1
     // 被强制清 0 (regardless of v 内 MIE 值).
     if ((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u) {
+        /* TEMP HINT (small_plan C.3 / A.7): 提示 fixture 缺 boot prelude 清 MDT.
+           只在真有"写 MIE=1 但被锁"时打 hint (one-shot per-process). 撤回时机:
+           small_plan A.7 fixture 整理完成后. TODO: remove this block when fixture
+           cleanup is done. 多 hart 下 static flag race 最多多打几次, 不致命. */
+        if (v & MSTATUS_MIE) {
+            static int mie_hint_shown = 0;
+            if (!mie_hint_shown) {
+                fprintf(stderr,
+                        "[csr hint TEMP] mstatus.MDT=1: write to mstatus.MIE forced to 0 "
+                        "(spec 3.1.6.2). Fixture likely missing boot prelude "
+                        "'csrw 0x310, x0' (small_plan A.7). This hint is one-shot.\n");
+                mie_hint_shown = 1;
+            }
+        }
         v &= ~MSTATUS_MIE;
     }
 
@@ -424,6 +438,20 @@ static void csr_sstatus_write(cpu_t *hart, uxlen_t v) {
      * SDT=1 时 SIE 必清". */
     uint32_t v_masked = (uint32_t)v & SSTATUS_MASK;
     if (v_masked & MSTATUS_SDT) {
+        /* TEMP HINT (small_plan C.3 / A.7): 提示 fixture 缺 boot prelude 清 SDT.
+           只在真有"写 SIE=1 但被锁"时打 hint (one-shot per-process). 撤回时机:
+           small_plan A.7 fixture 整理完成后. TODO: remove this block when fixture
+           cleanup is done. 多 hart 下 static flag race 最多多打几次, 不致命. */
+        if (v_masked & MSTATUS_SIE) {
+            static int sie_hint_shown = 0;
+            if (!sie_hint_shown) {
+                fprintf(stderr,
+                        "[csr hint TEMP] sstatus.SDT=1: write to sstatus.SIE forced to 0 "
+                        "(spec 4.1.1.5). Fixture likely missing boot prelude "
+                        "'csrw sstatus, x0' (small_plan A.7). This hint is one-shot.\n");
+                sie_hint_shown = 1;
+            }
+        }
         v_masked &= ~MSTATUS_SIE;
     }
     const u64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;
@@ -591,31 +619,21 @@ static uxlen_t csr_timeh_read(cpu_t *hart) {
 
 
 // ============================================================================
-// 临时调试 CSR (类 5; uart 实装后删除整段)
+// privrd (项目自定义 CSR 0xCC0) — silent 返当前 priv backdoor
 //
-// 含 privrd (0xCC0) 1 个 csr; 字段不存 cpu_t (csr.c 内 read 直接 fprintf 流式输出)。
-// 删除时机: uart + 真 trap 路径 (用 ecall + putchar) 替代后, 删本段 helper +
-// csr_op 内 case + riscv.h CSR_PRIVRD 宏。
+// 用途: fixture / demo (mini-shell cmd_csr / cmd_su) 通过 csrr 0xCC0 读当前 priv
+// (M=3 / S=1 / U=0; H=2 项目 reserved 不用). RV spec 不允许 User-mode 直接知道
+// priv, 0xCC0 是项目 backdoor.
+//
+// 行为: silent 返 (uxlen_t)hart->priv. 不打 stderr (早期临时设计是 fprintf "[priv] X"
+// 给 console 看, 但 uart 实装 + demo 高频读 0xCC0 频繁刷 stderr → 改 silent;
+// fixture 用 GPR 读 priv 值仍 work).
+//
+// RO csr — csr_op 入口判 [11:10]=0b11 时 trap 写; 没 write helper.
 // ============================================================================
 
-
-// ---- privrd (临时"作弊" CSR; 0xCC0; 等 uart 实装后删除) ----
-//
-// 设计意图: csrr 0xCC0 立即 fprintf "[priv] X" 输出 (X = M/S/H/U 之一), 同时 return
-// (uint32_t)hart->priv 让 fixture 也能 GPR 读到 (兼容性). RV spec 不允许 User-mode 直接
-// 知道 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换 — fprintf 让控制台可见, GPR
-// return 仍可用 (fixture 选择用 GPR 标记还是 console 输出都行)。
-// RO csr — csr_op 入口判 [11:10]=0b11 时 trap 写; 没 write helper.
-
-static char priv_to_char(uint8_t priv) {
-    /* priv encoding (riscv.h PRIV_*): U=0, S=1, H=2 (项目占位 reserved), M=3 */
-    static const char chars[4] = { 'U', 'S', 'H', 'M' };
-    return chars[priv & 0x3u];
-}
-
 static uxlen_t csr_privrd_read(cpu_t *hart) {
-    fprintf(stderr, "[priv] %c\n", priv_to_char(hart->priv));
-    return (uint32_t)hart->priv;
+    return (uxlen_t)hart->priv;
 }
 
 

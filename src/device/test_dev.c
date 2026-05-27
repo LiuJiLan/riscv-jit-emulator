@@ -9,6 +9,7 @@
 
 #include "test_dev.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,18 +26,20 @@
 // file-static state — sifive_test FINISHER 解析后的单个 main-readable 字段
 // ----------------------------------------------------------------------------
 //
-// plain int 不 _Atomic — 跨线程可见性靠 SRS/SDS 的 atomic release-acquire 同步:
-//   - test_dev_write 内先写 exit_code (plain), 然后 shutdown_signal_set_bit 内
-//     atomic_fetch_or release; main while 读 SRS (acquire) 退出后再读 exit_code,
-//     plain 字段通过 atomic release-acquire 边界跨线程可见 (dummy.txt §7 monitor 模型)
-//   - 唯一写入点 = test_dev_write (hart 主线程); 唯一读入点 = main while 之后 (同线程,
-//     但跨 atomic 边界); 不存在并发写
+// _Atomic int + INT32_MIN sentinel "未设置": shutdown 是一次性事件, 多 hart 同时
+// 写 magic 时走 first-writer-wins 语义 — 第一个 CAS 抢占 exit_code 的 hart 决定退
+// 出码, 后续 hart 写 silent ignore (跟 QEMU last-writer-wins-via-BQL 不同, 我们的
+// 行为更地道: shutdown 一次性事件不该被后续 hart 覆盖).
 //
-// 默认 0 (BSS) — PASS exit_code=0 是恒等, FAIL 路径写入新值。RESET 路径不写 exit_code
-// (返 0 默认, 因为 RESET 是 reset-and-continue, 真退出时按当时是否还有 PASS/FAIL 决定)。
+// 实装: test_dev_write PASS/FAIL 路径走 atomic_compare_exchange_strong (expected=
+// INT32_MIN, desired=code). CAS 成才调 shutdown_signal_set_bit(NORMAL_EXIT); 失败
+// 说明已有 hart 抢过, 直接返不动. test_dev_reset (RESET-and-continue 后) 把
+// sentinel 还原成 INT32_MIN 让下次 magic 还能抢. test_dev_get_exit_code 把 sentinel
+// 还原成 0 兜底 (main 端 "没跑到 FINISHER" 视图跟改前兼容).
 //
 // reset_req 字段已废除 — reset 触发改用 SRS bit SYSRESET_BIT_TEST_RESET 表达。
-static int test_dev_exit_code = 0;
+#define TEST_DEV_EXIT_SENTINEL  INT32_MIN
+static _Atomic int test_dev_exit_code = TEST_DEV_EXIT_SENTINEL;
 
 
 // ----------------------------------------------------------------------------
@@ -78,23 +81,33 @@ static int test_dev_write(void *ctx, uint32_t off, const void *buf, uint32_t siz
         device_clear_pending(value);
     } else if (off == (uint32_t)TEST_DEV_SIFIVE_OFF) {
         /* sifive_test FINISHER: cmd = low 16; arg = high 16 (FAIL exit code).
-           PASS/FAIL → shutdown_signal_set_bit(NORMAL_EXIT) (顺序 B 蕴含 SRS
-           BIT_SHUTDOWN_TRIGGER; ABORT_MASK 命中, main cleanup + return exit_code).
+           PASS/FAIL → CAS exit_code from sentinel → code (first-writer-wins);
+           成才调 shutdown_signal_set_bit(NORMAL_EXIT). CAS 失败说明已有 hart 抢过,
+           ignore (跟 QEMU last-writer-wins-via-BQL 不同; 我们语义更地道 — shutdown
+           一次性事件不该被后续 hart 覆盖).
            RESET → system_reset_signal_set_bit(TEST_RESET) (非 ABORT, main try_clear
            continue, SDS 不动 — timer / uart reader 跨 reset 一直跑, 跟真硬件 RTC
-           oscillator + UART pin always-on 一致).
-           写入顺序: 先 plain 字段 (exit_code), 后 set_bit 内 atomic_fetch_or release —
-           release-acquire 跟 main while 读取建立 happens-before, plain 字段可见. */
+           oscillator + UART pin always-on 一致). RESET 不抢 exit_code (RESET-and-
+           continue 路径, exit_code 由后续 PASS/FAIL 决定; test_dev_reset 把 sentinel
+           还原).
+           内存序: CAS release-acquire (CAS 成 release, 失败 acquire); 跟 shutdown_
+           signal_set_bit 内 atomic_fetch_or release 共同建立 happens-before; main while
+           读 SRS acquire 退出后再 atomic_load exit_code (acquire), 跨线程可见. */
         uint32_t cmd = value & 0xFFFFu;
         uint32_t arg = (value >> 16) & 0xFFFFu;
+        int desired;
         switch (cmd) {
           case TEST_DEV_FINISHER_PASS:
-            test_dev_exit_code = 0;
-            shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
-            break;
           case TEST_DEV_FINISHER_FAIL:
-            test_dev_exit_code = (int)arg;
-            shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
+            desired = (cmd == TEST_DEV_FINISHER_PASS) ? 0 : (int)arg;
+            int expected = TEST_DEV_EXIT_SENTINEL;
+            if (atomic_compare_exchange_strong_explicit(&test_dev_exit_code,
+                                                       &expected, desired,
+                                                       memory_order_release,
+                                                       memory_order_acquire)) {
+                shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
+            }
+            /* CAS 失败: 已有 hart 抢过, ignore */
             break;
           case TEST_DEV_FINISHER_RESET:
             system_reset_signal_set_bit(SYSRESET_BIT_TEST_RESET);
@@ -128,10 +141,12 @@ int test_dev_init(void) {
 }
 
 int test_dev_reset(void) {
-    /* system reset 每 iter (含 RESET cmd 触发的 continue path): exit_code 清.
-       不持锁 — 跟 plic_reset / uart_reset 内"system reset 时 dispatcher 主帧停, 无并发"
-       同前提. */
-    test_dev_exit_code = 0;
+    /* system reset 每 iter (含 RESET cmd 触发的 continue path): exit_code 还原
+       sentinel 让 RESET-and-continue 后下次 PASS/FAIL CAS 还能抢. atomic_store
+       release 跟 test_dev_write CAS / test_dev_get_exit_code acquire 配套 (虽然
+       reset 串行调时无并发, atomic 体例统一). */
+    atomic_store_explicit(&test_dev_exit_code, TEST_DEV_EXIT_SENTINEL,
+                          memory_order_release);
     return 0;
 }
 
@@ -151,5 +166,6 @@ void test_dev_destroy(void) {
 // SYSRESET_BIT_TEST_RESET 表达, main 直接读 SRS bit, 不需要 consume 式接口。
 
 int test_dev_get_exit_code(void) {
-    return test_dev_exit_code;
+    int v = atomic_load_explicit(&test_dev_exit_code, memory_order_acquire);
+    return (v == TEST_DEV_EXIT_SENTINEL) ? 0 : v;
 }

@@ -1074,14 +1074,27 @@ memory_order 选择。
                    同步 ACK + 异步 CLEAR race 引起的 spurious re-fire 回退. 详
                    plan §1.26 + trade_off_log §T.6 + a_03_review.md trail (A).
 
-  uart = 完整 monitor + reader 辅助线程
-    内部状态: pthread_mutex_t 保护的 uart struct (8 寄存器 + RX FIFO 16B 环形 +
-              device_line cache + thr_empty_pending_acked) + pthread_t reader_thread
-    内部 actor: file-static uart_reader_run routine (poll(STDIN, POLLIN, 100ms) 心跳
-                检 SDS; 命中 POLLIN 读 1 byte → push RX FIFO + 重算 device_line)
-    对外 consumer: uart_read (bus MMIO; RBR pop FIFO / IIR readout 副作用 ack THR)
-    对外 producer: uart_write (bus MMIO; THR putchar 锁外 / IER/LCR/MCR/FCR/SCR 字段写)
-    lifecycle:    uart_init / uart_reset / uart_destroy
+  uart = 完整 monitor + reader + tx_drain 双辅助线程 (异步默认体例对仗 virtio_blk)
+    内部状态: pthread_mutex_t 保护的 uart struct (8 寄存器 + RX FIFO + TX FIFO
+              UART_FIFO_SIZE 容量 + device_line cache + thr_empty_pending_acked)
+              + pthread_cond_t tx_not_empty + 双 pthread_t reader_thread / tx_drain_thread
+    内部 actor (2 个):
+      uart_reader_run    — RX 路径: poll(STDIN, POLLIN, 100ms) 心跳检 SDS; 命中
+                           POLLIN 读 1 byte → push RX FIFO + 重算 device_line
+      uart_tx_drain_run  — TX 路径: cond_timedwait(tx_not_empty, UART_TX_DRAIN_
+                           INTERVAL_MS=10ms) 兜底 + hart 入 queue cond_signal 立即
+                           wake; wake 后锁内拷整 FIFO 到 stack buf + reset
+                           tx_count=0 + 清 acked + 重算 device_line (让 ETBEI 中
+                           断 fire) → 锁外 write(STDOUT_FILENO, batch); 跟
+                           virtio_blk io_worker 同 cond_signal+timedwait 模式;
+                           shutdown 残余 drain (不丢字节, 跟 virtio_blk 丢残余请
+                           求语义不同)
+    对外 consumer: uart_read (bus MMIO; RBR pop FIFO / IIR readout 副作用 ack THR;
+                   LSR.THRE/TEMT 真反映 tx_count)
+    对外 producer: uart_write (bus MMIO; THR 入 tx_fifo + cond_signal / 满 silent
+                   drop / IER/LCR/MCR/FCR/SCR 字段写)
+    lifecycle:    uart_init / uart_reset / uart_destroy + 两对 spawn/join 接口
+                  (uart_start/join_reader_thread + uart_start/join_tx_drain_thread)
 
   runtime = degenerate monitor (单 flag 简化)
     extern _Atomic int runtime_system_reset_signal / runtime_shutdown_signal,
@@ -1506,7 +1519,7 @@ vs 标注式" 的策略选择。
   - src/main.c                (当前所有 host thread 的 spawn / join 责任)
   - src/runtime.{c,h}         (system_reset_signal / shutdown_signal extern flag)
   - src/platform/clint.{c,h}  (clint_start_timer_thread / clint_join_timer_thread 对偶)
-  - src/device/uart.{c,h}     (uart_start_reader_thread / uart_join_reader_thread 对偶)
+  - src/device/uart.{c,h}     (uart_start_rx_thread / uart_join_rx_thread 对偶)
   - src/device/virtio_blk.{c,h} (virtio_blk_start_io_worker_thread /
                                   virtio_blk_join_io_worker_thread 对偶)
   - 未来任何 spawn host thread 的模块
@@ -1531,13 +1544,18 @@ destroy 函数隐含 pthread_join 导致控制流隐式 block (看 destroy 不�
 
 函数命名 — spawn / join 对偶函数单独暴露, module_verb_object schema:
   - clint_start_timer_thread             / clint_join_timer_thread          (已实装)
-  - uart_start_reader_thread             / uart_join_reader_thread          (已实装)
+  - uart_start_rx_thread             / uart_join_rx_thread          (已实装)
+  - uart_start_tx_thread           / uart_join_tx_thread        (已实装)
   - virtio_blk_start_io_worker_thread    / virtio_blk_join_io_worker_thread (已实装)
   - 未来 hart_start    / hart_join         (SMP 真做时)
   - 未来 monitor_start / monitor_join      (perf shm 接口)
 
   (注: PLIC 不发线程 — 是 "monitor 但无辅助线程" 第一个完整范例; 曾试过异步
    refresh thread 后回退, 详 trade_off_log §T.6.)
+
+  (注: UART 双线程 reader + tx_drain — RX/TX 都异步, 对仗 virtio_blk io_worker
+   的 cond_signal+timedwait 模式; tx_drain join 入口先 cond_broadcast 唤醒立即
+   跳出 cond_timedwait 兜底 timeout 再 pthread_join, 不等 10ms tail.)
 
 destroy 函数纯 cleanup — atomic 字段清 / 资源 free 类, **不含 pthread_join**。
 跟 init 对偶, 反 init 做的事 (init 做了 atomic 字段初始化 + bus 注册 →

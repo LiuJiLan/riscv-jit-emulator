@@ -16,7 +16,7 @@
 //   - CSR 编号: trap setup 7 (mstatus / mstatush / mtvec / mepc / mcause / mtval / mscratch)
 //             + delegation 2 (medeleg / mideleg) + RO Identity 5 (mhartid / misa /
 //             mvendorid / marchid / mimpid) + S-mode 7 (sstatus / sepc / sscratch / stvec /
-//             scause / stval) + satp + 临时 1 (privrd)
+//             scause / stval) + satp + 项目自定义 1 (privrd 0xCC0, silent backdoor 返 priv)
 //   - mstatus 字段位段: MIE / MPIE / MPP + SIE / SPIE / SPP / SUM / MXR + SSTATUS_MASK +
 //                        future-proof SD / UXL / SXL
 //   - Exception Code (CAUSE_*) trap_raise_exception / mcause 字段值 完整集
@@ -214,7 +214,7 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 #define CSR_STVAL      0x143U          /* S-mode trap value (xtval[PRIV_S]) */
 
 // ----------------------------------------------------------------------------
-// CSR_PRIVRD (临时, 等 uart 实装后删除) —— "作弊" 寄存器, 读当前 priv
+// CSR_PRIVRD (项目自定义 RO CSR 0xCC0) — silent 返当前 priv backdoor
 //
 // 0xCC0-0xCFF 范围是 RV Privileged Spec Vol II §2.1 table 2.1 "User-level Custom
 // Read-Only" CSRs:
@@ -224,14 +224,11 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //
 // 写检查: csr_op 入口判 [11:10]=0b11 = RO → 写时 trap cause=2; csrr (RO 路径) OK.
 //
-// CSR_PRIVRD 真"作弊" 用途: csrr x.., 0xCC0 立即触发 fprintf "[priv] X" 输出 (X = M/S/H/U
-// 之一, csr.c csr_privrd_read 直接 fprintf 不缓存; "csrr 即输出"),
-// 同时 return (uint32_t)hart->priv 让 GPR 也能拿到 (兼容性)。
-// RV spec 不允许 User-mode 知道当前 priv; 项目 backdoor 用作 fixture 验证 MSU 三态切换
-// 正确性 — 控制台直接看到 priv 字符比构造 ecall+trap+handler 路径验更直接。
-//
-// 删除时机: uart 实装后, fixture 用 putchar + 真 trap 路径验 priv
-// 状态, 不需要这个 backdoor。
+// 用途: fixture / demo (mini-shell cmd_csr / cmd_su) 通过 csrr 0xCC0 读当前 priv
+// (M=3 / S=1 / U=0; H=2 项目 reserved 不用). RV spec 不允许 User-mode 知道当前
+// priv; 0xCC0 是项目 backdoor, silent 返 (uxlen_t)hart->priv (实装 csr.c
+// csr_privrd_read 一行). 早期临时设计 fprintf "[priv] X" 给 console 看, uart 实装 +
+// demo 高频读 0xCC0 后改 silent (避 stderr 刷屏).
 // ----------------------------------------------------------------------------
 #define CSR_PRIVRD     0xCC0U
 

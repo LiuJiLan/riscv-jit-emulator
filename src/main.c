@@ -22,7 +22,7 @@
 //     SRS/SDS=0 之后, 线程 spawn 之前; 详 runtime.h "external signal handler" 节) /
 //     clint_start_timer_thread (main 起 timer 辅助线程; 跨 system reset 一直跑, 随
 //     SDS 才退; dummy.txt §12 谁 spawn 谁 join) /
-//     uart_start_reader_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
+//     uart_start_rx_thread (main 起 RX reader 线程; 受 SDS 控制, 跨 system reset
 //     一直跑; 详 device/uart.h 顶段) /
 //     virtio_blk_start_io_worker_thread (--blk 路径下 spawn worker 异步 drain
 //     avail ring + pread/pwrite; 退化路径不 spawn)
@@ -394,11 +394,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // stdout unbuffered (进程级一次性): UART TX 走 stdout, 重定向到 pipe / 文件时
-    // glibc 默认全缓冲 (4 KB block flush), 字符会卡 libc buffer 看不到; 这里设
-    // _IONBF, UART 路径 putchar 不用每次 fflush. setvbuf 必须在向 stdout 写任何
-    // 字符之前调 (POSIX 要求), 放最早期。
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // UART TX 走 tx_drain thread → write(STDOUT_FILENO) 直接 syscall, 不经 stdio
+    // buffer; emulator 内部其他位置无 stdout 写路径 (fprintf 走 stderr / snprintf
+    // 不写 fd). setvbuf 在新模型下无意义, 不调.
 
     // decode 单测先跑 (decode 是纯函数, 不依赖 ram/cpu/mmu); fail 直接 return 1 不让
     // fixture 跑 (test-driven 模式)。
@@ -438,7 +436,7 @@ int main(int argc, char **argv) {
     }
 
     // UART (ns16550a) 注册到 bus (test_dev_init 之后)。**不发线程** — reader 线程由
-    // 下方 uart_start_reader_thread 显式起 (谁 spawn 谁 join, dummy.txt §12)。
+    // 下方 uart_start_rx_thread 显式起 (谁 spawn 谁 join, dummy.txt §12)。
     // 详 device/uart.h 顶段。
     if (uart_init() != 0) {
         fprintf(stderr, "uart_init failed\n");
@@ -516,7 +514,13 @@ int main(int argc, char **argv) {
     // blocking read(STDIN) + poll 100ms timeout cooperative shutdown)。错误处理跟
     // clint_start_timer_thread 同 — fail 内部 fprintf + set SRS=0 + SDS=0; while
     // 不进; cleanup 在外写一次。
-    uart_start_reader_thread();
+    uart_start_rx_thread();
+
+    // main 起 UART TX drain 辅助线程 (受 SDS 控制; 内部 cond_timedwait
+    // (tx_not_empty, 10ms) cooperative shutdown + drain 整 FIFO batch write
+    // (STDOUT_FILENO))。hart 写 THR 走 enqueue + cond_signal 立即 wake; FIFO 满
+    // silent drop 字节跟真 16550A 一致。错误处理跟 reader 同形态。
+    uart_start_tx_thread();
 
     // main 起 virtio-blk io_worker 辅助线程 (受 SDS 控制, 跟 plic refresh / uart
     // reader 同形态; 内部 cond_timedwait(not_empty, 100ms) + SDS 检 cooperative
@@ -605,7 +609,8 @@ int main(int argc, char **argv) {
     // CPU dump 已挪进 cpu_destroy (DEBUG_CPU_DUMP_ON gate); 见 cpu.c cpu_dump。
     // ------------------------------------------------------------------------
     clint_join_timer_thread();
-    uart_join_reader_thread();
+    uart_join_rx_thread();
+    uart_join_tx_thread();
     virtio_blk_join_io_worker_thread();
 
     // ------------------------------------------------------------------------

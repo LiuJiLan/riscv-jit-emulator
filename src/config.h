@@ -184,19 +184,29 @@
 //
 // 访问宽度: 1 byte only (8250 spec; size != 1 → CAUSE_*_ACCESS_FAULT)。
 // PLIC source_id: 跟 QEMU virt 一致 (UART0 = 10)。
-// RX FIFO 容量: 16 B (ns16550a spec; trigger level 简化 = 1)。
-#define UART_BASE        0x10000000UL
-#define UART_SIZE        0x00000100UL              /* 256 B 留 reg-shift 扩展 */
-#define UART_REG_RBR_THR 0x0UL                     /* RBR(R) / THR(W) / DLL(DLAB=1) */
-#define UART_REG_IER     0x1UL                     /* IER     / DLM(DLAB=1) */
-#define UART_REG_IIR_FCR 0x2UL                     /* IIR(R)  / FCR(W) */
-#define UART_REG_LCR     0x3UL                     /* LCR (bit 7 = DLAB) */
-#define UART_REG_MCR     0x4UL
-#define UART_REG_LSR     0x5UL                     /* LSR (R; THRE/TEMT/DR) */
-#define UART_REG_MSR     0x6UL                     /* MSR (R) */
-#define UART_REG_SCR     0x7UL
-#define UART_PLIC_IRQ    10U                       /* 跟 QEMU virt UART0 一致 */
-#define UART_RX_FIFO_CAP 16U                       /* ns16550a RX FIFO 16 B */
+//
+// FIFO 容量: UART_FIFO_SIZE 单宏 RX/TX 共用 (默认 128, 超 16550A baseline 16);
+// 寄存器接口不变 (软件按 fifosize 走, ns16550 标准 DTS binding 只 fifo-size 一个
+// 属性, 不分 RX/TX). 软件不通过 DTS 显式 fifo-size 时按默认 16 处理, emulator
+// 内部容量更大只是 dead capacity (不影响行为); 软件配 DTS fifo-size=128 才用满.
+// uart.c 加 _Static_assert(UART_FIFO_SIZE >= 16) 兜底 16550A 兼容性.
+//
+// TX drain thread 兜底周期: cond_timedwait wake interval, 主要为 SDS check 节奏
+// (hart 入 queue cond_signal 立即 wake 是主路径). 10 ms 足够 (interactive 字节
+// 最大延迟人不可感; 高吞吐场景下 hart 高频写 → write syscall 间隙 batch 自然).
+#define UART_BASE                 0x10000000UL
+#define UART_SIZE                 0x00000100UL     /* 256 B 留 reg-shift 扩展 */
+#define UART_REG_RBR_THR          0x0UL            /* RBR(R) / THR(W) / DLL(DLAB=1) */
+#define UART_REG_IER              0x1UL            /* IER     / DLM(DLAB=1) */
+#define UART_REG_IIR_FCR          0x2UL            /* IIR(R)  / FCR(W) */
+#define UART_REG_LCR              0x3UL            /* LCR (bit 7 = DLAB) */
+#define UART_REG_MCR              0x4UL
+#define UART_REG_LSR              0x5UL            /* LSR (R; THRE/TEMT/DR) */
+#define UART_REG_MSR              0x6UL            /* MSR (R) */
+#define UART_REG_SCR              0x7UL
+#define UART_PLIC_IRQ             10U              /* 跟 QEMU virt UART0 一致 */
+#define UART_FIFO_SIZE            128U             /* RX/TX 共用容量; ≥ 16550A baseline 16 */
+#define UART_TX_DRAIN_INTERVAL_MS 10U              /* drain thread cond_timedwait 兜底周期 (SDS check) */
 
 // ----------------------------------------------------------------------------
 // virtio-mmio block device (legacy v1.0 + DeviceID=2)

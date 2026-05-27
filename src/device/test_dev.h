@@ -24,9 +24,13 @@
 // CLINT    = "monitor + timer 辅助线程"
 // PLIC     = "monitor 但无线程"
 // UART     = "monitor + reader 辅助线程"
-// test_dev = **退化 monitor** — exit_code 只由 hart 主线程通过 MMIO 写; main 读取
-//            走 SRS/SDS atomic happens-before 边界 (release-acquire 同步, plain int
-//            跨线程仍可见); 不持锁; SET/CLEAR fanout 透传 plic 内 rwlock。
+// test_dev = **退化 monitor** — exit_code 由任意 hart 主线程通过 MMIO 写 (多 hart
+//            场景), 走 _Atomic int + CAS first-writer-wins 语义抢占 (第一个 CAS
+//            成功的 hart 决定退出码, 后续 hart silent ignore); main 读取走 SRS/
+//            SDS atomic happens-before 边界 (release-acquire 同步); 不持 mutex;
+//            SET/CLEAR fanout 透传 plic 内 rwlock。
+//            (跟 QEMU sifive_test last-writer-wins-via-BQL 不同 — 我们走 first-
+//            writer-wins 更地道, shutdown 是一次性事件不该被后续 hart 覆盖。)
 //            (reset_req 字段 + consume_reset_request 入口已废除 — reset 触发改用
 //            SRS bit SYSRESET_BIT_TEST_RESET 表达, main 直接读 SRS bit。)
 //
