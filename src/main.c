@@ -277,6 +277,42 @@ static int decode_test(void) {
     // C.EBREAK = 0x9002 (C2 funct3=100 bit12=1+rs1=0+rs2=0)
     CASE(0x9002, OP_EBREAK, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x9002, PC_STEP_NONE);
 
+    // ---- RV32M (10 case: 8 happy + 2 funct7 silent miscompile reject; 016 实装) ----
+    //
+    // R-type opcode 0x33 funct7=0x01 dispatch by funct3 (小 plan A.1):
+    //   funct3=0 MUL    / 1 MULH  / 2 MULHSU / 3 MULHU
+    //   funct3=4 DIV    / 5 DIVU  / 6 REM    / 7 REMU
+    // imm = 0 (R-type 无 imm); pc_step = PC_STEP_RV (默认; M ext 非 boundary)。
+    //
+    // 编码: funct7[31:25]=0x01 / rs2[24:20] / rs1[19:15] / funct3[14:12] / rd[11:7] / opcode=0x33
+    // 选 rd/rs1/rs2 不同寄存器号验字段透传不串。
+
+    // MUL    x1, x2, x3 = 0x023100B3
+    CASE(0x023100B3, OP_MUL,    /*rd*/1,  /*rs1*/2,  /*rs2*/3,  0, 0x023100B3, PC_STEP_RV);
+    // MULH   x4, x5, x6 = 0x02629233
+    CASE(0x02629233, OP_MULH,   /*rd*/4,  /*rs1*/5,  /*rs2*/6,  0, 0x02629233, PC_STEP_RV);
+    // MULHSU x7, x8, x9 = 0x029423B3
+    CASE(0x029423B3, OP_MULHSU, /*rd*/7,  /*rs1*/8,  /*rs2*/9,  0, 0x029423B3, PC_STEP_RV);
+    // MULHU  x10, x11, x12 = 0x02C5B533
+    CASE(0x02C5B533, OP_MULHU,  /*rd*/10, /*rs1*/11, /*rs2*/12, 0, 0x02C5B533, PC_STEP_RV);
+    // DIV    x13, x14, x15 = 0x02F746B3
+    CASE(0x02F746B3, OP_DIV,    /*rd*/13, /*rs1*/14, /*rs2*/15, 0, 0x02F746B3, PC_STEP_RV);
+    // DIVU   x16, x17, x18 = 0x0328D833
+    CASE(0x0328D833, OP_DIVU,   /*rd*/16, /*rs1*/17, /*rs2*/18, 0, 0x0328D833, PC_STEP_RV);
+    // REM    x19, x20, x21 = 0x035A69B3
+    CASE(0x035A69B3, OP_REM,    /*rd*/19, /*rs1*/20, /*rs2*/21, 0, 0x035A69B3, PC_STEP_RV);
+    // REMU   x22, x23, x24 = 0x038BFB33
+    CASE(0x038BFB33, OP_REMU,   /*rd*/22, /*rs1*/23, /*rs2*/24, 0, 0x038BFB33, PC_STEP_RV);
+
+    // funct7 silent miscompile reject 2 case (small_plan A.1 修复验证):
+    //   - funct7=0x02 + funct3=0: 之前老代码 funct3=0 不查 funct7 → 当 OP_ADD 跑乱; 现 OP_UNSUPPORTED。
+    //   - funct7=0x20 + funct3=2: 之前 funct3=2 老代码不查 funct7 → 当 OP_SLT 跑乱; 现 OP_UNSUPPORTED
+    //                              (RV ISA Table 24.1: funct7=0x20 仅 funct3=0/5 合法)。
+    // 期望 d.kind=OP_UNSUPPORTED; 其他字段 (rd/rs1/rs2) 仍按 R-type 通用编码位置填 (decode 顶部统一提取);
+    // d.imm=0, d.pc_step=PC_STEP_RV (decode 顶部默认, OP_UNSUPPORTED 路径不动)。
+    CASE(0x043100B3, OP_UNSUPPORTED, /*rd*/1, /*rs1*/2, /*rs2*/3, 0, 0x043100B3, PC_STEP_RV);
+    CASE(0x403120B3, OP_UNSUPPORTED, /*rd*/1, /*rs1*/2, /*rs2*/3, 0, 0x403120B3, PC_STEP_RV);
+
     #undef CASE
 
     if (fail == 0) {

@@ -506,18 +506,63 @@ decoded_inst_t decode(u32_t inst) {
         }
 
         // ---- R-type OP ----
+        // funct7 严格 dispatch (RV ISA Manual Vol I Table 24.1 + M-ext Vol I §7.1):
+        //   funct7 == 0x00: RV32I 8 条 (ADD/SLL/SLT/SLTU/XOR/SRL/OR/AND)
+        //   funct7 == 0x20: RV32I 子集 SUB (funct3=0) / SRA (funct3=5); 其他 funct3 reserved
+        //   funct7 == 0x01: RV32M 8 条 (MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU; 016 实装)
+        //   其他 funct7:    decode 归 OP_UNSUPPORTED
+        //
+        // 历史 silent miscompile bug (small_plan A.1, a_03 之前): 老 switch 只查 funct3 +
+        //   funct3=0/5 内嵌 funct7=0x20 判 SUB/SRA, 其他 funct3 完全不查 funct7 → funct7=1
+        //   的 M ext 落到 ADD/SLL/SLT/.../AND 路径跑乱数据 (bad apple GCC -march=rv32imc
+        //   撞穿). 016 改成 funct7 严格 dispatch + M ext 8 条新落地。
         case 0x33:
-            switch (funct3) {
-                case 0: d.kind = (funct7 == 0x20u) ? OP_SUB : OP_ADD; break;  // ADD/SUB 共 funct3=0
-                case 1: d.kind = OP_SLL;  break;
-                case 2: d.kind = OP_SLT;  break;
-                case 3: d.kind = OP_SLTU; break;
-                case 4: d.kind = OP_XOR;  break;
-                case 5: d.kind = (funct7 == 0x20u) ? OP_SRA : OP_SRL; break;  // SRL/SRA 共 funct3=5
-                case 6: d.kind = OP_OR;   break;
-                case 7: d.kind = OP_AND;  break;
+            switch (funct7) {
+                case 0x00u:
+                    switch (funct3) {
+                        case 0: d.kind = OP_ADD;  break;
+                        case 1: d.kind = OP_SLL;  break;
+                        case 2: d.kind = OP_SLT;  break;
+                        case 3: d.kind = OP_SLTU; break;
+                        case 4: d.kind = OP_XOR;  break;
+                        case 5: d.kind = OP_SRL;  break;
+                        case 6: d.kind = OP_OR;   break;
+                        case 7: d.kind = OP_AND;  break;
+                        default:
+                            // funct3 0..7 全覆盖, 不可达; 仅防御。
+                            d.kind = OP_UNSUPPORTED;
+                            break;
+                    }
+                    break;
+                case 0x20u:
+                    // 仅 funct3=0 (SUB) / funct3=5 (SRA) 合法; 其他 funct3 reserved。
+                    switch (funct3) {
+                        case 0: d.kind = OP_SUB; break;
+                        case 5: d.kind = OP_SRA; break;
+                        default:
+                            d.kind = OP_UNSUPPORTED;
+                            break;
+                    }
+                    break;
+                case 0x01u:
+                    // RV32M 整数乘除; 详 decode.h enum 段 M ext doc + spec edge cases。
+                    switch (funct3) {
+                        case 0: d.kind = OP_MUL;    break;
+                        case 1: d.kind = OP_MULH;   break;
+                        case 2: d.kind = OP_MULHSU; break;
+                        case 3: d.kind = OP_MULHU;  break;
+                        case 4: d.kind = OP_DIV;    break;
+                        case 5: d.kind = OP_DIVU;   break;
+                        case 6: d.kind = OP_REM;    break;
+                        case 7: d.kind = OP_REMU;   break;
+                        default:
+                            // funct3 0..7 全覆盖, 不可达; 仅防御。
+                            d.kind = OP_UNSUPPORTED;
+                            break;
+                    }
+                    break;
                 default:
-                    // 同 OP-IMM, funct3 0..7 全覆盖, 不可达, 仅防御。
+                    // 其他 funct7 (RV ISA reserved 或未来 A/F/B-ext 等): OP_UNSUPPORTED。
                     d.kind = OP_UNSUPPORTED;
                     break;
             }

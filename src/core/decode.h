@@ -6,18 +6,27 @@
 //       纯数据结构, 给 interpreter / translator 共用。decode 是纯函数, 不读 / 不写 cpu_t。
 //
 // op_kind_t 范围 (按 RV 指令类型分组; RVC 不单立 op_kind, 复用 RV32I 同源 op):
-//   - 算术 / 逻辑 / 立即数: 21 (LUI/AUIPC + 9 OP-IMM + 10 OP)
+//   - 算术 / 逻辑 / 立即数 (RV32I): 21 (LUI/AUIPC + 9 OP-IMM + 10 OP)
+//   - 整数乘除 (RV32M, 016 实装): 8 (MUL/MULH/MULHSU/MULHU + DIV/DIVU/REM/REMU;
+//                                    物理位置 enum 内嵌入 R-type OP 段 OP_AND 之后,
+//                                    同 opcode 0x33 聚合, 见下方 M ext 段 doc)
 //   - 控制流: 8 (6 branch + JAL + JALR)
 //   - CSR: 6 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
-//   - SYSTEM: 4 (ECALL / EBREAK / MRET / SRET)
+//   - SYSTEM: 5 (ECALL / EBREAK / MRET / SRET / WFI)
 //   - LOAD / STORE: 8 (5 LB/LH/LW/LBU/LHU + 3 SB/SH/SW)
 //   - SFENCE.VMA: 1
-//   共 48 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 49 个 op_kind。
-//   不在此范围的 opcode (FENCE / AMO / LR/SC / WFI / 等) decode 全部归 OP_UNSUPPORTED。
+//   共 57 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 58 个 op_kind。
+//   不在此范围的 opcode (FENCE / AMO / LR/SC / F/D / 等) decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
-//   时编译器逼着补 case, 不会漏。enum 顺序按"增量追加"哲学, 不重排已有顺序。
+//   时编译器逼着补 case, 不会漏。enum 顺序按 RV 指令 type/opcode 分段; 段内可追加 (例如
+//   同段 R-type opcode 0x33 内 M ext 8 条加在 OR/AND 之后), 不重排已有段间顺序。
+//
+//   TODO (a_04+): 现有 SRET / SFENCE_VMA / WFI 都是历史增量追加, 散落在 LOAD/STORE 之间
+//   或末尾, 跟 SYSTEM 段拆开了; 找时间一次性归位 (SRET 紧跟 MRET; SFENCE_VMA / WFI 进
+//   SYSTEM 段末). enum 数字会重排, interpreter / decode 都用名字不用数字, 重排无功能
+//   影响, 但 git blame 噪声大, 单独 commit。
 //
 // decoded_inst_t 字段:
 //   kind     - op_kind_t, 由 decode 分类
@@ -72,6 +81,47 @@ typedef enum {
     OP_SRA,
     OP_OR,
     OP_AND,
+
+    // ---- RV32M Integer Multiply/Divide (8), opcode 0x33 funct7=0x01 ----
+    // RV ISA Manual Vol I "M" extension. 物理位置嵌入 R-type OP 段 (同 opcode 0x33);
+    // funct3 8 子分类 (跟 RV32I OP funct7=0x00/0x20 路径互斥):
+    //   funct3=0 MUL    rd = (rs1 × rs2)[31:0]            (低 32 bit; signed/unsigned 等价)
+    //   funct3=1 MULH   rd = (sx(rs1) × sx(rs2))[63:32]   (signed × signed 高 32 bit)
+    //   funct3=2 MULHSU rd = (sx(rs1) × zx(rs2))[63:32]   (signed × unsigned 高 32 bit; 不对称)
+    //   funct3=3 MULHU  rd = (zx(rs1) × zx(rs2))[63:32]   (unsigned × unsigned 高 32 bit)
+    //   funct3=4 DIV    rd = rs1 / rs2 (signed)
+    //   funct3=5 DIVU   rd = rs1 / rs2 (unsigned)
+    //   funct3=6 REM    rd = rs1 % rs2 (signed)
+    //   funct3=7 REMU   rd = rs1 % rs2 (unsigned)
+    //
+    // spec edge cases (RV Unprivileged §7.2, decode 不感知, interpreter 自处理; 全部不 trap):
+    //   - DIV  by-0           : rd = -1 (all-ones)
+    //   - DIVU by-0           : rd = 2^32-1 (UINT32_MAX, all-ones)
+    //   - REM  by-0           : rd = rs1 (dividend 原样)
+    //   - REMU by-0           : rd = rs1
+    //   - DIV  INT_MIN ÷ -1   : rd = INT_MIN (overflow 不 trap, 返 dividend; C signed
+    //                                          overflow 是 UB, 必须 if 短路)
+    //   - REM  INT_MIN ÷ -1   : rd = 0       (overflow 不 trap, 返 0; 同上短路)
+    //
+    // 字段约定 (跟 R-type OP 一致):
+    //   d.rd / d.rs1 / d.rs2: 寄存器号 (decode 顶部统一提取)
+    //   d.imm:                 不用 (R-type 无 imm)
+    //   d.pc_step:             PC_STEP_RV (普通 +4; 默认值)
+    //
+    // 非块边界 (is_block_boundary_inst → 0; 跟算术 / 逻辑 / R-type OP 同性质)。
+    //
+    // 历史 silent miscompile bug 修复 (small_plan A.1): a_03 之前 decode case 0x33
+    //   funct3 switch 不查 funct7, funct7=1 的 M ext 被当 ADD/SLL/SLT/.../AND 跑出乱
+    //   数据; bad apple GCC -march=rv32imc 撞穿。016 顺手 funct7 严格分支 (0x00/0x20/
+    //   0x01 显式枚举, 其他 OP_UNSUPPORTED)。
+    OP_MUL,
+    OP_MULH,
+    OP_MULHSU,
+    OP_MULHU,
+    OP_DIV,
+    OP_DIVU,
+    OP_REM,
+    OP_REMU,
 
     // ---- B-type BRANCH (6), opcode 0x63 ----
     // 6 个变体 funct3 编码 (RV spec): BEQ=000, BNE=001, BLT=100, BGE=101, BLTU=110, BGEU=111
@@ -381,6 +431,9 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_SLLI:  case OP_SRLI:  case OP_SRAI:
         case OP_ADD:   case OP_SUB:   case OP_SLL:   case OP_SLT:  case OP_SLTU:
         case OP_XOR:   case OP_SRL:   case OP_SRA:   case OP_OR:   case OP_AND:
+        // ---- RV32M 8 条 (非 boundary; 跟 R-type OP 算术同性质, 同 opcode 0x33) ----
+        case OP_MUL:   case OP_MULH:  case OP_MULHSU: case OP_MULHU:
+        case OP_DIV:   case OP_DIVU:  case OP_REM:    case OP_REMU:
             return 0;
 
         // ---- OP_UNSUPPORTED (非 boundary; 走 trap_raise(2) + longjmp 跳回 dispatcher,

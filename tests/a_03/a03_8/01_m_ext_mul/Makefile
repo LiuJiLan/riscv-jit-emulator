@@ -1,0 +1,20 @@
+# a03_8 / 01_m_ext_mul
+# 验 RV32M 4 条 mul (MUL/MULH/MULHSU/MULHU) 在 emulator interpreter 跑得对。
+# 工具链 + 模式套 a01_3 / 01_arith_basic 同款。
+
+TOOL    := riscv64-unknown-elf
+CC      := $(TOOL)-gcc
+OBJCOPY := $(TOOL)-objcopy
+CFLAGS  := -nostdlib -nostartfiles -march=rv32imac -mabi=ilp32 -mcmodel=medany
+
+.PHONY: all clean
+all: out.bin
+
+out.elf: stub.S link.ld
+	$(CC) $(CFLAGS) -T link.ld stub.S -o out.elf
+
+out.bin: out.elf
+	$(OBJCOPY) -O binary out.elf out.bin
+
+clean:
+	rm -f out.elf out.bin

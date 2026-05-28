@@ -327,6 +327,92 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 WRITE_REG(d.rd, READ_REG(d.rs1) & READ_REG(d.rs2));
                 break;
 
+            // ---- RV32M Integer Multiply/Divide (8 op, 016 实装) ----
+            //
+            // pure case (无 trap 路径; spec 强制 by-0 / overflow 也返定值不 trap), 无 SYNC_COUNT。
+            // 边界 case 详 decode.h M ext 段 doc; 这里只做实装写法:
+            //
+            // MUL: 低 32 bit 乘积; signed/unsigned 等价 (mod 2^32 截断). uint32_t × uint32_t
+            //   = uint32_t (wrap-around defined), 干净不 UB。
+            //
+            // MULH/MULHU/MULHSU: 高 32 bit, 用 64-bit 中间.
+            //   MULH:   int64_t = (int32_t)rs1 × (int32_t)rs2 (signed sign-ext × signed sign-ext)
+            //   MULHU:  uint64_t = (uint32_t)rs1 × (uint32_t)rs2 (zero-ext × zero-ext)
+            //   MULHSU: signed × unsigned, 不对称. 写法见小段内注释 (small_plan A.1 拍定写法)。
+            //
+            // DIV/REM: signed 必须 if 短路 by-0 + INT_MIN÷-1 overflow (两个 C UB 都要避), 别的
+            //   case 用普通 / %.
+            // DIVU/REMU: unsigned 只需短路 by-0 (无 overflow case)。
+            case OP_MUL:
+                WRITE_REG(d.rd, READ_REG(d.rs1) * READ_REG(d.rs2));
+                break;
+            case OP_MULH: {
+                int64_t a = (int64_t)(int32_t)READ_REG(d.rs1);
+                int64_t b = (int64_t)(int32_t)READ_REG(d.rs2);
+                /* a * b 都 64-bit signed 表达, 不溢出 (32×32 → 64 bit 上界够用). */
+                WRITE_REG(d.rd, (uint32_t)((uint64_t)(a * b) >> 32));
+                break;
+            }
+            case OP_MULHU: {
+                uint64_t a = (uint64_t)READ_REG(d.rs1);
+                uint64_t b = (uint64_t)READ_REG(d.rs2);
+                WRITE_REG(d.rd, (uint32_t)((a * b) >> 32));
+                break;
+            }
+            case OP_MULHSU: {
+                /* signed × unsigned: rs1 sign-ext 到 int64_t, rs2 zero-ext 到 uint64_t;
+                 * 乘法用 uint64_t (C integer promotion: signed × unsigned 同 rank 时 signed
+                 * 隐式转 unsigned, bit pattern 等价 sign-ext 后 × unsigned; 数学结果范围
+                 * [INT64_MIN, ~INT64_MAX], 64-bit 一定装得下). 上 32 位即所求。 */
+                int64_t  a_ext = (int64_t)(int32_t)READ_REG(d.rs1);   /* sign-ext */
+                uint64_t b_ext = (uint32_t)READ_REG(d.rs2);           /* zero-ext */
+                uint64_t prod  = (uint64_t)a_ext * b_ext;
+                WRITE_REG(d.rd, (uint32_t)(prod >> 32));
+                break;
+            }
+            case OP_DIV: {
+                int32_t a = (int32_t)READ_REG(d.rs1);
+                int32_t b = (int32_t)READ_REG(d.rs2);
+                int32_t q;
+                if (b == 0) {
+                    q = -1;                /* spec: by-0 quotient = all-ones */
+                } else if (a == INT32_MIN && b == -1) {
+                    q = INT32_MIN;         /* spec: overflow → dividend; 避 C signed UB */
+                } else {
+                    q = a / b;
+                }
+                WRITE_REG(d.rd, (uint32_t)q);
+                break;
+            }
+            case OP_DIVU: {
+                uint32_t a = READ_REG(d.rs1);
+                uint32_t b = READ_REG(d.rs2);
+                /* spec: by-0 quotient = UINT32_MAX (all-ones); 无 overflow case */
+                WRITE_REG(d.rd, (b == 0u) ? UINT32_MAX : (a / b));
+                break;
+            }
+            case OP_REM: {
+                int32_t a = (int32_t)READ_REG(d.rs1);
+                int32_t b = (int32_t)READ_REG(d.rs2);
+                int32_t r;
+                if (b == 0) {
+                    r = a;                 /* spec: by-0 remainder = dividend */
+                } else if (a == INT32_MIN && b == -1) {
+                    r = 0;                 /* spec: overflow → 0; 避 C signed UB */
+                } else {
+                    r = a % b;
+                }
+                WRITE_REG(d.rd, (uint32_t)r);
+                break;
+            }
+            case OP_REMU: {
+                uint32_t a = READ_REG(d.rs1);
+                uint32_t b = READ_REG(d.rs2);
+                /* spec: by-0 remainder = dividend (rs1); 无 overflow case */
+                WRITE_REG(d.rd, (b == 0u) ? a : (a % b));
+                break;
+            }
+
             // ---- B-type BRANCH ----
             // 比较 rs1 / rs2 (按 funct3 决定有/无符号 + 比较方向); taken 走 pc + imm
             // (经 WRITE_PC_OR_TRAP 含对齐检查), not-taken 走 pc + 4 (固定 32-bit 分支)。
