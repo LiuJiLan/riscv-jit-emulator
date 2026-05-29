@@ -234,7 +234,7 @@ void dispatcher(cpu_t *hart) {
             current_tlb = tlb_alloc();
             if (current_tlb == NULL) {
                 fprintf(stderr,
-                        "[dispatcher] tlb_alloc failed for priv=%u asid=%u\n",
+                        "[dispatcher] tlb_alloc failed for priv=%u asid=%u" EOL,
                         (uint32_t)hart->priv, asid);
                 system_reset_signal_set_bit(SYSRESET_BIT_HART_MDT);
                 break;
@@ -303,7 +303,7 @@ void dispatcher(cpu_t *hart) {
     // === end perf timing ===
 
     // DEBUG trace 流尾部换行: dispatcher 在 while 体内通过 DEBUG_XXX 宏写入单字符流
-    // (无换行)。while 退出 = trace 流到此为止, 立刻打一次 \n 收尾, 让后面的 [perf] /
+    // (无换行)。while 退出 = trace 流到此为止, 立刻打一次 " EOL " 收尾, 让后面的 [perf] /
     // [dispatcher] halted 各占干净一行。放 t_end 之后 (fputc 的 I/O 不算进 [perf] 计时
     // 窗口)。受 DEBUG_TRACE_ON gate (DEBUG_NEWLINE; trace 关时无字符流, 换行同步退化 no-op)。
     DEBUG_NEWLINE();
@@ -318,7 +318,7 @@ void dispatcher(cpu_t *hart) {
         double perf_elapsed = (double)(t_end.tv_sec  - t_start.tv_sec)
                             + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
         fprintf(stderr,
-                "[perf] elapsed=%.6f s  total_count=%" PRIu64 "  MIPS=%.3f\n",
+                "[perf] elapsed=%.6f s  total_count=%" PRIu64 "  MIPS=%.3f" EOL,
                 perf_elapsed, total_count,
                 perf_elapsed > 0.0
                     ? (double)total_count / perf_elapsed / 1e6
@@ -328,7 +328,7 @@ void dispatcher(cpu_t *hart) {
     // === end perf timing ===
 
     fprintf(stderr,
-            "[dispatcher] halted: mstatus.MDT=%u sstatus.SDT=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "\n",
+            "[dispatcher] halted: mstatus.MDT=%u sstatus.SDT=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "" EOL,
             (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             total_count, hart->regs[0]);

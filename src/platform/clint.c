@@ -268,7 +268,7 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
 static void timer_log_stop(const char *reason) {
 #ifdef DEBUG_CLINT_TIMER_ON
     u64_t    now = atomic_load_explicit(&clint.mtime, memory_order_acquire);
-    fprintf(stderr, "[clint timer] stopped (%s): mtime=%" PRIu64 "\n", reason, now);
+    fprintf(stderr, "[clint timer] stopped (%s): mtime=%" PRIu64 "" EOL, reason, now);
 #else
     (void)reason;
 #endif
@@ -279,7 +279,7 @@ static void *timer_run(void *arg) {
 
     struct timespec next_wake;
     if (clock_gettime(CLOCK_MONOTONIC, &next_wake) != 0) {
-        fprintf(stderr, "[clint timer] clock_gettime(CLOCK_MONOTONIC) failed: %s\n",
+        fprintf(stderr, "[clint timer] clock_gettime(CLOCK_MONOTONIC) failed: %s" EOL,
                 strerror(errno));
         shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
         timer_log_stop("clock_gettime fail");
@@ -299,7 +299,7 @@ static void *timer_run(void *arg) {
         int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wake, NULL);
         if (rc == EINTR) continue;            // Linux 习惯: 信号中断 retry
         if (rc != 0) {
-            fprintf(stderr, "[clint timer] clock_nanosleep failed: %s\n",
+            fprintf(stderr, "[clint timer] clock_nanosleep failed: %s" EOL,
                     strerror(rc));
             shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
             timer_log_stop("clock_nanosleep fail");
@@ -350,7 +350,7 @@ int clint_init(void) {
         atomic_store_explicit(&clint_per_hart[i].mtip, 0u, memory_order_relaxed);
         int rc = pthread_mutex_init(&clint_per_hart[i].mtip_lock, NULL);
         if (rc != 0) {
-            fprintf(stderr, "clint_init: pthread_mutex_init(mtip_lock[%u]) failed: %s\n",
+            fprintf(stderr, "clint_init: pthread_mutex_init(mtip_lock[%u]) failed: %s" EOL,
                     i, strerror(rc));
             // 已 init 的前 i 把锁泄漏 (init 失败路径, main 不会跑 destroy chain);
             // 跟 cpu_create 半 init 失败回滚同体例 — 报错够清楚就行, 不强求 graceful。
@@ -370,7 +370,7 @@ int clint_init(void) {
         .name      = "clint",
     };
     if (bus_register_mmio(&dev) != 0) {
-        fprintf(stderr, "clint_init: bus_register_mmio failed\n");
+        fprintf(stderr, "clint_init: bus_register_mmio failed" EOL);
         return -1;
     }
     return 0;
@@ -423,7 +423,7 @@ void clint_start_timer_thread(void) {
 
     int rc = pthread_create(&clint.timer_thread, NULL, timer_run, NULL);
     if (rc != 0) {
-        fprintf(stderr, "clint_start_timer_thread: pthread_create failed: %s\n",
+        fprintf(stderr, "clint_start_timer_thread: pthread_create failed: %s" EOL,
                 strerror(rc));
         // 错误走 runtime signal 通道 — shutdown_signal_set_bit 内部按顺序 B 蕴含
         // SRS BIT_SHUTDOWN_TRIGGER, main while 因 SRS 非 0 自然不进, 走 cleanup
@@ -447,7 +447,7 @@ void clint_join_timer_thread(void) {
     //      但不影响正确性。已在退出路径, 不阻挡 destroy chain + return 0。
     int rc = pthread_join(clint.timer_thread, NULL);
     if (rc != 0) {
-        fprintf(stderr, "clint_join_timer_thread: pthread_join failed: %s\n",
+        fprintf(stderr, "clint_join_timer_thread: pthread_join failed: %s" EOL,
                 strerror(rc));
     }
 }

@@ -4,7 +4,7 @@
 //
 // 设计目的: dispatcher / trap / 中断 路径上的"重新取指 / 异常 / 中断"事件流式
 // 输出单字符到 stderr; 配合 fixture 人工观察跨页 / 中断密度, 不接入正式 unit test。
-// 换行时机由调用方拍 (典型: dispatcher 退出 dump 前打一次 fputc('\n', stderr))。
+// 换行时机由调用方拍 (典型: dispatcher 退出 dump 前打一次 fputs(EOL, stderr))。
 //
 // debug_cnt 不是 trap nesting / count_out; 是开发期 tick 累加, 仅作"已发生多少
 // trace 事件"参考。
@@ -39,9 +39,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "config.h"   // EOL 宏 (项目级 stderr 输出体例 = "\r\n")
+
 // 全局 trace tick counter。单 hart 单线程下安全; SMP 多 hart 时按上方
 // "thread-local"分类策略改 atomic 或 per-hart 字段 (SMP 真做时确认)。
 extern uint32_t debug_cnt;
+
+// EOL 宏定义在 config.h (项目级输出体例, 跨模块广泛使用); 这里靠 #include
+// "config.h" (上方) 拿到。debug.h 内 DEBUG_NEWLINE / DEBUG_TICK 用 fputs(EOL, ...)。
 
 // ----------------------------------------------------------------------------
 // 调试打印编译标志 (5 个; 由 CMakeLists.txt 按 build type 定义, 不在源码内 #define)
@@ -68,24 +73,24 @@ extern uint32_t debug_cnt;
 //   [main] elapsed / [decode_test] —— 那些是诊断 / 报错输出, 常开。
 // ----------------------------------------------------------------------------
 
-// DEBUG_TICK_TH: trace 流自动换行阈值 (每 N 个事件后 fputc('\n'))。80 按经典终端
-// 宽度, 不强制; 改大改小看 fixture 密度调。
+// DEBUG_TICK_TH: trace 流自动换行阈值 (每 N 个事件后 fputs(EOL, stderr))。80 按
+// 经典终端宽度, 不强制; 改大改小看 fixture 密度调。
 #define DEBUG_TICK_TH  80
 
-// DEBUG_TICK(): 内部 tick — 累加 debug_cnt + 到阈值打 \n。各字符事件宏内部统一调
-// 它, 不作"用户事件"独立暴露。
+// DEBUG_TICK(): 内部 tick — 累加 debug_cnt + 到阈值打 EOL。各字符事件宏内部统一
+// 调它, 不作"用户事件"独立暴露。
 //
 // 下方 DEBUG_TICK / DEBUG_XXX / DEBUG_NEWLINE 全部受 DEBUG_TRACE_ON gate (见上方 doc):
 // 开 → 正常输出; 关 → 退化为 do {} while (0) no-op。
 #ifdef DEBUG_TRACE_ON
 
-#define DEBUG_TICK()   do {                                      \
-    debug_cnt++;                                                 \
-    if ((debug_cnt % DEBUG_TICK_TH) == 0) fputc('\n', stderr);   \
+#define DEBUG_TICK()   do {                                       \
+    debug_cnt++;                                                  \
+    if ((debug_cnt % DEBUG_TICK_TH) == 0) fputs(EOL, stderr);     \
 } while (0)
 
-// DEBUG_XXX 字符事件宏: 写单字符到 stderr + DEBUG_TICK (tick 内部判换行 → \n 跟在
-// 字符后, 即"本行末尾"位置)。
+// DEBUG_XXX 字符事件宏: 写单字符到 stderr + DEBUG_TICK (tick 内部判换行 → EOL
+// 跟在字符后, 即"本行末尾"位置)。
 //
 // 事件 ↔ 字符映射 (字符可视觉调整, 不影响语义; 各 fixture 注释里仍用 fetch/check 概念
 // 词描述 trace, 字符层是实现细节):
@@ -127,7 +132,7 @@ extern uint32_t debug_cnt;
 // DEBUG_NEWLINE(): trace 字符流尾部换行。dispatcher 退出前打一次, 把无换行的 trace
 // 字符流跟后面的 [dispatcher] halted 分开。不走 DEBUG_TICK (不是 trace 事件, 只是收尾
 // 分隔); 受 DEBUG_TRACE_ON gate — trace 关时没有字符流, 换行同步退化 no-op。
-#define DEBUG_NEWLINE()    do { fputc('\n', stderr); } while (0)
+#define DEBUG_NEWLINE()    do { fputs(EOL, stderr); } while (0)
 
 #else  /* DEBUG_TRACE_ON 未定义 — trace 全部退化为 no-op (零开销, 不进 .text) */
 

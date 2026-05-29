@@ -6,6 +6,7 @@
 
 #include "tlb.h"
 #include "cpu.h"        // cpu_t 完整定义 (tlb_table_reset 需要访问 tlb_table[4])
+#include "config.h"     // EOL (项目级 stderr 输出体例)
 #include "riscv.h"      // PRIV_S / PRIV_H
 
 #include <errno.h>
@@ -20,7 +21,7 @@ tlb_t *tlb_alloc(void) {
     tlb_t *tlb = aligned_alloc(64, sizeof(tlb_t));
     if (tlb == NULL) {
         fprintf(stderr,
-                "tlb_alloc: aligned_alloc(64, %zu) failed: %s\n",
+                "tlb_alloc: aligned_alloc(64, %zu) failed: %s" EOL,
                 sizeof(tlb_t), strerror(errno));
         return NULL;
     }

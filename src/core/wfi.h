@@ -20,10 +20,11 @@
 //   - CLINT guest 写 mtimecmp[i]: 单 hart mtip 重算
 //   - CLINT guest 写 msip[i]: 直接 wfi_kick (msip 不 cache)
 //   - PLIC recompute_ctx_eip_locked: eip 0→1 翻转 (plic_ctx_to_hartid 反查)
-//   - main NORMAL_EXIT 退出: wfi_kick_all 加速 SDS shutdown
 //
-// 注: signal handler 路径不能调 wfi_kick* (pthread_mutex 不是 async-signal-safe);
-// shutdown_signal 由 SRS 传播, hart predicate 看 SRS, timeout 500ms 兜底唤醒。
+// shutdown 路径不在唤醒源里 (016+17-chat 拍): 哲学 "所有人 self-poll SRS/SDS
+// 自己停", hart 在 wfi 时靠 cond_timedwait 兜底 500ms 自醒 + predicate 重检 SRS
+// 退出, 接受此 tail latency. signal handler / 非 signal handler 路径一致.
+// 详 main.c L606 dispatcher 之后占位段 trail。
 //
 // 报错风格见 dummy.txt §5; 线程 lifecycle 见 dummy.txt §12; per-hart slot 协议
 // 见 dummy.txt §14。
@@ -101,8 +102,13 @@ void wfi_kick(uint32_t hartid);
 
 // wfi_kick_all — 唤醒所有 hart (for 循环逐个调 wfi_kick)。
 //
-// 用途: 全局事件 (shutdown SRS 设置) 需要让每个 hart re-check predicate; 当前
-// 主用在 main NORMAL_EXIT 路径加速 SDS shutdown (避免 500ms tail latency)。
+// 016+17-chat 拍: shutdown 路径不调本函数, 接受 hart 在 wfi 时 cond_timedwait
+// WFI_TIMEOUT_NS (config.h 500ms) 兜底自醒 + predicate 重检 SRS 退出 (详 main.c
+// L606 之后占位段 trail). 当前无调用者, 函数保留备多 hart / 灵感 — 候选
+// (a) hart 自治 kick (本对话提议; 先醒 hart kick 其余) (b) source 端 kick
+// (CLINT/PLIC stop / main spawn-join 范围内 kick; v2/v4 思路, 均撤). 真撞延迟
+// 问题再回看. 线程安全: for 循环展开 N 个 per-slot mutex kick, 多线程并发调
+// 同 slot 自动串行 (pthread_mutex), 无冲突。
 //
 // 调用约束: 同 wfi_kick (非 signal handler)。
 void wfi_kick_all(void);

@@ -26,14 +26,14 @@ int ram_init(void) {
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                    -1, 0);
     if (p == MAP_FAILED) {
-        fprintf(stderr, "ram_init: mmap failed: %s\n", strerror(errno));
+        fprintf(stderr, "ram_init: mmap failed: %s" EOL, strerror(errno));
         return -1;
     }
 
     // 显式排除 transparent huge page, 保 4KB 颗粒度服务 SMC 检测 (smc.c 的
     // page_dirty 位图按 4KB 索引; THP 把页合到 2MB 会让位图粒度失准)。
     if (madvise(p, GUEST_RAM_SIZE, MADV_NOHUGEPAGE) != 0) {
-        fprintf(stderr, "ram_init: madvise(MADV_NOHUGEPAGE) failed: %s\n",
+        fprintf(stderr, "ram_init: madvise(MADV_NOHUGEPAGE) failed: %s" EOL,
                 strerror(errno));
         munmap(p, GUEST_RAM_SIZE);
         return -1;
@@ -48,7 +48,7 @@ void ram_destroy(void) {
     if (host_ram_base == NULL) return;   // 未 init / 已 destroy, do nothing
     if (munmap(host_ram_base, GUEST_RAM_SIZE) != 0) {
         // POR 退出路径, 不 fatal; 进程结束后 OS 仍会回收。
-        fprintf(stderr, "ram_destroy: munmap failed: %s\n", strerror(errno));
+        fprintf(stderr, "ram_destroy: munmap failed: %s" EOL, strerror(errno));
     }
     host_ram_base = NULL;
     gpa_to_hva_offset = NULL;

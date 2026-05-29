@@ -15,6 +15,8 @@
 
 #include "bus.h"
 
+#include "config.h"      // EOL (项目级 stderr 输出体例)
+
 #include <stdint.h>
 #include <stdio.h>
 
@@ -28,12 +30,12 @@ static uint32_t   bus_table_n = 0;
 
 int bus_register_mmio(const mmio_dev_t *dev) {
     if (dev == NULL || dev->gpa_start >= dev->gpa_end) {
-        fprintf(stderr, "bus_register_mmio: invalid dev or range\n");
+        fprintf(stderr, "bus_register_mmio: invalid dev or range" EOL);
         return -1;
     }
     if (bus_table_n >= BUS_MAX_DEV) {
         fprintf(stderr,
-                "bus_register_mmio: bus_table full (%u/%u)\n",
+                "bus_register_mmio: bus_table full (%u/%u)" EOL,
                 bus_table_n, (uint32_t)BUS_MAX_DEV);
         return -1;
     }
@@ -42,7 +44,7 @@ int bus_register_mmio(const mmio_dev_t *dev) {
         if (dev->gpa_start < bus_table[i].gpa_end &&
             bus_table[i].gpa_start < dev->gpa_end) {
             fprintf(stderr,
-                    "bus_register_mmio: range [0x%08x,0x%08x) overlaps %s [0x%08x,0x%08x)\n",
+                    "bus_register_mmio: range [0x%08x,0x%08x) overlaps %s [0x%08x,0x%08x)" EOL,
                     dev->gpa_start, dev->gpa_end,
                     bus_table[i].name ? bus_table[i].name : "<noname>",
                     bus_table[i].gpa_start, bus_table[i].gpa_end);

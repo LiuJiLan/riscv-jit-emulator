@@ -46,7 +46,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     // H 扩展按 misa.h 决定 [PRIV_H] tlb 容器 alloc 等都属于未来)。
     cpu_t *hart = aligned_alloc(64, sizeof(cpu_t));
     if (hart == NULL) {
-        fprintf(stderr, "cpu_create: aligned_alloc(64, %zu) failed: %s\n",
+        fprintf(stderr, "cpu_create: aligned_alloc(64, %zu) failed: %s" EOL,
                 sizeof(cpu_t), strerror(errno));
         return NULL;
     }
@@ -117,7 +117,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     // [PRIV_S] S: ASID 容器, entries 由 walker 在 Sv32 路径懒分配。
     hart->tlb_table[PRIV_S] = calloc(ASID_MAX, sizeof(tlb_t *));
     if (hart->tlb_table[PRIV_S] == NULL) {
-        fprintf(stderr, "cpu_create: calloc tlb_table[PRIV_S] failed: %s\n", strerror(errno));
+        fprintf(stderr, "cpu_create: calloc tlb_table[PRIV_S] failed: %s" EOL, strerror(errno));
         cpu_destroy(hart);
         return NULL;
     }
@@ -183,15 +183,15 @@ void cpu_reset(cpu_t *hart) {
 static void cpu_dump(const cpu_t *hart) {
 #ifdef DEBUG_CPU_DUMP_ON
     fprintf(stderr,
-            "[cpu] reg dec:\n"
-            "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u\n"
-            "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u\n"
-            "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u\n"
-            "\tx13(a3)   = %11u  |  x14(a4)   = %11u  |  x15(a5)   = %11u  |  x16(a6)   = %11u\n"
-            "\tx17(a7)   = %11u  |  x18(s2)   = %11u  |  x19(s3)   = %11u  |  x20(s4)   = %11u\n"
-            "\tx21(s5)   = %11u  |  x22(s6)   = %11u  |  x23(s7)   = %11u  |  x24(s8)   = %11u\n"
-            "\tx25(s9)   = %11u  |  x26(s10)  = %11u  |  x27(s11)  = %11u  |  x28(t3)   = %11u\n"
-            "\tx29(t4)   = %11u  |  x30(t5)   = %11u  |  x31(t6)   = %11u\n",
+            "[cpu] reg dec:" EOL
+            "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u" EOL
+            "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u" EOL
+            "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u" EOL
+            "\tx13(a3)   = %11u  |  x14(a4)   = %11u  |  x15(a5)   = %11u  |  x16(a6)   = %11u" EOL
+            "\tx17(a7)   = %11u  |  x18(s2)   = %11u  |  x19(s3)   = %11u  |  x20(s4)   = %11u" EOL
+            "\tx21(s5)   = %11u  |  x22(s6)   = %11u  |  x23(s7)   = %11u  |  x24(s8)   = %11u" EOL
+            "\tx25(s9)   = %11u  |  x26(s10)  = %11u  |  x27(s11)  = %11u  |  x28(t3)   = %11u" EOL
+            "\tx29(t4)   = %11u  |  x30(t5)   = %11u  |  x31(t6)   = %11u" EOL,
             hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
             hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
             hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
@@ -202,15 +202,15 @@ static void cpu_dump(const cpu_t *hart) {
             hart->regs[29], hart->regs[30], hart->regs[31]);
 
     fprintf(stderr,
-            "[cpu] reg hex:\n"
-            "\tx1(ra)    = 0x%08X  |  x2(sp)    = 0x%08X  |  x3(gp)    = 0x%08X  |  x4(tp)    = 0x%08X\n"
-            "\tx5(t0)    = 0x%08X  |  x6(t1)    = 0x%08X  |  x7(t2)    = 0x%08X  |  x8(s0/fp) = 0x%08X\n"
-            "\tx9(s1)    = 0x%08X  |  x10(a0)   = 0x%08X  |  x11(a1)   = 0x%08X  |  x12(a2)   = 0x%08X\n"
-            "\tx13(a3)   = 0x%08X  |  x14(a4)   = 0x%08X  |  x15(a5)   = 0x%08X  |  x16(a6)   = 0x%08X\n"
-            "\tx17(a7)   = 0x%08X  |  x18(s2)   = 0x%08X  |  x19(s3)   = 0x%08X  |  x20(s4)   = 0x%08X\n"
-            "\tx21(s5)   = 0x%08X  |  x22(s6)   = 0x%08X  |  x23(s7)   = 0x%08X  |  x24(s8)   = 0x%08X\n"
-            "\tx25(s9)   = 0x%08X  |  x26(s10)  = 0x%08X  |  x27(s11)  = 0x%08X  |  x28(t3)   = 0x%08X\n"
-            "\tx29(t4)   = 0x%08X  |  x30(t5)   = 0x%08X  |  x31(t6)   = 0x%08X\n",
+            "[cpu] reg hex:" EOL
+            "\tx1(ra)    = 0x%08X  |  x2(sp)    = 0x%08X  |  x3(gp)    = 0x%08X  |  x4(tp)    = 0x%08X" EOL
+            "\tx5(t0)    = 0x%08X  |  x6(t1)    = 0x%08X  |  x7(t2)    = 0x%08X  |  x8(s0/fp) = 0x%08X" EOL
+            "\tx9(s1)    = 0x%08X  |  x10(a0)   = 0x%08X  |  x11(a1)   = 0x%08X  |  x12(a2)   = 0x%08X" EOL
+            "\tx13(a3)   = 0x%08X  |  x14(a4)   = 0x%08X  |  x15(a5)   = 0x%08X  |  x16(a6)   = 0x%08X" EOL
+            "\tx17(a7)   = 0x%08X  |  x18(s2)   = 0x%08X  |  x19(s3)   = 0x%08X  |  x20(s4)   = 0x%08X" EOL
+            "\tx21(s5)   = 0x%08X  |  x22(s6)   = 0x%08X  |  x23(s7)   = 0x%08X  |  x24(s8)   = 0x%08X" EOL
+            "\tx25(s9)   = 0x%08X  |  x26(s10)  = 0x%08X  |  x27(s11)  = 0x%08X  |  x28(t3)   = 0x%08X" EOL
+            "\tx29(t4)   = 0x%08X  |  x30(t5)   = 0x%08X  |  x31(t6)   = 0x%08X" EOL,
             hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
             hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
             hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
@@ -225,20 +225,20 @@ static void cpu_dump(const cpu_t *hart) {
     // double-trap 升级 (Smdbltrp/Ssdbltrp). S 槽 mtval2 显示 double-trap 升级时
     // 原本要写 stval 的值 (S-trap unexpected 路径).
     fprintf(stderr,
-            "[cpu] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X\n",
+            "[cpu] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X" EOL,
             (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M],
             hart->trap.mtval2);
     fprintf(stderr,
-            "[cpu] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X\n",
+            "[cpu] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X" EOL,
             (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
             hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
     // state dump: pc + priv + mstatus 低 32 位 + mstatush (含 MDT bit10)。
     fprintf(stderr,
-            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X\n",
+            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X" EOL,
             hart->regs[0],
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu),

@@ -590,7 +590,7 @@ int plic_init(void) {
     /* pthread_rwlock_init: 默认 attr; 失败按 dummy.txt §5 fprintf + 返 -1。 */
     int rc = pthread_rwlock_init(&plic.lock, NULL);
     if (rc != 0) {
-        fprintf(stderr, "plic_init: pthread_rwlock_init failed: rc=%d\n", rc);
+        fprintf(stderr, "plic_init: pthread_rwlock_init failed: rc=%d" EOL, rc);
         return -1;
     }
 
@@ -603,7 +603,7 @@ int plic_init(void) {
         .name      = "plic",
     };
     if (bus_register_mmio(&dev) != 0) {
-        fprintf(stderr, "plic_init: bus_register_mmio failed\n");
+        fprintf(stderr, "plic_init: bus_register_mmio failed" EOL);
         (void)pthread_rwlock_destroy(&plic.lock);
         return -1;
     }

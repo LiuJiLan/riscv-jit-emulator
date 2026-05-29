@@ -12,21 +12,17 @@
 //                                    同 opcode 0x33 聚合, 见下方 M ext 段 doc)
 //   - 控制流: 8 (6 branch + JAL + JALR)
 //   - CSR: 6 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
-//   - SYSTEM: 5 (ECALL / EBREAK / MRET / SRET / WFI)
+//   - SYSTEM: 6 (ECALL / EBREAK / MRET / SRET / SFENCE_VMA / WFI)
 //   - LOAD / STORE: 8 (5 LB/LH/LW/LBU/LHU + 3 SB/SH/SW)
-//   - SFENCE.VMA: 1
 //   共 57 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 58 个 op_kind。
 //   不在此范围的 opcode (FENCE / AMO / LR/SC / F/D / 等) decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
 //   时编译器逼着补 case, 不会漏。enum 顺序按 RV 指令 type/opcode 分段; 段内可追加 (例如
-//   同段 R-type opcode 0x33 内 M ext 8 条加在 OR/AND 之后), 不重排已有段间顺序。
-//
-//   TODO (a_04+): 现有 SRET / SFENCE_VMA / WFI 都是历史增量追加, 散落在 LOAD/STORE 之间
-//   或末尾, 跟 SYSTEM 段拆开了; 找时间一次性归位 (SRET 紧跟 MRET; SFENCE_VMA / WFI 进
-//   SYSTEM 段末). enum 数字会重排, interpreter / decode 都用名字不用数字, 重排无功能
-//   影响, 但 git blame 噪声大, 单独 commit。
+//   同段 R-type opcode 0x33 内 M ext 8 条加在 OR/AND 之后); 段间一般不重排, 真要归位
+//   历史散落项时单独 commit (git blame 噪声大但单 commit 自隔离, enum 数字重排对
+//   interpreter/decode 用名字访问无功能影响)。
 //
 // decoded_inst_t 字段:
 //   kind     - op_kind_t, 由 decode 分类
@@ -222,6 +218,62 @@ typedef enum {
     // is_block_boundary_inst → 1 (改 pc, 必须块尾)。
     OP_SRET,
 
+    // ---- I-type SYSTEM SFENCE.VMA ----
+    //
+    // 编码 (RV Privileged Spec Vol II §10.6.1):
+    //   opcode  = 0x73 (SYSTEM)                       inst[6:0]
+    //   rd      = 0    (RV spec 要求, 否则 reserved)  inst[11:7]
+    //   funct3  = 0                                    inst[14:12]
+    //   rs1     = vaddr 寄存器号                       inst[19:15]
+    //              rs1 == x0 → 操作覆盖所有 vaddr (简化方案 4.a 全清/单 ASID 全清)
+    //   rs2     = asid 寄存器号                        inst[24:20]
+    //              rs2 == x0 → 操作覆盖所有 asid (简化方案 4.a)
+    //   funct7  = 0x09 (= 0b0001001)                   inst[31:25]
+    //
+    // 跟 ECALL/EBREAK/MRET 用 imm[11:0] 区分不同, sfence.vma 由 funct7=0x09 区分; 因为
+    // imm[4:0] = rs2 字段 (5-bit 寄存器号) 是变量, imm[11:0] 不固定值 (rs2 ∈ 0..31, 32 个变种)。
+    //
+    // 字段约定:
+    //   d.rs1 = vaddr 寄存器号 (interpreter case 内 READ_REG(d.rs1) 拿 vaddr 值)
+    //   d.rs2 = asid 寄存器号  (interpreter case 内 READ_REG(d.rs2) 拿 asid 值, 截断到 ASID_MASK
+    //                            位由 sfence helper 内部做)
+    //   d.rd  = 0 (RV spec; decode 顶部统一提取 = 0)
+    //   d.imm = funct7|rs2 = 0x120..0x13F (decode 顶部 imm = inst[31:20] 提取所得; sfence case
+    //            不读此字段, 仅供 raw_inst trap 路径用)
+    //   d.pc_step = PC_STEP_RV (sfence 不是 control flow, +4 推进; 但是硬边界, fetch loop 末
+    //                            is_block_boundary_inst → 1 → goto out, dispatcher 重派发)
+    //
+    // 是块边界 (硬边界): sfence.vma 改 TLB 状态, 块内后续指令译码假设 (TLB / current_tlb 路径)
+    // 失效; dispatcher 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
+    //
+    // 未来 mstatus.TVM 检查: TVM=1 + S-mode sfence.vma → trap cause 2; 真做 OS 隔离时在
+    // interpreter case 入口 (或 sfence helper 入口) 加。
+    OP_SFENCE_VMA,
+
+    // ---- I-type SYSTEM WFI ----
+    // opcode 0x73, funct3=0, imm[11:0]=0x105; rd=0, rs1=0 (RV spec)。
+    //
+    // RV Privileged Spec §3.3.2: WFI 是一条 hint — 实现可挂起 hart 等中断, 也可直接当 NOP。
+    // 唤醒条件 (跟 mstatus.MIE 无关): (mie & mip) != 0 任何 enabled-by-mie 的中断 pending。
+    // 唤醒后:
+    //   - mstatus.MIE=1 → 走 trap 入向量 (xtvec)
+    //   - mstatus.MIE=0 → 继续 PC+4 (典型用法: 关中断 WFI 等事件, 软件醒后 poll mip)
+    //
+    // mstatus.TW (Timeout Wait): TW=1 + priv<M 时 WFI 必须 trap illegal (RV spec §3.1.6.5);
+    // interpreter case 入口检查; 当前实现 TW 触发立即 illegal (timeout=0 合法)。
+    //
+    // 字段约定:
+    //   d.rd = d.rs1 = 0 (RV spec; decode 顶部统一提取 = 0)
+    //   d.imm = 0x105 (decode 顶部提取所得; interpreter case 不读)
+    //   d.pc_step = PC_STEP_NONE (case 末尾自写 pc += 4 也行, 但 NONE 是 "case 必自写 pc"
+    //                              的明确表态; 跟 MRET/SRET 同体例 — 它们也走 case 自写 pc 路径)
+    //   注: NONE 跟实际行为 (醒来后 PC+4 或 trap 跳 xtvec) 兼容: trap 路径不到 fetch loop
+    //   末段; PC+4 路径 case 内 hart->regs[0] += 4 显式做
+    //
+    // 是块边界 (硬边界): WFI 必须块尾 — 唤醒可能触发 trap (pc 跳 xtvec) 或继续 (pc+=4),
+    // 块内后续指令无法静态译码 (路径不定); dispatcher 重派发时按新 pc 走 block 1。
+    OP_WFI,
+
     // ---- I-type LOAD (5), opcode 0x03 ----
     // funct3 编码 (RV spec):
     //   000 = LB    (Load Byte,           sign-ext 8-bit)
@@ -278,64 +330,6 @@ typedef enum {
     OP_SB,
     OP_SH,
     OP_SW,
-
-    // ---- I-type SYSTEM SFENCE.VMA ----
-    // 语义上属于 SYSTEM 段 (opcode 0x73 funct3=0), 但位置放在 LOAD/STORE 之后 +
-    // OP_UNSUPPORTED 之前 — enum 增量追加哲学, 不重排已有顺序。
-    //
-    // 编码 (RV Privileged Spec Vol II §10.6.1):
-    //   opcode  = 0x73 (SYSTEM)                       inst[6:0]
-    //   rd      = 0    (RV spec 要求, 否则 reserved)  inst[11:7]
-    //   funct3  = 0                                    inst[14:12]
-    //   rs1     = vaddr 寄存器号                       inst[19:15]
-    //              rs1 == x0 → 操作覆盖所有 vaddr (简化方案 4.a 全清/单 ASID 全清)
-    //   rs2     = asid 寄存器号                        inst[24:20]
-    //              rs2 == x0 → 操作覆盖所有 asid (简化方案 4.a)
-    //   funct7  = 0x09 (= 0b0001001)                   inst[31:25]
-    //
-    // 跟 ECALL/EBREAK/MRET 用 imm[11:0] 区分不同, sfence.vma 由 funct7=0x09 区分; 因为
-    // imm[4:0] = rs2 字段 (5-bit 寄存器号) 是变量, imm[11:0] 不固定值 (rs2 ∈ 0..31, 32 个变种)。
-    //
-    // 字段约定:
-    //   d.rs1 = vaddr 寄存器号 (interpreter case 内 READ_REG(d.rs1) 拿 vaddr 值)
-    //   d.rs2 = asid 寄存器号  (interpreter case 内 READ_REG(d.rs2) 拿 asid 值, 截断到 ASID_MASK
-    //                            位由 sfence helper 内部做)
-    //   d.rd  = 0 (RV spec; decode 顶部统一提取 = 0)
-    //   d.imm = funct7|rs2 = 0x120..0x13F (decode 顶部 imm = inst[31:20] 提取所得; sfence case
-    //            不读此字段, 仅供 raw_inst trap 路径用)
-    //   d.pc_step = PC_STEP_RV (sfence 不是 control flow, +4 推进; 但是硬边界, fetch loop 末
-    //                            is_block_boundary_inst → 1 → goto out, dispatcher 重派发)
-    //
-    // 是块边界 (硬边界): sfence.vma 改 TLB 状态, 块内后续指令译码假设 (TLB / current_tlb 路径)
-    // 失效; dispatcher 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
-    //
-    // 未来 mstatus.TVM 检查: TVM=1 + S-mode sfence.vma → trap cause 2; 真做 OS 隔离时在
-    // interpreter case 入口 (或 sfence helper 入口) 加。
-    OP_SFENCE_VMA,
-
-    // ---- I-type SYSTEM WFI ----
-    // opcode 0x73, funct3=0, imm[11:0]=0x105; rd=0, rs1=0 (RV spec)。
-    //
-    // RV Privileged Spec §3.3.2: WFI 是一条 hint — 实现可挂起 hart 等中断, 也可直接当 NOP。
-    // 唤醒条件 (跟 mstatus.MIE 无关): (mie & mip) != 0 任何 enabled-by-mie 的中断 pending。
-    // 唤醒后:
-    //   - mstatus.MIE=1 → 走 trap 入向量 (xtvec)
-    //   - mstatus.MIE=0 → 继续 PC+4 (典型用法: 关中断 WFI 等事件, 软件醒后 poll mip)
-    //
-    // mstatus.TW (Timeout Wait): TW=1 + priv<M 时 WFI 必须 trap illegal (RV spec §3.1.6.5);
-    // interpreter case 入口检查; 当前实现 TW 触发立即 illegal (timeout=0 合法)。
-    //
-    // 字段约定:
-    //   d.rd = d.rs1 = 0 (RV spec; decode 顶部统一提取 = 0)
-    //   d.imm = 0x105 (decode 顶部提取所得; interpreter case 不读)
-    //   d.pc_step = PC_STEP_NONE (case 末尾自写 pc += 4 也行, 但 NONE 是 "case 必自写 pc"
-    //                              的明确表态; 跟 MRET/SRET 同体例 — 它们也走 case 自写 pc 路径)
-    //   注: NONE 跟实际行为 (醒来后 PC+4 或 trap 跳 xtvec) 兼容: trap 路径不到 fetch loop
-    //   末段; PC+4 路径 case 内 hart->regs[0] += 4 显式做
-    //
-    // 是块边界 (硬边界): WFI 必须块尾 — 唤醒可能触发 trap (pc 跳 xtvec) 或继续 (pc+=4),
-    // 块内后续指令无法静态译码 (路径不定); dispatcher 重派发时按新 pc 走 block 1。
-    OP_WFI,
 
     // ---- 兜底 ----
     // 不在当前范围的 opcode (fence 0x0F / amo 0x2F / 真非法 opcode / 真非法 funct3 子段)
@@ -456,10 +450,17 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
             return 1;
 
-        // ---- SYSTEM 4 个 (硬边界) ----
-        // ECALL/EBREAK 触发 trap → pc 跳 xtvec; MRET → pc 跳 mepc; SRET → pc 跳 sepc。
-        // 都改 pc, 必须块尾。
+        // ---- SYSTEM 6 个 (硬边界) ----
+        // 子分组各自原因不同, 但都改 pc 或全局 TLB 状态, 必须块尾:
+        //   ECALL/EBREAK 触发 trap → pc 跳 xtvec
+        //   MRET / SRET → pc 跳 mepc / sepc
+        //   SFENCE.VMA  改 TLB 状态; 块内后续指令译码假设 (current_tlb 路径) 失效;
+        //                dispatcher 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重选叶 TLB)
+        //   WFI         唤醒可能 trap (MIE=1 + 中断 pending → 跳 xtvec) 或继续 (MIE=0 → PC+4);
+        //                块内后续指令静态译码假设不成立 (路径不定)
         case OP_ECALL: case OP_EBREAK: case OP_MRET: case OP_SRET:
+        case OP_SFENCE_VMA:
+        case OP_WFI:
             return 1;
 
         // ---- load/store 8 个 (非 boundary) ----
@@ -468,18 +469,6 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_LB:  case OP_LH:  case OP_LW:  case OP_LBU: case OP_LHU:
         case OP_SB:  case OP_SH:  case OP_SW:
             return 0;
-
-        // ---- SFENCE.VMA (硬边界) ----
-        // 改 TLB 状态; 块内后续指令译码假设 (current_tlb 路径) 失效, 必须块尾。dispatcher
-        // 重派发时按新 satp/TLB 状态走 block 1 (current_tlb 重新选叶 TLB)。
-        case OP_SFENCE_VMA:
-            return 1;
-
-        // ---- WFI (硬边界) ----
-        // 唤醒可能 trap (mstatus.MIE=1 + 中断 pending → 跳 xtvec) 或继续 (MIE=0 → PC+4),
-        // 块内后续指令静态译码假设不成立, 必须块尾。
-        case OP_WFI:
-            return 1;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
 }

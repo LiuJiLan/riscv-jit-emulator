@@ -10,6 +10,8 @@
 
 #include "runtime.h"
 
+#include "config.h"               // EOL (项目级 stderr 输出体例)
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -91,7 +93,7 @@ static int runtime_install_one(int sig) {
                                           thread 内部 retry 噪音 (跟 uart_reader_run
                                           现有 EINTR continue 正交, 多一层防护) */
     if (sigaction(sig, &sa, NULL) != 0) {
-        fprintf(stderr, "runtime_install_signal_handlers: sigaction(%d) failed: %s\n",
+        fprintf(stderr, "runtime_install_signal_handlers: sigaction(%d) failed: %s" EOL,
                 sig, strerror(errno));
         return -1;
     }
@@ -117,11 +119,11 @@ void runtime_restore_signal_handlers(void) {
     sa.sa_flags = 0;
     /* fail 路径只 fprintf 不传染; POR 收尾本就走单向退出, 这里 fail 不阻塞 cleanup */
     if (sigaction(SIGINT,  &sa, NULL) != 0)
-        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGINT)  failed: %s\n",  strerror(errno));
+        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGINT)  failed: %s" EOL,  strerror(errno));
     if (sigaction(SIGTERM, &sa, NULL) != 0)
-        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGTERM) failed: %s\n", strerror(errno));
+        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGTERM) failed: %s" EOL, strerror(errno));
     if (sigaction(SIGHUP,  &sa, NULL) != 0)
-        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGHUP)  failed: %s\n",  strerror(errno));
+        fprintf(stderr, "runtime_restore_signal_handlers: sigaction(SIGHUP)  failed: %s" EOL,  strerror(errno));
 }
 
 
@@ -149,7 +151,7 @@ void runtime_stdin_enter_raw(void) {
 
     if (tcgetattr(STDIN_FILENO, &runtime_stdin_state.saved_tio) != 0) {
         fprintf(stderr, "runtime_stdin_enter_raw: tcgetattr failed (%s); "
-                "stdin remains cooked\n", strerror(errno));
+                "stdin remains cooked" EOL, strerror(errno));
         return;
     }
 
@@ -157,7 +159,7 @@ void runtime_stdin_enter_raw(void) {
     cfmakeraw(&raw_tio);
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw_tio) != 0) {
         fprintf(stderr, "runtime_stdin_enter_raw: tcsetattr(raw) failed (%s); "
-                "stdin remains cooked\n", strerror(errno));
+                "stdin remains cooked" EOL, strerror(errno));
         return;
     }
 
@@ -171,7 +173,7 @@ void runtime_stdin_exit_raw(void) {
 
     if (tcsetattr(STDIN_FILENO, TCSANOW, &runtime_stdin_state.saved_tio) != 0) {
         fprintf(stderr, "runtime_stdin_exit_raw: tcsetattr(restore) failed (%s); "
-                "run 'stty sane' to recover stdin\n", strerror(errno));
+                "run 'stty sane' to recover stdin" EOL, strerror(errno));
     }
     runtime_stdin_state.tio_saved = 0;
 }

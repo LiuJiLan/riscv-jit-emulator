@@ -5,8 +5,8 @@
 // 三个函数:
 //   guest_load_bin   把 .bin 文件内容拷到 guest GPA = dst 处
 //   guest_load_elf   把 ELF 所有 PT_LOAD 段加载到各自 p_paddr 处
-//   guest_is_elf     探测文件是否 ELF
-// 未来加: guest_load_hex (Intel HEX 格式) + main.c 后缀分发加分支。
+//   guest_is_elf     探测文件是否 ELF (main.c --bios 三层 dispatch 的 magic fall back;
+//                                       后缀 .elf / .bin 显式时不调本函数, 详 main 端 doc)
 //
 // 报错风格见 src/dummy.txt §5。
 //

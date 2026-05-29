@@ -147,7 +147,7 @@ static void csr_mstatus_write(cpu_t *hart, uxlen_t v) {
                 fprintf(stderr,
                         "[csr hint TEMP] mstatus.MDT=1: write to mstatus.MIE forced to 0 "
                         "(spec 3.1.6.2). Fixture likely missing boot prelude "
-                        "'csrw 0x310, x0' (small_plan A.7). This hint is one-shot.\n");
+                        "'csrw 0x310, x0' (small_plan A.7). This hint is one-shot." EOL);
                 mie_hint_shown = 1;
             }
         }
@@ -457,7 +457,7 @@ static void csr_sstatus_write(cpu_t *hart, uxlen_t v) {
                 fprintf(stderr,
                         "[csr hint TEMP] sstatus.SDT=1: write to sstatus.SIE forced to 0 "
                         "(spec 4.1.1.5). Fixture likely missing boot prelude "
-                        "'csrw sstatus, x0' (small_plan A.7). This hint is one-shot.\n");
+                        "'csrw sstatus, x0' (small_plan A.7). This hint is one-shot." EOL);
                 sie_hint_shown = 1;
             }
         }
@@ -723,7 +723,7 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
         case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* 临时 RO; RO 写 trap 由入口判 */
         default:
             fprintf(stderr,
-                    "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2\n",
+                    "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2" EOL,
                     csr_addr);
             trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
     }

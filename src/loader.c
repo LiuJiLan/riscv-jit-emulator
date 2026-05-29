@@ -33,13 +33,13 @@ static int read_full_at(int fd, void *buf, size_t count, off_t offset,
         } while (n < 0 && errno == EINTR);
         if (n < 0) {
             fprintf(stderr,
-                    "read_full_at: pread(%s) failed at offset %lld for %s: %s\n",
+                    "read_full_at: pread(%s) failed at offset %lld for %s: %s" EOL,
                     path, (long long)cur, what, strerror(errno));
             return -1;
         }
         if (n == 0) {
             fprintf(stderr,
-                    "read_full_at: %s: unexpected EOF reading %s at offset %lld, %zu bytes left\n",
+                    "read_full_at: %s: unexpected EOF reading %s at offset %lld, %zu bytes left" EOL,
                     path, what, (long long)cur, remaining);
             return -1;
         }
@@ -54,21 +54,21 @@ int guest_load_bin(const char *path, uint64_t dst) {
     if (dst < GUEST_RAM_START ||
         dst >= GUEST_RAM_START + GUEST_RAM_SIZE) {
         fprintf(stderr,
-                "guest_load_bin: dst 0x%" PRIx64 " out of RAM range\n",
+                "guest_load_bin: dst 0x%" PRIx64 " out of RAM range" EOL,
                 dst);
         return -1;
     }
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "guest_load_bin: open(%s) failed: %s\n",
+        fprintf(stderr, "guest_load_bin: open(%s) failed: %s" EOL,
                 path, strerror(errno));
         return -1;
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "guest_load_bin: fstat(%s) failed: %s\n",
+        fprintf(stderr, "guest_load_bin: fstat(%s) failed: %s" EOL,
                 path, strerror(errno));
         close(fd);
         return -1;
@@ -78,7 +78,7 @@ int guest_load_bin(const char *path, uint64_t dst) {
     size_t available = (size_t)((GUEST_RAM_START + GUEST_RAM_SIZE) - dst);
     if (bytes > available) {
         fprintf(stderr,
-                "guest_load_bin: file too big: bytes=%zu, available=%zu\n",
+                "guest_load_bin: file too big: bytes=%zu, available=%zu" EOL,
                 bytes, available);
         close(fd);
         return -1;
@@ -93,7 +93,7 @@ int guest_load_bin(const char *path, uint64_t dst) {
     }
 
     if (close(fd) != 0) {
-        fprintf(stderr, "guest_load_bin: close(%s) failed: %s\n",
+        fprintf(stderr, "guest_load_bin: close(%s) failed: %s" EOL,
                 path, strerror(errno));
         return -1;
     }
@@ -104,7 +104,7 @@ int guest_load_bin(const char *path, uint64_t dst) {
 int guest_load_elf(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "guest_load_elf: open(%s) failed: %s\n",
+        fprintf(stderr, "guest_load_elf: open(%s) failed: %s" EOL,
                 path, strerror(errno));
         return -1;
     }
@@ -119,7 +119,7 @@ int guest_load_elf(const char *path) {
     // 1a. magic
     if (ehdr.e_ident[EI_MAG0] != ELFMAG0 || ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
         ehdr.e_ident[EI_MAG2] != ELFMAG2 || ehdr.e_ident[EI_MAG3] != ELFMAG3) {
-        fprintf(stderr, "guest_load_elf: %s: not an ELF file (bad magic)\n",
+        fprintf(stderr, "guest_load_elf: %s: not an ELF file (bad magic)" EOL,
                 path);
         close(fd);
         return -1;
@@ -130,13 +130,13 @@ int guest_load_elf(const char *path) {
     //     配置传递机制 (宏 / 运行时变量) 留到那时定, 不预先抽象。
     if (ehdr.e_ident[EI_CLASS] == ELFCLASS64) {
         fprintf(stderr,
-                "guest_load_elf: %s: ELFCLASS64 not supported in current build (RV32 only)\n",
+                "guest_load_elf: %s: ELFCLASS64 not supported in current build (RV32 only)" EOL,
                 path);
         close(fd);
         return -1;
     }
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS32) {
-        fprintf(stderr, "guest_load_elf: %s: invalid ELF class %u\n",
+        fprintf(stderr, "guest_load_elf: %s: invalid ELF class %u" EOL,
                 path, ehdr.e_ident[EI_CLASS]);
         close(fd);
         return -1;
@@ -145,7 +145,7 @@ int guest_load_elf(const char *path) {
     // 1c. data —— RISC-V 永远 LE
     if (ehdr.e_ident[EI_DATA] != ELFDATA2LSB) {
         fprintf(stderr,
-                "guest_load_elf: %s: not little-endian (RISC-V is LE only)\n",
+                "guest_load_elf: %s: not little-endian (RISC-V is LE only)" EOL,
                 path);
         close(fd);
         return -1;
@@ -154,7 +154,7 @@ int guest_load_elf(const char *path) {
     // 1d. machine
     if (ehdr.e_machine != EM_RISCV) {
         fprintf(stderr,
-                "guest_load_elf: %s: e_machine=%u, expected EM_RISCV (%u)\n",
+                "guest_load_elf: %s: e_machine=%u, expected EM_RISCV (%u)" EOL,
                 path, ehdr.e_machine, EM_RISCV);
         close(fd);
         return -1;
@@ -164,7 +164,7 @@ int guest_load_elf(const char *path) {
     if (ehdr.e_type != ET_EXEC) {
         fprintf(stderr,
                 "guest_load_elf: %s: e_type=%u; only ET_EXEC supported "
-                "(link with -no-pie or a bare-metal linker script)\n",
+                "(link with -no-pie or a bare-metal linker script)" EOL,
                 path, ehdr.e_type);
         close(fd);
         return -1;
@@ -174,7 +174,7 @@ int guest_load_elf(const char *path) {
     if (ehdr.e_phentsize != sizeof(Elf32_Phdr) || ehdr.e_phnum == 0) {
         fprintf(stderr,
                 "guest_load_elf: %s: invalid program header table "
-                "(e_phentsize=%u, e_phnum=%u)\n",
+                "(e_phentsize=%u, e_phnum=%u)" EOL,
                 path, ehdr.e_phentsize, ehdr.e_phnum);
         close(fd);
         return -1;
@@ -196,7 +196,7 @@ int guest_load_elf(const char *path) {
 
         if (phdr.p_filesz > phdr.p_memsz) {
             fprintf(stderr,
-                    "guest_load_elf: %s: PT_LOAD[%u] p_filesz (%u) > p_memsz (%u)\n",
+                    "guest_load_elf: %s: PT_LOAD[%u] p_filesz (%u) > p_memsz (%u)" EOL,
                     path, i, phdr.p_filesz, phdr.p_memsz);
             close(fd);
             return -1;
@@ -209,7 +209,7 @@ int guest_load_elf(const char *path) {
         if (seg_start < GUEST_RAM_START ||
             seg_end > GUEST_RAM_START + GUEST_RAM_SIZE) {
             fprintf(stderr,
-                    "guest_load_elf: %s: PT_LOAD[%u] [0x%" PRIx64 ", 0x%" PRIx64 ") out of RAM range\n",
+                    "guest_load_elf: %s: PT_LOAD[%u] [0x%" PRIx64 ", 0x%" PRIx64 ") out of RAM range" EOL,
                     path, i, seg_start, seg_end);
             close(fd);
             return -1;
@@ -229,7 +229,7 @@ int guest_load_elf(const char *path) {
     }
 
     if (close(fd) != 0) {
-        fprintf(stderr, "guest_load_elf: close(%s) failed: %s\n",
+        fprintf(stderr, "guest_load_elf: close(%s) failed: %s" EOL,
                 path, strerror(errno));
         return -1;
     }

@@ -193,7 +193,7 @@ static void drain_one_avail_round_locked(void) {
 
     /* bounds check: 整个 vring 必须在 RAM 区 */
     if (!IS_GPA_RAM(base_pa) || !IS_GPA_RAM(base_pa + vring_sz - 1u)) {
-        fprintf(stderr, "[virtio_blk] vring out of RAM: pfn=0x%x size=0x%x\n",
+        fprintf(stderr, "[virtio_blk] vring out of RAM: pfn=0x%x size=0x%x" EOL,
                 g_vblk.queue_pfn, vring_sz);
         return;
     }
@@ -279,7 +279,7 @@ static void drain_one_avail_round_locked(void) {
                 ssize_t n = pread(g_vblk.image_fd, hva, (size_t)len,
                                   (off_t)(sector * (uint64_t)VIRTIO_BLK_SECTOR_SIZE));
                 if (n != (ssize_t)len) {
-                    fprintf(stderr, "[virtio_blk] pread sector=%lu len=%u failed: %s\n",
+                    fprintf(stderr, "[virtio_blk] pread sector=%lu len=%u failed: %s" EOL,
                             (unsigned long)sector, len,
                             (n < 0) ? strerror(errno) : "short read");
                     status_byte = VIRTIO_BLK_S_IOERR;
@@ -289,7 +289,7 @@ static void drain_one_avail_round_locked(void) {
                 ssize_t n = pwrite(g_vblk.image_fd, hva, (size_t)len,
                                    (off_t)(sector * (uint64_t)VIRTIO_BLK_SECTOR_SIZE));
                 if (n != (ssize_t)len) {
-                    fprintf(stderr, "[virtio_blk] pwrite sector=%lu len=%u failed: %s\n",
+                    fprintf(stderr, "[virtio_blk] pwrite sector=%lu len=%u failed: %s" EOL,
                             (unsigned long)sector, len,
                             (n < 0) ? strerror(errno) : "short write");
                     status_byte = VIRTIO_BLK_S_IOERR;
@@ -373,7 +373,7 @@ static void *io_worker_run(void *arg) {
                                             &g_vblk.queue_mutex, &ts);
             if (rc == ETIMEDOUT) continue;   /* 重检 SDS + queue */
             if (rc != 0) {
-                fprintf(stderr, "[virtio_blk worker] cond_timedwait failed: %s\n",
+                fprintf(stderr, "[virtio_blk worker] cond_timedwait failed: %s" EOL,
                         strerror(rc));
                 vblk_queue_unlock();
                 shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
@@ -450,7 +450,7 @@ static void vblk_enqueue_work_token(void) {
             continue;   /* SDS 仍 0 (允许执行), 再 wait 一轮 */
         }
         if (rc != 0) {
-            fprintf(stderr, "[virtio_blk] enqueue cond_timedwait failed: %s\n",
+            fprintf(stderr, "[virtio_blk] enqueue cond_timedwait failed: %s" EOL,
                     strerror(rc));
             vblk_queue_unlock();
             shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
@@ -643,25 +643,25 @@ int virtio_blk_init(const char *image_path) {
 
     int fd = open(image_path, O_RDWR);
     if (fd < 0) {
-        fprintf(stderr, "virtio_blk_init: open(%s) failed: %s\n",
+        fprintf(stderr, "virtio_blk_init: open(%s) failed: %s" EOL,
                 image_path, strerror(errno));
         return -1;
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "virtio_blk_init: fstat(%s) failed: %s\n",
+        fprintf(stderr, "virtio_blk_init: fstat(%s) failed: %s" EOL,
                 image_path, strerror(errno));
         (void)close(fd);
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "virtio_blk_init: %s is not a regular file\n", image_path);
+        fprintf(stderr, "virtio_blk_init: %s is not a regular file" EOL, image_path);
         (void)close(fd);
         return -1;
     }
     if (st.st_size < 0 ||
         ((uint64_t)st.st_size % (uint64_t)VIRTIO_BLK_SECTOR_SIZE) != 0u) {
-        fprintf(stderr, "virtio_blk_init: %s size %lld not %u-aligned\n",
+        fprintf(stderr, "virtio_blk_init: %s size %lld not %u-aligned" EOL,
                 image_path, (long long)st.st_size, VIRTIO_BLK_SECTOR_SIZE);
         (void)close(fd);
         return -1;
@@ -672,25 +672,25 @@ int virtio_blk_init(const char *image_path) {
 
     int rc = pthread_mutex_init(&g_vblk.state_mutex, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_init: state_mutex init failed: %s\n", strerror(rc));
+        fprintf(stderr, "virtio_blk_init: state_mutex init failed: %s" EOL, strerror(rc));
         (void)close(fd); g_vblk.image_fd = -1; return -1;
     }
     rc = pthread_mutex_init(&g_vblk.queue_mutex, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_init: queue_mutex init failed: %s\n", strerror(rc));
+        fprintf(stderr, "virtio_blk_init: queue_mutex init failed: %s" EOL, strerror(rc));
         (void)pthread_mutex_destroy(&g_vblk.state_mutex);
         (void)close(fd); g_vblk.image_fd = -1; return -1;
     }
     rc = pthread_cond_init(&g_vblk.cond_not_empty, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_init: cond_not_empty init failed: %s\n", strerror(rc));
+        fprintf(stderr, "virtio_blk_init: cond_not_empty init failed: %s" EOL, strerror(rc));
         (void)pthread_mutex_destroy(&g_vblk.queue_mutex);
         (void)pthread_mutex_destroy(&g_vblk.state_mutex);
         (void)close(fd); g_vblk.image_fd = -1; return -1;
     }
     rc = pthread_cond_init(&g_vblk.cond_not_full, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_init: cond_not_full init failed: %s\n", strerror(rc));
+        fprintf(stderr, "virtio_blk_init: cond_not_full init failed: %s" EOL, strerror(rc));
         (void)pthread_cond_destroy (&g_vblk.cond_not_empty);
         (void)pthread_mutex_destroy(&g_vblk.queue_mutex);
         (void)pthread_mutex_destroy(&g_vblk.state_mutex);
@@ -706,7 +706,7 @@ int virtio_blk_init(const char *image_path) {
         .name      = "virtio_blk",
     };
     if (bus_register_mmio(&dev) != 0) {
-        fprintf(stderr, "virtio_blk_init: bus_register_mmio failed\n");
+        fprintf(stderr, "virtio_blk_init: bus_register_mmio failed" EOL);
         (void)pthread_cond_destroy  (&g_vblk.cond_not_full);
         (void)pthread_cond_destroy  (&g_vblk.cond_not_empty);
         (void)pthread_mutex_destroy (&g_vblk.queue_mutex);
@@ -747,7 +747,7 @@ void virtio_blk_destroy(void) {
        / 断电) 可能丢最近 sector write. fsync fail 仅 log 不 fatal (destroy 在
        shutdown 末段无 fallback; 真 fail 也 close 走). 不做 per-IO fsync (太慢). */
     if (fsync(g_vblk.image_fd) != 0) {
-        fprintf(stderr, "[virtio_blk] destroy: fsync failed: %s\n", strerror(errno));
+        fprintf(stderr, "[virtio_blk] destroy: fsync failed: %s" EOL, strerror(errno));
     }
 
     (void)close(g_vblk.image_fd);
@@ -777,7 +777,7 @@ void virtio_blk_start_io_worker_thread(void) {
 
     int rc = pthread_create(&g_vblk.io_worker_thread, NULL, io_worker_run, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_start_io_worker_thread: pthread_create failed: %s\n",
+        fprintf(stderr, "virtio_blk_start_io_worker_thread: pthread_create failed: %s" EOL,
                 strerror(rc));
         shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
     }
@@ -789,7 +789,7 @@ void virtio_blk_join_io_worker_thread(void) {
     }
     int rc = pthread_join(g_vblk.io_worker_thread, NULL);
     if (rc != 0) {
-        fprintf(stderr, "virtio_blk_join_io_worker_thread: pthread_join failed: %s\n",
+        fprintf(stderr, "virtio_blk_join_io_worker_thread: pthread_join failed: %s" EOL,
                 strerror(rc));
     }
 }

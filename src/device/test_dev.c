@@ -134,7 +134,7 @@ int test_dev_init(void) {
         .name      = "test_dev",
     };
     if (bus_register_mmio(&dev) != 0) {
-        fprintf(stderr, "test_dev_init: bus_register_mmio failed\n");
+        fprintf(stderr, "test_dev_init: bus_register_mmio failed" EOL);
         return -1;
     }
     return 0;

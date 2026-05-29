@@ -10,6 +10,24 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// ----------------------------------------------------------------------------
+// EOL — 项目级 stderr 输出 EOL 体例 (= "\r\n")
+//
+// 适用: emulator 自身所有 fprintf(stderr, ...) format string 末尾换行 (string
+// literal 拼接体例: fprintf(stderr, "foo: %s" EOL, err)), 以及 fputs/fputc-based
+// 换行 (debug.h DEBUG_NEWLINE / DEBUG_TICK 内 fputs(EOL, stderr))。
+//
+// 为什么 "\r\n": runtime_stdin_enter_raw cfmakeraw 关 OPOST → 终端 driver 不做
+// "\n" → "\r\n" 转换 (ONLCR 在 raw 下失效); 软件输 "\n" 终端只 line-feed 不
+// carriage-return → cursor 阶梯漂移 (staircase). EOL = "\r\n" 让 emulator 自己
+// 输出在 raw 终端 / 非 raw 终端 / 裸机串口 都正确 — 非 raw 模式 ONLCR 只 map
+// LF, 多一个 CR 等价 "重定 cursor 首列" 无副作用。
+//
+// 跟 guest UART TX (write(STDOUT_FILENO, buf, n)) 分离: 那是 guest 自己的字节流
+// (RV 程序 putchar 等), emulator 透传不解释 LF, 不走 EOL 体例。
+// ----------------------------------------------------------------------------
+#define EOL "\r\n"
+
 // guest 物理地址空间内, RAM 区域的起点 GPA。
 // 0x80000000 为 RISC-V常用的内存起点
 #define GUEST_RAM_START   0x80000000UL

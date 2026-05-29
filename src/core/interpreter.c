@@ -619,6 +619,68 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 break;
             }
 
+            // ---- I-type SYSTEM SFENCE.VMA ----
+            //
+            // 权限要求 (跟 OP_MRET/OP_SRET 同形态):
+            //   SFENCE.VMA 仅在 hart->priv >= S 时合法; U-mode → cause=2 illegal instruction,
+            //   tval=raw_inst。case 入口 PRIV_CHECK_OR_TRAP(PRIV_S) 显式判。
+            //   mstatus.TVM=1 时 S-mode SFENCE.VMA 也 trap to M (cause=2)。TVM 控制位长期
+            //   TODO (跟 SRET 的 TSR 同形态)。
+            //
+            // 接口设计: helper 接 4 个独立信息, 分两组 — 寄存器**值** (vaddr_val/asid_val,
+            // 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
+            // (rs1/rs2, 0..31)。两组语义独立不可互相推导:
+            //   - 值: 真做事用 (helper 4.a 简化下只用 asid_val; vaddr_val 是 (b)/(d) 精确实现
+            //          的预留, 当前 (void) 抑制 unused)
+            //   - 号: 判 RV spec "rs1=x0/rs2=x0" magic 编码 (= "忽略对应维度")
+            // 不能用 vaddr_val=0 推断 rs1=x0 — 因 vaddr=0 是合法实值不等同"忽略"。详见
+            // sfence.h 接口 doc。
+            //
+            // 透传 4 项 (按方案 B 参数顺序):
+            //   READ_REG(d.rs1)  → vaddr_val   (READ_REG 处理 d.rs1==0 → 0 的 x0 编码)
+            //   READ_REG(d.rs2)  → asid_val    (同上)
+            //   d.rs1            → rs1 编号    (helper 内判 d.rs1==0 即 RV spec rs1=x0)
+            //   d.rs2            → rs2 编号    (同上)
+            //
+            // d.rs1 = vaddr 寄存器号; d.rs2 = asid 寄存器号 (decode.h SFENCE.VMA 字段约定段)。
+            //
+            // case 末 break (不 goto out): fetch loop 末 += PC_STEP_RV (=4, decode 顶部
+            // case 0x73 默认), count++, boundary 检查 (sfence.vma 是 boundary, decode.h
+            // is_block_boundary_inst → 1) → goto out 退出 fetch loop, dispatcher 重派发
+            // 时 block 1 重新算 (regime, current_tlb), 因为 TLB 状态已变。
+            case OP_SFENCE_VMA:
+                SYNC_COUNT();
+                PRIV_CHECK_OR_TRAP(PRIV_S);
+                sfence_vma_helper(hart,
+                                  READ_REG(d.rs1), READ_REG(d.rs2),
+                                  d.rs1,           d.rs2);
+                break;
+
+            // ---- WFI (015 实装; RV spec §3.3.2 + §3.1.6.5 TW) ----
+            // priv<M + mstatus.TW=1 → trap illegal instruction (timeout=0 实装, spec 允许);
+            // 否则 wfi_wait 挂起直到 SRS 或 (mie & mip) 非 0 (predicate wfi_should_wake)。
+            // 醒来后 pc+=4 自推进 (PC_STEP_NONE 表态 "case 自写 pc"); break 让 fetch loop
+            // 末 count++ + boundary check → goto out, dispatcher 重派发后下一轮
+            // trap_check_interrupt 自动按 mip & mie 派发中断 (若 mstatus.MIE=1) 或继续
+            // (mstatus.MIE=0 → 软件 poll mip 自行处理)。
+            case OP_WFI:
+                DEBUG_WFI_ISSUE();              /* trace 'w' — wfi 指令到达 (TW 短路前打,
+                                                   illegal 路径也算 wfi 被发出过) */
+                if (hart->priv < PRIV_M &&
+                    (hart->trap._mstatus & (u64_t)MSTATUS_TW) != 0u) {
+                    SYNC_COUNT();
+                    trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION,
+                                         /*tval*/d.raw_inst);
+                    /* _Noreturn longjmp; 下面代码不可达 (trace 序: 'wE') */
+                }
+                SYNC_COUNT();
+                wfi_wait(hart->hartid, wfi_should_wake, hart);
+                DEBUG_WFI_WAKE();               /* trace 'W' — wfi_wait 返回后打 (不管真假醒).
+                                                   'wW' = predicate 即真没睡; 'wSW' = 真睡过
+                                                   一次; 'wSSW'+ = spurious/timeout 多睡几次. */
+                hart->regs[0] += 4u;            /* PC_STEP_NONE → 自推进 */
+                break;
+
             // ---- I-type LOAD (5 op) ----
             //
             // 不对称设计: load 走 inline 顶层 lsu_load_helper
@@ -717,68 +779,6 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
                 break;
             }
-
-            // ---- I-type SYSTEM SFENCE.VMA ----
-            //
-            // 权限要求 (跟 OP_MRET/OP_SRET 同形态):
-            //   SFENCE.VMA 仅在 hart->priv >= S 时合法; U-mode → cause=2 illegal instruction,
-            //   tval=raw_inst。case 入口 PRIV_CHECK_OR_TRAP(PRIV_S) 显式判。
-            //   mstatus.TVM=1 时 S-mode SFENCE.VMA 也 trap to M (cause=2)。TVM 控制位长期
-            //   TODO (跟 SRET 的 TSR 同形态)。
-            //
-            // 接口设计: helper 接 4 个独立信息, 分两组 — 寄存器**值** (vaddr_val/asid_val,
-            // 由 caller READ_REG 处理 x0 编码) 跟寄存器**编号**
-            // (rs1/rs2, 0..31)。两组语义独立不可互相推导:
-            //   - 值: 真做事用 (helper 4.a 简化下只用 asid_val; vaddr_val 是 (b)/(d) 精确实现
-            //          的预留, 当前 (void) 抑制 unused)
-            //   - 号: 判 RV spec "rs1=x0/rs2=x0" magic 编码 (= "忽略对应维度")
-            // 不能用 vaddr_val=0 推断 rs1=x0 — 因 vaddr=0 是合法实值不等同"忽略"。详见
-            // sfence.h 接口 doc。
-            //
-            // 透传 4 项 (按方案 B 参数顺序):
-            //   READ_REG(d.rs1)  → vaddr_val   (READ_REG 处理 d.rs1==0 → 0 的 x0 编码)
-            //   READ_REG(d.rs2)  → asid_val    (同上)
-            //   d.rs1            → rs1 编号    (helper 内判 d.rs1==0 即 RV spec rs1=x0)
-            //   d.rs2            → rs2 编号    (同上)
-            //
-            // d.rs1 = vaddr 寄存器号; d.rs2 = asid 寄存器号 (decode.h SFENCE.VMA 字段约定段)。
-            //
-            // case 末 break (不 goto out): fetch loop 末 += PC_STEP_RV (=4, decode 顶部
-            // case 0x73 默认), count++, boundary 检查 (sfence.vma 是 boundary, decode.h
-            // is_block_boundary_inst → 1) → goto out 退出 fetch loop, dispatcher 重派发
-            // 时 block 1 重新算 (regime, current_tlb), 因为 TLB 状态已变。
-            case OP_SFENCE_VMA:
-                SYNC_COUNT();
-                PRIV_CHECK_OR_TRAP(PRIV_S);
-                sfence_vma_helper(hart,
-                                  READ_REG(d.rs1), READ_REG(d.rs2),
-                                  d.rs1,           d.rs2);
-                break;
-
-            // ---- WFI (015 实装; RV spec §3.3.2 + §3.1.6.5 TW) ----
-            // priv<M + mstatus.TW=1 → trap illegal instruction (timeout=0 实装, spec 允许);
-            // 否则 wfi_wait 挂起直到 SRS 或 (mie & mip) 非 0 (predicate wfi_should_wake)。
-            // 醒来后 pc+=4 自推进 (PC_STEP_NONE 表态 "case 自写 pc"); break 让 fetch loop
-            // 末 count++ + boundary check → goto out, dispatcher 重派发后下一轮
-            // trap_check_interrupt 自动按 mip & mie 派发中断 (若 mstatus.MIE=1) 或继续
-            // (mstatus.MIE=0 → 软件 poll mip 自行处理)。
-            case OP_WFI:
-                DEBUG_WFI_ISSUE();              /* trace 'w' — wfi 指令到达 (TW 短路前打,
-                                                   illegal 路径也算 wfi 被发出过) */
-                if (hart->priv < PRIV_M &&
-                    (hart->trap._mstatus & (u64_t)MSTATUS_TW) != 0u) {
-                    SYNC_COUNT();
-                    trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION,
-                                         /*tval*/d.raw_inst);
-                    /* _Noreturn longjmp; 下面代码不可达 (trace 序: 'wE') */
-                }
-                SYNC_COUNT();
-                wfi_wait(hart->hartid, wfi_should_wake, hart);
-                DEBUG_WFI_WAKE();               /* trace 'W' — wfi_wait 返回后打 (不管真假醒).
-                                                   'wW' = predicate 即真没睡; 'wSW' = 真睡过
-                                                   一次; 'wSSW'+ = spurious/timeout 多睡几次. */
-                hart->regs[0] += 4u;            /* PC_STEP_NONE → 自推进 */
-                break;
 
             // ---- 兜底 ----
             case OP_UNSUPPORTED:

@@ -51,7 +51,7 @@
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
-#include "core/wfi.h"          // wfi_init / wfi_destroy / wfi_kick_all (015 WFI 唤醒框架)
+#include "core/wfi.h"          // wfi_init / wfi_destroy (015 WFI 唤醒框架; wfi_kick_all 016+17-chat 拍不调, 见 L606 trail)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -65,6 +65,8 @@
 #include <string.h>
 #include <time.h>       // clock_gettime / struct timespec (main lifecycle 总耗时)
 
+// has_suffix: 判 *s 是否以 *suffix 结尾 (大小写敏感)。--bios 三层 dispatch 用
+// (后缀 .elf / .bin 显式优先; 详 main 内 --bios 调用点 doc)。
 static int has_suffix(const char *s, const char *suffix) {
     size_t ns = strlen(s);
     size_t nsuf = strlen(suffix);
@@ -97,7 +99,7 @@ static int decode_test(void) {
                 _d.imm != (int32_t)(eimm) || _d.raw_inst != (uint32_t)(eraw) ||         \
                 _d.pc_step != (uint32_t)(estep)) {                                      \
                 fprintf(stderr,                                                        \
-                    "[decode_test] FAIL raw=0x%08x: kind=%d rd=%u rs1=%u rs2=%u imm=%d raw_inst=0x%x pc_step=%u\n", \
+                    "[decode_test] FAIL raw=0x%08x: kind=%d rd=%u rs1=%u rs2=%u imm=%d raw_inst=0x%x pc_step=%u" EOL, \
                     (uint32_t)(raw), _d.kind, _d.rd, _d.rs1, _d.rs2, _d.imm,            \
                     _d.raw_inst, _d.pc_step);                                           \
                 fail++;                                                                \
@@ -316,9 +318,9 @@ static int decode_test(void) {
     #undef CASE
 
     if (fail == 0) {
-        fprintf(stderr, "[decode_test] PASS (%d/%d)\n", total - fail, total);
+        fprintf(stderr, "[decode_test] PASS (%d/%d)" EOL, total - fail, total);
     } else {
-        fprintf(stderr, "[decode_test] FAIL (%d/%d)\n", total - fail, total);
+        fprintf(stderr, "[decode_test] FAIL (%d/%d)" EOL, total - fail, total);
     }
     return fail;
 }
@@ -338,8 +340,12 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     // 命令行参数解析:
     //
-    //   --bios FILE       简便 alias 后缀分发; .bin → load_bin GUEST_RAM_START
-    //                                          .elf → load_elf (按 p_paddr)
+    //   --bios FILE       简便 alias 三层 dispatch: 后缀 .elf → load_elf;
+    //                                            后缀 .bin → load_bin GUEST_RAM_START;
+    //                                            其他/无后缀 → magic 探测 (guest_is_elf)
+    //                                            命中走 load_elf, 否则 load_bin。
+    //                                            后缀显式优先于 magic, 防 raw 文件首字节
+    //                                            碰巧 0x7F 'E' 'L' 'F' 被误判 ELF.
     //   --load FILE       无 ADDR → guest_load_elf (按 ELF p_paddr 加载)
     //   --load ADDR=FILE  有 ADDR → guest_load_bin (raw 到 ADDR, 不解 ELF 头)
     //   --blk FILE        virtio-blk image (空 = 模块退化为不存在)
@@ -364,16 +370,30 @@ int main(int argc, char **argv) {
 
         if (strcmp(arg, "--bios") == 0) {
             if (++i >= argc) {
-                fprintf(stderr, "--bios needs FILE\n");
+                fprintf(stderr, "--bios needs FILE" EOL);
                 return 1;
             }
             if (load_count >= LOAD_OP_MAX) {
-                fprintf(stderr, "too many load ops (max %d)\n", LOAD_OP_MAX);
+                fprintf(stderr, "too many load ops (max %d)" EOL, LOAD_OP_MAX);
                 return 1;
             }
             const char *file = argv[i];
             load_ops[load_count].file = file;
+            // 三层 dispatch:
+            //   1. 后缀 .elf 显式 → load_elf (即使 magic 不命中也强走 load_elf; 文件
+            //      坏掉报错让 user 知道, 不被 magic fallback 掩盖)
+            //   2. 后缀 .bin 显式 → load_bin GUEST_RAM_START (即使内容碰巧 0x7F 'E'
+            //      'L' 'F' 也按 raw 处理; user 显式意图优先于 magic 探测)
+            //   3. 其他后缀 / 无后缀 → guest_is_elf magic 探测 fall back
+            // guest_is_elf 开文件失败 silent 返 0, 报错延后到 guest_load_bin/elf 内
+            // open 失败 (一致的 stderr 报错路径)。
             if (has_suffix(file, ".elf")) {
+                load_ops[load_count].as_elf = 1;
+                load_ops[load_count].addr = 0;
+            } else if (has_suffix(file, ".bin")) {
+                load_ops[load_count].as_elf = 0;
+                load_ops[load_count].addr = GUEST_RAM_START;
+            } else if (guest_is_elf(file)) {
                 load_ops[load_count].as_elf = 1;
                 load_ops[load_count].addr = 0;
             } else {
@@ -384,11 +404,11 @@ int main(int argc, char **argv) {
 
         } else if (strcmp(arg, "--load") == 0) {
             if (++i >= argc) {
-                fprintf(stderr, "--load needs FILE or ADDR=FILE\n");
+                fprintf(stderr, "--load needs FILE or ADDR=FILE" EOL);
                 return 1;
             }
             if (load_count >= LOAD_OP_MAX) {
-                fprintf(stderr, "too many load ops (max %d)\n", LOAD_OP_MAX);
+                fprintf(stderr, "too many load ops (max %d)" EOL, LOAD_OP_MAX);
                 return 1;
             }
             const char *spec = argv[i];
@@ -403,7 +423,7 @@ int main(int argc, char **argv) {
                 char *end = NULL;
                 unsigned long addr = strtoul(spec, &end, 0);
                 if (end != eq || end == spec) {
-                    fprintf(stderr, "--load: bad ADDR in '%s'\n", spec);
+                    fprintf(stderr, "--load: bad ADDR in '%s'" EOL, spec);
                     return 1;
                 }
                 load_ops[load_count].file = eq + 1;
@@ -414,20 +434,20 @@ int main(int argc, char **argv) {
 
         } else if (strcmp(arg, "--blk") == 0) {
             if (++i >= argc) {
-                fprintf(stderr, "--blk needs FILE\n");
+                fprintf(stderr, "--blk needs FILE" EOL);
                 return 1;
             }
             blk_path = argv[i];
 
         } else {
-            fprintf(stderr, "unknown arg: %s\n", arg);
-            fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]\n", argv[0]);
+            fprintf(stderr, "unknown arg: %s" EOL, arg);
+            fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]" EOL, argv[0]);
             return 1;
         }
     }
 
     if (load_count == 0) {
-        fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]\n", argv[0]);
+        fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]" EOL, argv[0]);
         return 1;
     }
 
@@ -438,14 +458,14 @@ int main(int argc, char **argv) {
     // decode 单测先跑 (decode 是纯函数, 不依赖 ram/cpu/mmu); fail 直接 return 1 不让
     // fixture 跑 (test-driven 模式)。
     if (decode_test() != 0) {
-        fprintf(stderr, "decode_test failed\n");
+        fprintf(stderr, "decode_test failed" EOL);
         return 1;
     }
 
     // 全局 ram_init: 调用后 ram.h 暴露的 host_ram_base / gpa_to_hva_offset 可用。
     // 报错风格见 src/dummy.txt §5。
     if (ram_init() != 0) {
-        fprintf(stderr, "ram_init failed\n");
+        fprintf(stderr, "ram_init failed" EOL);
         return 1;
     }
 
@@ -453,7 +473,7 @@ int main(int argc, char **argv) {
     // timer 辅助线程由下方 clint_start_timer_thread 显式起 (谁 spawn 谁 join, dummy.txt
     // §12)。详 platform/clint.h。
     if (clint_init() != 0) {
-        fprintf(stderr, "clint_init failed\n");
+        fprintf(stderr, "clint_init failed" EOL);
         return 1;
     }
 
@@ -461,14 +481,14 @@ int main(int argc, char **argv) {
     // hot path 通过 atomic 字段优化 (plic_ctx_eip / plic_pending_bitmap_cache),
     // set/clear 走同步 wrlock; 演进 trail 详 trade_off_log §T.6.
     if (plic_init() != 0) {
-        fprintf(stderr, "plic_init failed\n");
+        fprintf(stderr, "plic_init failed" EOL);
         return 1;
     }
 
     // test_dev 注册到 bus (plic_init 之后)。无内部状态 + 无锁; 写 TEST_DEV_SET_OFF /
     // TEST_DEV_CLEAR_OFF 直 fanout 调 plic.device_set/clear_pending。详 device/test_dev.h。
     if (test_dev_init() != 0) {
-        fprintf(stderr, "test_dev_init failed\n");
+        fprintf(stderr, "test_dev_init failed" EOL);
         return 1;
     }
 
@@ -476,7 +496,7 @@ int main(int argc, char **argv) {
     // 下方 uart_start_rx_thread 显式起 (谁 spawn 谁 join, dummy.txt §12)。
     // 详 device/uart.h 顶段。
     if (uart_init() != 0) {
-        fprintf(stderr, "uart_init failed\n");
+        fprintf(stderr, "uart_init failed" EOL);
         return 1;
     }
 
@@ -486,7 +506,7 @@ int main(int argc, char **argv) {
     // virtio_blk_start_io_worker_thread 显式起 (跟 uart/plic/clint 同形态)。
     // 详 device/virtio_blk.h 顶段。
     if (virtio_blk_init(blk_path) != 0) {
-        fprintf(stderr, "virtio_blk_init failed\n");
+        fprintf(stderr, "virtio_blk_init failed" EOL);
         return 1;
     }
 
@@ -501,7 +521,7 @@ int main(int argc, char **argv) {
             err = guest_load_bin(load_ops[li].file, load_ops[li].addr);
         }
         if (err != 0) {  // loader 内部已 fprintf "why"
-            fprintf(stderr, "load failed: %s\n", load_ops[li].file);
+            fprintf(stderr, "load failed: %s" EOL, load_ops[li].file);
             return 1;
         }
     }
@@ -513,7 +533,7 @@ int main(int argc, char **argv) {
     // 跟 cpu_reset 序列一致, 不需要 main 端再写 hart 字段。
     cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/(uxlen_t)0);
     if (hart == NULL) {  // cpu_create 内部已 fprintf "why"
-        fprintf(stderr, "cpu_create failed\n");
+        fprintf(stderr, "cpu_create failed" EOL);
         return 1;
     }
 
@@ -524,7 +544,7 @@ int main(int argc, char **argv) {
     // wfi_kick; 当前 PLIC 不在 init 时 set pending (都是 guest 写或 device 后续调),
     // 但保险起见也放在 plic_init 之后。
     if (wfi_init() != 0) {
-        fprintf(stderr, "wfi_init failed\n");
+        fprintf(stderr, "wfi_init failed" EOL);
         cpu_destroy(hart);
         return 1;
     }
@@ -607,6 +627,15 @@ int main(int argc, char **argv) {
         // ====================================================================
         // 占位: 所有 SRS-controlled 线程 join — 跟上面 spawn 对偶, 同范围
         // (hart 线程 + 其他受 SRS 控制的辅助线程都在这里 join, 不限于 hart)。
+        //
+        // 单 hart 同步现状 (016+17-chat 拍定): 上面 dispatcher(hart) 返回 ≡ hart
+        // 退 wfi 退 main loop, 退化的 join 形式. 哲学 = "所有人 self-poll SRS/SDS
+        // 自己停" — shutdown 路径下 hart 在 wfi 时靠 wfi.c cond_timedwait 兜底
+        // WFI_TIMEOUT_NS (config.h 500ms) 自醒 + predicate 重检 SRS 退出, 接受
+        // 此 tail latency. signal handler / 非 signal handler 路径无差异, 没有
+        // "通知者" 角色. 多 hart 未来如需缩短 shutdown tail, 见 wfi.h 顶段 +
+        // wfi_kick_all 函数 doc (候选: hart 自治 kick / source 端 kick — 真撞
+        // 延迟问题再回看).
         // ====================================================================
 
         // ====================================================================
@@ -647,12 +676,9 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
 
-    // 015 加: 非 signal handler 上下文路径主动 kick 所有可能在 WFI cond_wait 的 hart;
-    // shutdown_signal_set_bit 自动设 SRS (内部传播), hart predicate 看到 SRS 非 0 退出。
-    // 但 hart 可能正在 cond_timedwait 内, 不主动 kick 要等 timeout (500ms) 才唤;
-    // 这里显式 kick 加快退出。signal handler 路径走的 shutdown_signal_set_bit 不调
-    // 此函数 (async-signal-safe 约束), 那条路径接受 500ms tail latency。
-    wfi_kick_all();
+    // hart 退出协议走 SRS self-poll, 不需要主动 wfi_kick — L606 dispatcher 返回
+    // 时 hart 已退 wfi 退 main loop. 哲学详 L606 之后占位段 trail; wfi_kick_all
+    // 函数保留备多 hart / 灵感 (详 wfi.h).
 
     // ------------------------------------------------------------------------
     // POR 退出段 (while 外): 回收 SDS 控制的辅助线程 → 三 destroy
@@ -687,7 +713,7 @@ int main(int argc, char **argv) {
                    + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
     int    e_min   = (int)(total_s / 60.0);
     double e_sec   = total_s - (double)e_min * 60.0;
-    fprintf(stderr, "[main] elapsed: %d min %.3f s (total %.3f s)\n",
+    fprintf(stderr, "[main] elapsed: %d min %.3f s (total %.3f s)" EOL,
             e_min, e_sec, total_s);
 
     clint_destroy();
@@ -723,7 +749,7 @@ int main(int argc, char **argv) {
         int test_code = test_dev_get_exit_code();
         fprintf(stderr,
                 "[main] external signal %u -> exit %d; "
-                "test_dev exit code at interrupt: %d\n",
+                "test_dev exit code at interrupt: %d" EOL,
                 sig, 128 + (int)sig, test_code);
         return 128 + (int)sig;
     }

@@ -344,7 +344,7 @@ static void *uart_reader_run(void *arg) {
         int rc = poll(&pfd, 1, 100);            /* 100 ms timeout cooperative shutdown */
         if (rc < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "[uart reader] poll failed: %s\n", strerror(errno));
+            fprintf(stderr, "[uart reader] poll failed: %s" EOL, strerror(errno));
             break;
         }
         if (rc == 0) continue;                  /* timeout — 再判 SDS */
@@ -355,7 +355,7 @@ static void *uart_reader_run(void *arg) {
         if (n == 0) break;                      /* EOF; stdin closed / pipe 跑完 */
         if (n < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "[uart reader] read failed: %s\n", strerror(errno));
+            fprintf(stderr, "[uart reader] read failed: %s" EOL, strerror(errno));
             break;
         }
 
@@ -421,7 +421,7 @@ static void *uart_tx_drain_run(void *arg) {
             if (rc == ETIMEDOUT) continue;       /* 重检 tx_count + SDS */
             if (rc == 0) continue;               /* signaled 或 spurious; 重检 */
             /* 真异常 (rc != 0 且 != ETIMEDOUT) — 走 cleanup */
-            fprintf(stderr, "[uart tx_drain] cond_timedwait failed: %s\n",
+            fprintf(stderr, "[uart tx_drain] cond_timedwait failed: %s" EOL,
                     strerror(rc));
             uart_unlock();
             shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
@@ -451,7 +451,7 @@ static void *uart_tx_drain_run(void *arg) {
                 ssize_t w = write(STDOUT_FILENO, batch + written, n - written);
                 if (w < 0) {
                     if (errno == EINTR) continue;
-                    fprintf(stderr, "[uart tx_drain] write failed: %s\n",
+                    fprintf(stderr, "[uart tx_drain] write failed: %s" EOL,
                             strerror(errno));
                     shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
                     return NULL;
@@ -459,7 +459,7 @@ static void *uart_tx_drain_run(void *arg) {
                 if (w == 0) {
                     /* POSIX: write 0 写 0 字节正常返回, 但持续 0 算异常 — short
                        write 形态. stdout 一般不撞, 防御性走 fail 路径. */
-                    fprintf(stderr, "[uart tx_drain] write returned 0 (short write)\n");
+                    fprintf(stderr, "[uart tx_drain] write returned 0 (short write)" EOL);
                     shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
                     return NULL;
                 }
@@ -490,7 +490,7 @@ static void *uart_tx_drain_run(void *arg) {
             ssize_t w = write(STDOUT_FILENO, batch + written, n - written);
             if (w < 0) {
                 if (errno == EINTR) continue;
-                fprintf(stderr, "[uart tx_drain] tail-drain write failed: %s\n",
+                fprintf(stderr, "[uart tx_drain] tail-drain write failed: %s" EOL,
                         strerror(errno));
                 /* shutdown 路径已在, 不再 set DEVICE_FAIL — 仅 log */
                 break;
@@ -518,13 +518,13 @@ int uart_init(void) {
 
     int rc = pthread_mutex_init(&uart.lock, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_init: pthread_mutex_init failed: %s\n", strerror(rc));
+        fprintf(stderr, "uart_init: pthread_mutex_init failed: %s" EOL, strerror(rc));
         return -1;
     }
 
     rc = pthread_cond_init(&uart.tx_not_empty, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_init: pthread_cond_init failed: %s\n", strerror(rc));
+        fprintf(stderr, "uart_init: pthread_cond_init failed: %s" EOL, strerror(rc));
         (void)pthread_mutex_destroy(&uart.lock);
         return -1;
     }
@@ -538,7 +538,7 @@ int uart_init(void) {
         .name      = "uart",
     };
     if (bus_register_mmio(&dev) != 0) {
-        fprintf(stderr, "uart_init: bus_register_mmio failed\n");
+        fprintf(stderr, "uart_init: bus_register_mmio failed" EOL);
         (void)pthread_cond_destroy(&uart.tx_not_empty);
         (void)pthread_mutex_destroy(&uart.lock);
         return -1;
@@ -604,7 +604,7 @@ void uart_start_rx_thread(void) {
 
     int rc = pthread_create(&uart.reader_thread, NULL, uart_reader_run, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_start_rx_thread: pthread_create failed: %s\n",
+        fprintf(stderr, "uart_start_rx_thread: pthread_create failed: %s" EOL,
                 strerror(rc));
         shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
     }
@@ -616,7 +616,7 @@ void uart_join_rx_thread(void) {
        一行不 fatal (跟 clint_join_timer_thread 同形态). */
     int rc = pthread_join(uart.reader_thread, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_join_rx_thread: pthread_join failed: %s\n",
+        fprintf(stderr, "uart_join_rx_thread: pthread_join failed: %s" EOL,
                 strerror(rc));
     }
 
@@ -643,7 +643,7 @@ void uart_start_tx_thread(void) {
 
     int rc = pthread_create(&uart.tx_drain_thread, NULL, uart_tx_drain_run, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_start_tx_thread: pthread_create failed: %s\n",
+        fprintf(stderr, "uart_start_tx_thread: pthread_create failed: %s" EOL,
                 strerror(rc));
         shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
     }
@@ -657,7 +657,7 @@ void uart_join_tx_thread(void) {
 
     int rc = pthread_join(uart.tx_drain_thread, NULL);
     if (rc != 0) {
-        fprintf(stderr, "uart_join_tx_thread: pthread_join failed: %s\n",
+        fprintf(stderr, "uart_join_tx_thread: pthread_join failed: %s" EOL,
                 strerror(rc));
     }
 }

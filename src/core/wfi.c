@@ -49,7 +49,7 @@ int wfi_init(void) {
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
         int rc = pthread_mutex_init(&wfi_slots[i].mutex, NULL);
         if (rc != 0) {
-            fprintf(stderr, "wfi_init: pthread_mutex_init(slot[%u].mutex) failed: %s\n",
+            fprintf(stderr, "wfi_init: pthread_mutex_init(slot[%u].mutex) failed: %s" EOL,
                     i, strerror(rc));
             // 半 init 路径回滚: 前 i 个 mutex / cond 不主动 destroy (跟 clint_init
             // 失败回滚同体例 — main 不会跑 destroy chain, 进程退出 OS 回收资源)。
@@ -57,7 +57,7 @@ int wfi_init(void) {
         }
         rc = pthread_cond_init(&wfi_slots[i].cond, NULL);
         if (rc != 0) {
-            fprintf(stderr, "wfi_init: pthread_cond_init(slot[%u].cond) failed: %s\n",
+            fprintf(stderr, "wfi_init: pthread_cond_init(slot[%u].cond) failed: %s" EOL,
                     i, strerror(rc));
             (void)pthread_mutex_destroy(&wfi_slots[i].mutex);  // 当前 i 的 mutex 已 init, 单独 cleanup
             return -1;
