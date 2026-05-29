@@ -1,5 +1,8 @@
 # a02_7 / 16_blocksize_64
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # perf 套件·block 大小 sweep (fixture 12-16): bare M-mode 纯算术紧循环, 每个 block
 # 固定 64 条指令 (= config.h BLOCK_INST_LIMIT 软边界上限)。配 中断检查 ON/OFF A/B

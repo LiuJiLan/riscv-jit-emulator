@@ -1,5 +1,8 @@
 # a03_4 / 01_async_multi_source
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # T6.2 PLIC 异步消费可见性 + 多 source 仲裁正确性:
 #   主帧紧凑 SET 1/2/3/4 (4 次连续 sw test_dev SET_OFF), ring 入队 4 event;
@@ -8,7 +11,7 @@
 #     - lw PLIC pending bitmap @0x0C001000 → 期望 = 0x1E (bit 1-4 都 set)
 #     - csrr mip → 期望 MEIP bit (0x800) set
 #   再紧凑 CLEAR 1/2/3/4 + spin → 期望 pending=0 + MEIP=0
-#   ecall halt; dump 验 s0/s1/s2/s3.
+#   test_dev FINISHER 干净停机; dump 验 s0/s1/s2/s3.
 #
 # T6.1 时 device_set_pending 是同步 (直接 wrlock 改 sources[].device_line), pending
 # bitmap 立即可见; T6.2 后异步消费, pending bitmap 有 ms 量级延迟. 本 fixture 通过
@@ -94,8 +97,11 @@ spin2:
     # ---- csrr mip (验 MEIP bit clear) ----
     csrr    s3, mip                 # s3 = mip (期望 0x800 bit clear; 其他 bit 不挑)
 
-    # ---- halt: ecall → triple fault (mtvec 默认 0, ecall 走 handler 又取指 fault) ----
-    ecall
+    # ---- halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0 ----
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
 
 # ===== 期望结果 =====
 # 期望最终寄存器 (debug build cpu_dump):
@@ -104,9 +110,9 @@ spin2:
 #   s2 = 0                     (PLIC pending bitmap after CLEAR + 5ms spin)
 #   s3 不含 0x800 bit          (mip MEIP clear; mask 0x800)
 #
-# 期望 trap dump (halt 路径 triple fault):
-#   in_trap = 3
-#   mcause  = 1                (CAUSE_INST_ACCESS_FAULT; ecall + mtvec=0 → 取指 fault)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径

@@ -1,5 +1,8 @@
 # a02_7 / 02_mmu_sv32
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # 解释器 perf 套件之二: REGIME_SV32 取指路径吞吐。跟 01_bare 同一个纯 ALU+branch
 # 紧循环, 但在 S-mode + Sv32 下跑 —— 每个 block 取指经叶 TLB 查找 (命中态)。

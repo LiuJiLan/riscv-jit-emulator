@@ -1,9 +1,13 @@
 # a02_6 / 02_clint_timer_auto_fire
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 timer 辅助线程真异步累加 mtime → mtimecmp 越过阈值 → MTIP → trap deliver
 # 端到端 — 跟 a02_5/01 同形态, 区别在 mtimecmp 设大点 (跨多个 timer wake), 体现
 # "mtime 跟 host wall clock 推进 / 不靠 dispatcher 指令数".
+# (注: 改 test_dev 停机, 旧叙事见 REVIEW B.3)
 #
 # ===== 思路 =====
 # 流程:
@@ -44,6 +48,7 @@ _start:
     sw      x0, 4(t0)               # 高 32 = 0
 
     # mstatus.MIE = 1 (bit 3)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
     # busy wait_loop: spin 直到 handler 设 s0=1
@@ -56,8 +61,11 @@ wait_loop:
     # ---- handler 返回后 halt ----
     mv      a0, s1                  # a0 = handler 保存的 mcause (期望 0x80000007)
 
-    csrw    mtvec, x0               # 清 mtvec
-    ecall                            # triple fault halt
+    # ---- 停机: test_dev FINISHER PASS ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 保存 mcause (期望 0x80000007 = CAUSE_INTERRUPT_BIT | IRQ_M_TIMER)
@@ -78,7 +86,5 @@ m_handler:
 #   s0 (x8)  = 1            (handler 设, 验 handler 真跑)
 #   s1 (x9)  = 0x80000007   (handler 保存 mcause)
 #   a5 (x15) >> 0           (wait_loop 跑大量轮; 不像 a02_5/01 只跑几十轮)
-#
-# 期望 trap dump:
-#   in_trap = 3             (halt path triple fault, 跟 a02_5/01 同形态)
-#   mcause  = 1             (ecall → mtvec=0 → mmu fail; 跟 a02_5/01 同)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit 0

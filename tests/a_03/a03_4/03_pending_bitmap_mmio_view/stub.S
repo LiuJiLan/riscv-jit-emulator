@@ -1,5 +1,8 @@
 # a03_4 / 03_pending_bitmap_mmio_view
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # PLIC MMIO pending bitmap 区 (off [0x1000, 0x2000)) 读路径完整验证. T6.2 post-EIP
 # 改 atomic_load(plic_pending_bitmap_cache[word_idx], acquire) 直返 — 过去 a_03
@@ -134,8 +137,11 @@ spin2:
     li      t0, 0x0C001000
     lw      s10, 0(t0)              # word 0 (期望 0; word 1/2 同, 不重复 dump 省寄存器)
 
-    # ---- halt: ecall → triple fault (mtvec=0) ----
-    ecall
+    # ---- halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0 ----
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
 
 # ===== 期望结果 =====
 # 期望最终寄存器 (debug build cpu_dump):
@@ -151,9 +157,9 @@ spin2:
 #   s9 = 0x22   (complete 后 word 0, bit 1 重新可见; cache 跟 claimed 清联动)
 #   s10 = 0     (CLEAR 后 word 0, 全清; consumer 异步 drain 跟 cache 联动)
 #
-# 期望 trap dump (halt 路径 triple fault):
-#   in_trap = 3
-#   mcause  = 1                (CAUSE_INST_ACCESS_FAULT; ecall + mtvec=0)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径

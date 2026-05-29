@@ -1,5 +1,8 @@
 # a_01_8 / 07_sv32_superpage_lw_sw
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 lsu SV32 在 4MB superpage (level=1 leaf) 上 lw/sw 走通 + fast path 命中。
 # 跟 fixture 04 (level=1 → level=0 4KB 路径) 互补, 验 walker 另一条主路径。
@@ -28,7 +31,7 @@
 #      sw 0x12345678 → vaddr 0x80001004 (fast path 命中, 同 4KB)
 #      lw  vaddr 0x80001004 → x11 (fast path)
 #      ecall (cause=9 from S)
-#   3. M handler: csrr mcause → x12; halt triple fault
+#   3. M handler: csrr mcause → x12; test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -85,15 +88,20 @@ m_handler:
     csrr x12, mcause                # x12 = 9
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump (跟 fixture 04 同 — 只是 PT 路径不同, S phase 行为相同):
 #   x10 = 0xCAFEBABE
 #   x11 = 0x12345678
 #   x12 = 9
-#   mcause = 11, priv = 3, in_trap = 3, mtvec = 0
+#   x30 = 0x100000 (停机用 scratch: test_dev base)
+#   x31 = 0x5555   (停机用 scratch: FINISHER PASS magic)
+#   priv = 3
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 / x11 都对 → walker superpage 路径正确 + fill TLB 4KB 粒度 OK

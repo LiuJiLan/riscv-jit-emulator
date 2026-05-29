@@ -1,5 +1,8 @@
 # a03_2 / 07_int_seip_delegated
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # SEIP 通过 mideleg 代理到 S handler (而不是 M handler):
 #   trap_set_interrupt_state: priv < M AND mideleg.bit(cause_low) = 1 → deliver_priv = S
@@ -18,13 +21,17 @@
 #   4. mret 切 S (mstatus.MPP=S)
 #   5. S 开 SIE → fire SEIP, deliver S (mideleg.SEIP=1), jump stvec
 #   6. s_handler: scause=0x80000009; PLIC claim @ ctx 1 + complete + device_clear; sret
-#   7. 回 S 退 wait_loop, S-ecall → m_halt → triple fault
+#   7. 回 S 退 wait_loop, S-ecall → m_halt → test_dev FINISHER PASS 干净停机
 #
 # ===== 期望结果 =====
 #   s0 = 1
 #   s1 = 0x80000009   (CAUSE_INTERRUPT_BIT | IRQ_S_EXT, 写 scause)
 #   s2 = 3            (PLIC claim @ ctx 1 返 src=3)
-#   in_trap = 3 / pc = 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 原停机靠 S-ecall → m_halt csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变
+#  MDT abort, m_halt 改 test_dev 干净停机 (S-ecall → M 的 deliver 路径保留)。
+#  绝对 pc / total_count 见 REVIEW B.3 段。)
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -92,5 +99,7 @@ s_handler:
     sret
 
 m_halt:
-    csrw    mtvec, x0
-    ecall                                  # M-ecall → triple fault → halt
+    # S-ecall deliver 到此 (M); test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)

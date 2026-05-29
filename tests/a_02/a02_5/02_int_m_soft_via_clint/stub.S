@@ -1,5 +1,8 @@
 # a02_5 / 02_int_m_soft_via_clint
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # M-mode software interrupt 通过 CLINT.msip MMIO 触发。
 #
@@ -24,6 +27,7 @@ _start:
     csrw    mie, t0
 
     # mstatus.MIE = 1
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
     # 写 CLINT.msip[0] = 1 → 触发 M software interrupt
@@ -40,8 +44,11 @@ wait_loop:
 
     mv      a0, s1
 
-    csrw    mtvec, x0
-    ecall
+    # ---- halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     csrr    s1, mcause              # 期望 0x80000003 (CAUSE_INTERRUPT_BIT | IRQ_M_SOFT)
@@ -59,3 +66,6 @@ m_handler:
 #   s0 = 1
 #   s1 = 0x80000003
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

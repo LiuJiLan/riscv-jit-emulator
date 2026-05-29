@@ -1,8 +1,13 @@
 # a02_2 / 02_bus_unmapped_reject
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # bus_dispatch_* 未命中 reject 验证 — read + write 两条 branch (cover bus 自产
 # CAUSE_LOAD_ACCESS_FAULT / CAUSE_STORE_ACCESS_FAULT)。
+# (注: 原收尾用 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改 test_dev
+#  干净停机, 旧 triple-fault 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 触发 case (2 个):
@@ -19,6 +24,9 @@
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0               # 清 mstatush.MDT (Smdbltrp reset=1; 否则首个 M-mode
+                                 # 访问 fault → MDT abort, handler 跑不到)
+
     # set mtvec
     la   t0, m_handler
     csrw mtvec, t0
@@ -35,9 +43,11 @@ _start:
     li   t0, 0x03000000
     lw   t2, 0(t0)
 
-    # done: triple fault halt
-    csrw mtvec, x0
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                      # 防 fall-through 落进 m_handler (dispatcher 下个 block 末退)
 
 # ----------------------------------------------------------------------------
 # m_handler — switch on s0 写 mtval (+ case 1 写 cause) 到 a 寄存器, mret +4
@@ -70,7 +80,7 @@ epilogue:
 #   a1 (x11) = 5            case 1 mcause
 #   a2 (x12) = 0x03000000   case 1 mtval
 #   s0 (x8)  = 2            (2 case 都进了 handler)
-#
-# halt 路径: 2 case 完后 csrw mtvec, x0 + ecall → 下轮 fetch pc=0 → triple fault
-#            halt。main dump 的 mcause/mtval 是 cause 1 / 0 (最后 root cause), 不是
-#            case 7 / 5; cause 7 / 5 通过 handler 写入 a 寄存器验证。
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: cause 7 / 5 通过 handler 写入 a 寄存器验证; 绝对 pc / total_count 见 REVIEW
+#  B.3 段, 不在断言内。)

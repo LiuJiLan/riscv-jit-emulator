@@ -1,5 +1,8 @@
 # a03_2 / 08_mtvec_vectored_meip
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # mtvec vectored mode (mode=1): fire async interrupt 时 pc = base + 4*cause_low.
 # 验 MEIP (cause_low=11) 跳 m_vec_base+44 这条 entry.
@@ -8,15 +11,18 @@
 # vectored jump table 每个 entry = `jal x5, m_vec_handler` (x5=t0 当临时 ra; jal 后
 # x5 = entry_addr + 4 = base + 4*cause_low + 4). handler 内算 cause_low = (x5 - base
 # - 4) / 4, compare == 11, mismatch 走 fail_loop 死循环 (release timeout 暴露 fail);
-# match 才走 PLIC claim/complete + mret 正常路径 (release in_trap=3 ✓).
+# match 才走 PLIC claim/complete + mret 正常路径 → 主流程 test_dev FINISHER 干净停机.
 #
-# 比用 `j entry / li sN=marker` 强: release 不 dump GPR, 用 in_trap=3 vs timeout
+# 比用 `j entry / li sN=marker` 强: release 不 dump GPR, 用 exit 0 vs timeout
 # 区分 pass/fail, 不依赖 debug build GPR 验.
 #
 # ===== 期望结果 =====
-#   pass: in_trap=3 / pc=0 (release / debug 都看得到)
+#   pass: test_dev FINISHER PASS → exit code 0 (release / debug 都看得到; 跳对 entry)
 #   fail (vectored 跳错 entry): timeout (release) / 卡 fail_loop (debug)
 #   debug 下 GPR: s0=1 / s1=11 (cause_low 实际命中) / s3=44 (offset)
+#                 x30=0x100000 / x31=0x5555 (停机 scratch)
+# (注: 原停机靠 csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变 MDT abort, 改
+#  test_dev 干净停机; pass 判据从 in_trap=3 改 exit 0。)
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -44,13 +50,17 @@ _start:
 
     li      t1, TEST_DEV_BASE
     li      t0, 3;  sw t0, TEST_DEV_SET_OFF(t1)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8                # MIE=1 → fire MEIP → vectored
 
 wait_loop:
     beqz    s0, wait_loop
 
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # ============================================================================
 # m_vec_base — vectored jump table; 每 entry = jal x5, handler (x5 = entry+4)

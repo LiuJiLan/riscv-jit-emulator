@@ -1,5 +1,8 @@
 # a03_2 / 02_plic_priority_arbitration
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # PLIC claim 仲裁按 priority 排序 (RV PLIC spec §7): 同时 set src=3 (prio=2) 和
 # src=5 (prio=5), 第 1 次 claim 期望返 src=5 (高 prio 优先); complete 5 后 src=3
@@ -12,7 +15,10 @@
 #   s1 = 5            (第 1 次 claim, prio 高的 src=5)
 #   s2 = 3            (第 2 次 claim, 剩下的 src=3)
 #   s3 = 2            (handler 进入次数, 期望 2)
-#   in_trap = 3 / pc = 0  (halt path triple fault)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 原停机靠 csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变 MDT abort, 改
+#  test_dev 干净停机。绝对 pc / total_count 见 REVIEW B.3 段。)
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -51,13 +57,17 @@ _start:
     li      t0, 5;  sw t0, TEST_DEV_SET_OFF(t1)
 
     # 开 MIE → 下一 block trap_check fire MEIP
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
 wait_loop:
     beqz    s0, wait_loop
 
-    csrw    mtvec, x0
-    ecall                                  # halt
+    # halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     addi    s3, s3, 1                       # 进入次数 ++

@@ -1,8 +1,14 @@
 # a_01_9 / 02_m_s_trap_csrs
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 7 个 csr (mscratch + medeleg + mideleg + sscratch + stvec + scause + stval) csrw +
 # csrr 字段值。
+# (注: 原收尾靠 csrw mtvec,x0 + ecall 强制 triple fault; a_03 Smdbltrp 后 triple fault 变
+#  MDT abort, 改 test_dev 干净停机。7 个 csr 读回值在停机前已入 x10-x15/x4,
+#  test_dev 停机不影响这些值。原 triple-fault / mcause=11 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 测试组织: 本 fixture 只在 M 态测 csrw/csrr 字段读写, 不测 trap delivery (那归
@@ -23,16 +29,12 @@
 #
 # main dump 范围 = x4-x7 + x10-x15 共 8 GPR; 7 个 csr 读回值分配如下:
 #   x10 mscratch / x11 medeleg / x12 mideleg / x13 sscratch /
-#   x14 stvec    / x15 scause  / x4  stval (m_handler 地址 csrw 完不再用, x4 重用)
+#   x14 stvec    / x15 scause  / x4  stval
 
 .section .text
 .option norvc
 .globl _start
 _start:
-    # ---- 设 M handler ----
-    la   x4, m_handler
-    csrw mtvec, x4
-
     # ---- mscratch (0x340) ----
     li   x6, 0xCAFEBABE
     csrw 0x340, x6
@@ -63,21 +65,21 @@ _start:
     csrw 0x142, x6
     csrr x15, 0x142             # 期望 9
 
-    # ---- stval (0x143); x4 重用 (m_handler 地址 csrw 完不再用) ----
+    # ---- stval (0x143) ----
     li   x6, 0x80001000
     csrw 0x143, x6
     csrr x4, 0x143              # 期望 0x80001000
 
-    ecall                       # cause=11 from M; trap deliver M handler
-
-m_handler:
-halt:
-    csrw mtvec, x0
-    ecall                       # cause=11 from M, mtvec=0 fetch fail → triple fault
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000          # test_dev base
+    li   x31, 0x5555            # FINISHER PASS magic
+    sw   x31, 0(x30)            # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 关键验证点:
 #   - x10/x12/x13/x15/x4 = 写入值原样回读 → csr 字段读写路径走通
 #   - x11 = 0xFFFFF7FF (bit 11 清 0) → medeleg WARL hardwire bit 11 真生效
 #   - x14 = 0x80100000 (低 2 位清 0) → stvec WARL MODE 截 (跟 mtvec 同)
-#   - mcause = 11 (handler 末 ecall, 跟 fixture a01_9/01 同, 验 csr_op trap delivery 没退化)
+#   - x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
+#   - 停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

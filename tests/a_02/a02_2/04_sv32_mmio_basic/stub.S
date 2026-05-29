@@ -1,8 +1,13 @@
 # a_02_2 / 04_sv32_mmio_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 经 mmu 翻译后到 CLINT MMIO 的读写路径 — a_02_2/01 (BARE) 的 SV32 版本,
 # 同时也是 a_01_8/04 (SV32 + RAM lw/sw) 的 MMIO 版本。
+# (注: 原收尾用 handler 末 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后
+#  改 test_dev 干净停机, 旧 triple-fault / in_trap=3 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # P3 后路径 (跟 BARE 路径同语义, 不同入口):
@@ -96,8 +101,11 @@ m_handler:
     csrr x15, mcause                # x15 = 9
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    # ---- 停机: test_dev FINISHER PASS (M-mode BARE) ----
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                         # 防 fall-through 落进 setup_pt (dispatcher 下个 block 末退)
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -107,7 +115,9 @@ halt:
 #   a3 (x13) = 0xCAFEBABE
 #   a4 (x14) = 0xFEEDFACE
 #   x15      = 9          (mcause from handler entry; ecall_from_S)
-#   in_trap=3 mcause=11 priv=3  (handler 末 ecall_from_M 第 2 次保留)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - 5 个 a 寄存器对 → SV32 walker_helper_load/store 真走 MMIO 分支 + mmio_*_helper

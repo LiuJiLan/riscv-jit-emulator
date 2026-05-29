@@ -1,5 +1,8 @@
 # a02_7 / 05_mem_tlbmiss
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # 解释器 perf 套件之五: 访存松散、故意制造 TLB miss。S-mode + Sv32 下用步进跨页
 # 的 load 模式扫过 256 个数据页 (> 64-entry 叶 TLB), 稳态下每次 load 都 TLB miss

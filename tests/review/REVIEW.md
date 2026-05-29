@@ -479,3 +479,246 @@ ROI 更清晰:
 - 代价 = 中断延迟 + N/2 条指令 (~80ns @ 100MIPS), RV spec 不要求即时投递, 接受
 - 决策: 留给后续 milestone (跟 JIT 真接入后再评估; JIT 跑期 dispatcher 入口频率会
   变, 现在节流的 ROI 数字会偏 — 等 JIT 落地后再拍).
+
+---
+
+## a_03 收尾测试整理 — run_tests 改造 + A.7 prelude + B.3 跑批 — 2026-05-30
+
+范围: run_tests.py 接口改造 (必做前置) + A.7 老 fixture boot prelude 批量补 +
+B.3 第一轮全量跑批分类。stub.S 三段→四段重排 (全量) **本次未做**, 留后续 session
+(见 reorg_spec.md "banner 结构" 已升四段; 存量 stub.S 仅这次动到的加了第四段)。
+session log: `a_03_session_018.md`。
+
+### 工具演进 (run_tests.py + reorg_spec.md, durable)
+
+- **接口换新**: 旧 `[EMU, artifact]` 已对不上现 CLI (报 unknown arg)。新 base =
+  `[EMU, --bios, artifact]`。
+- **方案 A explicit declaration**: stub.S banner 第四段「运行参数」声明 `# RUN-*`
+  tag, run_tests grep 解析覆盖默认 (撤了"后缀自动检测" + "集中 JSONL", 见
+  a_03_session_017/018 brainstorm trail)。schema (reorg_spec.md "运行参数" 段):
+  `RUN-BLK` / `RUN-STDIN` / `RUN-EXPECT-EXIT` / `RUN-RELEASE` / `RUN-TIMEOUT`。
+- **双 frozen 二进制**: `out/riscv_jit_emulator` (debug+ASan, 默认) +
+  `out/riscv_jit_emulator_release` (RUN-RELEASE 用)。a02_7 perf 套件 16 fixture 打
+  `# RUN-RELEASE` — debug 比 release 慢 ~30x 跑不满 timeout, 正确性批走 release
+  跑到完整作冒烟, 测速仍归 run_perf.py。
+- **fail loud**: tag 残缺 (未知名 / value tag 缺值 / 布尔 tag 带值 / 文件不存在 /
+  数值解析失败 / RUN-RELEASE 但 release 二进制缺) → 该 fixture 标 CONFIG-ERROR 跳过。
+- **ASAN_OPTIONS=detect_leaks=0**: 批跑非 gdb 环境下 LSan exit-time 扫描会把正常
+  停机报泄漏 → 非 0 退出污染 PASS/FAIL, 关掉 (跟 CLion run config 体例一致)。
+- **RUN-STDIN 延迟投递** (`STDIN_DELAY=0.1s`, 见下方 uart 竞态 trail)。
+
+### B.3 第一轮跑批结果
+
+121 fixture, **0 FAIL / 0 CONFIG-ERROR / 0 TIMEOUT** (A.7 + harness 修完后)。
+中间态 trail: A.7 补之前 32 个 TIMEOUT — 16 个 A.7 缺 prelude (debug+release 都挂)
++ 16 个 a02_7 perf (debug 慢, RUN-RELEASE 后秒完) + 1 个 uart_rx_echo 启动竞态。
+sifive 两个走 RUN-EXPECT-EXIT 断言 PASS (05→0 / 06→42)。
+
+### 演进 trail 续 (durable — 接 a_02 收尾的 A/B/C/D)
+
+- **(E) A.7 boot prelude 加一条指令 → 地址/计数漂移** —— Smdbltrp 落地后 mstatus.MDT
+  reset 默认 = 1, 强制"写 mstatus.MIE"清 0; 老 fixture (写在 MDT 语义之前) 开中断前
+  没清 MDT → MIE 永 0 → 中断不 fire → 等 IRQ 的 fixture 永久 spin。A.7 在每个开 MIE
+  的指令 (`csrrsi x0, mstatus, 0x8` 等) 前补一条 `csrw 0x310, x0` (清 mstatush.MDT;
+  数字 0x310 因 binutils <2.38 不认 mstatush 助记符)。**副作用**: 该指令其后所有地址
+  +4 字节、total_count +1、且 csrw 是硬块边界故多一个 block。**功能正确** (这些
+  fixture 的可观测正确性靠寄存器值 mcause/claim/data, 地址无关, 批跑全 exit=0); 漂的
+  是 stub.S「期望结果」段里的绝对 PC / total_count / block 计数注解。
+
+### 待校准 fixture 清单 (因 (E), A.7 补 prelude 后期望漂; 共 17 个 A.7 fixture)
+
+prelude 仅清 MDT 不改可观测寄存器结果, 故只有带"绝对 PC / total_count / block 逐块
+计数"注解的 fixture 的「期望结果」段需要重算。等全量三段→四段重排 pass 时随手校准
+(不本次逐一改, 一阶段一事):
+
+- **a01_7/01_trap_priv_save_restore** —— 重度 PC/count 注解 (banner 列了每条指令的
+  0x00/0x08/.. 地址 + 逐 block count/total)。prelude 插在 0x0c 前 → 其后全 +4、每个
+  block count / total 全漂。校准量最大的一个。
+- **a02_5/06_int_priority** —— banner "xepc 落在 wait_loop 内" 的落点推导依赖 prelude
+  前后指令布局, 地址平移后 xepc 具体值漂 (中断仍正确 fire, mcause 仍 0x80000003)。
+- 其余 14 个 (a02_5/01,02,07; a02_6/02; a03_2/01,02,03,04,05,08; a03_3/01,02,04;
+  a03_5/01,02) —— 主要核对各自 banner 有无绝对 PC / total_count 注解; 多数只列寄存器
+  期望 (地址无关) 应不受影响, 重排时逐个扫一眼确认。
+
+### uart_rx_echo 启动竞态 trail (harness 侧解决, 不改 src)
+
+`a03_3/04_uart_rx_echo` 在瞬时 pipe stdin (`printf 'abc' | emu`) 下永久 spin; 延迟
+≥10ms 再投则 echo "abc" exit=0 (实测 0.01/0.05/0.1 都过, delay=0 挂)。根因: reader
+线程 vs guest 设备 init (PLIC source 10 + UART ERBFI 使能) 的启动先后, pipe 把 3 字节
+瞬时塞进来时 RX 字节早于中断使能就绪 → 丢边沿。UART 代码本身在 IER 写后有重评
+device_line (uart.c L296-300), 仍挂说明是更细的瞬时竞态。**决策 (user 拍)**: harness
+侧处理 (模拟器 init 极快 <10ms, 给小延迟不脆) —— run_tests 对 RUN-STDIN 一律用 Popen
+先 spawn → sleep `STDIN_DELAY=0.1s` → 再写 stdin, 让 guest 先跑完 init。**不改 src**;
+emulator 侧那个瞬时竞态留作潜在 forward item (真要查是 src 并发排查, 当前不做)。
+fixture 本就被其 Makefile 注成主要给交互/键盘用; harness 延迟让自动化批跑也能稳过。
+
+### 工具链升级连带 — B.3 重整时必做 (session_018 末)
+
+session_018 末把 RISC-V 工具链从 apt gcc 10.2 / binutils 2.35.1 升到 riscv-collab
+预编译 (ubuntu-22.04, release 2026.05.19) **gcc 16.1.0 / binutils 2.46** (装到
+/opt/riscv-2026.05.19, 前缀仍 riscv64-unknown-elf-)。两个连带影响 B.3 重整:
+
+1. **-march 必须补 `_zicsr_zifencei`** —— binutils 2.46 把 Zicsr/Zifencei 从 base I
+   拆成独立扩展, 现 fixture `-march=rv32imac` 编 csr/fence.i 报 "extension zicsr/
+   zifencei required" → 新工具链编不过。**逐 fixture 按语义改, 不机械 sed** (存量:
+   89 rv32imac / 35 rv32im 无 c / 1 rv64imac; 后两类可能是故意限 ISA / class64 reject
+   负测, 盲 sed 会错改)。用 csr/fence.i 的补 zicsr_zifencei, 故意限制的保留。
+2. **期望校准基准 = gcc16 输出** —— gcc16 codegen ≠ gcc10.2, 指令数/地址在 A.7
+   prelude drift 之上再漂。B.3 重整 = 改 march → 用 gcc16 重 make → 重排注释 + 对着
+   gcc16 实跑输出校准期望, 一次到位 (别对着旧 gcc10.2 的旧期望逐字抠)。
+
+当前 out.bin 仍是旧 gcc10.2 产物 (A.7/B.3 首轮跑批基准), 在 B.3 用 gcc16 重 make 前有效。
+
+---
+
+## B.3 全量重整 — march 迁移 + gcc16 重编 (分多 session) — 2026-05-30 起
+
+session_019 起做 B.3 大头, 一个 sub-milestone 一遍 (march 改 → gcc16 重编 → 注释核
+四段 → 期望核对 → run_tests 跑批确认绿)。session log: `a_03_session_019.md`。
+
+### 关键发现 1: 纯汇编 fixture 跨工具链逐字节相同 (durable, 大幅收窄重整范围)
+
+实证: 纯汇编 stub (手写指令, 含 `.option norvc`) 在 gcc16+rv32imac_zicsr_zifencei 下
+重编, out.bin 与旧 gcc10.2+rv32imac 产物 **md5 逐字节相同** —— 汇编器对手写指令不做
+codegen 选择, `_zicsr_zifencei` 只是放行 csr 指令、编码不变。**只有 `.S+.c` fixture**
+(main.c 经 gcc codegen) 的 out.bin 才会因 gcc16 漂。全项目 `.S+.c` fixture 仅 21 个
+(见 `ls */*/*/main.c`); 其余纯汇编 fixture 期望零漂, B.3 对它们 = 仅改 Makefile march
+行 (+ 注释核四段, 多数已合规)。
+
+连带: "最重的 a01_7/01" 也是纯汇编 → gcc16 不再添新漂, 它的 drift 全来自 018 已加的
+A.7 prelude (已在 on-disk out.bin、已标上文待校准), B.3 不再叠加。
+
+### 关键发现 2: stub.S 多数已四段合规 (运行参数段可选)
+
+四段 = 运行参数 / 测试目的 / 思路 / 期望结果。运行参数段仅 RUN-* tag fixture 才有
+(018 已给 a02_7/sifive/virtio/uart 那批补上), 其余按 spec "无则整段省略"。a_01 全部
+stub.S 已是 (测试目的|思路|期望结果) 三段 = 四段合规形态。所以 "三段→四段重整" 对绝大
+多数 fixture 是 no-op; B.3 实质 = **march 迁移 + .S+.c 期望校准**, 不是 118 stub 大重排。
+
+### 演进 trail 续 (durable — 接 A/B/C/D/E)
+
+- **(F) Smdbltrp 改 halt 路径: 旧 triple-fault dump → MDT abort; in_trap 字段废除** ——
+  a_03 session_011 落地 Double Trap + 废 in_trap 字段后, 早期 trap fixture (a_01/a_02)
+  里 "handler 末再 ecall_from_M 第 2 次 → triple fault → in_trap=3, mcause=11" 的收尾
+  路径不再成立: 第 2 次 M-trap 撞 MDT=1 → 直接 MDT abort 停机, mcause 停在首次 trap 的
+  cause (非 11), in_trap 字段已不存在 (现 dump 显示 mstatus.MDT=1)。**核心逻辑断言仍
+  成立** (寄存器值 / scause / sepc / mtval 都对, DEBUG_CPU_DUMP reg/trap dump 可核),
+  漂的只是「期望结果」段尾部那几行 halt 状态注解 (in_trap=3 / mcause=11 / 绝对 pc /
+  total_count)。这条根因独立于 gcc16 (是 emulator 侧演进), 影响所有早期"末尾再触一次
+  M-trap 收尾"的 trap fixture。
+
+### a_01 已做 (session_019)
+
+- march: 26 个 csr-using fixture CFLAGS 补 `_zicsr_zifencei` (base 保留: rv32imac ×18 /
+  rv32im ×8; 非 csr 的 a01_1/3/4 + a01_10/03-07 rvc + rv64imac class64 负测 不动)。
+  a01_5/01 Makefile 旧 zicsr 体例注释加 2.46 迁移 trail (不删旧叙事)。
+- gcc16 重编全 a_01: 28 纯汇编 fixture out.bin 逐字节不变; 9 个 `.S+.c` 漂
+  (a01_8/04-09 + a01_9/03 + a01_10/01,02)。
+- run_tests 全量批 (121 fixture, a_01 新 out.bin + a_02/a_03 仍 018 gcc10.2 基准):
+  **0 FAIL / 0 TIMEOUT / 0 CONFIG-ERROR**。
+
+### a_01 .S+.c 期望待校准 (因 (F) + gcc16, 共 9 个; 核心断言已过, 仅尾部注解漂)
+
+下列 fixture「期望结果」段尾部 halt 注解 (in_trap=3 / mcause=11 / 绝对 pc/total_count)
+描述的是旧 triple-fault 收尾, 现走 MDT abort; 核心寄存器/trap 断言实跑仍对。按
+"一阶段一事" 标 trail, 不本轮逐一改 (待 user 拍校准深度):
+
+- a01_8/04_sv32_lw_sw_basic (x10/11/12/13 ✓; mcause 期望 11 实际 9, in_trap=3 废)
+- a01_8/05_sv32_hw_managed_ad (x15 A/D 写回 ✓; 同上尾部漂)
+- a01_8/06_sv32_load_page_fault (cause 13 ✓; x13 lw PC 因 gcc16 漂)
+- a01_8/07_sv32_superpage_lw_sw (同 04)
+- a01_8/08_sv32_pt_not_in_ram (cause 5 ✓; x13 PC 漂)
+- a01_8/09_sv32_root_pt_not_in_ram (cause 1 ✓; x13/x14 绝对 PC 漂)
+- a01_9/03_medeleg_deliver_s (scause=9/sepc ✓; M 侧 mcause 期望 0 实际 16, in_trap=3 废)
+- a01_10/01_sum_load_fast_path (x10=0xDEADBEEF/x11=0/cause 13 ✓; x14 lw PC 漂)
+- a01_10/02_sum_store_fast_path (x10=0xCAFEBABE/cause 15 ✓; x14 sw PC 漂)
+
+### 更深发现 + 策略升级: 同步 trap fixture 因 MDT=1-at-reset 失效 → test_dev 停机改造 (user 拍)
+
+核实 pure-asm trap fixture 实跑寄存器时发现: **核心断言真的不成立了** (a01_5/04 x2=99 mret
+证据 → 实跑 0; a01_6/02 x1=4 csrr 抓的 mcause → 实跑 0)。根因比 (F) 叙事漂更深: cpu_reset
+mstatus.MDT=1, 这些同步 trap fixture **没 A.7 prelude 清 MDT** → 第一个 trap 就撞 MDT=1 直接
+MDT abort, **handler 根本没跑** → csrr 没抓到值 / mret 没回来。A.7 那轮只补了"开中断等 IRQ"
+的 fixture, 漏了同步 trap fixture (它们同样需清 MDT 才能投递首个 trap)。批跑 0 FAIL 没抓到
+(这些无 exit 断言, abort cleanup 也 exit 0)。
+
+**user 拍策略 (session_019)**: "受当时开发阶段只能用 triple-fault 停机的都改 test_dev;
+纯粹测 triple-fault 行为本身的留着 (改测 MDT abort)"。组合配方 (实证可行):
+1. 有 handler 收 trap 的: `_start` 加 `csrw 0x310, x0` 清 MDT prelude (让首个 trap 投递);
+2. 收尾 `csrw mtvec,x0 + ecall` (借 triple-fault 当停机) → test_dev FINISHER PASS
+   (`li x30,0x100000; li x31,0x5555; sw x31,0(x30)`; scratch 统一 x30/x31, 与数据/断言寄存器
+   错开) → SRS=0 干净退主循环, 寄存器停在干净末态可见;
+3. 加 `RUN-EXPECT-EXIT: 0` (test_dev PASS 收尾退出码 0, 白捡验证点);
+4. 删 inline 绝对地址注释 (随 prelude/test_dev 平移、layout 相关); 核心断言保留, 绝对
+   pc/total_count 标本节;
+5. 纯粹测停机协议的 (a01_5/05_triple_fault_halt) 不转 test_dev、不加 prelude — 改测
+   "ecall under MDT=1 → MDT abort" (旧 triple-fault 协议的后继), 只更新叙事。
+
+这是 **code-region 改 (fixture 重做), 偏离"整理 pass 只动注释"** — user 授权。out.bin 随之变
+(纯汇编也变, 因为加了 prelude/test_dev 指令)。
+
+### B.3 test_dev 改造进度 (session_019)
+
+- **a_01_5 + a_01_6 done (7 fixture)**: a01_5/02,03,04 + a01_6/01,02,03 转 test_dev (exit 0
+  断言全绿, 核心断言 x1/x2/x3 干净恢复可见); a01_5/05 改 MDT-abort 断言 (留)。a01_8/04
+  期望段废叙事已先压一行 (待按本体例补 RUN-EXPECT-EXIT / 重核, 它是 .S+.c handler 在 boot 已
+  清 MDT、寄存器本就可见的那类)。全量批 121 fixture 0 FAIL/0 TIMEOUT, PASS 2→8。
+- **剩 (后续 session)**: a01_7/01-04 + a01_8/01-03 (pure-asm trap, 同体例); a01_8/04-09 +
+  a01_9/03 + a01_10/01,02 (.S+.c, handler 在 stub/main.c, 末尾 ecall_from_M → test_dev,
+  需逐个定位 handler); a01_9/01,02; a01_10/03-07 (跑飞 fetch-fault 停 → 末尾补 test_dev);
+  然后 a_02 (~40) / a_03 (~30) csr fixture march 迁移 + 同类 test_dev 改造。
+- 上方"a_01 .S+.c 期望待校准"清单中, 转了 test_dev 的 fixture 待校准项被本改造吸收 (核心
+  断言转为干净可见); 未转的绝对 pc/total_count 漂仍留本节 trail。
+
+### B.3 test_dev 改造 — 全量完成 (session_019, 并行 6 agent + 中心 march)
+
+整盘 test_dev 改造一 session 内完成 (并行 subagent 按 sub-milestone 分组, 每 agent 自验证
+重编+跑+查 exit/寄存器)。最终全量批: **121 fixture, 0 FAIL / 0 TIMEOUT / 0 CONFIG-ERROR,
+PASS 81** (转换 fixture RUN-EXPECT-EXIT:0 + sifive + virtio + uart_rx 全绿; 仅 4 个 loader
+reject 负测 exit=1 符合预期)。
+
+- **转 test_dev (~79)**: a_01 (29, 除 a01_5/05) + a02_2/03/04/05/06 (~30) + a03_1/02/03/04/05
+  (~20)。配方 = 清 MDT prelude (handler 需跑且未清的) + test_dev FINISHER PASS 收尾 (scratch
+  x30/x31; a03_3/04/05 agent 用 t0/t1 — 与该批断言寄存器 t6/a6/a7 错开, 功能等价) +
+  RUN-EXPECT-EXIT:0 + 删 inline 绝对地址 + 核心断言保留。
+- **fall-through 守卫**: test_dev 是 SRS=0 在"下个 block 边界"才退, sw 非边界 → 收尾 sw 后若
+  有可执行代码会 fall-through 重跑。停机段不在文件末尾的 fixture 加 `1: j 1b` 自旋守卫
+  (a01_7/01 + 多个 a02_2)。
+- **M-mode handler 需补 prelude**: BARE M-mode 下首个 trap 撞 MDT=1 abort → handler 跑不到,
+  这类补 `csrw 0x310,x0` (a02_2/02,03; a02_5/08; a03_1/02; a02_2/04,07 等)。S/U-mode trap
+  (用 SDT 非 MDT) 不需要。
+- **留 (不转)**: a01_5/05 (改 MDT-abort 断言); a03_3/05,06 (sifive 已 test_dev); a03_6/* /
+  a03_7/* (wfi) / a03_8/* (M ext) — 这批 **早已用 test_dev/sifive FINISHER 停机**, 无需改。
+- **a02_7 ×16 排除 test_dev 改造** (user 拍: perf 套件 release 测速用) — 仅 march 迁移 +
+  保留 018 的 RUN-RELEASE tag, 不动停机。
+- **顺手改正的 doc 错**: a02_3/01 s0 期望 3→2 (case2 在 epilogue 自增前停机, 旧 doc 错);
+  a02_6/03 perf a2/a3 期望 0x540C1E60→0x540D6AA0 (旧 doc 算错, 接 a_02 收尾 (D) 段那条)。
+
+### ⚠ 系统性转换 bug: test_dev halt 漏 fall-through 守卫 (已全修, session_019)
+
+test_dev FINISHER 停机语义 = 置 SRS=0, dispatcher 在**下个 block 边界**才退主循环。停机
+`sw` 不是 block 边界 → 若 halt sw 后还有可执行代码 (handler / 数据 / 子程序), 会先
+**fall-through 执行**到下个 block 边界才退。批跑只查 exit code (RUN-EXPECT-EXIT) 看不出来,
+但 fall-through 会**悄悄改坏注释里的核心断言**。
+
+agent 加 `1: j 1b` 自旋守卫不一致 (A1/B1 加了, C1 + 参考件 a01_5/04 漏了)。精确扫出
+**21 个 halt 后有代码却漏守卫**, 已全部补 `1: j 1b` (sw 后紧跟; j 是 block 边界, SRS=0
+即退, 不落进后续 handler/数据)。全量批仍 0 FAIL。
+
+诊断起点 = 查"a03_2/03 claim 返 0": 同步 probe claim 返 3 正常 → 中断驱动场景失败 →
+定位是 fall-through 重跑 handler (真 trap claim 返 3, fall-through 再 claim 返 0 覆盖 s2)。
+补守卫后 s2=3 正确。**不是 PLIC bug。**
+
+凡是 halt 后有代码的 fixture 都要带守卫 —— 后续新写/整理 fixture 沿用 (reorg_spec 体例点)。
+
+### 真·预存期望漂 (跟 test_dev 改造无关, 留 trail 待 user 定改期望)
+
+补守卫后复查, 三个 agent flag 项里只剩 2 个是真 drift (a03_2/03 已证是守卫 bug、已修):
+- a03_1/01_plic_mmio_skeleton — 期望段列 14 行 `[plic] ...` stderr trace, 但 PLIC 骨架期的
+  逐访问 trace fprintf 在完整 atomic 实装时已删 (plic.c 现 `[plic]` = 0 个) → 实跑无 trace。
+  根因 (B) 类 (stub→完整实装)。改期望注释即可 (fixture 真正测的 "MMIO 不 fault" 靠 exit 0)。
+- a03_2/05_int_priority — 6 源优先级实跑序 M_EXT/M_SOFT/S_EXT/S_SOFT/S_TIMER/M_TIMER,
+  M_TIMER 垫底 (期望标准序应 M_TIMER 第 3)。**编码器正确** (trap.c 标准序); 真因 = MTIP 是
+  `mip.MTIP=(mtime>=mtimecmp)` 连续条件、靠 timer 线程**异步**推 mtime, 其余 5 源瞬时置位 →
+  轮到 M_TIMER 时 mtime 还没被推过 mtimecmp, 编码器跳过, 等异步推过才垫底 fire。根因 (C) 类
+  (mtime 异步化)。改期望注释说明即可 (s3=6 handler 进入次数正确, 非 fall-through 污染)。

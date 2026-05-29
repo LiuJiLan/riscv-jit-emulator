@@ -1,5 +1,8 @@
 # a02_7 / 01_bare
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # 解释器 perf 套件之一: REGIME_BARE 路径吞吐基线。M-mode bare 下纯 ALU+branch
 # 紧循环, 不碰内存 / CSR / MMU —— 测"取指走 identity bypass、解释器执行纯计算

@@ -1,5 +1,9 @@
 # a03_5 / 02_virtio_blk_write_sector
 #
+# ===== 运行参数 =====
+# RUN-BLK: disk.img
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # virtio-blk 写后读自闭环 — 两笔 IO 验落盘:
 #   阶段 1: header.type=OUT + data buf 填 0xa5a5a5a5 (头 16 B) + sector=0
@@ -60,6 +64,7 @@ _start:
     csrw    mtvec, t0
     li      t0, 0x800               # mie.MEIP
     csrw    mie, t0
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8        # mstatus.MIE
 
     # ---- PLIC: priority[1]=1 / threshold=0 / enable bit 1 ----
@@ -208,9 +213,12 @@ wait_phase2:
     li      t0, STATUS_ADDR
     lbu     t6, 0(t0)
 
-    # ---- halt ----
-    csrw    mtvec, x0
-    ecall
+    # ---- halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0 ----
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     csrr    s2, mcause              # 期望 0x8000000B
@@ -243,7 +251,7 @@ m_handler:
 #   s3 = 1                   (最后一次 claim)
 #   s4 = 1                   (最后一次 InterruptStatus bit0)
 #
-# halt 路径 triple fault: in_trap=3, mcause=1.
+# 停机 (test_dev sifive FINISHER PASS): shell 退出码 $? = 0; SRS=0 退主循环.
 #
 # 不期望:
 #   - 任何 [bus] CAUSE_*_ACCESS_FAULT

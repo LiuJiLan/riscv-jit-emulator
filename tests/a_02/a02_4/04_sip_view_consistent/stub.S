@@ -1,8 +1,12 @@
 # a02_4 / 04_sip_view_consistent
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # sip 入口验证 — mip / sip 看同物理 _mip_sw 字段; sip 内 SSIP RW, STIP / SEIP RO
 # (RV spec §5.1.4 + §3.1.9, SIP_WRITABLE_MASK = 1<<IRQ_S_SOFT).
+# (注: 改 test_dev 停机, 旧叙事见 REVIEW B.3)
 #
 # ===== 思路 =====
 # 全程 BARE M-mode (M priv 数字 >= S, 可直接访问 sip 入口 — sip CSR 编号 priv
@@ -36,7 +40,10 @@ _start:
     csrrc   zero, sip, t0
     csrr    a4, sip                               # a4 = 0
 
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li      x30, 0x100000                         # test_dev base
+    li      x31, 0x5555                           # FINISHER PASS magic
+    sw      x31, 0(x30)                            # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -45,5 +52,5 @@ _start:
 #   a2 (x12) = 0x00000002   csrs sip 试 set STIP (RO in sip), 不生效, sip 仍 2
 #   a3 (x13) = 0x00000002   csrs sip 试 set SEIP (RO in sip), 不生效, sip 仍 2
 #   a4 (x14) = 0x00000000   csrc sip 清 SSIP (RW), sip 变 0
-#
-# halt: ecall.
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit 0

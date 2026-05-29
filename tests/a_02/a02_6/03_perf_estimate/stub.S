@@ -1,9 +1,13 @@
 # a02_6 / 03_perf_estimate
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 跑一段长工作循环, 读 mtime 前后做 delta, 配合 [dispatcher] halted total_count
 # 算 effective MIPS — debug 解释器性能基线 (release + JIT 接入后跑同 fixture
 # 对比, 性能数据进论文)。
+# (注: 改 test_dev 停机, 旧叙事见 REVIEW B.3)
 #
 # ===== 思路 =====
 # 仅用现有指令: lw / sw / add / addi / lui / bnez / sub / mv / csrw / ecall;
@@ -53,22 +57,26 @@ work_loop:
     mv      a2, s0                  # a2 = final acc (跨运行应一致, 验正确性)
     mv      a3, t1                  # a3 = last loaded value (验 lsu 路径)
 
-    # ---- halt: 清 mtvec + ecall 触发 triple fault ----
-    csrw    mtvec, x0
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器 (粗略):
 #   a0 (x10) = start_mtime_lo  (一般几千 ~ 几万, 取决于 host 启动到 _start 间隔)
 #   a1 (x11) = end_mtime_lo    (> a0; 长跑后 mtime 跨过多个 timer wake)
 #   a2 (x12) = sum 32-bit truncated (跨运行一致; ITER_COUNT=100000 时
-#              = 2*(1+2+...+100000) mod 2^32 = 10_000_100_000 mod 2^32 = 0x540C1E60)
-#   a3 (x13) = 0x540C1E60      (= a2; 最后一次 sw/lw 配对验证 lsu)
+#              = 2*(1+2+...+100000) mod 2^32 = 10_000_100_000 mod 2^32 = 0x540D6AA0)
+#   a3 (x13) = 0x540D6AA0      (= a2; 最后一次 sw/lw 配对验证 lsu)
+#              (注: 旧注写 0x540C1E60 系算错, 实测/正确值 0x540D6AA0; 与本次停机改造无关)
 #   a5 (x15) = a1 - a0         (mtime delta, 单位 100 ns; 预期 10M-20M debug build)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit 0
 #
-# 期望 trap dump:
-#   in_trap = 3                (halt path triple fault, 跟 a02_5 各 + a02_6/01-02 同)
-#   total_count ≈ 600_020      (100K * 6 + setup/halt ~20; 看 [dispatcher] halted 行)
+# 期望计数 (perf 口径; 见 [dispatcher] halted 行):
+#   total_count ≈ 600_020      (100K * 6 + setup/停机 ~20; 绝对值随停机改 test_dev 微漂,
+#                               见 REVIEW B.3 段; 算 MIPS 用实测 total_count 不用此估值)
 #
 # 期望 elapsed (main 末段打印):
 #   "X min Y.YYY s (total Z.ZZZ s)" — Z 应跟 a5/10_000_000 量级匹配

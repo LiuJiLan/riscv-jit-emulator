@@ -14,10 +14,10 @@
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc
 OBJCOPY := $(TOOL)-objcopy
-CFLAGS  := -nostdlib -nostartfiles -march=rv32imac -mabi=ilp32 -mcmodel=medany
+CFLAGS  := -nostdlib -nostartfiles -march=rv32imac_zicsr_zifencei -mabi=ilp32 -mcmodel=medany
 
 .PHONY: all clean
-all: out.bin
+all: out.bin input.txt
 
 out.elf: stub.S link.ld
 	$(CC) $(CFLAGS) -T link.ld stub.S -o out.elf
@@ -25,5 +25,10 @@ out.elf: stub.S link.ld
 out.bin: out.elf
 	$(OBJCOPY) -O binary out.elf out.bin
 
+# input.txt: 喂 fixture stdin 的 3 字符 "abc" (无换行 — handler echo 满 3 个
+# s0=3 跳出正常停机, 不靠 timeout)。RUN-STDIN tag 指向它 (stub.S 运行参数段)。
+input.txt:
+	printf 'abc' > input.txt
+
 clean:
-	rm -f out.elf out.bin
+	rm -f out.elf out.bin input.txt

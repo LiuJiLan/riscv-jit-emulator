@@ -1,5 +1,8 @@
 # a_01_8 / 04_sv32_lw_sw_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 lsu SV32 在 4KB 页 (level=1 → level=0 leaf) 上 lw/sw 走通 + 第二次 fast path。
 # 跟 fixture 02 (4MB superpage fetch) 互补 — 02 走 level=1 leaf, 04 走 level=0 leaf。
@@ -29,7 +32,7 @@
 #      sw 0x12345678 → vaddr 0x80001004 (TLB hit fast path)
 #      lw vaddr 0x80001004 → x11  (TLB hit fast path)
 #      ecall (cause=9 from S; trap deliver M)
-#   3. M handler: csrr mcause=9; halt triple fault
+#   3. M handler: csrr mcause=9; test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -90,8 +93,9 @@ m_handler:
     bne  x12, x13, halt             # 防御 (期望 fall through)
 
 halt:
-    csrw mtvec, x0                  # mtvec=0
-    ecall                           # cause=11 from M → mmu fail → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -99,9 +103,11 @@ halt:
 #   x11    = 0x12345678   (第二次 lw, 同地址刚被 sw)
 #   x12    = 9            (ecall_from_S cause)
 #   x13    = 9            (比较 reg)
-#   in_trap = 3
-#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
+#   x30    = 0x100000     (停机用 scratch: test_dev base)
+#   x31    = 0x5555       (停机用 scratch: FINISHER PASS magic)
 #   priv   = 3            (M)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 / x11 都对 → lsu SV32 4KB lw/sw 路径全跑通 (含 walker fall back + fast path)

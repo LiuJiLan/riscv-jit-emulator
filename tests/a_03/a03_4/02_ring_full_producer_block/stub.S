@@ -1,5 +1,8 @@
 # a03_4 / 02_ring_full_producer_block
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # T6.2 plic_refresh_queue 16 slot ring 满时 producer block 路径 (cond_timedwait
 # not_full 100ms 心跳 + 真等 consumer signal not_full) 不死锁 + consumer 正确 drain:
@@ -9,7 +12,7 @@
 #     sources[1].device_line=1, sources[1].claimed=0);
 #   CLEAR source 1 (一次) + spin 5ms;
 #   lw PLIC pending bitmap → 期望 0;
-#   ecall halt; dump 验 s0/s1.
+#   test_dev FINISHER 干净停机; dump 验 s0/s1.
 #
 # T6.2 ring 满时 producer 在 plic_enqueue_refresh 内 cond_timedwait not_full 100ms;
 # consumer 在 plic_pending_refresh_run 拿 mutex + 消费 1 event + 释放 mutex +
@@ -80,17 +83,20 @@ spin2:
     li      t0, 0x0C001000
     lw      s1, 0(t0)                      # s1 = pending (期望 0)
 
-    # ---- halt: ecall → triple fault ----
-    ecall
+    # ---- halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0 ----
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
 
 # ===== 期望结果 =====
 # 期望最终寄存器 (debug build cpu_dump):
 #   s0 = 0x2          (PLIC pending bitmap after SET 1 × 200 + 20ms spin; bit 1 set)
 #   s1 = 0            (PLIC pending bitmap after CLEAR + 5ms spin)
 #
-# 期望 trap dump (halt 路径 triple fault):
-#   in_trap = 3
-#   mcause  = 1       (CAUSE_INST_ACCESS_FAULT; ecall + mtvec=0 → 取指 fault)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - 主帧死锁 (run-config timeout 10s 命中 = producer block 路径 cond_timedwait

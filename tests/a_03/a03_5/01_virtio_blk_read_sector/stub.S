@@ -1,5 +1,9 @@
 # a03_5 / 01_virtio_blk_read_sector
 #
+# ===== 运行参数 =====
+# RUN-BLK: disk.img
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # virtio-mmio block device (legacy v1.0) 读 sector 0 端到端 — 验:
 #   1. magic/version/device_id/vendor_id 4 个 R-only 寄存器值
@@ -72,6 +76,7 @@ _start:
     csrw    mtvec, t0
     li      t0, 0x800               # mie.MEIP = bit 11
     csrw    mie, t0
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8        # mstatus.MIE = bit 3
 
     # ---- 配 PLIC: priority[1]=1, threshold[ctx0]=0, enable[ctx0].bit1=1 ----
@@ -185,9 +190,12 @@ wait_loop:
     li      t0, STATUS_ADDR
     lbu     t6, 0(t0)
 
-    # ---- halt (清 mtvec + ecall → triple fault) ----
-    csrw    mtvec, x0
-    ecall
+    # ---- halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0 ----
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     csrr    s2, mcause              # 期望 0x8000000B (INT_BIT | IRQ_M_EXT)
@@ -224,8 +232,9 @@ m_handler:
 #   s3 = 1          (PLIC claim → virtio-blk source_id)
 #   s4 = 1          (InterruptStatus bit0 = used buffer notification)
 #
-# halt 路径 triple fault:
-#   in_trap = 3, mcause = 1 (INST_ACCESS_FAULT; mtvec=0 后 ecall trap → 0 取指 fault)
+# 停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - 任何 [bus] CAUSE_*_ACCESS_FAULT (vring/data 都在 RAM 内, virtio_blk 寄存器合法)

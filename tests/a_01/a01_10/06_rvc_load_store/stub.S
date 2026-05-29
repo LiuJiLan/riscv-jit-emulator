@@ -1,7 +1,13 @@
 # a_01_10 / 06_rvc_load_store
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 RVC load/store case (a_01_10 (7) step 4):
+# (注: 原收尾靠 ecall → mtvec=0 fetch fail → triple fault (in_trap=3); a_03 Smdbltrp 后
+#  首个 trap 撞 MDT=1 即 abort, 改在末尾追加 test_dev 干净停机替代跑飞。RVC load/store 结果
+#  在停机前已落定。原 in_trap=3 / mcause=1 收尾叙事见 REVIEW B.3 段。)
 #   C.LW   (C0 funct3=010, CL-format) — load word, rd'/rs1' 都 3-bit (x8-x15)
 #   C.SW   (C0 funct3=110, CS-format) — store word, rs1'/rs2' 都 3-bit
 #   C.LWSP (C2 funct3=010, CI-format) — load word sp-relative, rd 5-bit
@@ -59,8 +65,10 @@ _start:
     c.li      x15, 5             # x15 = 5
     c.swsp    x15, 20(sp)        # mem[sp + 20] = 5
 
-    # ---- 退出 (BARE M-mode, mtvec=0, ecall chain in_trap=3 halt) ----
-    ecall
+    # ---- 停机: test_dev FINISHER PASS (替代原跑飞进 fetch-fault) ----
+    li   x30, 0x100000         # test_dev base
+    li   x31, 0x5555           # FINISHER PASS magic
+    sw   x31, 0(x30)           # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -73,9 +81,10 @@ _start:
 #   x13 = 12               (rs2' for C.SW offset 4; decimal)
 #   x14 = 12               (C.LW 回读 mem[x8+4] = 12; decimal)
 #   x15 = 5                (rs2 for C.SWSP offset 20; decimal)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
 #
-# 末态 (跟 fixture 03/04/05 同 BARE M-mode mtvec=0 chain):
-#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3
+# 停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / in_trap / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 == x9 → C.SW + C.LW (rd-relative, offset 0) 通过

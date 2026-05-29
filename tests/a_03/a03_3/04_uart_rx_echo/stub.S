@@ -1,5 +1,9 @@
 # a03_3 / 04_uart_rx_echo
 #
+# ===== 运行参数 =====
+# RUN-STDIN: input.txt
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # UART RX 中断 PLIC 联调 — 验 reader thread → RX FIFO → device_set_pending(10) →
 # PLIC 仲裁 → MEIP 合成 → handler pop RBR + echo THR + complete 全链路:
@@ -15,7 +19,7 @@
 #        - sb 同字节 THR (echo 到 stdout)
 #        - sw complete = 10
 #        - s0++; mret
-#   6. FIFO 空 → device_line=0 → 主帧 s0=3 跳出 → ecall halt
+#   6. FIFO 空 → device_line=0 → 主帧 s0=3 跳出 → test_dev FINISHER 干净停机
 #
 # ===== 思路 =====
 # RX 中断"读 IIR 不清"语义: pop RBR (lb 走 size=1 path) 是唯一清 RX 中断的方式;
@@ -48,6 +52,7 @@ _start:
     csrw    mtvec, t0
     li      t0, 0x800               # mie.MEIP
     csrw    mie, t0
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8        # mstatus.MIE = 1
 
     # ---- 配 PLIC: priority[10]=1 ----
@@ -87,9 +92,12 @@ wait_loop:
     bltu    s0, t0, wait_loop       # s0 < 3 spin; s0 >= 3 fall through 跳出
 
 done:
-    # halt: 清 mtvec + ecall → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 验 mcause
@@ -140,9 +148,9 @@ m_handler_set_done:
 #   s3 = 10           (claim_src)
 #   a5 > 0
 #
-# 期望 trap dump (halt 路径 triple fault):
-#   in_trap = 3
-#   mcause  = 1       (ecall + mtvec=0 取指 fault)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0   (clean 退出; reader 启动竞态 / pipe EOF 时外部 timeout 包装防 hang)
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - 程序 hang (timeout 命中 — 说明 reader / PLIC fanout / 中断 deliver 哪环断了)

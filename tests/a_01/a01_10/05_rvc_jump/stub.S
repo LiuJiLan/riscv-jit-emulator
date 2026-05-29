@@ -1,7 +1,13 @@
 # a_01_10 / 05_rvc_jump
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 RVC jump case (a_01_10 (7) step 3):
+# (注: 原收尾靠 ecall → mtvec=0 fetch fail → triple fault (in_trap=3); a_03 Smdbltrp 后
+#  首个 trap 撞 MDT=1 即 abort, 改在末尾追加 test_dev 干净停机替代跑飞。RVC jump/return 结果
+#  在停机前已落定。原 in_trap=3 / mcause=1 收尾叙事见 REVIEW B.3 段。)
 #   C.J     (funct3=101, CJ-format) — 无条件跳, rd=x0
 #   C.JAL   (funct3=001, CJ-format, RV32-only) — call subroutine, ra=x1=pc+2
 #   C.JR    (C2 funct3=100, bit12=0+rs2=0) — return, rd=x0, jump to rs1
@@ -51,7 +57,11 @@ after_j:
     c.jalr    x6                 # ra (x1) = pc+2; jump x6 (= sub2)
     # 返回这里, x12 = 7
 
-    ecall                        # cause=11 → trap chain in_trap=3 halt
+    # ---- 停机: test_dev FINISHER PASS (替代原跑飞进 fetch-fault) ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # ============================================================
 # sub1: 累加 x11 + 返回 (验 C.JR rs1=x1)
@@ -74,6 +84,7 @@ sub2:
 #   x12 = 7       (C.JALR → sub2 → c.li x12, 7 → c.jr x1 return; decimal 7)
 #   x6 = sub2 PC  (la x6, sub2 设的; 0x80000xxx 范围, hex 显示 0x800000xx)
 #   x1 = ret_jalr (最后 C.JALR 设的 ra; 0x80000xxx 范围)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
 #
-# 末态 (跟 fixture 03/04 同 BARE M-mode mtvec=0 chain):
-#   in_trap=3 / mcause=1 / mepc=0 / mtvec=0 / priv=3
+# 停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / in_trap / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

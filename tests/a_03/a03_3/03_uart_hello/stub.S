@@ -1,5 +1,8 @@
 # a03_3 / 03_uart_hello
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # Hello world 纯 TX 轮询 — 不接 PLIC / 不接 trap, 纯走 UART TX fast path:
 #   1. la a0, msg (pc-relative)
@@ -8,7 +11,7 @@
 #      因 LSR_BASE = THRE|TEMT = 0x60, THRE bit 永远 1)
 #   4. sb 字符 → THR (0x10000000)
 #   5. addi 指针 → loop
-#   6. msg 完后 ecall halt
+#   6. msg 完后 test_dev FINISHER 干净停机
 #
 # milestone "顺手 hello world" — a_03_end 边界不钉死, 这里 hello world 顺手副产物.
 # pipe / file 重定向时 stdout 不卡 buffer (main setvbuf _IONBF).
@@ -51,8 +54,12 @@ poll_loop:
     j       loop
 
 done:
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # 字符串放 ecall 之后 — la pc-relative 自动算偏移
 msg:
@@ -62,9 +69,9 @@ msg:
 # 期望 stdout:
 #   "Hello, RISC-V!\n"
 #
-# 期望 trap dump (halt 路径 triple fault):
-#   in_trap = 3
-#   mcause  = 1     (CAUSE_INST_ACCESS_FAULT; ecall + mtvec=0 取指 fault)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - poll_loop 死循环 (LSR.THRE 一直 0 — 说明 UART read LSR 路径 bug)

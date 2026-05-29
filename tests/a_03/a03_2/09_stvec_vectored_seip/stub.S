@@ -1,5 +1,8 @@
 # a03_2 / 09_stvec_vectored_seip
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # stvec vectored mode (mode=1): fire SEIP delegated → S handler vectored, cause_low=9
 # 期望跳 s_vec_base+36.
@@ -9,9 +12,12 @@
 # 期望 9, mismatch fail_loop 死循环; match 正常 PLIC ctx1 claim/complete + sret.
 #
 # ===== 期望结果 =====
-#   pass: in_trap=3 / pc=0
+#   pass: test_dev FINISHER PASS → exit code 0 (跳对 entry → S-ecall → m_halt 干净停机)
 #   fail: timeout / 卡 fail_loop
 #   debug 下 GPR: s0=1 / s1=9 / s2=3 / s3=36
+#                 x30=0x100000 / x31=0x5555 (停机 scratch)
+# (注: 原停机靠 S-ecall → m_halt csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变
+#  MDT abort, m_halt 改 test_dev 干净停机; pass 判据从 in_trap=3 改 exit 0。)
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -94,5 +100,7 @@ fail_loop:
     j       fail_loop
 
 m_halt:
-    csrw    mtvec, x0
-    ecall
+    # S-ecall deliver 到此 (M); test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)

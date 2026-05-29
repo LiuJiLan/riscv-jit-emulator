@@ -1,5 +1,8 @@
 # a_01_8 / 08_sv32_pt_not_in_ram
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker 内 PT 不在 RAM 时报 access fault (cause 5; load 路径)。
 # 项目 a_01 不实现 PMP, 用 RAM 区检查代替 (mmu.c walker level=0 PT 读检查); 未来 PMP
@@ -35,7 +38,7 @@
 #      lui  x4, 0x90000          # vaddr = 0x90000000 (远段 vpn1=0x240)
 #      lw   x10, 0(x4)            # walker(R) level=0 PT RAM 检查失败 → trap 5 (longjmp)
 #      ecall                      # 防御
-#   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; halt
+#   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -83,17 +86,21 @@ m_handler:
     csrr x14, mtval                 # x14 = 0x90000000
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
 #   x10 = 0                  (lw 失败没写)
 #   x12 = 5                  (mcause = LOAD_ACCESS_FAULT)
-#   x13 = 失败 lw 的 PC      (mepc; 实际值看反汇编)
+#   x13 = 失败 lw 的 PC      (mepc; 绝对值随 codegen 漂, 不钉死)
 #   x14 = 0x90000000         (mtval = 失败 lw 的 GVA)
-#   mcause = 11              (handler 末 ecall_from_M 第 2 次)
-#   priv = 3, in_trap = 3
+#   x30 = 0x100000           (停机用 scratch: test_dev base)
+#   x31 = 0x5555             (停机用 scratch: FINISHER PASS magic)
+#   priv = 3
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x12 = 5 → walker 真在 PT-not-in-RAM 路径报 LOAD_ACCESS_FAULT (跟 page fault 区分)

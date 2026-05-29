@@ -1,5 +1,8 @@
 # a02_5 / 06_int_priority
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 中断优先级 (RV Priv Spec §3.1.9 + trap_check_interrupt 优先级 encoder):
 #   优先级: M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER
@@ -43,6 +46,7 @@ _start:
     li      a5, 0
 
     # mstatus.MIE = 1 (一开就 fire; xepc 落在 wait_loop 内, mret 不重置 s0)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
 wait_loop:
@@ -51,8 +55,11 @@ wait_loop:
 
     mv      a0, s1               # a0 = scause? 不, mcause; 期望 0x80000003 (M_SOFT 优先)
 
-    csrw    mtvec, x0
-    ecall                        # halt
+    # ---- halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000        # test_dev base
+    li      x31, 0x5555          # FINISHER PASS magic
+    sw      x31, 0(x30)          # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     csrr    s1, mcause           # 期望 0x80000003 (CAUSE_INTERRUPT_BIT | IRQ_M_SOFT;
@@ -77,6 +84,8 @@ m_handler:
 #   s0 = 1
 #   s1 = 0x80000003
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证: 即使 MTIP 跟 MSIP 同时 pending (mtime >= mtimecmp 跟 msip=1 都成立), trap_check_
 # interrupt 内 encoder 按 §3.1.9 选 M_SOFT (bit 3) 而不是 M_TIMER (bit 7).

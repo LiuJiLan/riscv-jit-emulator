@@ -1,5 +1,8 @@
 # a_01_9 / 03_medeleg_deliver_s
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 medeleg delegate ecall_from_S 给 S handler 真生效 (deliver_priv 按 medeleg.bit
 # 派发, 不是 hard-coded PRIV_M)。
@@ -22,21 +25,17 @@
 #      csrw stvec, x0   (清 stvec 让下次 deliver S 失败)
 #      ecall (cause=9; medeleg.bit(9)=1 仍 deliver S; in_trap 1→2; 跳 stvec=0)
 #   5. fetch from 0 fail (mmu_translate_pc walker walk vpn1=0, root_pt[0]=0 V=0):
-#      fault_cause = INST_PAGE_FAULT (12); trap_set_state(12, 0); in_trap 2→3 早 return,
-#      不 deliver M, 不切 priv, 不写字段; dispatcher 看 in_trap=3 break
-#   6. m_handler 走不到 (m_handler 段为空, 跟 halt label 同地址但永不执行)
+#      fault_cause = INST 类; medeleg.bit 不含 → deliver M → 跳 mtvec=m_handler
+#   6. m_handler/halt: test_dev FINISHER PASS 干净停机 (priv=M)
 #
 # 关键验证点:
 #   - x10 = 9 → medeleg deliver S 真生效 (deliver_priv 按 medeleg.bit 派发, 不是
-#     hard-coded PRIV_M; 后者会让 mcause=9, scause=0)
-#   - priv = 1 (PRIV_S) → 真切到 S 后保持
-#   - mcause = 0 → deliver M 路径从未走过 (hard-coded PRIV_M 形态下 mcause=9)
+#     hard-coded PRIV_M; 后者会让第 1 次 ecall_from_S 直接 deliver M, scause 不写, x10=0)
+#   - x11 = 1 → 真切到 S 后 S phase 跑过
 #
 # 反例 (deliver_priv 仍 hard-coded PRIV_M, 用 medeleg 派发未实装时):
-#   - x10 = 0 (scause 没写)
-#   - mcause = 9 (ecall_from_S 直接 deliver M)
-#   - priv = 3 (M; 没切 S)
-#   这种情况能立即识别 medeleg 真接的回归 bug。
+#   - x10 = 0 (scause 没写; 第 1 次 ecall_from_S 直接 deliver M, 没走 [PRIV_S] 槽)
+#   这种情况能立即识别 medeleg 真接的回归 bug (核心区分点是 x10: 真生效=9 / 未实装=0)。
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -97,17 +96,18 @@ s_handler:
 
 m_handler:
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M, mtvec=0 fetch fail → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main dump:
 #   x10 = 9              (scause; deliver S 写 [PRIV_S] 槽 — 核心验证点)
 #   x11 = 1              (S phase 标记)
-#   x12 = 0x8000005C     (s_target ecall PC; sepc 第 1 次 deliver 写)
-#   mcause = 0           (deliver M 路径从未走过, mcause 保持初值 0)
-#   mtval  = 0           (同上)
-#   mepc   = 0           (同上)
-#   mtvec  = 0x80000070  (_start 设过, 后续没改; m_handler 地址 = halt label)
-#   priv = 1 (PRIV_S)    (第 2 次 deliver S 后 priv=S; 第 3 次早 return 不变)
-#   in_trap = 3
+#   x12 = s_target ecall PC (sepc 第 1 次 deliver 写; 绝对值随 codegen 漂, 不钉死)
+#   x30 = 0x100000       (停机用 scratch: test_dev base)
+#   x31 = 0x5555         (停机用 scratch: FINISHER PASS magic)
+#   priv = 3 (M)         (s_handler 末 ecall → deliver S → stvec=0 fetch fail → INST 类
+#                          deliver M → m_handler 干净停机, 故 halt 时 priv=M)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

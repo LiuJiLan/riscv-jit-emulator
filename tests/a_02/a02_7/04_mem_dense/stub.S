@@ -1,5 +1,8 @@
 # a02_7 / 04_mem_dense
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # 解释器 perf 套件之四: 访存密集路径吞吐。M-mode bare 下每轮 6 条访存 (3 sw +
 # 3 lw) 打一个小热工作集。04↔01_bare 隔出访存路径开销; lw 走 fast path (BARE

@@ -1,7 +1,12 @@
 # a02_2 / 01_mmio_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # CLINT MMIO 读写基础验证 (T1: bus + CLINT 路径走通; 不验 timer / soft interrupt)。
+# (注: 原收尾用 M-mode ecall → triple fault 停机; a_03 Smdbltrp 后改 test_dev 干净
+#  停机, 旧 triple-fault 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 走 BARE 模式 (priv=M, satp=0); CLINT 在 0x02000000..0x02010000, 不在 RAM 区,
@@ -41,7 +46,10 @@ _start:
     lw   a3, 0(t0)               # a3 = 0xCAFEBABE
     lw   a4, 4(t0)               # a4 = 0xFEEDFACE
 
-    ecall                        # halt (M-mode ecall → cause 11 → triple fault)
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -50,6 +58,6 @@ _start:
 #   a2 (x12) = 0x00000001   msip[0] (写 1 读 1)
 #   a3 (x13) = 0xCAFEBABE   mtime 低半
 #   a4 (x14) = 0xFEEDFACE   mtime 高半
-#
-# halt 路径: ecall (cause 11 from M; mtvec=0 未设 → 跳 pc=0 不可执行 → 二次 inst
-# access fault → 三次 → in_trap=3 triple fault halt)。
+#   x30 = 0x100000 / x31 = 0x5555  (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)

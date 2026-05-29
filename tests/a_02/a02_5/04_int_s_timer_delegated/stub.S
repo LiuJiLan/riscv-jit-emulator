@@ -1,5 +1,8 @@
 # a02_5 / 04_int_s_timer_delegated
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # S-mode timer interrupt 委托 (mideleg.STIE=1, M-mode 软件 inject STIP)。
 # 形态特点: 验证 mideleg / S-mode trap delivery / scause 高位 = CAUSE_INTERRUPT_BIT 拼接.
@@ -59,7 +62,7 @@ wait_loop:
 
     mv      a0, s1               # a0 = scause (期望 0x80000005)
 
-    # halt path: ecall_from_S (cause=9) → M trap → m_handler 清 mtvec + ecall → triple fault
+    # halt path: ecall_from_S (cause=9) → M trap → m_handler test_dev 干净停机
     ecall
 
 s_handler:
@@ -74,8 +77,10 @@ s_handler:
 m_handler:
     # M-mode 处理: 期望此 fixture 不到 M timer 路径 (mideleg delegate 了); m_handler 实
     # 际只承接 S 的 ecall (cause=9 deliver M; medeleg=0 默认) → 充当 halt 入口.
-    csrw    mtvec, x0
-    ecall                        # ecall_from_M (cause=11) → mtvec=0 → triple fault
+    # ---- test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000        # test_dev base
+    li      x31, 0x5555          # FINISHER PASS magic
+    sw      x31, 0(x30)          # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -83,6 +88,8 @@ m_handler:
 #   s0 = 1            (handler 设置)
 #   s1 = 0x80000005   (CAUSE_INTERRUPT_BIT | IRQ_S_TIMER)
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 期望 trap dump (S 槽留有 interrupt deliver 信息):
 #   scause = 0x80000005   (trap_set_interrupt_state 写 xcause[PRIV_S])

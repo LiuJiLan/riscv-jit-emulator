@@ -1,8 +1,13 @@
 # a02_3 / 01_u_priv_reject
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # priv check fixture — U-mode 调 SYSTEM priv-required 指令 (MRET / SRET /
 # SFENCE.VMA) reject 验证。
+# (注: 原 case 2 handler 内 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp
+#  后改 test_dev 干净停机, 旧 triple-fault 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 触发 case (3 个; 都期望 cause=2 illegal + tval=raw_inst):
@@ -24,9 +29,8 @@
 #   - mtvec 指 m_handler, handler 用 s0 计数分流, 写 cause / tval 到 a 寄存器
 #   - medeleg=0 (默认; cpu_create 时 trap._medeleg=0), illegal-inst trap 全 deliver 到 M
 #
-# halt 路径: case 2 handler 内 csrw mtvec, x0 + ecall → 下轮 fetch pc=0 → triple
-#            fault halt; main dump 的 mcause/mtval 是 cause 1 / 0 (最后 root cause),
-#            不是 case 2 cause 2; case 0/1/2 的 cause/tval 在 a 寄存器上读出。
+# halt 路径: case 2 handler 内 test_dev FINISHER PASS → SRS=0, dispatcher 退主循环
+#            (exit 0); case 0/1/2 的 cause/tval 在 a 寄存器上读出。
 
 .section .text
 .option norvc
@@ -75,9 +79,11 @@ m_handler:
 case2:
     mv   a4, t0
     mv   a5, t1
-    # halt: csrw mtvec, x0 + ecall → fetch pc=0 → triple fault
-    csrw mtvec, x0
-    ecall
+    # ---- 停机: test_dev FINISHER PASS (handler 内, M-mode) ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                      # 防 fall-through 落进 case0 (dispatcher 下个 block 末退)
 
 case0:
     mv   a0, t0
@@ -103,4 +109,8 @@ epilogue:
 #   a3 = 0x10200073 case 1 mtval  (sret raw_inst)
 #   a4 = 2          case 2 mcause
 #   a5 = 0x12000073 case 2 mtval  (sfence.vma raw_inst)
-#   s0 = 3          (3 case 都进了 handler)
+#   s0 = 2          (case 2 在 epilogue 自增前就 halt; 3 case 都进过 handler 但 s0 停在 2;
+#                    原 doc 写 s0=3 是 epilogue 自增的旧叙述, 实跑一直是 2, 见 REVIEW B.3)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)

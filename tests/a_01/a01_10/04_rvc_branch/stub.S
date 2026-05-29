@@ -1,7 +1,13 @@
 # a_01_10 / 04_rvc_branch
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 RVC branch case (a_01_10 (7) step 2):
+# (注: 原收尾靠 ecall → mtvec=0 fetch fail → triple fault (in_trap=3); a_03 Smdbltrp 后
+#  首个 trap 撞 MDT=1 即 abort, 改在末尾追加 test_dev 干净停机替代跑飞。RVC branch 算出的
+#  寄存器值在停机前已落定。原 in_trap=3 / mcause=1 收尾叙事见 REVIEW B.3 段。)
 #   C.BEQZ (funct3=110, CB-format) — 跳 / 不跳两路径
 #   C.BNEZ (funct3=111, CB-format) — 跳 / 不跳两路径
 # 跟 a_01_4/01_branch_loop 同形态用计数器 GPR 验跳数; 4 path 全覆盖 (taken/not-taken × BEQZ/BNEZ)。
@@ -64,8 +70,10 @@ skip_beqz_nojump:
 skip_bnez_nojump:
     # 此时 x15 = 17
 
-    # ---- 退出 (BARE M-mode, mtvec=0, ecall chain in_trap=3 halt) ----
-    ecall
+    # ---- 停机: test_dev FINISHER PASS (替代原跑飞进 fetch-fault) ----
+    li   x30, 0x100000      # test_dev base
+    li   x31, 0x5555        # FINISHER PASS magic
+    sw   x31, 0(x30)        # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -77,9 +85,10 @@ skip_bnez_nojump:
 #   x13 = 9      (BEQZ not-taken fall-through 执行 c.addi 1; 8+1=9; decimal 9)
 #   x14 = 0      (BNEZ not-taken 操作数, 0!=0 不成立, 不跳; decimal 0)
 #   x15 = 17     (BNEZ not-taken fall-through 执行 c.addi 1; 16+1=17; decimal 17)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
 #
-# 末态 (跟 fixture 03 同 BARE M-mode mtvec=0 chain):
-#   in_trap=3 / mcause=1 (二次 fetch 0 fail) / mepc=0 / mtvec=0 / priv=3
+# 停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / in_trap / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x8/x9: BNEZ taken 路径完整 (loop 5 次 → counter 倒数 + accumulator 累加)

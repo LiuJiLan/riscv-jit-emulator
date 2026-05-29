@@ -1,5 +1,8 @@
 # a03_2 / 01_plic_int_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # PLIC 完整状态机端到端 (T2' 验收 fixture):
 #   1. 配 PLIC: priority[3]=1, threshold[ctx0]=0, enable[ctx0][word0] bit3=1
@@ -12,7 +15,7 @@
 #        - sw TEST_DEV_CLEAR_OFF(t1), 3 → device_clear_pending(3)
 #        - sw complete @ PLIC_BASE+0x200004, 3 → PLIC 清 sources[3].claimed
 #        - mret
-#   5. 主流程退 ecall → triple fault (mtvec 清后 ecall 走 0 取指 fault, 跟 a_02 halt 同)
+#   5. 主流程 test_dev FINISHER PASS 干净停机 (SRS=0 退主循环)
 #
 # 触发源是 PLIC (经 device_set_pending 模拟外设拉线), 触发通道是 test_dev MMIO 写。
 # (a_03_3/01_test_dev_basic 是同体例 fixture, 跑通效果等价, 留 a_03 收尾 milestone
@@ -41,6 +44,7 @@ _start:
     csrw    mie, t0
 
     # mstatus.MIE = 1 (bit 3)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
     # ---- 配 PLIC: priority[3]=1 ----
@@ -74,9 +78,11 @@ wait_loop:
     mv      a0, s1
     mv      a1, s2
 
-    # halt: 清 mtvec + ecall → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 验 mcause = INT_BIT | IRQ_M_EXT (11) = 0x8000000B
@@ -106,10 +112,12 @@ m_handler:
 #   s1 = 0x8000000B
 #   s2 = 3
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
 #
-# 期望 trap dump (halt 路径 triple fault, 跟 a_02 halt 同):
-#   in_trap = 3                 (ecall + mtvec=0 → 取指 fault)
-#   mcause  = 1                 (CAUSE_INST_ACCESS_FAULT)
+# 停机:
+#   test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 原停机靠 ecall + mtvec=0 triple fault; a_03 Smdbltrp 后变 MDT abort, 改
+#  test_dev 干净停机。绝对 pc / total_count 见 REVIEW B.3 段。)
 #
 # 不期望:
 #   - cpu_dump 出现 mcause=5/7 (LOAD/STORE_ACCESS_FAULT; bus 失败路径

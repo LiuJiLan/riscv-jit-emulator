@@ -1,12 +1,19 @@
 # a_01_8 / 03_msu_priv_chain
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 综合 fixture (f) sret 切 priv + (g) SV32 walker, 验 MSU 三态都能正确通过 mmu fetch
 # + csrr CSR_PRIVRD (0xCC0) 验当前 priv 值. 验证靠 GPR x10/x11/x12/x13 dump.
+# handler 验 cause=8, test_dev FINISHER PASS 干净停机 (handler 在 M 模式, satp 不影响 M).
 #
 # (a_03_02 T2' 改造: 删 csrw CSR_TOHOST 4 行 — CSR_TOHOST 0x800 在 T2' 改造为 PLIC
 # device_set/clear_pending 触发通道, 不再 fprintf 流式输出. priv 验证完全依赖 GPR
 # dump, [tohost] stderr 行不再产生 — REVIEW 一笔闭环.)
+# (注: 原停机靠 csrw mtvec,x0 + ecall 强制 triple fault — a_03 Smdbltrp 后 triple fault 变
+#  MDT abort, 且 cpu_reset MDT=1 会让首个 trap 就 abort、handler 跑不到; 故 _start 先清 MDT,
+#  收尾改 test_dev 干净停机。原 triple-fault/in_trap=3 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # RV spec check_perm 矛盾点: 同一个 PTE 不能同时让 S 和 U 跑 fetch:
@@ -34,6 +41,8 @@
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0              # 清 mstatush.MDT (否则首个 trap 撞 MDT=1 直接 abort, handler 跑不到)
+
     # ---- 设 M handler ----
     la   x4, m_handler
     csrw mtvec, x4
@@ -103,8 +112,10 @@ m_handler:
     bne  x14, x15, halt         # cause != 8 → halt 防御
 
 halt:
-    csrw mtvec, x0
-    ecall                       # cause=11 from M → triple fault
+    # ---- 停机: test_dev FINISHER PASS (handler 在 M 模式, satp 不影响 M, 0x100000 直接物理写) ----
+    li   x30, 0x100000          # test_dev base
+    li   x31, 0x5555            # FINISHER PASS magic
+    sw   x31, 0(x30)            # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -114,13 +125,10 @@ halt:
 #   x13 = 3                      (M handler priv)
 #   x14 = 8                      (handler csrr mcause)
 #   x15 = 8                      (比较 reg)
-#   pc = 0
-#   in_trap = 3
-#   mcause = 11                  (handler 末 ecall, 字段保留第 2 次)
-#   mepc = 0x800000xx            (handler 末 ecall PC, 实际值跑出来核对)
-#   mtvec = 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
 #   priv = 3
-#   mstatus = 0x18A0 (?)         (推算: SPIE=1 sret 残留 + MPP=M=0x1800 + ... 跑出来核对)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / mstatus 终值见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10/x11/x12/x13 = 3/1/0/3 → MSU 三态都被正确 csrr 0xCC0 拿到 priv (= csr_privrd_read 对)

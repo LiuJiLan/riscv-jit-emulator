@@ -19,8 +19,13 @@
 #           ... / BIN_i-vs-BIN1 %)
 #
 # 依赖:  cmake-build-release/riscv_jit_emulator (Release 构建, DEBUG_PERF_ON 开);
-#        各 fixture 的 out.bin —— 本脚本每个 fixture 先 make 一遍再跑。
+#        各 fixture 的 out.bin —— 本脚本每个 fixture 先 make 一遍再跑 (make 继承调用者
+#        env, 用 gcc16 跑需调用前 export PATH=/opt/riscv-2026.05.19/bin:$PATH)。
 #        --compare 模式下 EMU 由 BIN1..N 覆盖, cmake-build-release/ 不一定要存在。
+#
+# 运行接口 (a_03 收尾, 跟 run_tests.py 对齐): cmd = [EMU, '--bios', out.bin]。emulator
+# 新 CLI 要求 --bios (旧 [EMU, artifact] 报 unknown arg)。perf 套件 a02_7 全是无设备/
+# 无 stdin fixture, 不需 run_tests 的 RUN-* tag 解析; 恒走 release binary。
 #
 # perf 口径: 单 fixture ITER_COUNT 调到 Release ~1s, 连跑取 median —— 冷启动
 # (TLB/cache 冷 + mmap RAM 首次触页) 摊薄到 <0.1%; 单跑更久反被 CPU turbo 降频 /
@@ -55,9 +60,15 @@ def discover(subpath):
 def run_once(emu, out_bin):
     """跑一次, 解析 stderr 的 [perf] 行; 返 (elapsed, total_count, mips) 或 None。"""
     art_rel = os.path.relpath(out_bin, REPO)
+    # 接口跟 run_tests.py 对齐 (a_03 收尾): emulator 现要求 `--bios <artifact>` base,
+    # 旧 `[emu, artifact]` 报 unknown arg。perf 套件 (a02_7) 全是 bare/mmu/mem fixture,
+    # 无 stdin / 块设备 / exit 断言, 故不需 run_tests 的 RUN-* tag 解析; 恒用 release
+    # binary (RUN-RELEASE 隐含)。ASAN_OPTIONS detect_leaks=0 跟 run_tests 同 (release
+    # 一般无 ASan, 但带上无害, 防 frozen binary 偶含 sanitizer 时污染)。
+    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1")
     try:
-        p = subprocess.run([emu, art_rel], cwd=REPO, capture_output=True,
-                           timeout=TIMEOUT, start_new_session=True)
+        p = subprocess.run([emu, "--bios", art_rel], cwd=REPO, capture_output=True,
+                           timeout=TIMEOUT, start_new_session=True, env=env)
     except subprocess.TimeoutExpired:
         return None
     m = PERF_RE.search(p.stderr.decode(errors="replace"))

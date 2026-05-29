@@ -1,5 +1,8 @@
 # a03_2 / 06_csr_int_csr_mask
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 中断相关 CSR (mie / mip / sip / sie) 的 WARL mask 行为. 全单元测试, 不开 MIE
 # 不触发中断 — 纯 csrr/csrw + GPR dump 验.
@@ -29,6 +32,10 @@
 #   s6 = 0x000   (csrw mip 0 → _mip_sw 清; csrr mip)
 #   s7 = 0x222   (csrw mip 0x222 → 设 SSIP/STIP/SEIP_sw; csrr mip)
 #   s8 = 0x222   (csrr sip 同上 = mip & SIP_MASK)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 原停机靠 csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变 MDT abort, 改
+#  test_dev 干净停机。本 fixture 不开 MIE 不触发中断。)
 
 .section .text
 .option norvc
@@ -69,6 +76,7 @@ _start:
     # ---- sip read = mip & SIP_MASK ----
     csrr    s8, sip                         # 期望 0x222
 
-    # ---- halt: 不开 MIE (mip 设着也不 fire), 清 mtvec + ecall → triple fault ----
-    csrw    mtvec, x0
-    ecall
+    # ---- halt: 不开 MIE (mip 设着也不 fire), test_dev FINISHER PASS 干净停机 ----
+    li      x30, 0x100000           # test_dev base (scratch)
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)

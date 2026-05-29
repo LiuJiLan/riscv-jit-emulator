@@ -1,5 +1,8 @@
 # a02_7 / 14_blocksize_16
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # perf 套件·block 大小 sweep (fixture 12-16): bare M-mode 纯算术紧循环, 每个 block
 # 固定 16 条指令。配 中断检查 ON/OFF A/B (见 REVIEW.md), 测"每 block 一次的中断

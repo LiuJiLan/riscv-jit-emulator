@@ -1,5 +1,8 @@
 # a_01_8 / 09_sv32_root_pt_not_in_ram
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker level=1 PT (root_pt 自身) 不在 RAM 时报 access fault — 走 fetch 路径
 # 触发 INST_ACCESS_FAULT (cause 1)。跟 fixture 08 (level=0 leaf_pt 不在 RAM, load 路径
@@ -35,7 +38,7 @@
 #      mepc = s_target identity vaddr + mstatus.MPP=PRIV_S; mret 切 S
 #   2. mret 后: dispatcher 调 mmu_translate_pc(s_target vaddr) → walker level=1 PT 读
 #      RAM 检查 fail → trap 1 (路径 2b); s_target 内任何指令都不会执行
-#   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; halt
+#   3. M handler: csrr mcause/mepc/mtval → x12/x13/x14; test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -80,20 +83,24 @@ m_handler:
     csrr x14, mtval                 # x14 = s_target PA (= gva, mmu_translate_pc 第 2 参)
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
 #   x10 = 0                  (s_target 永未执行)
 #   x12 = 1                  (mcause = INST_ACCESS_FAULT)
-#   x13 = 0x80000040         (mepc = s_target PA = mret 后 cpu->pc, 实际值看反汇编)
-#   x14 = 0x80000040         (mtval = s_target PA, mmu_translate_pc trap_set_state 第 2 参 = gva)
-#   mcause = 11              (handler 末 ecall_from_M 第 2 次保留)
-#   priv = 3, in_trap = 3
+#   x13 = s_target PA        (mepc = mret 后 cpu->pc; 绝对值随 codegen 漂, 不钉死; x13 == x14)
+#   x14 = s_target PA        (mtval = mmu_translate_pc trap_set_state 第 2 参 = gva; 绝对值随 codegen 漂)
+#   x30 = 0x100000           (停机用 scratch: test_dev base)
+#   x31 = 0x5555             (停机用 scratch: FINISHER PASS magic)
+#   priv = 3
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x12 = 1 → mmu_translate_pc 真在 PT-not-in-RAM 路径报 INST_ACCESS_FAULT (跟 lw cause 5 区分)
-#   - x14 = 0x80000040 → trap_set_state 路径 mtval 协议跟 trap_raise_exception 一致 (都写 gva)
-#   - x13 = 0x80000040 → mepc = 失败 fetch 的 vaddr (没真执行任何指令, mret 后 cpu->pc)
+#   - x14 == x13 → trap_set_state 路径 mtval 协议跟 trap_raise_exception 一致 (都写 gva = 失败 fetch vaddr)
+#   - x13 = mepc = 失败 fetch 的 vaddr (没真执行任何指令, mret 后 cpu->pc)
 #   - 跟 fixture 08 形成 walker RAM 检查两段 (level=1 + level=0) 完整覆盖

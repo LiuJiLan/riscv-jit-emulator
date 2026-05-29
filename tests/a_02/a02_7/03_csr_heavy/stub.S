@@ -1,5 +1,8 @@
 # a02_7 / 03_csr_heavy
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # 解释器 perf 套件之三: CSR 密集路径吞吐。M-mode bare 下每轮读 8 条 CSR, 每条
 # csrr 走 csr_op 大 helper (slow path)。03↔01_bare 的 MIPS 差 = CSR 读路径相对

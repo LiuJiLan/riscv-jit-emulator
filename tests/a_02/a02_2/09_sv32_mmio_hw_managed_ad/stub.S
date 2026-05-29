@@ -1,8 +1,13 @@
 # a_02_2 / 09_sv32_mmio_hw_managed_ad
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker hw-managed A/D 在 leaf PA 是 MMIO 时的行为
 # (a_01_8/05 RAM 版的 MMIO 版本)。
+# (注: 原 halt 用 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改
+#  test_dev 干净停机, 旧 triple-fault / in_trap=3 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 关键 (a_02_003 后): A/D 是 PTE 描述的"page 被 access/dirty", 跟 page 内容
@@ -78,8 +83,11 @@ m_handler:
     lw   x15, 16(x14)               # leaf_pt_mmio[4] offset 16; 期望 0x008010C7
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    # ---- 停机: test_dev FINISHER PASS (M-mode BARE) ----
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                         # 防 fall-through 落进 setup_pt (dispatcher 下个 block 末退)
 
 # ===== 期望结果 =====
 # 期望 main.c dump (a_02_003 后):
@@ -88,7 +96,9 @@ halt:
 #   x14 = 0x80102000             (leaf_pt_mmio PA)
 #   x15 = 0x00801007             (PT 内 leaf_pt_mmio[4]; P2 后 MMIO 路径不写回 PT,
 #                                  PTE 保留起步值 0x00801007, A=0 D=0)
-#   in_trap=3 mcause=11 priv=3
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点 (a_02_003 后):
 #   - x10 = 0xDEADBEEF → S phase sw 经 walker → mmio_write_helper 真到 CLINT, 后续

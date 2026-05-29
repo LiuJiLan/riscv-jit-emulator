@@ -1,5 +1,8 @@
 # a03_3 / 02_uart_tx_int
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # UART TX 中断 PLIC 联调 — 验 UART 内部状态机 → device_set_pending(10) → PLIC 仲裁
 # → MEIP 合成 → handler claim/ack/complete 全链路:
@@ -15,7 +18,7 @@
 #          uart_compute_device_line 拉低 → device_clear_pending(10))
 #        - sw complete = 10
 #        - mret
-#   5. 主帧 spin wait_loop → s0=1 → 跳出 → ecall halt
+#   5. 主帧 spin wait_loop → s0=1 → 跳出 → test_dev FINISHER 干净停机
 #
 # ===== 思路 =====
 # UART 8 寄存器 byte-access, sb/lb 走 size=1 path; 立即数 0..7 都在 RV I-type imm 12-bit
@@ -52,6 +55,7 @@ _start:
     csrw    mtvec, t0
     li      t0, 0x800               # mie.MEIP = bit 11
     csrw    mie, t0
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8        # mstatus.MIE = bit 3
 
     # ---- 配 PLIC: priority[10]=1 ----
@@ -97,9 +101,12 @@ wait_loop:
     mv      a0, s2                  # mcause = 0x8000000B 期望
     mv      a1, s3                  # claim_src = 10 期望
 
-    # halt: 清 mtvec + ecall → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t0, 0x00100000          # TEST_DEV_BASE
+    li      t1, 0x5555              # FINISHER_PASS
+    sw      t1, 0(t0)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 验 mcause
@@ -132,9 +139,9 @@ m_handler:
 # 期望 stdout:
 #   "OK\n"           (3 字符; UART TX 走 putchar)
 #
-# 期望 trap dump (halt 路径 triple fault, 跟 a_02 halt 同):
-#   in_trap = 3
-#   mcause  = 1      (CAUSE_INST_ACCESS_FAULT; ecall 后 mtvec=0 取指 fault)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - 任何 [bus] CAUSE_*_ACCESS_FAULT (UART/PLIC 不该产 fault)

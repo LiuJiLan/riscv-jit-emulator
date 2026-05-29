@@ -1,5 +1,8 @@
 # a_01_10 / 02_sum_store_fast_path
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 lsu store fast path SUM corner case (a01_9 (6) → a_01_10 修):
 #   S+PTE_U=1+SUM=1 sw user page → check_perm(W) 通过 → 成功
@@ -38,7 +41,7 @@
 #      sw x11, 0(x4) → 期望 store page fault cause 15 (check_perm(W) 拒绝)
 #                        → mem 内容不变 (但本 fixture 不验内存, 只验 cause/mtval)
 #   5. m_handler phase2 (cause=15): dump x12=mcause(15)/x13=mtval(0x80001000)/x14=mepc;
-#      csrw mtvec=0; ecall → triple fault
+#      test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST,    0x800
 .equ CSR_PRIVRD,    0xCC0
@@ -126,8 +129,9 @@ m_handler_phase2:
     j    halt
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → mmu fail → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -135,10 +139,12 @@ halt:
 #   x11    = 0xDEADBEEF   (预设比较值; sw page fault 不影响 GPR — 核心验证点 2 间接)
 #   x12    = 15           (CAUSE_STORE_PAGE_FAULT — phase2 mcause)
 #   x13    = 0x80001000   (mtval = sw GVA — phase2 mtval)
-#   x14    = s_phase_sum0 sw 指令 PC (具体值看 gcc 编出来)
-#   in_trap = 3
-#   mcause = 11           (handler 末 ecall_from_M 第 2 次, 字段保留)
+#   x14    = s_phase_sum0 sw 指令 PC (mepc; 绝对值随 codegen 漂, 不钉死)
+#   x30    = 0x100000     (停机用 scratch: test_dev base)
+#   x31    = 0x5555       (停机用 scratch: FINISHER PASS magic)
 #   priv   = 3            (M)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 = 0xCAFEBABE → SUM=1 路径 sw 通过 store_helper 命中段 (check_perm(W) 通过) +

@@ -1,7 +1,15 @@
 # a_01_8 / 02_sv32_remote_fetch
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验证 SV32 walker 真激活 + mmu_translate_pc SV32 fetch 路径 (Step 6 加).
+# handler 验 cause=9, test_dev FINISHER PASS 干净停机 (handler 在 M 模式, satp 不影响 M, 0x100000
+# 直接物理地址写 test_dev)。
+# (注: 原停机靠 csrw mtvec,x0 + ecall 强制 triple fault — a_03 Smdbltrp 后 triple fault 变
+#  MDT abort, 且 cpu_reset MDT=1 会让首个 trap 就 abort、handler 跑不到; 故 _start 先清 MDT,
+#  收尾改 test_dev 干净停机。原 triple-fault/in_trap=3 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 设计 (user "几个 gva 远页都指向第一个物理页"): 用 4MB superpage 把两个不同 vaddr
@@ -43,9 +51,11 @@
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0              # 清 mstatush.MDT (否则首个 trap 撞 MDT=1 直接 abort, handler 跑不到)
+
     # ---- 设 M handler ----
-    la   x4, m_handler          # 0x00-0x07
-    csrw mtvec, x4              # 0x08
+    la   x4, m_handler
+    csrw mtvec, x4
 
     # ---- Build root PT @ PA 0x80100000 (1 MiB 偏移; 跟 5b 同位置) ----
     # 注: sw 的 imm 限 RV32 S-type 12-bit signed [-2048, 2047]; 直接写 0x800(x4) 超范围.
@@ -65,41 +75,43 @@ _start:
     sw   x5, 0(x4)
 
     # ---- 设 satp: MODE=Sv32 + PPN=0x80100 ----
-    lui  x6, 0x80080            # 0x20: x6 = 0x80080000
-    addi x6, x6, 0x100          # 0x24: x6 = 0x80080100 (satp value)
-    csrw satp, x6               # 0x28
+    lui  x6, 0x80080            # x6 = 0x80080000
+    addi x6, x6, 0x100          # x6 = 0x80080100 (satp value)
+    csrw satp, x6
 
     # ---- sfence.vma 让新 satp 生效 ----
-    sfence.vma                  # 0x2c
+    sfence.vma
 
     # ---- 设 mret 目标 = s_target 的远 vaddr (= s_target_PA + 0x04000000) ----
-    la   x7, s_target           # 0x30-0x37: x7 = s_target PA (linker 钉 0x800000xx)
-    lui  x4, 0x4000             # 0x38: x4 = 0x04000000 (复用 x4, 不再用 root_pt_pa)
-    add  x7, x7, x4             # 0x3c: x7 = s_target 的远 vaddr (0x840000xx)
-    csrw mepc, x7               # 0x40
+    la   x7, s_target           # x7 = s_target PA (linker 钉 0x800000xx)
+    lui  x4, 0x4000             # x4 = 0x04000000 (复用 x4, 不再用 root_pt_pa)
+    add  x7, x7, x4             # x7 = s_target 的远 vaddr (0x840000xx)
+    csrw mepc, x7
 
     # ---- 设 mstatus.MPP = PRIV_S (mret 切 S) ----
-    addi x4, x0, 1              # 0x44
-    slli x4, x4, 11             # 0x48: x4 = 0x800
-    csrw mstatus, x4            # 0x4c
+    addi x4, x0, 1
+    slli x4, x4, 11             # x4 = 0x800
+    csrw mstatus, x4
 
     # ---- mret → priv=S, pc=远 vaddr → mmu_translate_pc walker 真激活 ----
-    mret                        # 0x50
+    mret
 
 s_target:
-    # ---- S-mode (远 vaddr fetch 经 SV32 walker 找到这里; 实际 PA 0x80000054) ----
-    addi x10, x0, 1             # 0x54: SV32 fetch 真激活证据
-    addi x11, x0, 2             # 0x58
-    ecall                       # 0x5c: cause=9 from S; trap deliver M (没 medeleg)
+    # ---- S-mode (远 vaddr fetch 经 SV32 walker 找到这里) ----
+    addi x10, x0, 1             # SV32 fetch 真激活证据
+    addi x11, x0, 2
+    ecall                       # cause=9 from S; trap deliver M (没 medeleg)
 
 m_handler:
-    csrr x12, mcause            # 0x60: 期望 cause=9 (ecall from S)
-    addi x13, x0, 9             # 0x64
-    bne  x12, x13, halt         # 0x68: cause != 9 → halt 防御 (期望 fall through)
+    csrr x12, mcause            # 期望 cause=9 (ecall from S)
+    addi x13, x0, 9
+    bne  x12, x13, halt         # cause != 9 → halt 防御 (期望 fall through)
 
 halt:
-    csrw mtvec, x0              # 0x6c: mtvec=0
-    ecall                       # 0x70: cause=11 from M → mmu fail → triple fault
+    # ---- 停机: test_dev FINISHER PASS (handler 在 M 模式, satp 不影响 M, 0x100000 直接物理写) ----
+    li   x30, 0x100000          # test_dev base
+    li   x31, 0x5555            # FINISHER PASS magic
+    sw   x31, 0(x30)            # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 (main.c dump):
@@ -107,13 +119,10 @@ halt:
 #   x11 = 2                  (S-mode 第二条标记)
 #   x12 = 9                  (mcause = ecall from S, handler csrr 进读)
 #   x13 = 9                  (比较 reg)
-#   pc = 0                   (handler 末 ecall trap 跳 mtvec=0; triple fault)
-#   in_trap = 3
-#   mcause = 11              (handler 末 ecall = ecall from M; 字段保留第 2 次)
-#   mepc = 0x80000xxx        (handler 末 ecall PC; 实际值看跑出来)
-#   mtvec = 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
 #   priv = 3                 (M)
-#   mstatus = 0x1820 (?)     (推算同 fixture (f) 末段; SPIE 残留可能不一样, 跑出来核对)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / mstatus 终值见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 = 1 + x11 = 2 → SV32 fetch 真激活, 远 vaddr 通过 walker 找到 PA 跑 inst (没 SV32

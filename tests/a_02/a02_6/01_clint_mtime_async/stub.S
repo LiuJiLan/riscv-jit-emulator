@@ -1,11 +1,15 @@
 # a02_6 / 01_clint_mtime_async
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 timer 辅助线程真异步累加 atomic clint.mtime:
 #   1. 读 CLINT mtime 低 32 (MMIO @ 0x0200BFF8) → t0
 #   2. poll 等 mtime 值变 (max 10M iter 防卡死) → t1
 #   3. 验 t1 > t0 → s0=1 success / 否则 s0=0xBAD fail
-#   4. ecall → mtvec=0 triple fault halt
+#   4. test_dev FINISHER PASS 干净停机
+# (注: 改 test_dev 停机, 旧叙事见 REVIEW B.3)
 #
 # ===== 思路 =====
 # 期望 (1ms 一次 fetch_add += TIMEBASE_PER_WAKE=10000):
@@ -54,8 +58,10 @@ fail:
     li      a5, 0                   # a5 = 0 (没观察到 delta)
 
 halt:
-    csrw    mtvec, x0               # 清 mtvec, ecall 走 pc=0 → mmu fail triple fault
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -63,7 +69,5 @@ halt:
 #   a0 (x10) = mtime t0     (一般 ~几千; cpu_create / clint_init 到 _start 已过几 us)
 #   a1 (x11) = mtime t1     (> a0)
 #   a5 (x15) > 0            (delta; 一般 ~10000 量级或更大, 取决于 host schedule)
-#
-# 期望 trap dump:
-#   in_trap = 3             (halt path triple fault)
-#   mcause  = 1             (CAUSE_INST_ACCESS_FAULT 第 2 次保留; 跟 a02_5 同形态)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit 0

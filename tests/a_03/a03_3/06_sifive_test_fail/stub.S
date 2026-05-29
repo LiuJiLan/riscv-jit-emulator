@@ -1,5 +1,8 @@
 # a03_3 / 06_sifive_test_fail
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 42
+#
 # ===== 测试目的 =====
 # sifive_test FINISHER FAIL 路径 — 验 jit-emu 退出码上报 fail code:
 #   1. sw (42<<16)|0x3333 → test_dev offset 0

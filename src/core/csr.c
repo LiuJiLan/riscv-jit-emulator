@@ -137,20 +137,6 @@ static void csr_mstatus_write(cpu_t *hart, uxlen_t v) {
     // 跨 csr 不能同写, 仅看当前 _mstatus.MDT 状态: MDT=1 时 csrw mstatus 写 MIE=1
     // 被强制清 0 (regardless of v 内 MIE 值).
     if ((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u) {
-        /* TEMP HINT (small_plan C.3 / A.7): 提示 fixture 缺 boot prelude 清 MDT.
-           只在真有"写 MIE=1 但被锁"时打 hint (one-shot per-process). 撤回时机:
-           small_plan A.7 fixture 整理完成后. TODO: remove this block when fixture
-           cleanup is done. 多 hart 下 static flag race 最多多打几次, 不致命. */
-        if (v & MSTATUS_MIE) {
-            static int mie_hint_shown = 0;
-            if (!mie_hint_shown) {
-                fprintf(stderr,
-                        "[csr hint TEMP] mstatus.MDT=1: write to mstatus.MIE forced to 0 "
-                        "(spec 3.1.6.2). Fixture likely missing boot prelude "
-                        "'csrw 0x310, x0' (small_plan A.7). This hint is one-shot." EOL);
-                mie_hint_shown = 1;
-            }
-        }
         v &= ~MSTATUS_MIE;
     }
 
@@ -447,20 +433,6 @@ static void csr_sstatus_write(cpu_t *hart, uxlen_t v) {
      * SDT=1 时 SIE 必清". */
     uint32_t v_masked = (uint32_t)v & SSTATUS_MASK;
     if (v_masked & MSTATUS_SDT) {
-        /* TEMP HINT (small_plan C.3 / A.7): 提示 fixture 缺 boot prelude 清 SDT.
-           只在真有"写 SIE=1 但被锁"时打 hint (one-shot per-process). 撤回时机:
-           small_plan A.7 fixture 整理完成后. TODO: remove this block when fixture
-           cleanup is done. 多 hart 下 static flag race 最多多打几次, 不致命. */
-        if (v_masked & MSTATUS_SIE) {
-            static int sie_hint_shown = 0;
-            if (!sie_hint_shown) {
-                fprintf(stderr,
-                        "[csr hint TEMP] sstatus.SDT=1: write to sstatus.SIE forced to 0 "
-                        "(spec 4.1.1.5). Fixture likely missing boot prelude "
-                        "'csrw sstatus, x0' (small_plan A.7). This hint is one-shot." EOL);
-                sie_hint_shown = 1;
-            }
-        }
         v_masked &= ~MSTATUS_SIE;
     }
     const u64_t keep = hart->trap._mstatus & ~(uint64_t)SSTATUS_MASK;

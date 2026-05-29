@@ -27,12 +27,16 @@
 # 版本下默认含 csr 指令 (zicsr 在较老 binutils 里隐含进 base, 不能用 z 前缀显式声明 —
 # 加了会报 "unsupported ISA subset 'z'")。新版 binutils 支持 _zicsr 显式但与旧版不兼容,
 # 这里保留与 a01_4 一致。
+# 注 (a_03 收尾 B.3, 2026-05-30): 工具链升到 binutils 2.46, 它把 Zicsr 从 base I 拆成
+# 独立扩展 — rv32imac 编 csr 现报 "extension 'zicsr' required"。CFLAGS march 已补
+# _zicsr_zifencei (对齐项目目标 ISA RV32 G); 上述旧版叙事保留作 trail。csr 指令编码不变,
+# out.bin 与旧 gcc10.2 产物逐字节相同。
 # build flow: stub.S → out.elf → out.bin (objcopy 提 raw bytes); 与 a01_3 / a01_4 一致。
 
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc
 OBJCOPY := $(TOOL)-objcopy
-CFLAGS  := -nostdlib -nostartfiles -march=rv32imac -mabi=ilp32 -mcmodel=medany
+CFLAGS  := -nostdlib -nostartfiles -march=rv32imac_zicsr_zifencei -mabi=ilp32 -mcmodel=medany
 
 .PHONY: all clean
 all: out.bin

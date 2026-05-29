@@ -1,5 +1,8 @@
 # a02_5 / 09_stvec_vectored_s_soft
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # stvec mode=1 vectored + delegated SSIP fire → pc = stvec_base + 4 * IRQ_S_SOFT。
 # 跟 fixture 07 区别: stvec (S-mode trap vector) 代替 mtvec; 验 stvec mode=1 路径跟 mtvec
@@ -59,7 +62,7 @@ wait_loop:
 
     mv      a0, s1               # a0 = scause from s_handler_ssip
 
-    ecall                        # halt: ecall_from_S → M (medeleg=0 默认) → m_handler
+    ecall                        # halt: ecall_from_S → M (medeleg=0 默认) → m_handler test_dev 停机
 
 # stvec.BASE 4 字节对齐
 .align 2
@@ -86,9 +89,11 @@ s_handler_ssip:
     sret
 
 m_handler:
-    # halt path: ecall_from_S 到 M; 清 mtvec + ecall_from_M → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt path: ecall_from_S 到 M → test_dev 干净停机 (scratch x30/x31)
+    li      x30, 0x100000        # test_dev base
+    li      x31, 0x5555          # FINISHER PASS magic
+    sw      x31, 0(x30)          # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 halt:
     # s_vec_table 错跳 slot 兜底 (不该走到)
@@ -100,6 +105,8 @@ halt:
 #   s0 = 1
 #   s1 = 0x80000001
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证:
 #   - s_handler_ssip 真跑 (s0=1, s1=0x80000001) → stvec vectored 跳到 base + 4

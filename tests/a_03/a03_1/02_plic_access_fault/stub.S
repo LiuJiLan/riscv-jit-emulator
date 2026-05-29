@@ -1,5 +1,8 @@
 # a03_1 / 02_plic_access_fault
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # PLIC 边界 fault 语义 — "PLIC region 内 silent (除 reserved fprintf 报告) + PLIC
 # 区外 bus 自产 fault" 切分验证。
@@ -34,6 +37,8 @@
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0                   # 清 mstatush.MDT (Smdbltrp reset=1; case 5/6 fault 进
+                                     # handler, 否则首个 fault trap 即 MDT double-trap abort)
     # set mtvec
     la   t0, m_handler
     csrw mtvec, t0
@@ -79,9 +84,11 @@ _start:
     li   t0, 0x0C600004              # PLIC_BASE + PLIC_SIZE + 4
     lw   t1, 0(t0)
 
-    # done: triple fault halt
-    csrw mtvec, x0
-    ecall
+    # done: test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li   x30, 0x100000               # test_dev base
+    li   x31, 0x5555                 # FINISHER PASS magic
+    sw   x31, 0(x30)
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # ----------------------------------------------------------------------------
 # m_handler — 按 mcause 分流 (5=load fault s2++, 7=store fault s3++);
@@ -121,10 +128,13 @@ epilogue:
 #   s2 (x18) = 1            (load  fault: case 6)
 #   s3 (x19) = 1            (store fault: case 5)
 #
-# 期望 trap dump:
-#   in_trap = 3                 (halt path csrw mtvec=0 + ecall + triple fault)
-#   mcause  = 1                 (CAUSE_INST_ACCESS_FAULT, 最后 root cause; cause 5/7
-#                                 通过 handler 写入 s2/s3 验证, 不存在 main dump 里)
+# 停机:
+#   test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
+#   (cause 5/7 通过 handler 写入 s2/s3 验证, 不存在 main dump 里)
+# (注: 原停机靠 csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变 MDT abort,
+#  改 test_dev 干净停机。unexpected-cause 错误逃逸路径仍走 ecall。
+#  绝对 pc / total_count 见 REVIEW B.3 段。)
 #
 # 期望 stderr 只多一行 (case 4 reserved fprintf):
 #   [plic] ctx=0 reserved W

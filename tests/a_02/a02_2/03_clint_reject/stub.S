@@ -1,7 +1,12 @@
 # a02_2 / 03_clint_reject
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # CLINT 内部 reject 验证 — clint_write 4 类 branch + clint_read 1 类 sample。
+# (注: 原收尾用 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改 test_dev
+#  干净停机, 旧 triple-fault 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # clint.c read/write 是对称镜像 (cause 5 vs 7 区别, 内部 branch 完全同源); write
@@ -19,6 +24,9 @@
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0               # 清 mstatush.MDT (Smdbltrp reset=1; 否则首个 M-mode
+                                 # 访问 fault → MDT abort, handler 跑不到)
+
     # set mtvec
     la   t0, m_handler
     csrw mtvec, t0
@@ -48,9 +56,11 @@ _start:
     li   t0, 0x02000004
     lw   t2, 0(t0)
 
-    # done: triple fault halt
-    csrw mtvec, x0
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                      # 防 fall-through 落进 m_handler (dispatcher 下个 block 末退)
 
 # ----------------------------------------------------------------------------
 # m_handler — switch on s0 写 mtval (+ case 4 写 cause) 到 a 寄存器, mret +4
@@ -100,6 +110,7 @@ epilogue:
 #   a5 (x15) = 0x02000004   case 4 mtval
 #   s0 (x8)  = 5            (5 case 都进了 handler)
 #   s1 (x9)  = 4*7 + 5 = 33 (cause sanity sum)
-#
-# halt 路径: 5 case 完后 csrw mtvec, x0 + ecall → triple fault halt; cause 7/5
-# 通过 handler 写入 a/s 寄存器, dump 验证。
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: cause 7/5 通过 handler 写入 a/s 寄存器 dump 验证; 绝对 pc / total_count 见
+#  REVIEW B.3 段, 不在断言内。)

@@ -1,7 +1,12 @@
 # a02_3 / 02_s_mret_reject
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # priv check fixture — S-mode 调 MRET reject。
+# (注: 原 handler 内 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改
+#  test_dev 干净停机, 旧 triple-fault 叙事见 REVIEW B.3 段。)
 #
 # MRET 仅在 priv >= M 时合法 (M-only system 指令); S-mode 调 MRET 触发
 # PRIV_CHECK_OR_TRAP(PRIV_M) cause 2 illegal + tval=raw_inst (interpreter case
@@ -20,7 +25,7 @@
 #   - mtvec 指 m_handler; medeleg=0 (默认; 显式确保 illegal-inst trap deliver 到 M
 #     而不是经 S 委托回 S 形成循环)
 #
-# halt: handler 内 csrw mtvec, x0 + ecall → fetch pc=0 → triple fault.
+# halt: handler 内 test_dev FINISHER PASS → SRS=0, dispatcher 退主循环 (exit 0)。
 
 .section .text
 .option norvc
@@ -68,12 +73,17 @@ m_handler:
     mv   a1, t1
     addi s0, s0, 1
 
-    # halt: csrw mtvec, x0 + ecall → fetch pc=0 → triple fault
-    csrw mtvec, x0
-    ecall
+    # ---- 停机: test_dev FINISHER PASS (handler 内, M-mode) ----
+    li   x30, 0x100000           # test_dev base
+    li   x31, 0x5555             # FINISHER PASS magic
+    sw   x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                      # 防 fall-through (dispatcher 下个 block 末退)
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 2          mcause (illegal instruction)
 #   a1 = 0x30200073 mtval  (mret raw_inst)
 #   s0 = 1          (handler 进过 1 次)
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)

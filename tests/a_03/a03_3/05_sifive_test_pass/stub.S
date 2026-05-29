@@ -1,5 +1,8 @@
 # a03_3 / 05_sifive_test_pass
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # sifive_test FINISHER PASS 路径 — 验 jit-emu 退出码:
 #   1. sw 0x5555 → test_dev offset 0 (TEST_DEV_SIFIVE_OFF)

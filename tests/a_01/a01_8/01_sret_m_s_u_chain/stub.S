@@ -1,113 +1,81 @@
 # a_01_8 / 01_sret_m_s_u_chain
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验证 sret 切 priv (S→U) + sstatus / sepc CSR 入口 (Step 6 加).
-# 22 条指令 (la×2 算 4 条) = 88 字节 (32-bit only, .option norvc).
 #
 # 覆盖范围:
 #   1. sret 切 priv (S→U): 验 _mstatus.SPP/SPIE/SIE 字段操作 + sepc 拿 PC
 #   2. sstatus CSR 入口 (csrw sstatus 写 mask 内字段; csrw sepc 写 sepc)
 #   3. mret 切 priv (M→S): 跟 a_01_7 mret 切 U 同形态 (不同 MPP 值)
 #   4. 跨 priv ecall: U-mode ecall 走 cause=8 (跟 a_01_7/04 cause=8 路径一致, 但走 sret)
+# (注: 原停机靠 csrw mtvec,x0 + ecall 强制 triple fault — a_03 Smdbltrp 后 triple fault 变
+#  MDT abort, 且 cpu_reset MDT=1 会让首个 trap 就 abort、handler 跑不到; 故 _start 先清 MDT,
+#  收尾改 test_dev 干净停机。原 triple-fault/in_trap=3 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 路径 (user "M→S→U→M (没代理, 先同一回 M)" — 不依赖 SV32 walker, 不用 lw/sw):
-#   1. M-mode 起步: 设 mtvec / mepc / mstatus.MPP=PRIV_S → mret → 切 S
+#   1. M-mode 起步: 清 MDT → 设 mtvec / mepc / mstatus.MPP=PRIV_S → mret → 切 S
 #   2. S-mode: 设 sepc / sstatus.SPP=PRIV_U → sret → 切 U
 #   3. U-mode: ecall (cause=8 from U) → trap deliver M (deliver_priv hard-code PRIV_M)
-#   4. M-handler: 验 cause=8; csrw mtvec=0 + ecall 触发 triple fault 退出 dispatcher
-#
-# 字节地址布局 (.text 钉 0x80000000):
-#   0x00 la x4, m_handler   (8B; gcc auipc+addi)
-#   0x08 csrw mtvec, x4
-#   0x0c la x5, s_program   (8B)
-#   0x14 csrw mepc, x5
-#   0x18 addi x6, x0, 1     (PRIV_S 编码值 = 1)
-#   0x1c slli x6, x6, 11    (x6 = 1 << 11 = 0x800, MPP_S 在 mstatus bits 12:11)
-#   0x20 csrw mstatus, x6
-#   0x24 mret               (M→S; priv=MPP=S, MIE=MPIE=0, MPIE=1, MPP=U)
-#   ---- s_program (0x28) ----
-#   0x28 addi x10, x0, 1    (S 起步标记)
-#   0x2c la x7, u_program   (8B)
-#   0x34 csrw sepc, x7
-#   0x38 csrw sstatus, x0   (SPP=PRIV_U=0; sstatus 整体清 0 — sret 切 U 关键)
-#   0x3c sret               (S→U; priv=SPP=U, SIE=SPIE=0, SPIE=1, SPP=U=0; pc=sepc)
-#   ---- u_program (0x40) ----
-#   0x40 addi x11, x0, 2    (U 起步标记 — sret 真生效证据)
-#   0x44 ecall              (cause=8 from U; trap deliver M)
-#   ---- m_handler (0x48) ----
-#   0x48 csrr x12, mcause   (期望 8)
-#   0x4c addi x13, x0, 8
-#   0x50 bne x12, x13, halt (offset = halt - 0x50 = 4; 实际 fall through 即可, 但
-#                             加这条是防御 — 万一 cause != 8 也跳到 halt 停机)
-#   ---- halt (0x54) ----
-#   0x54 csrw mtvec, x0     (mtvec=0)
-#   0x58 ecall              (cause=11 from M; trap → mtvec=0 → fetch 0 fail → triple fault)
-#
-# mstatus 推算时序 (注释方便 debug):
-#   阶段 1 起步:                          mstatus = 0
-#   阶段 2 csrw mstatus, 0x800:          mstatus = 0x800   (MPP=01=S)
-#   阶段 3 mret (M→S, MPP→priv 等):       mstatus = 0x80    (MPP=U=0; MPIE=1; MIE=0)
-#   阶段 4 csrw sstatus, x0:              mstatus = 0x80    (SSTATUS_MASK 不覆盖 MPIE)
-#   阶段 5 sret (S→U):                    mstatus = 0xA0    (SPIE=1; SPP=U=0; +MPIE 残留)
-#   阶段 6 ecall (U→M trap, deliver M):   mstatus = 0x20    (MPP=caller=U=0; MPIE=MIE=0;
-#                                                              MIE=0; SPIE 残留)
-#   阶段 7 handler 跑 (csrr/addi/bne):    mstatus = 0x20    (不动)
-#   阶段 8 ecall (M→M trap):              mstatus = 0x1820  (MPP=caller=M=3; MPIE=MIE=0;
-#                                                              MIE=0; SPIE 残留)
-#   阶段 9 fetch 0 fail (in_trap 2→3):    mstatus = 0x1820  (候选 A 早 return 不动字段)
+#   4. M-handler: 验 cause=8; test_dev FINISHER PASS 干净停机 (退主循环)
 
 .section .text
 .option norvc
 .globl _start
 _start:
+    csrw 0x310, x0          # 清 mstatush.MDT (否则首个 trap 撞 MDT=1 直接 abort, handler 跑不到)
+
     # ---- M-mode 起步 ----
-    la   x4, m_handler      # 0x00-0x07: la (8 字节)
-    csrw mtvec, x4          # 0x08
+    la   x4, m_handler      # la (8 字节)
+    csrw mtvec, x4
 
-    la   x5, s_program      # 0x0c-0x13: la (8 字节)
-    csrw mepc, x5           # 0x14
+    la   x5, s_program      # la (8 字节)
+    csrw mepc, x5
 
-    addi x6, x0, 1          # 0x18: x6 = 1 (PRIV_S 编码)
-    slli x6, x6, 11         # 0x1c: x6 = 0x800 (MPP_S)
-    csrw mstatus, x6        # 0x20: mstatus = 0x800 (MPP=01=PRIV_S, 其他 0)
+    addi x6, x0, 1          # x6 = 1 (PRIV_S 编码)
+    slli x6, x6, 11         # x6 = 0x800 (MPP_S 在 mstatus bits 12:11)
+    csrw mstatus, x6        # mstatus = 0x800 (MPP=01=PRIV_S, 其他 0)
 
-    mret                    # 0x24: M→S, pc=mepc=s_program
+    mret                    # M→S, pc=mepc=s_program
 
 s_program:
     # ---- S-mode 起步标记 ----
-    addi x10, x0, 1         # 0x28: x10 = 1
+    addi x10, x0, 1         # x10 = 1
 
     # ---- 设 sret 目标 = u_program ----
-    la   x7, u_program      # 0x2c-0x33: la (8 字节)
-    csrw sepc, x7           # 0x34: sepc = u_program
+    la   x7, u_program      # la (8 字节)
+    csrw sepc, x7           # sepc = u_program
 
     # ---- 设 sstatus.SPP = PRIV_U = 0 (sret 切 U 关键) ----
     # csrw sstatus, x0 写整个 sstatus = 0; SPP=0 即 PRIV_U; SIE=SPIE=SUM=MXR=0;
     # 不影响 mstatus 的 M-mode-only 字段 (MPP/MPIE/MIE 通过 SSTATUS_MASK 保护)
-    csrw sstatus, x0        # 0x38
+    csrw sstatus, x0
 
-    sret                    # 0x3c: S→U, pc=sepc=u_program
+    sret                    # S→U, pc=sepc=u_program
 
 u_program:
     # ---- U-mode 起步标记 (sret 真生效证据) ----
-    addi x11, x0, 2         # 0x40: x11 = 2
+    addi x11, x0, 2         # x11 = 2
 
     # ---- 触发 ecall (cause=8 from U) → trap deliver M ----
-    ecall                   # 0x44
+    ecall
 
     # ---- 不到此处 ----
 
 m_handler:
     # ---- M handler: 验 cause=8 ----
-    csrr x12, mcause        # 0x48: x12 = mcause (期望 8)
-    addi x13, x0, 8         # 0x4c: x13 = 8
-    bne  x12, x13, halt     # 0x50: x12 != 8 → halt (防御; 期望 fall through 因 cause=8)
+    csrr x12, mcause        # x12 = mcause (期望 8)
+    addi x13, x0, 8         # x13 = 8
+    bne  x12, x13, halt     # x12 != 8 → halt (防御; 期望 fall through 因 cause=8)
 
 halt:
-    # ---- 停机: csrw mtvec=0 + ecall 触发 triple fault 退出 dispatcher ----
-    csrw mtvec, x0          # 0x54: mtvec = 0
-    ecall                   # 0x58: ecall from M (cause=11) → 跳 0 → mmu fail → triple fault
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000      # test_dev base
+    li   x31, 0x5555        # FINISHER PASS magic
+    sw   x31, 0(x30)        # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 (main.c dump):
@@ -115,24 +83,11 @@ halt:
 #   x11 = 2                  (U 起步标记 — sret 真生效证据!)
 #   x12 = 8                  (mcause from U ecall, csrr 进 handler 时读)
 #   x13 = 8                  (比较寄存器)
-#   pc = 0                   (handler 末 ecall trap 跳 mtvec=0; 第 3 次 trap 候选 A 早 return)
-#   in_trap = 3              (triple fault)
-#   mcause = 11              (handler 末 ecall = ecall from M; 字段保留第 2 次)
-#   mtval = 0                (ecall tval=0)
-#   mepc = 0x80000058        (handler 末 ecall PC)
-#   mtvec = 0                (handler 自己清的)
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
 #   priv = 3                 (M; deliver_priv hard-code PRIV_M)
-#   mstatus = 0x1820         (推算: 详见上段 mstatus 推算时序; 实际跑出来核对)
-#     - MPP = M = 0b11 << 11 = 0x1800   (handler 末 ecall trap 设 MPP=caller=M)
-#     - MPIE = 0                          (旧 MIE = 0 → MPIE = 0)
-#     - MIE = 0                           (trap 入口 disable interrupt)
-#     - SPP = 0                           (sret 末段 reset)
-#     - SPIE = 1                          (sret 末段设; deliver M 路径不动 S 字段, 残留)
-#     - 0x1800 | 0x20 = 0x1820 ✓
-#   total_count: 待算 (跑出来核对)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证点:
-#   - x11 = 2 → sret 真生效 (没 sret 跑不到 0x40)
+#   - x11 = 2 → sret 真生效 (没 sret 跑不到 u_program)
 #   - x12 = 8 → cause=8 from U (ecall_from_U 跟 a_01_7 cause=8 编码一致)
-#   - mstatus.SPIE = 1 → sret 末段把 SPIE 设 1 (RV spec)
-#   - mstatus.SPP = 0 → sret 末段把 SPP reset 为 PRIV_U=0
+# (注: 绝对 pc / total_count / mstatus 终值见 REVIEW B.3 段; 不在断言内。)

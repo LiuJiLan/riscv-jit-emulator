@@ -1,5 +1,8 @@
 # a_01_8 / 05_sv32_hw_managed_ad
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker 内 hw-managed A/D —— PT init PTE.A=0 D=0; 经一次 store 后 walker 应
 # set A=1 + D=1 写回 PT。fixture 04 是 PTE.A=1+D=1 直接走 fast path; 05 让起步是 0,
@@ -58,7 +61,7 @@
 #      csrr mcause → x12 (期望 9)
 #      lui x14, 0x80101 → x14 = leaf_pt PA (M-mode BARE identity)
 #      lw  x15, 4(x14)  → x15 = leaf_pt[1] PTE 当前值 (期望 0x200800C7, A+D 都 1)
-#      ecall → triple fault halt
+#      test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -117,8 +120,9 @@ m_handler:
     lw   x15, 4(x14)                # x15 = leaf_pt[1] = 0x200800C7 (期望)
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → mmu fail → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -126,8 +130,11 @@ halt:
 #   x12 = 9              (ecall_from_S)
 #   x14 = 0x80101000     (leaf_pt PA)
 #   x15 = 0x200800C7     (PT 内 leaf_pt[1] 经 walker set A+D 后的值; 起步是 0x20080007)
-#   mcause = 11          (handler 末 ecall_from_M, 字段保留第 2 次)
-#   priv = 3, in_trap = 3
+#   x30 = 0x100000       (停机用 scratch: test_dev base)
+#   x31 = 0x5555         (停机用 scratch: FINISHER PASS magic)
+#   priv = 3
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x10 对 → sw → walker → host store 链路真走通 (而不是 walker 跳过没实际写)

@@ -1,7 +1,14 @@
 # a_01_10 / 03_rvc_arith
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 RVC 算术 + 逻辑 + 移位 case (~16 case, a_01_10 (7) step 1)。
+# (注: 原收尾靠 ecall → mtvec=0 fetch fail → triple fault (in_trap=3); a_03 Smdbltrp 后
+#  首个 trap 撞 MDT=1 即 abort, 改在 RVC 序列末尾追加 test_dev 干净停机替代跑飞。
+#  RVC 算出的寄存器值在停机前已落定, test_dev 停机不影响。原 in_trap=3 / mcause=1
+#  "二次 fetch 0 fail" 收尾叙事见 REVIEW B.3 段。)
 # 不含 sp-relative load/store: C.ADDI4SPN / C.LWSP / C.SWSP 留 fixture 06。
 # 控制流 (C.JAL/J/JR/JALR/BEQZ/BNEZ/EBREAK) 留 fixture 04-05。
 #
@@ -104,16 +111,14 @@ _start:
     c.li      x15, 12
     c.and     x15, x9               # x15 = 12 & 5 = 4 (验 C.AND; 期望 x15 = 4)
 
-    # ---- 退出 (BARE M-mode, mtvec=0, ecall chain in_trap=3 halt) ----
-    ecall                           # cause=11 from M → trap_set_state → mtvec=0 fetch fail → in_trap=3
+    # ---- 停机: test_dev FINISHER PASS (替代原跑飞进 fetch-fault) ----
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump (假设跑通):
-#   pc = 0 (regs[0] = mtvec = 0, fetch 0 fail 第二次写)
-#   x1 = 0 (ra 没动)
 #   x2 = 64 (sp, 0x40)
-#   x3 = 0 (gp 没动)
-#   x4..x7 = 0 (没动, hex 显示 0x00000000)
 #   x8 = 0x0F (ANDI: -1 & 0xF)
 #   x9 = 0x05 (LI 5; rs2 共用 for SUB/XOR/OR/AND; 不被它们改)
 #   x10 = 4 (SRLI; decimal)
@@ -128,16 +133,12 @@ _start:
 #   x19 = 0x00000010 (LI 1 + SLLI 4 = 16)
 #   x20 = 0x00000010 (MV from x19)
 #   x21 = 0x00000020 (LI 16 + ADD x19 = 32)
-#   x22..x31 = 0 (没动)
-#   in_trap = 3 (ecall_from_M chain to fetch fault + in_trap=3 halt)
-#   mcause = 1 (二次 trap = INST_ACCESS_FAULT, mtvec=0 fetch 0 fail; 候选 A 字段保留)
-#   mepc = 0 (二次 trap mepc, 因为 fetch 0 fail 时 pc 已是 0)
-#   mtvec = 0 (没设 mtvec, 默认 0)
-#   priv = 3 (M)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证点:
 #   - x10..x15 各 final 值符合 RVC 解码 + interpreter 执行结果
 #   - x16..x21 各 final 值符合 5-bit RVC 算术
 #   - x2 = 64 验 C.ADDI16SP
 #   - x8 / x9 (hex dump) 符合 ANDI / rs2 共用值
-#   - dispatcher count = 28 (15 case 中, NOP+ecall 也算; gcc 编出来后看具体)
+# (注: 绝对 pc / total_count / in_trap / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

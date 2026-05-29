@@ -1,5 +1,8 @@
 # a02_5 / 01_int_m_timer_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # M-mode timer interrupt 基本路径 — 端到端验证 (假设 mtime 在主动步进)。
 #
@@ -33,6 +36,7 @@ _start:
     sw      x0, 4(t0)               # 高 32 = 0
 
     # mstatus.MIE = 1 (bit 3); csrrsi 立即数 0x8 = (1<<3)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
     # 等待 timer interrupt fire 的 busy loop (handler 将设 s0=1 退出)
@@ -45,9 +49,11 @@ wait_loop:
     # ---- handler 返回后 ----
     mv      a0, s1                  # a0 = handler 保存的 mcause (期望 0x80000007)
 
-    # ---- halt: 清 mtvec + ecall 触发 triple fault ----
-    csrw    mtvec, x0
-    ecall
+    # ---- halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 保存 mcause 待 main 验证 (期望 0x80000007 = CAUSE_INTERRUPT_BIT | IRQ_M_TIMER)
@@ -68,13 +74,6 @@ m_handler:
 #   s0 (x8)  = 1            (handler 设置, 验证 handler 真跑)
 #   s1 (x9)  = 0x80000007   (handler 保存 mcause)
 #   a5 (x15) > 0            (wait_loop 至少跑一轮)
-#
-# 期望 trap dump:
-#   in_trap = 3             (halt path triple fault)
-#   mcause  = 1             (CAUSE_INST_ACCESS_FAULT 第 2 次保留; 路径:
-#                            ecall_from_M (cause 11, in_trap=1) → mtvec=0 → mmu fail pc=0
-#                            (cause 1, in_trap=2) → mmu fail again (cause 1, in_trap=3 早 return))
-#
-# trace 期望 (debug.h 互斥协议): 'cf' × N (主 setup 阶段 + wait_loop 多轮 check no fire)
-# → 'tf' (timer fire + refetch from mtvec) → 'cf' (handler 内 MIE=0 deliver_mask=0)
-# → 'Ef' × 3 (halt path ecall triple fault).
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

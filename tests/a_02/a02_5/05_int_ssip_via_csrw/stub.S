@@ -1,5 +1,8 @@
 # a02_5 / 05_int_ssip_via_csrw
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # SSIP 软件 inject path (S-mode 自己 csrw sip 设 SSIP, mideleg.SSIE=1 deliver S)。
 # 形态特点: 验证 SSIP 是 S-mode csrw sip 可写位 (spec §5.1.4: S-mode csrw sip 仅 SSIP 可写,
@@ -70,9 +73,10 @@ s_handler:
     sret
 
 m_handler:
-    # halt: ecall_from_S 到 M (medeleg=0 默认), 清 mtvec + ecall_from_M → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt: ecall_from_S 到 M (medeleg=0 默认) → test_dev 干净停机 (scratch x30/x31)
+    li      x30, 0x100000        # test_dev base
+    li      x31, 0x5555          # FINISHER PASS magic
+    sw      x31, 0(x30)          # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -80,3 +84,5 @@ m_handler:
 #   s0 = 1
 #   s1 = 0x80000001
 #   a5 > 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)

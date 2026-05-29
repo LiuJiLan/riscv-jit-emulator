@@ -1,5 +1,8 @@
 # a_01_8 / 06_sv32_load_page_fault
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker → trap 路径 (load page fault, cause 13)。
 #
@@ -28,7 +31,7 @@
 #      csrr x12, mcause           # 期望 13 (LOAD_PAGE_FAULT)
 #      csrr x13, mepc             # lw 指令 PC (期望 0x80000044, 见反汇编)
 #      csrr x14, mtval            # 期望 0x80001000 (lw 的 GVA)
-#      ecall halt → triple fault (但 mcause/mtval/mepc 会被第 2 次 trap 覆盖, GPR 保留)
+#      test_dev FINISHER PASS 干净停机
 
 .equ CSR_TOHOST, 0x800
 .equ CSR_PRIVRD, 0xCC0
@@ -76,18 +79,21 @@ m_handler:
     csrr x14, mtval                 # x14 = 0x80001000 (失败 lw 的 GVA)
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 干净停机: test_dev 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
 #   x10 = 0                  (lw 失败没写; 默认 0)
 #   x12 = 13                 (mcause = LOAD_PAGE_FAULT, csrr 到 GPR 保留)
-#   x13 = 0x80000044         (lw 指令 PC, 实际值看反汇编)
+#   x13 = 失败 lw 指令的 PC  (mepc; 绝对值随 codegen 漂, 不钉死)
 #   x14 = 0x80001000         (mtval = lw GVA)
-#   mcause = 11              (handler 末 ecall_from_M, 字段 in_trap=3 第 2 次保留)
-#   mtval  = 0               (ecall_from_M 不存 tval)
-#   priv = 3, in_trap = 3
+#   x30 = 0x100000           (停机用 scratch: test_dev base)
+#   x31 = 0x5555             (停机用 scratch: FINISHER PASS magic)
+#   priv = 3
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)
 #
 # 关键验证点:
 #   - x12 = 13 → walker 失败正确报 LOAD_PAGE_FAULT

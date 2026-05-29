@@ -1,7 +1,13 @@
 # a_01_9 / 01_m_ro_identity_csrs
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 5 个 M-mode RO Identity CSR (mhartid + misa + mvendorid + marchid + mimpid)。
+# (注: 原收尾靠 csrw mtvec,x0 + ecall 强制 triple fault; a_03 Smdbltrp 后 triple fault 变
+#  MDT abort, 改 test_dev 干净停机。所有 RO Identity csr 值在停机前已读入 x10-x15,
+#  test_dev 停机不影响这些值。原 triple-fault / mcause=11 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 测试组织: a_01_8 fixture 文件夹只放 a_01_8 主轴 fixture (SV32 walker); a01_9
@@ -35,10 +41,6 @@
 .option norvc
 .globl _start
 _start:
-    # ---- 设 M handler ----
-    la   x4, m_handler
-    csrw mtvec, x4
-
     # ---- 读 5 个 RO Identity CSR (csrr 编码: csrrs rd, csr, x0; new_val=0 不触发写) ----
     csrr x10, 0xF14         # mhartid; 期望 0
     csrr x11, 0x301         # misa;    期望 0
@@ -54,14 +56,10 @@ _start:
     csrw 0x301, x5          # csrw misa, x5
     csrr x15, 0x301         # 期望仍 0
 
-    ecall                   # cause=11 from M; trap deliver M handler
-
-m_handler:
-    # 不验 cause, 直接 halt (mcause 最终 = 11; trap dump 保留第 2 次, 即 handler 末 ecall)
-
-halt:
-    csrw mtvec, x0
-    ecall                   # cause=11 from M → mmu fail (mtvec=0) → triple fault
+    # ---- 停机: test_dev FINISHER PASS ----
+    li   x30, 0x100000      # test_dev base
+    li   x31, 0x5555        # FINISHER PASS magic
+    sw   x31, 0(x30)        # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望 main dump:
@@ -71,5 +69,6 @@ halt:
 #   x13 = 0    (marchid)
 #   x14 = 0    (mimpid)
 #   x15 = 0    (csrw misa 0xFFFFFFFF 后 csrr misa, 验 noop)
-#   mcause = 11 (handler 末 ecall_from_M, 字段保留第 2 次)
-#   priv = 3, in_trap = 3, mtvec = 0
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / mcause 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

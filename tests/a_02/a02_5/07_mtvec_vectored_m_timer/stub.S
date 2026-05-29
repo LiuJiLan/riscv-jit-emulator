@@ -1,5 +1,8 @@
 # a02_5 / 07_mtvec_vectored_m_timer
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # mtvec mode=1 vectored, M timer interrupt fire → pc = base + 4 * IRQ_M_TIMER (= base + 28)。
 # 跟 a02_5/01 区别: mtvec mode=1 (vectored) vs mode=0 (direct); 验 trap_set_interrupt_state
@@ -37,6 +40,7 @@ _start:
     li      s0, 0
     li      a5, 0
 
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8     # mstatus.MIE = 1
 
 wait_loop:
@@ -45,8 +49,11 @@ wait_loop:
 
     mv      a0, s1               # a0 = mcause from timer_handler
 
-    csrw    mtvec, x0
-    ecall                        # halt
+    # ---- halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000        # test_dev base
+    li      x31, 0x5555          # FINISHER PASS magic
+    sw      x31, 0(x30)          # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # vec_table 4 字节对齐 (mtvec.BASE 要求); 12 slot 覆盖 IRQ_*_EXT 最大位号 11
 .align 2
@@ -76,9 +83,11 @@ timer_handler:
     mret
 
 halt:
-    # 走到这里 = vectored 跳错 slot (不该发生; bug 兜底)
-    csrw    mtvec, x0
-    ecall
+    # 走到这里 = vectored 跳错 slot (不该发生; bug 兜底)。
+    # 兜底也走 test_dev FINISHER PASS, 但跑错 slot 会留 s0=0/a0=0 暴露 bug。
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
@@ -86,6 +95,8 @@ halt:
 #   s0 = 1
 #   s1 = 0x80000007
 #   a5 > 0            (wait_loop 至少跑一轮)
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证:
 #   - timer_handler 真跑 (s0=1 + s1=0x80000007) → vectored mode 跳到 base + 4*7 而不是 base

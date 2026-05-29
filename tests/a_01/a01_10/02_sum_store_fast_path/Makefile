@@ -5,7 +5,7 @@
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc
 OBJCOPY := $(TOOL)-objcopy
-CFLAGS  := -nostdlib -nostartfiles -ffreestanding -march=rv32im -mabi=ilp32 -mcmodel=medany
+CFLAGS  := -nostdlib -nostartfiles -ffreestanding -march=rv32im_zicsr_zifencei -mabi=ilp32 -mcmodel=medany
 # 注: -march=rv32im (去 a + c) — 同 a_01_8 / a_01_10 fixture 系列, RVC 完整后 cleanup。
 
 .PHONY: all clean

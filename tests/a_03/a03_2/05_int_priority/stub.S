@@ -1,5 +1,8 @@
 # a03_2 / 05_int_priority
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 完整 6-source 中断优先级 (RV Priv Spec §3.1.9 + U74-MC §8.9):
 #   M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER
@@ -26,14 +29,24 @@
 #   - clear STIP: csrw mip, 0 (清 STIP)
 #
 # ===== 期望结果 =====
-#   s4 = 0x8000000B (cause 11 = M_EXT) — iter 1
+#   s4 = 0x8000000B (cause 11 = M_EXT)  — iter 1
 #   s5 = 0x80000003 (cause 3  = M_SOFT) — iter 2
-#   s6 = 0x80000007 (cause 7  = M_TIMER) — iter 3
-#   s7 = 0x80000009 (cause 9  = S_EXT) — iter 4
-#   s8 = 0x80000001 (cause 1  = S_SOFT) — iter 5
-#   s9 = 0x80000005 (cause 5  = S_TIMER) — iter 6
+#   s6 = 0x80000009 (cause 9  = S_EXT)  — iter 3
+#   s7 = 0x80000001 (cause 1  = S_SOFT) — iter 4
+#   s8 = 0x80000005 (cause 5  = S_TIMER)— iter 5
+#   s9 = 0x80000007 (cause 7  = M_TIMER)— iter 6  (垫底; 见下注 1)
 #   s3 = 6 (handler 进入次数)
 #   s0 = 1 (退出 wait_loop)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注 1: M_TIMER (cause 7) 标准优先级应排第 3 (M_EXT>M_SOFT>M_TIMER>S_EXT>S_SOFT>S_TIMER),
+#  实跑却垫底。优先级编码器本身正确 (trap.c 即标准序); 真因 = MTIP 是 mip.MTIP=(mtime>=
+#  mtimecmp) 连续条件, 靠 timer 辅助线程异步 (~1ms wake) 推 mtime, 而其余 5 源 (MEIP/MSIP/
+#  SEIP_sw/SSIP/STIP) 全瞬时置位 → 轮到 M_TIMER 那刻 mtime 还没推过 mtimecmp=5, 编码器跳过
+#  选次高 (S_EXT), 等异步推过后 M_TIMER 才垫底 fire。即本 fixture 实测的是"异步 mtime 下的
+#  有效优先级序", 非纯静态优先级序。REVIEW 根因 (C) mtime 异步化。)
+# (注 2: 原停机靠 csrw mtvec=0 + ecall triple fault; a_03 Smdbltrp 后变 MDT abort, 改
+#  test_dev 干净停机。绝对 pc / total_count 见 REVIEW B.3 段。)
 
 .equ TEST_DEV_BASE,      0x00100000
 .equ TEST_DEV_SET_OFF,   0x40
@@ -80,13 +93,17 @@ _start:
     li      t0, 0x222;  csrw mip, t0
 
     # ---- 开 MIE → 下一 block trap_check fire 最高 (= M_EXT) ----
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
 wait_loop:
     beqz    s0, wait_loop
 
-    csrw    mtvec, x0
-    ecall                                  # halt
+    # halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31)
+    li      x30, 0x100000
+    li      x31, 0x5555
+    sw      x31, 0(x30)
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 # ============================================================================
 # m_handler — dispatch 6 cases, 每次清当前 cause 对应源 + 记 cause + mret

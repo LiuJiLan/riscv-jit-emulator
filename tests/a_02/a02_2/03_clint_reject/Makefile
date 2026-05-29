@@ -6,7 +6,7 @@
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc
 OBJCOPY := $(TOOL)-objcopy
-CFLAGS  := -nostdlib -nostartfiles -march=rv32imac -mabi=ilp32 -mcmodel=medany
+CFLAGS  := -nostdlib -nostartfiles -march=rv32imac_zicsr_zifencei -mabi=ilp32 -mcmodel=medany
 
 .PHONY: all clean
 all: out.bin

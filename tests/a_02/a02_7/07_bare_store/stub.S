@@ -1,5 +1,8 @@
 # a02_7 / 07_bare_store
 #
+# ===== 运行参数 =====
+# RUN-RELEASE
+#
 # ===== 测试目的 =====
 # perf 套件 3×2 之一 (bare/密集mmu/稀疏mmu × 纯load/纯store; fixture 06-11)。M-mode
 # bare 下每轮 8 条 sw 打同

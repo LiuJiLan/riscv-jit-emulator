@@ -4,7 +4,7 @@
 TOOL    := riscv64-unknown-elf
 CC      := $(TOOL)-gcc
 OBJCOPY := $(TOOL)-objcopy
-CFLAGS  := -nostdlib -nostartfiles -ffreestanding -march=rv32im -mabi=ilp32 -mcmodel=medany
+CFLAGS  := -nostdlib -nostartfiles -ffreestanding -march=rv32im_zicsr_zifencei -mabi=ilp32 -mcmodel=medany
 # -march=rv32im 同 04: 项目 RVC 完整实现是 a01_9 (7) 待办, 当前 decode 只识别
 # C.LI / C.ADDI 两个 RVC; 全程禁 c 让 gcc 只发 32-bit 指令。
 

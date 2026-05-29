@@ -1,8 +1,15 @@
 # a_01_10 / 07_cross_page
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 BARE M-mode 下 interpreter 跨页保护 (interpreter.c 内 page_mask 检测推进后跨页 →
 # goto out, dispatcher 重新 mmu_translate_pc 拿新 page hva 进新 block)。
+# (注: 原收尾靠 ecall → mtvec=0 fetch fail → triple fault (in_trap=3); a_03 Smdbltrp 后
+#  首个 trap 撞 MDT=1 即 abort, 改在第 2 页 cross_page 块末尾追加 test_dev 干净停机替代跑飞。
+#  跨页推进发生在 page_end_block → cross_page 之间, 与停机方式无关, 跨页验证点不受影响。
+#  原 in_trap=3 / mcause=1 收尾叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 模板风格: 纯 .S, BARE M-mode, 套 a_01_10/03-06 同形态。
@@ -44,16 +51,20 @@ page_end_block:
 cross_page:
     addi    x13, x0, 4                   # 0x80001000: x13 = 4 (第 2 页起点)
     addi    x14, x0, 5                   # 0x80001004: x14 = 5
-    ecall                                # 0x80001008: trap → mtvec=0 → fetch trap 链 → in_trap=3
+
+    # ---- 停机: test_dev FINISHER PASS (替代原跑飞进 fetch-fault) ----
+    li      x30, 0x100000                # test_dev base
+    li      x31, 0x5555                  # FINISHER PASS magic
+    sw      x31, 0(x30)                  # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
-# 期望 dump (M-mode, mtvec=0 默认):
+# 期望 dump (M-mode):
 #   x10 = 1   (_start: ADDI; 入口块 li)
 #   x11 = 2   (page_end_block 第 1 条 0xFF8 ADDI; 推进后 hva_pc=0xFFC 仍第 1 页, 不退出)
 #   x12 = 3   (page_end_block 第 2 条 0xFFC ADDI; 推进后 hva_pc=0x1000 跨页 → goto out)
 #   x13 = 4   (cross_page 第 1 条 0x1000 ADDI; 验 dispatcher 真重派发)
 #   x14 = 5   (cross_page 第 2 条 0x1004 ADDI)
-#   pc  = 0   (ecall trap_set_state 写 regs[0]=mtvec[PRIV_M]=0; 后续 fetch trap 链到 in_trap=3)
-#   in_trap = 3
-#   total_count = 6  (li + jal + 4 ADDI; ecall 触发 trap, SYNC_COUNT 在 trap_raise 之前
-#                     count 还没 ++, ecall 那条不计入)
+#   x30 = 0x100000 / x31 = 0x5555 (停机 scratch: test_dev base / FINISHER PASS magic)
+#
+# 停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
+# (注: 绝对 pc / total_count / in_trap 随 test_dev 收尾漂, 见 REVIEW B.3 段; 不在断言内。)

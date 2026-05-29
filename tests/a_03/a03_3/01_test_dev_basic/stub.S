@@ -1,5 +1,8 @@
 # a03_3 / 01_test_dev_basic
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # test_dev MMIO fanout 端到端 (T3 step A 验收 fixture):
 #   1. 配 PLIC: priority[3]=1, threshold[ctx0]=0, enable[ctx0][word0] bit3=1
@@ -12,7 +15,7 @@
 #        - sw TEST_DEV_CLEAR_OFF(t1), 3 → device_clear_pending(3)
 #        - sw complete @ PLIC_BASE+0x200004, 3 → PLIC 清 sources[3].claimed
 #        - mret
-#   5. 主流程退 ecall → triple fault (mtvec 清后 ecall 走 0 取指 fault, 跟 a_02 halt 同)
+#   5. 主流程退 → test_dev sifive FINISHER PASS 干净停机 (exit_code=0)
 #
 # 跟 a_03_2/01 的本质同体例 (step B 切后 a_03_2/01 也用 test_dev MMIO); 此 fixture 是
 # step A 新建的 test_dev 验收入口, 跟 a_03_2/01 跑通效果等价, 留 a_03 收尾 milestone
@@ -44,6 +47,7 @@ _start:
     csrw    mie, t0
 
     # mstatus.MIE = 1 (bit 3)
+    csrw    0x310, x0               # mstatush 清 MDT (A.7 prelude; 否则下条 MIE 写被强制 0)
     csrrsi  x0, mstatus, 0x8
 
     # ---- 配 PLIC: priority[3]=1 ----
@@ -77,9 +81,12 @@ wait_loop:
     mv      a0, s1
     mv      a1, s2
 
-    # halt: 清 mtvec + ecall → triple fault
-    csrw    mtvec, x0
-    ecall
+    # halt: test_dev sifive FINISHER PASS → 干净停机, exit_code=0
+    # 注: 替代旧 triple-fault 停机 (Smdbltrp MDT abort 后不再可用)
+    li      t2, 0x00100000          # TEST_DEV_BASE
+    li      t3, 0x5555              # FINISHER_PASS
+    sw      t3, 0(t2)               # sifive FINISHER off 0
+1:  j       1b                      # 防 fall-through: SRS=0 下个 block 边界退
 
 m_handler:
     # 验 mcause = INT_BIT | IRQ_M_EXT (11) = 0x8000000B
@@ -110,9 +117,9 @@ m_handler:
 #   s2 = 3
 #   a5 > 0
 #
-# 期望 trap dump (halt 路径 triple fault, 跟 a_02 halt 同):
-#   in_trap = 3                 (ecall + mtvec=0 → 取指 fault)
-#   mcause  = 1                 (CAUSE_INST_ACCESS_FAULT)
+# 期望停机 (test_dev sifive FINISHER PASS):
+#   shell 退出码 $? = 0
+#   [dispatcher] halted: ... (SRS=0 退主循环)
 #
 # 不期望:
 #   - 任何 [bus] CAUSE_*_ACCESS_FAULT (test_dev / plic 不该产 fault)

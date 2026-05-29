@@ -1,7 +1,12 @@
 # a_02_2 / 06_sv32_clint_reject
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 经 mmu 翻译后到 CLINT 内部 reject 路径 (a_02_2/03 BARE 版的 SV32 版本)。
+# (注: 原 m_halt 用 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改
+#  test_dev 干净停机, 旧 triple-fault / in_trap=3 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 跟 a_02_2/03 比, 多走一遍 walker; clint_read/write 内部判 reject 行为应一致。
@@ -69,8 +74,8 @@ s_target:
     addi x4, x4, 4
     lw   x6, 0(x4)
 
-    # case 4 后 handler 内 detect s0==5 → 不 mret, M-mode 内 halt; 不需要 S phase
-    # 后续 csrw mtvec 0 + ecall (S 不能 csrw mtvec)。防御: 真跑到 = handler 没正确
+    # case 4 后 handler 内 detect s0==5 → 不 mret, 在 handler 内 (M-mode) 走 test_dev
+    # 干净停机 (m_halt), 不回 S phase。防御: 真跑到 = handler 没正确
     # detect halt, 走 ebreak 留 debug 信号。
     ebreak
 
@@ -115,11 +120,14 @@ epilogue:
 
 # ----------------------------------------------------------------------------
 # m_halt — case chain 完成后从 handler 直接走 halt 路径 (still in M-mode); 跟
-# a_02_2/05 同形态。
+# a_02_2/05 同形态。test_dev FINISHER PASS 干净停机。
+# (停机 scratch 借用 x30/x31 — 此处 epilogue 已不再用它们, 复用安全。)
 # ----------------------------------------------------------------------------
 m_halt:
-    csrw mtvec, x0
-    ecall
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                         # 防 fall-through 落进后续代码 (dispatcher 下个 block 末退)
 
 # ===== 期望结果 =====
 # 期望 main.c dump (跟 a_02_2/03 一致):
@@ -131,4 +139,6 @@ m_halt:
 #   a5 (x15) = 0x02000004         case 4 mtval
 #   s0 (x8)  = 5
 #   s1 (x9)  = 33                 (4*7 + 5)
-#   in_trap=3 mcause=11 priv=3
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)

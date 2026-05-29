@@ -1,8 +1,13 @@
 # a_02_2 / 07_sv32_leaf_pt_in_mmio
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # 验 SV32 walker level=0 PT 落 CLINT (MMIO) 区时报 access fault (cause 5; load 路径)
 # — a_01_8/08 (PT 落完全 RAM 外 0xC0000000) 的 MMIO 版本。
+# (注: 原 halt 用 csrw mtvec,x0 + ecall → triple fault 停机; a_03 Smdbltrp 后改
+#  test_dev 干净停机, 旧 triple-fault / in_trap=3 叙事见 REVIEW B.3 段。)
 #
 # ===== 思路 =====
 # 验证 mmu_walk 内 IS_GPA_RAM(pte0_pa) 检查对 "PT 落 MMIO" 跟 "PT 落完全不存在" 行为
@@ -62,8 +67,11 @@ m_handler:
     csrr x14, mtval                 # x14 = 0x90000000
 
 halt:
-    csrw mtvec, x0
-    ecall                           # cause=11 from M → triple fault
+    # ---- 停机: test_dev FINISHER PASS (M-mode BARE) ----
+    li   x30, 0x100000              # test_dev base
+    li   x31, 0x5555                # FINISHER PASS magic
+    sw   x31, 0(x30)                # 置 exit_code=0 + SRS=0, dispatcher 退主循环
+1:  j    1b                         # 防 fall-through 落进 setup_pt (dispatcher 下个 block 末退)
 
 # ===== 期望结果 =====
 # 期望 main.c dump:
@@ -71,4 +79,6 @@ halt:
 #   x12 = 5                        (LOAD_ACCESS_FAULT)
 #   x13 = 失败 lw 的 PC            (mepc; 看反汇编, 在 s_target 内)
 #   x14 = 0x90000000               (mtval = 失败 lw 的 GVA)
-#   in_trap=3 mcause=11 priv=3
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0
+# (注: 绝对 pc / total_count 见 REVIEW B.3 段; 不在断言内。)

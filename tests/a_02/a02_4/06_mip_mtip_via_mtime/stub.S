@@ -1,9 +1,13 @@
 # a02_4 / 06_mip_mtip_via_mtime
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # mip.MTIP 合成路径验证 — clint_timer_pending 内 (mtime ≥ mtimecmp[hartid]) 派生.
 # 验证 clint_init mtimecmp 初值 UINT64_MAX (不是 0; 否则 0>=0 → spurious MTIP).
 # RV Priv Spec §3.2.1 `>=` 边界 (mtime==mtimecmp 仍 pending).
+# (注: 改 test_dev 停机, 旧叙事见 REVIEW B.3)
 #
 # ===== 思路 =====
 # **重要**: timer 辅助线程异步累加 mtime 后, guest sw 写 mtime=100 是瞬态值; 任一
@@ -46,7 +50,10 @@ _start:
     sw      t1, 0(t0)                             # mtimecmp[31:0] = 100
     csrr    a4, mip                               # a4 = 0x80
 
-    ecall
+    # ---- 停机: test_dev FINISHER PASS ----
+    li      x30, 0x100000                         # test_dev base
+    li      x31, 0x5555                           # FINISHER PASS magic
+    sw      x31, 0(x30)                            # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望寄存器 a3 不严格确定 (取决于 timer wake 时机):
@@ -60,8 +67,8 @@ _start:
 #   a2 (x12) = 0x00000080   写 mtimecmp=50,  mtime≥50  → MTIP=1 (1<<7)
 #   a3 (x13) = 0 or 0x80    写 mtimecmp=200, MTIP 取决 wake 时机 (见上)
 #   a4 (x14) = 0x00000080   写 mtimecmp=100, mtime≥100 → MTIP=1
-#
-# halt: ecall.
+#   x30 = 0x100000 / x31 = 0x5555  (停机 scratch)
+#   停机 = test_dev FINISHER PASS → exit 0
 #
 # 长期 TODO: 真要严格验 a3=0 要把 fixture 拆成 "短时间窗口内串完 step 3-4-5"
 # 或用 csrw 直接屏蔽 MTIE 测合成读 (而不是 sw mtimecmp).

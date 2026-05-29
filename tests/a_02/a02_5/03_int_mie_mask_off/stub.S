@@ -1,5 +1,8 @@
 # a02_5 / 03_int_mie_mask_off
 #
+# ===== 运行参数 =====
+# RUN-EXPECT-EXIT: 0
+#
 # ===== 测试目的 =====
 # mstatus.MIE = 0 时不触发 trap (验全局 IE 屏蔽; trap_check_interrupt 内 deliver_mask = 0)。
 #
@@ -43,18 +46,17 @@ busy_loop:
     # 验 mcause 没变 (没有 trap 发生)
     csrr    a1, mcause              # 期望 a1 = 0
 
-    # halt: ecall (cause=11; mtvec=0 默认 → fetch 0 fail → triple fault)
-    ecall
+    # ---- halt: test_dev FINISHER PASS 干净停机 (scratch x30/x31) ----
+    li      x30, 0x100000           # test_dev base
+    li      x31, 0x5555             # FINISHER PASS magic
+    sw      x31, 0(x30)             # 置 exit_code=0 + SRS=0, dispatcher 退主循环
 
 # ===== 期望结果 =====
 # 期望最终寄存器:
 #   a0 = 0x80                (mip.MTIP=1, 合成读看到; 但 IE 屏蔽不 trap)
-#   a1 = 0                   (mcause; trap 没发生过 (handler ecall 第 2 次 trap 后 cause=11
-#                              但本 fixture halt 之后才发生, csrr a1 时仍 0))
-#
-# 期望 trap dump:
-#   in_trap = 3              (halt 的 ecall 触发 triple fault)
-#   mcause  = 11             (halt 的 ecall_from_M; 字段保留第 2 次)
+#   a1 = 0                   (mcause; 全程无 trap; test_dev 干净停机不产生 trap, mcause 仍 0)
+#   x30 = 0x100000 / x31 = 0x5555 (停机用 scratch: test_dev base / FINISHER PASS magic)
+#   停机 = test_dev FINISHER PASS → exit code 0 (SRS=0 退主循环, 非 trap / abort)
 #
 # 关键验证:
 #   - 整个 busy_loop 期间没有 trap 跳 (a0 csrr 在 busy_loop 完成后才执行, 跟 mcause=0 一起证实)
