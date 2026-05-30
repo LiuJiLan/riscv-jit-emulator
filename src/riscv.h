@@ -155,7 +155,7 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 // 拆 per-hart 私有 + 多 hart 共享 两组:
 //   per-hart (mhartid + misa): cpu_info_per_hart_t 嵌入 cpu_t (cpu.h); cpu_create 入参写入;
 //                               异构 SMP 时不同 hart 字段值不同 (e.g. 1×MU + 4×MSU)。
-//                               015 dual storage: mhartid 同时窄化写 cpu_t.hartid (uint32_t)
+//                               dual storage: mhartid 同时窄化写 cpu_t.hartid (uint32_t)
 //                               服务 clint/plic/wfi index 用, CSR 读仍走 per_hart_info 字段。
 //   共享 (mvendorid + marchid + mimpid): cpu_info_shared_t struct + cpu.c static const
 //                                         cpu_info_shared_default; cpu_t 持指针; 机器整体属性。
@@ -207,7 +207,7 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //
 // trap_set_exception_state 按 _medeleg.bit(cause) / trap_set_interrupt_state 按
 // mideleg.bit(cause_low) 派发 deliver_priv = S 时写 [PRIV_S] 槽; sret 路径跟 mret 反操作
-// 同形态 (priv=SPP, SIE=SPIE, SPIE=1, SPP=PRIV_U, pc=sepc, in_trap=0)。
+// 同形态 (priv=SPP, SIE=SPIE, SPIE=1, SPP=PRIV_U, pc=sepc)。
 #define CSR_SSTATUS    0x100U
 #define CSR_SEPC       0x141U
 #define CSR_SSCRATCH   0x140U          /* S-mode scratch (xscratch[PRIV_S]) */
@@ -295,11 +295,11 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 //   - SSTATUS_MASK                    (sstatus = mstatus 的 masked view)
 //   - SD (RV32 真启用 + RV64 #if 0)   (future-proof; FS/XS 真做时联动)
 //   - UXL/SXL (RV64 #if 0)            (future-proof; 切 RV64 时启用)
-// MDT / SDT (Smdbltrp / Ssdbltrp 扩展, 项目已实装 a_03_session_011 起): 见上方
+// MDT / SDT (Smdbltrp / Ssdbltrp 扩展, 项目已实装): 见上方
 // MSTATUS_SDT / MSTATUSH_MDT 段; 写规则 + trap 行为详 csr.c / trap.c.
 //
 // 其余 (UBE / MPRV / TVM / TSR / mstatush.SBE/MBE/GVA/MPV/MPELP 等) 真用时再加;
-// TW 015 起已加 (服务 WFI mstatus.TW 检查)。
+// TW 已加 (服务 WFI mstatus.TW 检查)。
 //
 // 命名风格:
 //   单 bit 字段: <field>_SHIFT + <field>            (single-bit mask)
@@ -318,9 +318,9 @@ typedef uint64_t u64_t;     /* RV spec 钉死 64-bit; 不跟 XLEN, 切 RV64 不�
 
 // TW (Timeout Wait, bit 21): mstatus M-mode 字段; RV spec §3.1.6.5.
 //   priv < M 执行 WFI 时若 TW=1, 实现必须在"有限时间内"trap illegal instruction;
-//   spec 允许 timeout=0 (立即 trap), 015 实装走最严格 timeout=0 路径。
+//   spec 允许 timeout=0 (立即 trap), 实装走最严格 timeout=0 路径。
 //   M-mode WFI 不受 TW 影响 (M 自己的事)。运用场景: M-mode firmware / hypervisor
-//   通过 TW 拦截低 priv WFI, 防 OS 关全部 sie + WFI hang 核 (详 plan / session log)。
+//   通过 TW 拦截低 priv WFI, 防 OS 关全部 sie + WFI hang 核 (详 plan / trade_off_log)。
 #define MSTATUS_TW_SHIFT    21U
 #define MSTATUS_TW          (1U << MSTATUS_TW_SHIFT)          /* = 0x00200000 */
 

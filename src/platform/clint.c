@@ -64,7 +64,7 @@ static struct {
 // per-hart MTIP cache slot (dummy.txt §14)
 // ----------------------------------------------------------------------------
 //
-// 015 引入: csr_mip_read 合成 MTIP 之前是 is_clint_timer_pending 内 2 atomic_load
+// 由来: csr_mip_read 合成 MTIP 之前是 is_clint_timer_pending 内 2 atomic_load
 // (mtime + mtimecmps[hartid]) + 比较; 升级成 writer 维护 atomic cache 后, reader
 // 单 atomic_load(mtip[hartid]), 跟 PLIC ctx_eip 同体例。
 //
@@ -307,13 +307,13 @@ static void *timer_run(void *arg) {
         }
 
         // release 跟 consumer (clint_read mtime) 的 acquire-load 配对, 建立
-        // happens-before。is_clint_timer_pending 015 起读 mtip cache, 不直读 mtime;
+        // happens-before。is_clint_timer_pending 读 mtip cache, 不直读 mtime;
         // mtip cache 由下面 recompute_all_mtip 维护 (内部 atomic_store release)。
         atomic_fetch_add_explicit(&clint.mtime,
                                   (uint64_t)TIMEBASE_PER_WAKE,
                                   memory_order_release);
 
-        // 015 加: mtime 涨之后, 对每 hart 重算 MTIP (是 cache; 翻 0→1 时调 wfi_kick
+        // mtime 涨之后, 对每 hart 重算 MTIP (是 cache; 翻 0→1 时调 wfi_kick
         // 唤醒可能 WFI 的 hart)。每 hart 进自己 mtip_lock, 不互相串行。
         clint_recompute_all_mtip();
     }
@@ -343,7 +343,7 @@ int clint_init(void) {
         atomic_store_explicit(&clint.msip[i],      0,          memory_order_relaxed);
     }
 
-    // 015 加: per-hart MTIP cache slot 初始化 (dummy.txt §14)
+    // per-hart MTIP cache slot 初始化 (dummy.txt §14)
     // mtip 初值 0 (mtimecmp 是 UINT64_MAX 哨兵, mtime=0 < UINT64_MAX → mtip=0 一致);
     // mtip_lock 调 pthread_mutex_init, 失败走 runtime signal 通道。
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
@@ -399,7 +399,7 @@ void clint_destroy(void) {
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
         atomic_store_explicit(&clint.mtimecmps[i], 0, memory_order_relaxed);
         atomic_store_explicit(&clint.msip[i],      0, memory_order_relaxed);
-        // 015 加: 销毁 per-hart mtip_lock (dummy.txt §14 + §12 init/destroy 配对)。
+        // 销毁 per-hart mtip_lock (dummy.txt §14 + §12 init/destroy 配对)。
         // 必须在 timer_thread join 之后调 (timer thread tick 调 recompute_mtip 持锁);
         // main.c 退出顺序: clint_join_timer_thread → 各 destroy chain → clint_destroy,
         // 即此时 timer thread 已退, 无 race。
@@ -469,7 +469,7 @@ int is_clint_msip_pending(uint32_t hartid) {
 
 int is_clint_timer_pending(uint32_t hartid) {
     if (hartid >= MAX_HARTS) return 0;
-    // 015 起改成单 atomic_load: writer (timer thread / clint_write mtime|mtimecmp)
+    // 单 atomic_load: writer (timer thread / clint_write mtime|mtimecmp)
     // 都接了 clint_recompute_mtip 钩子维护 mtip cache, reader 不再每次比 mtime/mtimecmps,
     // 跟 PLIC ctx_eip 同体例 (dummy.txt §14 + trade_off_log §T.6 同源思路)。
     // acquire 跟 recompute 内 atomic_store release 配对建立 happens-before。

@@ -97,7 +97,7 @@ static struct {
     } contexts[PLIC_N_CONTEXTS];
     int8_t            plic_ctx_map[MAX_HARTS * 4];        /* index = hartid<<2+priv; -1 = 没连线 */
     int8_t            plic_ctx_to_hartid[PLIC_N_CONTEXTS]; /* 反查: ctx_id → hartid; -1 = 未绑定;
-                                                              015 加, 服务 wfi_kick on eip 0→1 */
+                                                              服务 wfi_kick on eip 0→1 */
     pthread_rwlock_t  lock;
 } plic;
 
@@ -253,7 +253,7 @@ static void plic_recompute_ctx_eip_locked(uint32_t ctx_id) {
     int v_new = plic_ctx_has_pending_locked(ctx_id);
     int v_old = atomic_load_explicit(&plic_ctx_eip[ctx_id], memory_order_relaxed);
     atomic_store_explicit(&plic_ctx_eip[ctx_id], v_new, memory_order_release);
-    // 015 加: ctx eip 0→1 翻转 → 唤醒该 ctx 对应 hart (可能在 WFI cond_wait)。
+    // ctx eip 0→1 翻转 → 唤醒该 ctx 对应 hart (可能在 WFI cond_wait)。
     //
     // ctx → hartid 走 plic_ctx_to_hartid[] 反查表 (plic_init 跟 plic_ctx_map 同处填);
     // 未绑定 (-1) 跳过 (合法状态, 例如 U/VS 槽当前都 -1)。
@@ -564,7 +564,7 @@ int plic_init(void) {
     for (uint32_t i = 0; i < MAX_HARTS * 4u; i++) {
         plic.plic_ctx_map[i] = -1;
     }
-    /* 015 加: 反查表 plic_ctx_to_hartid 全 -1 init, 服务 wfi_kick on eip 0→1 */
+    /* 反查表 plic_ctx_to_hartid 全 -1 init, 服务 wfi_kick on eip 0→1 */
     for (uint32_t c = 0; c < PLIC_N_CONTEXTS; c++) {
         plic.plic_ctx_to_hartid[c] = -1;
     }

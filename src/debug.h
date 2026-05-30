@@ -59,7 +59,7 @@ extern uint32_t debug_cnt;
 //                          (WFI 事件 trace 字符 'w' / 'S' / 'W'; interpreter / wfi 用;
 //                           独立 gate — 跟 DEBUG_TRACE_ON 解耦, 因 WFI 事件粒度稀疏,
 //                           fixture 测试时可单开 WFI trace 不要全 instruction trace,
-//                           或反过来全开 trace 但关 WFI; 015 拆出独立 gate)
+//                           或反过来全开 trace 但关 WFI; 独立 gate)
 //   DEBUG_PERF_ON        — dispatcher [perf] 主循环计时行 (dispatcher.c 内 #ifdef)
 //   DEBUG_CPU_DUMP_ON    — cpu_destroy 内 CPU 寄存器/trap/state dump (cpu.c cpu_dump)
 //   DEBUG_CLINT_TIMER_ON — [clint timer] stopped 行 (clint.c timer_log_stop)
@@ -152,7 +152,7 @@ extern uint32_t debug_cnt;
 // DEBUG_TRACE_WFI_ON gate — WFI 事件 trace 字符 (独立于 DEBUG_TRACE_ON)
 // ----------------------------------------------------------------------------
 //
-// 015 拆出独立 gate, 因 WFI 事件 (case OP_WFI 入口 / 进 cond_wait / wfi_wait 返回)
+// 独立 gate, 因 WFI 事件 (case OP_WFI 入口 / 进 cond_wait / wfi_wait 返回)
 // 是 hart-coarse 事件 (单 fixture 通常只几次), 跟 dispatcher fetch/check 字符的
 // 粒度差几个数量级。独立 gate 让 fixture 测试可以:
 //   - 只开 WFI trace, 不打 fetch/check 海量字符 — 验 WFI 行为不被噪声淹

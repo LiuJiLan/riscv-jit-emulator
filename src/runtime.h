@@ -81,7 +81,7 @@
 // host-side stdin raw mode (line-buffered → char-by-char):
 //   - runtime 持有 host stdin termios 配置 — termios 是 process 唯一资源, 不是
 //     UART guest 模型内部状态; 归 runtime 跟 SDS/SRS / signal handler 同质
-//     (都是 host process 级生命周期管理)。详 session_012 chat 决策。
+//     (都是 host process 级生命周期管理)。
 //   - runtime_stdin_enter_raw: isatty 检 + tcgetattr 备份 + cfmakeraw +
 //     tcsetattr; isatty=0 (pipe/file input) 或 tcsetattr fail 一律退化 cooked
 //     (fprintf 一行不 fatal, plan tcsetattr fail 选项 A)

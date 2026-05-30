@@ -27,7 +27,7 @@
 // ----------------------------------------------------------------------------
 // trap_set_exception_state —— 架构语义层 (sync exception 路径), 不长跳
 //
-// in_trap 字段废除 (a_03_session_011), 改走 spec-defined MDT/SDT 路径:
+// spec-defined MDT/SDT 路径 (无独立 in_trap 嵌套计数字段):
 //   S-trap entry: 若 sstatus.SDT=1, unexpected trap (Ssdbltrp §4.1.1.5) →
 //                 升级到 M-mode, cause=CAUSE_DOUBLE_TRAP, mtval2=原 tval, tval=0
 //   M-trap entry: 若 mstatus.MDT=1, unexpected trap (Smdbltrp §3.1.6.2) →
@@ -283,19 +283,10 @@ int trap_check_interrupt(cpu_t *hart) {
     else if (ready & (1u << IRQ_S_SOFT))  irq = IRQ_S_SOFT;
     else                                  irq = IRQ_S_TIMER;
 
-    // [TODO] a_03_session_011 in_trap 字段废除后, trap_check_interrupt 返值从
-    // "透传 in_trap 当前值" 退化为常量 1. 当前 trap_set_interrupt_state 也总返
-    // 1 (deliver-OK / critical-error 同值), caller (dispatcher) 也不区分 —
-    // 都 continue 让 while(SRS==0) 接管。
-    //
-    // 是否要改:
-    //   - 现状已满足 caller 需求 (二值 0/非0 就够 — 跟 mmu_translate_pc 接口
-    //     约定一致), 不改也行。
-    //   - 透传 trap_set_*_state 返值比 (void)cast + return 1 略直观 (表达"返
-    //     值来自下层 helper"); 实际值仍是 1, 没行为差异。
-    //   - 未来若 trap_set_*_state 引入多状态值 (e.g. 2=critical-error 区分
-    //     deliver-OK), 透传自然受益; 当前二值无差异。
-    // 当前选透传 (轻微改善), 未来视需求再细分状态码。
+    // 透传 trap_set_interrupt_state 返值 (恒 1: deliver-OK / critical-error 同值,
+    // caller dispatcher 不区分, 都 continue 让 while(SRS==0) 接管)。透传比
+    // (void)cast + return 1 略直观 (表达"返值来自下层 helper"); 未来 set_*_state
+    // 若引入多状态码 (e.g. 2=critical-error) 透传自然受益。
     return trap_set_interrupt_state(hart, irq);
 }
 

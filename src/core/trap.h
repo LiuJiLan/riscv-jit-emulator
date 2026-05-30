@@ -27,7 +27,7 @@
 //   - "_" 前缀: 物理存储是 64 位但 csr 入口拆 32 位访问的字段 (_mstatus); csr 大 switch
 //     的 mstatus / mstatush 入口映射到 _mstatus 的低/高半边。
 //
-// helper 形态 (a_03_session_011 起改 spec-defined MDT/SDT 路径; 详 trap.c):
+// helper 形态 (spec-defined MDT/SDT 路径; 详 trap.c):
 //   trap_set_exception_state(hart, cause, tval) -> int
 //     算 deliver_priv 后, 检 sstatus.SDT (S-trap entry, SDT=1 升级 M cause=DOUBLE_TRAP
 //     mtval2=原 tval) + 检 mstatus.MDT (M-trap entry, MDT=1 critical-error abort);
@@ -110,8 +110,8 @@ typedef struct {
     //   reset 初值 MDT=1, SDT=1 (spec §3.1.6.2 / §4.1.1.5)。详 csr.c 写规则 + trap.c
     //   MDT/SDT 检查路径。
     // _medeleg: priv spec 1.12 定义 medelegh (0x312) 为 RV32 高 32 位入口, 物理 64 位
-    //   存 cause bitmap (RV64 单入口整体访问)。a_03_session_011 起 medelegh 入口实装
-    //   (跟 mstatush 平行), 字段类型 uint64_t 已 RV64-ready。
+    //   存 cause bitmap (RV64 单入口整体访问)。medelegh 入口实装 (跟 mstatush 平行),
+    //   字段类型 uint64_t 已 RV64-ready。
     //   trap_set_exception_state 按 _medeleg.bit(cause) 派发 deliver_priv (U/S-mode trap +
     //   bit=1 → deliver S, 否则 deliver M; M-mode trap 总 M)。
     u64_t     _mstatus;
@@ -152,10 +152,9 @@ typedef struct {
     // 破坏 "本 hart 单线程访问 _mip_sw" 前提, 真做时需改 _Atomic + atomic 路径。
     uxlen_t   _mip_sw;         // csr 入口 mip (0x344) / sip (0x144) 软件可写子集
 
-    // (a_03_session_011 起 in_trap 字段废除, 改走 spec-defined MDT/SDT: mstatus.MDT
-    // 在 _mstatus bit 42 / sstatus.SDT 在 _mstatus bit 24, trap.c S/M-trap entry 检
-    // SDT/MDT 字段, SDT=1 升级到 M cause=DOUBLE_TRAP, MDT=1 → critical-error abort.
-    // 详 trap.c 注释 + dispatcher.c 末段历史段)。
+    // Double Trap 状态走 spec-defined MDT/SDT (无独立 in_trap 嵌套计数字段): MDT 在
+    // _mstatus bit 42 / SDT 在 _mstatus bit 24, trap.c S/M-trap entry 检 SDT/MDT 字段,
+    // SDT=1 升级到 M cause=DOUBLE_TRAP, MDT=1 → critical-error abort。详 trap.c。
 } trap_csrs_t;
 
 
@@ -167,7 +166,7 @@ typedef struct {
 //   - dispatcher.c IALIGN 兜底 (dummy.txt §9 单一源)
 //   - trap_raise_exception 内部 (复用本 helper 的"写字段+计数")
 //
-// 行为 (a_03_session_011 起 spec-defined MDT/SDT 路径):
+// 行为 (spec-defined MDT/SDT 路径):
 //   deliver_priv = (caller == M) ? M : (_medeleg.bit(cause) ? S : M);
 //   if (deliver_priv == S && sstatus.SDT == 1) {     /* Ssdbltrp §4.1.1.5 */
 //       mtval2 = tval; cause = DOUBLE_TRAP; tval = 0; deliver_priv = M;

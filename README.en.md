@@ -2,6 +2,10 @@
 
 English | [简体中文](./README.md)
 
+> **Note:** this English README lags behind the project state — it currently
+> reflects roughly the a_02 close. The [简体中文](./README.md) version is the
+> authoritative, up-to-date one; this translation is refreshed less often.
+
 A graduate-level user-space RISC-V JIT emulator, targeting RV32 G plus the
 standard compressed extension C, with the goal of booting OpenSBI / small OSes /
 FreeRTOS-with-MMU. Milestone a_02 (the interpreter + bus/MMIO stage) is closed

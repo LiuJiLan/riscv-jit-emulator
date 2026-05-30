@@ -51,7 +51,7 @@
 #include "core/cpu.h"
 #include "core/decode.h"
 #include "core/dispatcher.h"
-#include "core/wfi.h"          // wfi_init / wfi_destroy (015 WFI 唤醒框架; wfi_kick_all 016+17-chat 拍不调, 见 L606 trail)
+#include "core/wfi.h"          // wfi_init / wfi_destroy (WFI 唤醒框架; wfi_kick_all 不调用, 见 wfi.h doc)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -279,7 +279,7 @@ static int decode_test(void) {
     // C.EBREAK = 0x9002 (C2 funct3=100 bit12=1+rs1=0+rs2=0)
     CASE(0x9002, OP_EBREAK, /*rd*/0, /*rs1*/0, /*rs2*/0, 0, 0x9002, PC_STEP_NONE);
 
-    // ---- RV32M (10 case: 8 happy + 2 funct7 silent miscompile reject; 016 实装) ----
+    // ---- RV32M (10 case: 8 happy + 2 funct7 silent miscompile reject) ----
     //
     // R-type opcode 0x33 funct7=0x01 dispatch by funct3 (小 plan A.1):
     //   funct3=0 MUL    / 1 MULH  / 2 MULHSU / 3 MULHU
@@ -306,7 +306,7 @@ static int decode_test(void) {
     // REMU   x22, x23, x24 = 0x038BFB33
     CASE(0x038BFB33, OP_REMU,   /*rd*/22, /*rs1*/23, /*rs2*/24, 0, 0x038BFB33, PC_STEP_RV);
 
-    // funct7 silent miscompile reject 2 case (small_plan A.1 修复验证):
+    // funct7 silent miscompile reject 2 case (修复验证):
     //   - funct7=0x02 + funct3=0: 之前老代码 funct3=0 不查 funct7 → 当 OP_ADD 跑乱; 现 OP_UNSUPPORTED。
     //   - funct7=0x20 + funct3=2: 之前 funct3=2 老代码不查 funct7 → 当 OP_SLT 跑乱; 现 OP_UNSUPPORTED
     //                              (RV ISA Table 24.1: funct7=0x20 仅 funct3=0/5 合法)。
@@ -537,7 +537,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 015 加: WFI 唤醒框架 init (core/wfi.h; 每 hart 一 pthread_mutex + cond)。
+    // WFI 唤醒框架 init (core/wfi.h; 每 hart 一 pthread_mutex + cond)。
     // 必须在 clint_start_timer_thread 之前 — timer thread 一旦开始 tick 就会
     // 调 clint_recompute_all_mtip → 可能 wfi_kick(i), 那时 wfi_slots 必须已 init。
     // 同理 plic 任何 device_set_pending 路径会调 plic_recompute_ctx_eip_locked →
@@ -628,7 +628,7 @@ int main(int argc, char **argv) {
         // 占位: 所有 SRS-controlled 线程 join — 跟上面 spawn 对偶, 同范围
         // (hart 线程 + 其他受 SRS 控制的辅助线程都在这里 join, 不限于 hart)。
         //
-        // 单 hart 同步现状 (016+17-chat 拍定): 上面 dispatcher(hart) 返回 ≡ hart
+        // 单 hart 同步现状: 上面 dispatcher(hart) 返回 ≡ hart
         // 退 wfi 退 main loop, 退化的 join 形式. 哲学 = "所有人 self-poll SRS/SDS
         // 自己停" — shutdown 路径下 hart 在 wfi 时靠 wfi.c cond_timedwait 兜底
         // WFI_TIMEOUT_NS (config.h 500ms) 自醒 + predicate 重检 SRS 退出, 接受
@@ -676,8 +676,8 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
 
-    // hart 退出协议走 SRS self-poll, 不需要主动 wfi_kick — L606 dispatcher 返回
-    // 时 hart 已退 wfi 退 main loop. 哲学详 L606 之后占位段 trail; wfi_kick_all
+    // hart 退出协议走 SRS self-poll, 不需要主动 wfi_kick — 上方 dispatcher 返回
+    // 时 hart 已退 wfi 退 main loop. 哲学详上方 dispatcher 返回后占位段; wfi_kick_all
     // 函数保留备多 hart / 灵感 (详 wfi.h).
 
     // ------------------------------------------------------------------------
@@ -721,7 +721,7 @@ int main(int argc, char **argv) {
     test_dev_destroy();
     uart_destroy();
     virtio_blk_destroy();
-    // 015 加: WFI 框架 destroy (各 hart pthread_mutex_destroy + cond_destroy)。
+    // WFI 框架 destroy (各 hart pthread_mutex_destroy + cond_destroy)。
     // 必须在所有 wfi_kick 来源 (timer thread / io workers 已 join + clint/plic destroy
     // 也已 atomic 清字段) 之后 — clint_destroy / plic_destroy 都不再调 wfi_kick。
     wfi_destroy();
@@ -735,7 +735,7 @@ int main(int argc, char **argv) {
     //   - EXTERNAL_SIGNAL (SIGINT/SIGTERM/SIGHUP) 命中: 按 POSIX 惯例返 128 + signum
     //     (130 / 143 / 129); stderr 顺手打印 test_dev_exit_code (默认 0 = "还没跑
     //     到 FINISHER", 非 0 = test_dev 已设的 FAIL arg), 给 fixture 自动化/人工
-    //     debug 留 trail (session_012 chat 拍 EXTERNAL_SIGNAL > NORMAL_EXIT 优先;
+    //     debug 留 trail (EXTERNAL_SIGNAL > NORMAL_EXIT 优先;
     //     "user 硬意图退出 不应被 test_dev 抢先写的 0 盖过")
     //   - 否则 (NORMAL_EXIT 命中 / DEVICE_FAIL 命中 / HART_MDT 命中): 沿用旧路径
     //     返 test_dev_get_exit_code() — sifive_test FINISHER PASS=0 / FAIL=arg;

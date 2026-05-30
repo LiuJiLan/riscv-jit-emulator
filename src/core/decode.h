@@ -7,7 +7,7 @@
 //
 // op_kind_t 范围 (按 RV 指令类型分组; RVC 不单立 op_kind, 复用 RV32I 同源 op):
 //   - 算术 / 逻辑 / 立即数 (RV32I): 21 (LUI/AUIPC + 9 OP-IMM + 10 OP)
-//   - 整数乘除 (RV32M, 016 实装): 8 (MUL/MULH/MULHSU/MULHU + DIV/DIVU/REM/REMU;
+//   - 整数乘除 (RV32M): 8 (MUL/MULH/MULHSU/MULHU + DIV/DIVU/REM/REMU;
 //                                    物理位置 enum 内嵌入 R-type OP 段 OP_AND 之后,
 //                                    同 opcode 0x33 聚合, 见下方 M ext 段 doc)
 //   - 控制流: 8 (6 branch + JAL + JALR)
@@ -106,10 +106,9 @@ typedef enum {
     //
     // 非块边界 (is_block_boundary_inst → 0; 跟算术 / 逻辑 / R-type OP 同性质)。
     //
-    // 历史 silent miscompile bug 修复 (small_plan A.1): a_03 之前 decode case 0x33
-    //   funct3 switch 不查 funct7, funct7=1 的 M ext 被当 ADD/SLL/SLT/.../AND 跑出乱
-    //   数据; bad apple GCC -march=rv32imc 撞穿。016 顺手 funct7 严格分支 (0x00/0x20/
-    //   0x01 显式枚举, 其他 OP_UNSUPPORTED)。
+    // funct7 严格分支起因: 早期 decode case 0x33 funct3 switch 不查 funct7, funct7=1
+    //   的 M ext 被当 ADD/SLL/SLT/.../AND 跑出乱数据 (silent miscompile)。现 funct7
+    //   严格分支 (0x00/0x20/0x01 显式枚举, 其他 OP_UNSUPPORTED)。
     OP_MUL,
     OP_MULH,
     OP_MULHSU,

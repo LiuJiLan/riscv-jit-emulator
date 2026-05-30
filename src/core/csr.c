@@ -31,7 +31,7 @@
 //   sip      (0x144) → csr_mip_read(hart) & SIP_MASK (合成的 mask view); 写仅 SSIP
 //                       (SIP_WRITABLE_MASK = 1<<IRQ_S_SOFT; STIP/SEIP RO in sip)
 //   mhartid  (0xF14) → hart->per_hart_info.mhartid (RO; uxlen_t CSR 镜像直读;
-//                       015 dual storage: cpu_t.hartid 是 uint32_t index 镜像不走此路径)
+//                       dual storage: cpu_t.hartid 是 uint32_t index 镜像不走此路径)
 //   misa     (0x301) → hart->per_hart_info.misa (RW-effective-RO; write WARL noop)
 //   mvendorid(0xF11) → hart->shared_info->mvendorid (RO)
 //   marchid  (0xF12) → hart->shared_info->marchid (RO)
@@ -56,7 +56,7 @@
 //          独立, 不能共享。cpu_create 入参 misa + mhartid 直接写入 hart->per_hart_info。
 //          csr.c csr_mhartid/misa_read 读 hart->per_hart_info.xxx。
 //
-//          015 dual storage: mhartid 也窄化 (uint32_t) 写 cpu_t.hartid 顶层字段服务 index
+//          dual storage: mhartid 也窄化 (uint32_t) 写 cpu_t.hartid 顶层字段服务 index
 //          用 (clint/plic/wfi 数组下标), csr 读 mhartid 仍走 per_hart_info 本字段 (uxlen_t).
 //          详 cpu.h cpu_t.hartid 字段注释。
 //      4b 多 hart 共享 (mvendorid + marchid + mimpid): cpu_info_shared_t struct + cpu_t 内
@@ -324,7 +324,7 @@ static void csr_mie_write(cpu_t *hart, uxlen_t v) {
  * csr.h 加声明. */
 uxlen_t csr_mip_read(cpu_t *hart) {
     uxlen_t  mip_view = hart->trap._mip_sw;
-    uint32_t hartid   = hart->hartid;                  /* 015 dual storage: cpu_t.hartid 是
+    uint32_t hartid   = hart->hartid;                  /* dual storage: cpu_t.hartid 是
                                                           uint32_t (index 用), 直接喂下游
                                                           is_clint_*_pending / is_plic_*_pending
                                                           uint32_t 入参. CSR 镜像走另字段
@@ -525,7 +525,7 @@ static void csr_sip_write(cpu_t *hart, uxlen_t v) {
 // M-mode RO Identity CSR (类 4) — 拆 per-hart + shared 两组
 //
 // 4a per-hart 私有 (mhartid + misa): 数据在 hart->per_hart_info.{mhartid, misa} (嵌入,
-//    cpu_create 入参写入); 异构 SMP 时不同 hart 字段值不同。015 dual storage: mhartid
+//    cpu_create 入参写入); 异构 SMP 时不同 hart 字段值不同。dual storage: mhartid
 //    同时窄化写 cpu_t.hartid (uint32_t) 服务 index 用, csr 读仍走本 per_hart_info 字段。
 // 4b 多 hart 共享 (mvendorid + marchid + mimpid): 数据在 hart->shared_info->xxx 解引用
 //    (指针, cpu.c static const cpu_info_shared_default; 机器整体属性, 不区分 hart)。

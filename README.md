@@ -5,8 +5,10 @@
 研究生级别的 RISC-V 用户态 JIT 模拟器,目标支持 RV32 G + 标准压缩扩展 C,跑通
 OpenSBI / 小型 OS / FreeRTOS-with-MMU。milestone a_03(PLIC + UART 外部中断 +
 virtio-blk + 端到端验证)已收口,T1~T6 全部落地, monitor 范式集齐四态 (CLINT
-timer / UART reader / virtio-blk io_worker / PLIC 无线程纯 atomic);下一
-milestone 待启动。
+timer / UART reader / virtio-blk io_worker / PLIC 无线程纯 atomic);收尾期另落地
+RV32M 整数乘除 / WFI 真实装 / Smdbltrp+Ssdbltrp Double Trap (in_trap 字段废除走
+spec MDT/SDT) / host signal handler (SIGINT/TERM/HUP) + stdin raw 模式 /
+`--bios`|`--load`|`--blk` 命令行;SRS/SDS 升级为 32-bit bitmap。下一 milestone 待启动。
 
 
 ## 设计目标
@@ -27,7 +29,7 @@ milestone 待启动。
 graph TB
     SDS["SDS — shutdown signal<br/>跨多次 system reset 长存<br/>(例: CLINT timer ≈ 振荡器类长存部件)"]
     SRS["SRS — system reset signal<br/>一群对等 SRS 域器件随之起停<br/>(dispatcher / 中断控制器 / 外设 ...)"]
-    HR["in_trap — hart-reset 编码<br/>dispatcher 内部一级自治"]
+    HR["hart 内部自治<br/>(Double Trap 停机 / WFI 自睡自醒)"]
     SDS -. "强制 (自上而下)" .-> SRS
     SRS -. "强制 (自上而下)" .-> HR
     HR -. "上报 (自下而上, 自己消化不了才升级)" .-> SRS
@@ -105,9 +107,9 @@ monitor 模型(Hoare/Hansen 范式)把共享状态的 atomic 字段与 memory_or
 
 ### dispatcher 主循环
 
-每个 hart 跑一个 `dispatcher`:`sigsetjmp` 一次性永久落点 + `while (in_trap < 3)`
+每个 hart 跑一个 `dispatcher`:`sigsetjmp` 一次性永久落点 + `while (system_reset_signal == 0)`
 多块循环 + 迭代头扫尾。每轮三个 block:选叶 TLB / 取指 / 进实际运行段(当前为
-解释器)。退出由 `in_trap` 位段编码控制。详见「控制流概览」「in_trap 位段编码」。
+解释器)。退出由 SRS bitmap 控制。详见「控制流概览」「hart 内部停机与唤醒机制」。
 
 ### 实际运行块的内存模型
 
@@ -167,27 +169,36 @@ graph TB
   identity + IS_GPA_RAM 检查,不需要 TLB(real CPU bare 下也 bypass MMU/TLB)
 
 
-## in_trap 位段编码
+## hart 内部停机与唤醒机制
 
-`hart->trap.in_trap` 是位段编码(host 端协议,多种信号可叠加):
+WFI 实装后 hart 内部有两套机制(取代早期 host 自定义的 in_trap 位段编码 +
+triple-fault 退出协议)。
 
-| 位段     | 值范围   | 含义                                                          |
-|----------|----------|---------------------------------------------------------------|
-| bit 0-1  | 0..3     | 实际 trap 嵌套深度:0/1/2 普通 nesting; 3 = triple fault       |
-| bit 2    | 4..7     | 留白,防止 trap 嵌套位将来扩展跟下面位段冲突                  |
-| bit 3    | 8..15    | 内部异常 / 内部正常停机(host 端协议,不是 RV trap)           |
-| bit 4    | 16..31   | 留白                                                          |
-| bit 5+   | 32+      | 未来停机扩展                                                  |
+**Double Trap 停机(Smdbltrp / Ssdbltrp,无 NMI)** —— cpu_reset 时 mstatus.MDT=1 /
+sstatus.SDT=1(spec §3.1.6.2 / §4.1.1.5):
 
-设计哲学(位表示叠加):
+- S-trap entry 检 sstatus.SDT=1 → unexpected,升级 deliver M,cause=`DOUBLE_TRAP`
+  (mtval2 存原 tval)
+- M-trap entry 检 mstatus.MDT=1 → critical-error:不实装 NMI → 整机 abort
+  (`system_reset_signal_set_bit(HART_MDT)` 走 ABORT_MASK 通道,main 统一 cleanup)
+- mret 清 MDT / sret 清 SDT
 
-- 解释器 / JIT 内部只看 bit 0-1(trap nesting 视角),`in_trap < 3` 即继续
-- 高位(bit 3+)仅由 dispatcher 写,解释器 / JIT 不碰
-- `while (in_trap < 3)` 的判断作为安全闸:高位一被设值就 ≥ 8 > 3,dispatcher 自动退出
-- reset 路径只清 bit 0-1;高位由 reset 流程显式按停机类型决定
+这套取代了早期"in_trap 嵌套计数 + triple-fault 退出"的 host 自定义协议(详
+trade_off_log §T.9)。dispatcher 退出统一靠 `while (system_reset_signal == 0)`,
+退出原因由 SRS bitmap 的 bit 编码表达(HART_MDT / shutdown / test_dev / signal)。
 
-跟 RV Smdbltrp 扩展(`CAUSE_DOUBLE_TRAP=16`)无关 —— Smdbltrp 是规范层 trap 投递机制,
-in_trap 是 host emulator 退出协议,两者并存但语义不重叠。
+**WFI 唤醒(cond_wait + per-hart slot)** —— WFI 不再是 NOP / busy-wait:
+
+- 挂起:`pthread_cond_wait` + per-hart `(mutex, cond)` slot;predicate 查 SRS +
+  `(mip & mie)`,醒来必重检
+- 唤醒:CLINT / PLIC 的 pending 0→1 翻转处调 `wfi_kick`(lock + cond_signal);
+  `cond_timedwait` 500ms 兜底(kick 漏调也自醒)
+- shutdown 走 self-poll(predicate 第一条查 SRS,醒来即退;无"通知者"角色)
+- TW=1 + priv<M 的 WFI 走 timeout=0 → trap illegal(spec §3.1.6.5 允许最严格)
+
+四不变式(lock-hold predicate / source lock+signal / while 重检 / timeout 兜底)详
+trade_off_log §T.8。两套机制跟顶段「信号层级」图的"hart 内部自治"一层对应:hart
+自己消化不了(M-mode critical-error)时升级写 SRS,SRS 域器件随之起停。
 
 
 ## 控制流概览
@@ -199,7 +210,7 @@ graph TD
     Loader --> Cpu["cpu_create<br/>+ 启动协议<br/>(pc / satp / priv / a0 / a1)"]
     Cpu --> Disp[dispatcher]
     Disp --> Sj[sigsetjmp 永久落点]
-    Sj --> Wh{"in_trap < 3?"}
+    Sj --> Wh{"SRS == 0?"}
     Wh -->|true| Hd["迭代头扫尾<br/>count 累加 / trap_check_interrupt"]
     Hd --> B1["block 1<br/>regime + current_tlb"]
     B1 --> B2["block 2<br/>mmu_translate_pc<br/>→ (pa, hva)"]
@@ -240,14 +251,15 @@ graph LR
   (内部已写硬件 reset 默认状态) / 显式 set SRS=1 SDS=1 / 起 timer 辅助线程
   (clint_start_timer_thread)。timer 辅助线程跨 system reset 一直跑 (跟真硬件
   RTC oscillator 不掉电不停一致), 随 SDS 才退
-- **System reset** — main while 每 iter: cpu_reset (regs/pc/mstatus/in_trap 清,
-  保留 hartid hardwired) + clint_reset (mtimecmp/msip 清回 sentinel, **mtime
-  不动 timer 不动**) + dispatcher(hart) + 区分 SR-only 重 iter vs shutdown 退
-  出 (当前简化恒 shutdown, if(0) 占位预留)
+- **System reset** — main while 每 iter: cpu_reset (regs/pc/mstatus 清, 保留
+  hartid hardwired) + clint_reset (mtimecmp/msip 清回 sentinel, **mtime 不动
+  timer 不动**) + dispatcher(hart) + 区分 SR-only 重 iter vs shutdown 退出
+  (SYSRESET_BIT_TEST_RESET 命中且非 ABORT_MASK → try_clear continue 重 iter;
+  否则 cleanup 退出)
 - **HART reset** — dispatcher 内部 per-hart 重启 (future; dispatcher.c 末段
   注释占位); SMP 多 hart 时单 hart fail 不影响其他 hart
 
-### main 流程伪码 (当前形态, a_02 T5 落地)
+### main 流程伪码 (a_02 T5 形态; a_03 收尾后 SRS/SDS 已 bitmap 化 + 加 signal handler + TEST_RESET reset 重 iter 真做, 当前真相详 runtime.h / main.c)
 
 ```c
 int main(int argc, char **argv) {
@@ -335,7 +347,7 @@ graph TB
     end
 
     subgraph "runtime = degenerate monitor"
-        RT_State["extern _Atomic int<br/>system_reset_signal (SRS)<br/>shutdown_signal (SDS)"]
+        RT_State["_Atomic uint32_t bitmap (封装接口函数)<br/>system_reset_signal (SRS)<br/>shutdown_signal (SDS)"]
         RT_Use["caller 直接 atomic_load_explicit /<br/>atomic_store_explicit (无封装函数)"]
     end
 ```
@@ -346,10 +358,10 @@ graph TB
   只动 shared 字段。memory_order: producer release (atomic_fetch_add &mtime) /
   consumer acquire (is_clint_timer_pending / clint_read), 配对建立 happens-
   before
-- **runtime** = degenerate monitor (单 flag 简化): `extern _Atomic int` 直接
-  读写, 无封装函数; 单字段无跨字段一致性问题, 不强制接口函数。"SDS 蕴含 SRS"
-  触发关系契约 — set SDS=0 之前必须先 set SRS=0 ("通知所有辅助线程退" 蕴含
-  "system 自己也得退")
+- **runtime** = degenerate monitor: SRS/SDS 是两个 `_Atomic uint32_t` bitmap
+  (0=允许 / 非0=触发对应停机路径), 经 `*_set_bit` / `*_try_clear` 接口函数封装协议
+  (atomic_fetch_or 不覆盖别人 bit)。"SDS 蕴含 SRS" 契约固化在 `shutdown_signal_set_bit`
+  内 (顺序 B: 先 set SDS bit, 后 set SRS BIT_SHUTDOWN_TRIGGER)。详 runtime.h
 
 外部模块 (csr.c / dispatcher.c / bus.c 等) **不直接 atomic_\* 操作 clint 内部
 字段**, 一律走 consumer/producer 接口。例: csr_mip_read 合成读时走
@@ -379,8 +391,10 @@ return 0
 - **不用 pthread_cancel / pthread_kill**: deferred cancel 在 interpreter / JIT
   深栈取消 = 状态半更新风险; pthread_kill 是发 signal SIGKILL 杀整进程不是
   杀线程; 一律 cooperative (atomic flag + worker periodic check + main join)
-- **不引入 SIGINT/SIGTERM signal handler**: Ctrl-C 默认杀进程足够 (atomic_fetch_add
-  是 lock-prefixed 单指令, 杀进程不破坏数据); 等 reset 体系成熟 (a_03+) 再做
+- **已实装 SIGINT/SIGTERM/SIGHUP signal handler**: handler 内只做 atomic CAS
+  external_signal_no (first-wins) + shutdown_signal_set_bit (async-signal-safe;
+  同 SIGSEGV 约束不调 malloc/锁); raw mode 下 ^C 字节进 guest, handler 是 cooked
+  路径 fallback; main 末段按 POSIX 128+signum 返出。详 runtime.h
 - **destroy 函数纯 cleanup**: 不含 pthread_join (避免控制流隐式 block); spawn /
   join 对偶函数单独暴露由 spawn 调用方显式 join
 
@@ -504,8 +518,8 @@ count 同步契约:may-trap 路径 case 内同步在 trap_raise 之前;boundary 
 
 #### dispatcher.{c,h}
 
-hart 主循环。形态:**sigsetjmp 一次性永久落点 + while(in_trap<3) 多块循环 +
-迭代头扫尾**。每轮 3 block:
+hart 主循环。形态:**sigsetjmp 一次性永久落点 + while(system_reset_signal==0) 多块
+循环 + 迭代头扫尾**。每轮 3 block:
 
 - **block 1** —— 按 `priv + xatp.mode` 算派发包 `(regime, current_tlb)`
 - **block 2** —— `mmu_translate_pc` 取指
@@ -513,7 +527,7 @@ hart 主循环。形态:**sigsetjmp 一次性永久落点 + while(in_trap<3) 多
 
 helper 端 longjmp 跳回 sigsetjmp 落点会跳过迭代尾,所以扫尾(count 累加 / 未来
 mtime 推进 / 中断检查 / `perf_advance`)必须搬到迭代头 —— 跟正常 continue 路径
-同形态。退出条件由 `in_trap` 位段编码控制(详见 [in_trap 位段编码](#in_trap-位段编码))。
+同形态。退出条件由 SRS bitmap 控制(详见 [hart 内部停机与唤醒机制](#hart-内部停机与唤醒机制))。
 
 
 #### csr.{c,h}
@@ -541,7 +555,8 @@ xcause/xtval/xepc + 切 priv mstatus 字段 + `regs[0] = xtvec`,medeleg 分流)�
 exception 长跳 / interrupt 返回的形态不对偶是 by design(dummy.txt §1 路径 D)。
 
 `deliver_priv` 按 medeleg 真生效(M-mode trap 总 M;U/S-mode + bit=1 → S)。
-`in_trap >= 3` 时不 deliver,字段保留第二次状态作 root cause 给 main dump。
+Double Trap(spec MDT/SDT):S-trap SDT=1 升级 M `DOUBLE_TRAP`;M-trap MDT=1 →
+critical-error(字段保留作 root cause 给 main dump)。
 
 
 #### mmu.{c,h}
@@ -725,9 +740,9 @@ worker (详 dummy.txt §7 monitor 模型 + file_plan §T 异步默认体例)。
   mstatus 字段 / **PRIV_CHECK_OR_TRAP** 在 MRET/SRET/SFENCE.VMA 入口判 priv;
   interrupt:`trap_check_interrupt` 接入 dispatcher loop 顶 + mideleg 分流 +
   vectored mode(mtvec/stvec mode=1 真接,base+4*cause)
-- dispatcher(sigsetjmp 永久落点 + while(in_trap<3) + 迭代头扫尾 + count 同步契约;
-  **循环顶 pc IALIGN 兜底** single source 捕所有写 pc 路径错误, dummy.txt §9)
-- in_trap 位段编码(bit 0-1 trap 嵌套 / bit 3 内部停机 / 高位预留)
+- dispatcher(sigsetjmp 永久落点 + while(system_reset_signal==0) + 迭代头扫尾 +
+  count 同步契约; **循环顶 pc IALIGN 兜底** single source 捕所有写 pc 路径错误, dummy.txt §9)
+- Double Trap 停机(spec MDT/SDT)+ WFI 唤醒(cond_wait + per-hart slot)
 - 跨页保护(interpreter 推进后 hva_pc 跨 4 KB → 退出 block,dispatcher 重派发)
 - **bus + CLINT MMIO** (mmio_dev_t 注册表 + 线性派发; CLINT mtime/mtimecmp/msip
   `_Atomic`, 布局跟 QEMU virt + SiFive CLINT 一致)

@@ -32,7 +32,7 @@
 //
 // 注: misa 跟 mhartid 不在这里 (per-hart 私有, 进 cpu_info_per_hart_t — 异构 SMP 时
 // 不同 hart 的字段值不同; mhartid 显然 per-hart 不同, misa 也可能 per-hart 不同)。
-// 015 dual storage: hart->per_hart_info.mhartid (CSR 镜像) + cpu_t.hartid (index 用),
+// dual storage: hart->per_hart_info.mhartid (CSR 镜像) + cpu_t.hartid (index 用),
 // 都由 cpu_create 入参 mhartid 写; 详 cpu.h cpu_t.hartid 字段注释。
 static const cpu_info_shared_t cpu_info_shared_default = {
     .mvendorid = 0,

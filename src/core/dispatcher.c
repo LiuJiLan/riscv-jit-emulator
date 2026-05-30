@@ -49,8 +49,8 @@
 //
 //   - 退出条件: system_reset_signal 非 0 (任一 bit 设了即退; bitmap 编码见 runtime.h)。
 //     M-mode double trap (mstatus.MDT=1 时再来 trap) 在 trap.c 内部检查到, 自己 set
-//     SYSRESET_BIT_HART_MDT — dispatcher 不主动写 SRS。a_03_session_011 起 in_trap
-//     字段废除, 改走 spec-defined MDT/SDT (Smdbltrp/Ssdbltrp); 历史段见本文件末尾。
+//     SYSRESET_BIT_HART_MDT — dispatcher 不主动写 SRS。Double Trap 走 spec-defined
+//     MDT/SDT (Smdbltrp/Ssdbltrp); 详本文件末尾段。
 //
 //   - mmu_translate_pc 路径 (dummy.txt §1 路径 C, 不长跳): rc != 0 → continue, 让 while
 //     条件接管。
@@ -128,9 +128,9 @@ void dispatcher(cpu_t *hart) {
     // runtime.h doc)。memory_order_relaxed 内层 hot path 不付 acquire 代价 (set
     // 路径用 release, 见 runtime.c set_bit / main.c try_clear)。
     //
-    // a_03_session_011 起: in_trap 字段废除, while 条件不再含 in_trap < 3; M-mode
-    // critical-error (mstatus.MDT=1 时 trap_set_*_state 检) 在 trap.c 内自己
-    // set HART_MDT, dispatcher 退出原因统一通过 system_reset_signal 表达。
+    // while 条件不含 in_trap (无独立 in_trap 字段); M-mode critical-error
+    // (mstatus.MDT=1 时 trap_set_*_state 检) 在 trap.c 内自己 set HART_MDT,
+    // dispatcher 退出原因统一通过 system_reset_signal 表达。
     while (atomic_load_explicit(&system_reset_signal, memory_order_relaxed) == 0u) {
 
     // ========================================================================
@@ -228,8 +228,7 @@ void dispatcher(cpu_t *hart) {
         // SV32 路径需 current_tlb 非 NULL 才走 walker; NULL 时走懒分配 (tlb_alloc 写回)。
         // tlb_alloc 失败 = host 内存耗尽 (host 错, 跟 guest 无关), 走 hart-internal
         // hard halt — 视同 M-mode double fault, set SYSRESET_BIT_HART_MDT 让 main 走
-        // ABORT_MASK 路径 cleanup return 非 0。in_trap bit 3 兜底位段已废除, 直接
-        // 出 dispatcher。
+        // ABORT_MASK 路径 cleanup return 非 0, 直接出 dispatcher。
         if (current_tlb == NULL) {
             current_tlb = tlb_alloc();
             if (current_tlb == NULL) {
@@ -334,90 +333,32 @@ void dispatcher(cpu_t *hart) {
             total_count, hart->regs[0]);
 
     // ========================================================================
-    // 历史: in_trap 字段 → SRS bitmap → spec MDT/SDT
+    // M-mode critical-error (Smdbltrp) → 整机 abort, 不 per-hart restart
     //
-    // 最先 (a_02 末 / a_03 初): 提出 cpu_t.trap.in_trap (uint8_t) 字段是为了
-    // 跟踪 trap 嵌套深度 — 名字 "in_trap" 即由此而来。位段最初设计:
-    //   bit 0-1  实际 trap 嵌套深度 (0/1/2 普通 nesting; 3 = triple fault)
-    //
-    // 方案落实时顺手扩展: 同一字段还有冗余高位 (bit 3+, 值 ≥ 8 远大于 3,
-    // dispatcher while(in_trap < 3) 自动失败退出), 顺便用作内部停机位段 —
-    // 一字段兼两用:
-    //   bit 2    留白 (跟下面停机段拉开间距)
-    //   bit 3    内部异常硬停机 (tlb_alloc fail 等 host 错; 跟 RV trap 无关)
-    //   bit 4+   留白 / 未来扩展
-    // mret/sret 路径只清 bit 0-1; 高位停机标记一旦设, while 自然退出。
-    //
-    // 当时 (in_trap 字段一字两用方案确定时) 设想: sifive_test 兼容设备触发
-    // 整机停机, 可以直接写 cpu_t.trap.in_trap 高位完成 — 单核下不需要 atomic,
-    // 写法简单。但同时也意识到, 真到多核时跨 hart 写 in_trap 就必须用 atomic
-    // 变量。项目当时还是单核, 这条想法就搁置了。
-    //
-    // 后来 CLINT 实装时, 引入 runtime SRS / SDS 信号 (早期 _Atomic int 形态)。
-    // CLINT timer 是真多线程异步源 (跨 hart 写 mtime, 主帧读), 必须走 atomic;
-    // 顺便把"sifive_test 触发整机停机" 这条早期设想接上 SRS — 跨设备停机通道
-    // 终于真做出来, 但走的是新加的 SRS 变量, 不是 in_trap 高位。
-    //
-    // in_trap 字段从这时起定位转为"为未来 double trap 服务" — 把 spec MDT/SDT
-    // 的"上次 trap 没退又来一次 = 不可恢复" 语义用 host 计数器近似 (候选 A 早
-    // return 不 deliver)。这套机制本质是不实装 Smdbltrp / Ssdbltrp 扩展时的
-    // 简化兜底。
-    //
-    // a_03_session_011 真做 Smdbltrp / Ssdbltrp 时, 根据手册发现 in_trap 字段
-    // 本身没必要 — spec MDT 在 mstatus, SDT 在 sstatus, trap entry 检字段 +
-    // 没退就是 unexpected, 跟踪效果跟 in_trap 计数器等价。同时 SRS 已升级为
-    // 32-bit bitmap (详 runtime.h)。in_trap 字段彻底清, M-mode critical-error
-    // 走 system_reset_signal SYSRESET_BIT_HART_MDT, 跟 ABORT_MASK 通道统一。
-    //
-    // 现在 (a_03_session_011 起): in_trap 字段废除, 改走 spec-defined 路径:
-    //   - S-trap entry 检查 sstatus.SDT — SDT=1 时升级 deliver_priv=M,
+    // Double Trap 走 spec-defined MDT/SDT (无独立 in_trap 嵌套计数字段):
+    //   - S-trap entry 检 sstatus.SDT — SDT=1 升级 deliver_priv=M,
     //     cause=CAUSE_DOUBLE_TRAP (Ssdbltrp §4.1.1.5 unexpected trap)
-    //   - M-trap entry 检查 mstatus.MDT — MDT=1 时不 deliver, hart 进 critical-
-    //     error state, set system_reset_signal SYSRESET_BIT_HART_MDT 通知 main
-    //     (Smdbltrp §3.1.6.2 unexpected trap; 项目不实装 NMI, MDT 无 RNMI handler
-    //     接管, 必走 critical-error)
-    //   - mret 清 MDT=0 (按 spec §3.1.6.2); sret 清 SDT=0 (按 spec §4.1.1.5)
+    //   - M-trap entry 检 mstatus.MDT — MDT=1 不 deliver, hart 进 critical-error,
+    //     set SYSRESET_BIT_HART_MDT 通知 main (Smdbltrp §3.1.6.2; 项目不实装 NMI,
+    //     无 RNMI handler 接管, 必走 critical-error)
+    //   - mret 清 MDT=0 (spec §3.1.6.2); sret 清 SDT=0 (spec §4.1.1.5)
     //
-    // ------------------------------------------------------------------------
-    // 为什么 MDT critical-error 选 "abort 整个模拟器" 而不是 per-hart restart
+    // spec §3.1.6.2 末段: critical-error 时 platform 行为自由 ("restarting the
+    // affected hart or restarting the entire platform, among others")。项目选
+    // "整机 abort + cleanup chain return 非 0":
+    //   1. 跟 QEMU 实践一致 (不实装 NMI 时 MDT critical-error 走 abort), 减少
+    //      对照行为差异。
+    //   2. 走现有 ABORT_MASK 通道 (SYSRESET_BIT_HART_MDT 在 mask 内), main 统一
+    //      cleanup + return exit_code, 跟 sifive_test PASS/FAIL / 设备 fail 出口
+    //      同路径; 不需要新增 per-hart restart 生命周期 (单 hart 下 restart 整
+    //      hart ≡ restart 整机)。
     //
-    // spec §3.1.6.2 末段: "The actions performed by the platform when a hart
-    // asserts a critical-error signal are platform-specific. The range of
-    // possible actions include restarting the affected hart or restarting the
-    // entire platform, among others." — 平台自由选择, 重启单 hart 或整机皆合规。
-    //
-    // 项目选 "整机 abort + cleanup chain return 非 0", 理由:
-    //   1. 跟 QEMU 实践一致 — QEMU 不实装 NMI 时 MDT critical-error 走 abort,
-    //      减少对照行为差异; 简化基准对照测试。
-    //   2. 方便模拟器停机 — 走现有 ABORT_MASK 通道 (SYSRESET_BIT_HART_MDT 在
-    //      mask 内), main 端统一 cleanup + return exit_code, 跟 sifive_test
-    //      PASS/FAIL / 设备 fail 出口完全同路径; 不需要新增 "per-hart restart"
-    //      生命周期 (那是真 SMP 的事, 单 hart 下 restart 整 hart ≡ restart 整机)。
-    //
-    // 未来真 SMP 落地时, 可以为 SYSRESET 新增一个 "per-hart MDT" bit (放
-    // ABORT_MASK 外, 跟 TEST_RESET 同 reset-allowed 体例), 单 hart MDT 走 hart
-    // 局部 reset 不影响别的 hart, 跟 spec "可重启单 hart" 选项对应。当前单 hart
-    // 简化下两条路径等价。
+    // 底下 if(0) 保留 (不删) 的理由: 未来真 SMP + per-hart reset 时这是入口 —
+    // 按 hart-internal 错类型分流, 仅本 hart 的设新 "per-hart MDT" bit (放
+    // ABORT_MASK 外走 reset continue 路径), 对应 spec "可重启单 hart" 选项。
+    // 当前 condition 0 = dead branch (MDT critical-error 由 trap.c 自己 set
+    // HART_MDT, tlb_alloc fail 路径也自己 set, dispatcher 末段不需补刀)。
     // ========================================================================
-    // 底下这个 if 留着 (而不是删) 的理由:
-    //   spec §3.1.6.2 末段说 platform 在 hart critical-error 时的行为可以是
-    //   "restarting the affected hart" (重启单 hart, 不影响别的 hart) 或
-    //   "restarting the entire platform" (重启整机)。HART 在手册里是有资格被
-    //   单独 reset 的, 只是项目当前没实现这条路径 (单 hart 简化下 per-hart
-    //   reset ≡ 整机 reset)。
-    //   未来真做 SMP + per-hart reset 时, 这个 if 是入口 — 按 hart-internal 错
-    //   类型分流: 跟整机有关的设 ABORT bit, 仅本 hart 的设新 "per-hart MDT" bit
-    //   (放 ABORT_MASK 外, 走 reset continue 路径)。
-    //
-    // 当前 condition 0 = dead branch (in_trap 字段废除, MDT critical-error 由 trap.c
-    // 自己 set HART_MDT, tlb_alloc fail 路径也自己 set, 不需要 dispatcher 末段补刀;
-    // 整段保留是给未来 per-hart reset 触发改 condition 用)。
-    //
-    // /* 未来实现某种方法转跳到这里, 或者, 其他方法调用 cpu_reset, 甚至在外面
-    //    由 main 来 reset 单核; 三条路径都让 hart 单独重启不影响别的 hart */
-    // if (M-mode Double Fault) {
-    //     仅 reset 本 hart();
-    // }
     if (0) {
         system_reset_signal_set_bit(SYSRESET_BIT_HART_MDT);
     }

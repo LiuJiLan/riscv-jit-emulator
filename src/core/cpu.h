@@ -56,7 +56,7 @@
 // misa:    该 hart 实际支持的扩展 (MU 跟 MSU 的 misa 字段不一样)。
 // 嵌入 cpu_t 字段 (非指针; per-hart 私有就跟着 cpu_t 走, 不需要外部 alloc)。
 //
-// 015 dual storage: mhartid (此处, CSR 语义) 跟 cpu_t.hartid (顶层, uint32_t index 语义)
+// dual storage: mhartid (此处, CSR 语义) 跟 cpu_t.hartid (顶层, uint32_t index 语义)
 // 都在 cpu_create 同时写, 持平 cpu_t 整个 lifetime (mhartid CSR 是 RO + hartid index 是
 // 硬件 wired, 都不变); 不会出现两字段不同步。csr_mhartid_read 走本字段 (uxlen_t 直读);
 // clint/plic/wfi 数组下标走 cpu_t.hartid (uint32_t 直读, 无 cast)。
@@ -86,7 +86,7 @@ typedef struct cpu_s {
     _Alignas(64) uxlen_t  regs[32];
     uint8_t               priv;             // RV privilege encoding (riscv.h PRIV_*); 当前启动 PRIV_M
     uint32_t              hartid;           // hart 线程编号 (index 用; dummy.txt §13 index
-                                                //   非目标用 uint32_t). 015 提层 — 多模块按
+                                                //   非目标用 uint32_t). 提层 — 多模块按
                                                 //   数组下标用 (clint_per_hart[hartid] /
                                                 //   wfi_slots[hartid] / wfi_kick(hartid) /
                                                 //   is_clint_*_pending(hartid) 等). dual storage

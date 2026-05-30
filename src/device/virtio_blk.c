@@ -492,7 +492,7 @@ static int virtio_blk_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
       case VBLK_REG_VERSION:         value = VBLK_VERSION;     break;
       case VBLK_REG_DEVICE_ID:       value = VBLK_DEVICE_ID;   break;
       case VBLK_REG_VENDOR_ID:       value = VBLK_VENDOR_ID;   break;
-      case VBLK_REG_DEVICE_FEAT:     value = 0u;               break;   /* 无可选 feature */
+      case VBLK_REG_DEVICE_FEAT:     value = 0u;               break;   /* 无可选 feature; 持久化一致性 TODO 见 .h 顶段 (feat=0=声称 write-through 但实现 write-back) */
       case VBLK_REG_QUEUE_NUM_MAX:   value = VIRTIO_BLK_QUEUE_NUM_MAX; break;
 
       case VBLK_REG_QUEUE_PFN:

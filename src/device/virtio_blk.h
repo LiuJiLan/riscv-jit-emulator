@@ -82,9 +82,17 @@
 //   0x104 Config:cap_hi     R = (uint32_t)(capacity_sectors >> 32)
 //   其他 off: 读 silent 返 0 / 写 silent 吞 (跟 PLIC reserved 区体例)
 //
-// 后端 = host file (pread/pwrite; 不 fsync 不 mmap):
+// 后端 = host file (pread/pwrite; destroy 时 fsync 一次, 不 mmap):
 //   - virtio_blk_init(path) 时 open(O_RDWR) + fstat 取 capacity (st_size/512)
-//   - 完成 IO 不 fsync (write-back 默认; durable IO 留 TODO)
+//   - 完成 IO 不每笔 fsync (write-back: 进 host page cache); virtio_blk_destroy
+//     关 fd 前 fsync 一次 (= 常规 flush-on-close)。
+//   - [TODO 持久化一致性, plan §2 #51] DeviceFeatures=0 = 向 guest 声称 write-
+//     through (无易失写缓存, spec: 写完成即 durable), 但实现是 write-back + 仅
+//     destroy flush → 不兑现该承诺 (断电/强杀丢最近写)。两条修法 (a_04+ 真接 OS 拍):
+//       (a) offer VIRTIO_BLK_F_FLUSH + 处理 VIRTIO_BLK_T_FLUSH (收 FLUSH → fsync,
+//           按需非每笔; 把持久化时机交 guest — 推荐, 对应真盘 cache flush 命令)
+//       (b) 真 write-through (每笔 fsync / O_DSYNC) 兑现 feat=0 声称 — 慢但合法
+//   - mmap backend 留 TODO (plan §2 #52)
 //   - st_size 必须 512 对齐 (否则 init 返 -1)
 //
 // ----------------------------------------------------------------------------

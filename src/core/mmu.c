@@ -79,7 +79,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
         if (pa_to_fetch_hva(pa, hva_out) != 0) {
             // 直调 trap_set_exception_state (dummy.txt §1 路径 2b, mmu_translate_pc 不长跳);
             // cause=1 (Instruction Access Fault, RV spec §3.1.16 cause table); tval=fetch GVA。
-            // 返回 in_trap 当前值给 dispatcher (0/非0 信号; dispatcher continue 让 while 兜底)。
+            // 返回 trap_set_exception_state 返值给 dispatcher (0/非0 信号; dispatcher continue 让 while 兜底)。
             return (int)trap_set_exception_state(hart, CAUSE_INST_ACCESS_FAULT, /*tval*/gva);
         }
         *pa_out = pa;

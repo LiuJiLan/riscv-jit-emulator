@@ -19,7 +19,7 @@
 #include "runtime.h"    // system_reset_signal (wfi_should_wake predicate 内读)
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception (_Noreturn longjmp)
-#include "wfi.h"        // wfi_wait / wfi_predicate_fn (015 WFI 唤醒框架)
+#include "wfi.h"        // wfi_wait / wfi_predicate_fn (WFI 唤醒框架)
 
 #include <stdatomic.h>  // atomic_load_explicit (wfi_should_wake 读 SRS)
 #include <stdbool.h>    // wfi_predicate_fn 返 bool
@@ -32,7 +32,7 @@
 //
 // closure = cpu_t * (caller 传 hart 进去); 返 true 时 wfi_wait 内 cond_wait 退出。
 //
-// 唤醒条件 (RV spec §3.3.2 + 015 设计):
+// 唤醒条件 (RV spec §3.3.2):
 //   1. SRS 非 0 (system reset 信号; HART 只看 SRS 不看 SDS, dummy.txt 体例) — 退出 hart loop
 //   2. (mie & csr_mip_read(hart)) != 0 — 任何 enabled-by-mie 的中断 pending; 跟 mstatus.MIE
 //      无关 (WFI 唤醒不要求 global IE; spec 明确规定)
@@ -179,7 +179,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
     //   不适用 (任何 priv OK / 由其他机制判):
     //   - ECALL / EBREAK (任何 priv OK; ECALL 按 priv 分流 cause 8/9/11)
     //   - CSR 6 case CSRRW/RS/RC/WI/SI/CI (csr_op 入口判 priv: csr_addr[9:8] vs hart->priv)
-    //   - WFI (015 实装; 走 priv<M + mstatus.TW=1 → illegal 路径, case 入口 if 直
+    //   - WFI (走 priv<M + mstatus.TW=1 → illegal 路径, case 入口 if 直
     //          inline 不复用 PRIV_CHECK_OR_TRAP 宏 — priv check 条件不一样: PRIV_CHECK_OR_TRAP
     //          是"priv 太低 trap", WFI 是"priv 不够 且 TW=1 才 trap", 复用反而绕)
     //
@@ -327,7 +327,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 WRITE_REG(d.rd, READ_REG(d.rs1) & READ_REG(d.rs2));
                 break;
 
-            // ---- RV32M Integer Multiply/Divide (8 op, 016 实装) ----
+            // ---- RV32M Integer Multiply/Divide (8 op) ----
             //
             // pure case (无 trap 路径; spec 强制 by-0 / overflow 也返定值不 trap), 无 SYNC_COUNT。
             // 边界 case 详 decode.h M ext 段 doc; 这里只做实装写法:
@@ -338,7 +338,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // MULH/MULHU/MULHSU: 高 32 bit, 用 64-bit 中间.
             //   MULH:   int64_t = (int32_t)rs1 × (int32_t)rs2 (signed sign-ext × signed sign-ext)
             //   MULHU:  uint64_t = (uint32_t)rs1 × (uint32_t)rs2 (zero-ext × zero-ext)
-            //   MULHSU: signed × unsigned, 不对称. 写法见小段内注释 (small_plan A.1 拍定写法)。
+            //   MULHSU: signed × unsigned, 不对称. 写法见小段内注释。
             //
             // DIV/REM: signed 必须 if 短路 by-0 + INT_MIN÷-1 overflow (两个 C UB 都要避), 别的
             //   case 用普通 / %.
@@ -656,7 +656,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                                   d.rs1,           d.rs2);
                 break;
 
-            // ---- WFI (015 实装; RV spec §3.3.2 + §3.1.6.5 TW) ----
+            // ---- WFI (RV spec §3.3.2 + §3.1.6.5 TW) ----
             // priv<M + mstatus.TW=1 → trap illegal instruction (timeout=0 实装, spec 允许);
             // 否则 wfi_wait 挂起直到 SRS 或 (mie & mip) 非 0 (predicate wfi_should_wake)。
             // 醒来后 pc+=4 自推进 (PC_STEP_NONE 表态 "case 自写 pc"); break 让 fetch loop

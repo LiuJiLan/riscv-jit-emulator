@@ -509,13 +509,13 @@ decoded_inst_t decode(u32_t inst) {
         // funct7 严格 dispatch (RV ISA Manual Vol I Table 24.1 + M-ext Vol I §7.1):
         //   funct7 == 0x00: RV32I 8 条 (ADD/SLL/SLT/SLTU/XOR/SRL/OR/AND)
         //   funct7 == 0x20: RV32I 子集 SUB (funct3=0) / SRA (funct3=5); 其他 funct3 reserved
-        //   funct7 == 0x01: RV32M 8 条 (MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU; 016 实装)
+        //   funct7 == 0x01: RV32M 8 条 (MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU)
         //   其他 funct7:    decode 归 OP_UNSUPPORTED
         //
-        // 历史 silent miscompile bug (small_plan A.1, a_03 之前): 老 switch 只查 funct3 +
-        //   funct3=0/5 内嵌 funct7=0x20 判 SUB/SRA, 其他 funct3 完全不查 funct7 → funct7=1
-        //   的 M ext 落到 ADD/SLL/SLT/.../AND 路径跑乱数据 (bad apple GCC -march=rv32imc
-        //   撞穿). 016 改成 funct7 严格 dispatch + M ext 8 条新落地。
+        // funct7 严格 dispatch 起因: 老 switch 只查 funct3 + funct3=0/5 内嵌 funct7=0x20
+        //   判 SUB/SRA, 其他 funct3 完全不查 funct7 → funct7=1 的 M ext 落到
+        //   ADD/SLL/SLT/.../AND 路径跑乱数据 (silent miscompile)。现 funct7 严格 dispatch
+        //   + M ext 8 条落地。
         case 0x33:
             switch (funct7) {
                 case 0x00u:
