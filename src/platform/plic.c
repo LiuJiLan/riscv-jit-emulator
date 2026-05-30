@@ -31,7 +31,9 @@
 #include <string.h>
 
 #include "config.h"          // PLIC_* / MAX_HARTS
+#include "core/cpu.h"        // n_harts (运行期 hart 数; cap=MAX_HARTS) — 存在性边界 / 填表
 #include "core/wfi.h"        // wfi_kick (ctx_eip 0→1 翻转唤醒 WFI hart)
+#include "runtime.h"         // runtime_fatal (反查表读到 -1 = emulator bug 紧急停机)
 #include "platform/bus.h"    // mmio_dev_t / bus_register_mmio
 #include "riscv.h"           // CAUSE_LOAD/STORE_ACCESS_FAULT / PRIV_M / PRIV_S
 
@@ -249,14 +251,35 @@ static int plic_ctx_has_pending_locked(uint32_t ctx_id) {
 // atomic_load_explicit(acquire) 配对建立 happens-before (producer/consumer 范式;
 // dummy.txt §7 monitor 模型 memory_order 配对规则)。
 
+// plic_ctx_is_phantom — ctx_id 是否对应一个不存在的 hart (hart >= n_harts)。
+//
+// 判定 = plic_ctx_to_hartid[ctx_id] < 0: plic_init 按 n_harts 填实连线 (0..2*n_harts-1
+// 的 ctx 有 hartid >= 0), phantom hart 的 ctx 槽保持 -1。ctx_to_hartid 按 ctx_id 紧凑
+// 索引不含 U/VS, 故 <0 干净等价 phantom (详 plic_recompute_ctx_eip_locked 注释)。
+//
+// 用于第 2 类越界语义: guest 经 MMIO 写/读 phantom ctx 一律 silent drop (跟 QEMU
+// sifive_plic "region 内越界 silent ignore" 对齐); 也是 plic_recompute_ctx_eip_locked
+// 的 ctx_to_hartid<0 fatal 的硬前置 (phantom enable 永不写进 → eip 永不 0→1 撞 fatal)。
+//
+// ctx_to_hartid 在 plic_init 后只读, 不变; 锁内锁外读都安全 (caller 多在锁内, 命名
+// 不加 _locked 以示"不依赖锁")。入参 ctx_id 须已过 < PLIC_N_CONTEXTS 边界。
+static int plic_ctx_is_phantom(uint32_t ctx_id) {
+    return plic.plic_ctx_to_hartid[ctx_id] < 0;
+}
+
 static void plic_recompute_ctx_eip_locked(uint32_t ctx_id) {
     int v_new = plic_ctx_has_pending_locked(ctx_id);
     int v_old = atomic_load_explicit(&plic_ctx_eip[ctx_id], memory_order_relaxed);
     atomic_store_explicit(&plic_ctx_eip[ctx_id], v_new, memory_order_release);
     // ctx eip 0→1 翻转 → 唤醒该 ctx 对应 hart (可能在 WFI cond_wait)。
     //
-    // ctx → hartid 走 plic_ctx_to_hartid[] 反查表 (plic_init 跟 plic_ctx_map 同处填);
-    // 未绑定 (-1) 跳过 (合法状态, 例如 U/VS 槽当前都 -1)。
+    // ctx → hartid 走 plic_ctx_to_hartid[] 反查表 (plic_init 跟 plic_ctx_map 同处填)。
+    // 这里只在 eip 真 0→1 时读 → 此时该 ctx 必有 enable&pending source = 必是存在 hart
+    // 的真 ctx; phantom ctx (hart >= n_harts) 的 enable 被 plic_write drop 永远全 0,
+    // has_pending 恒 0, v_new 恒 0, 0→1 翻转对 phantom 永不成立 → 走不到这里。所以
+    // 读到 h < 0 (未绑定) = 存在的 ctx 丢了硬连线 = emulator bug → runtime_fatal。
+    // (注: ctx_to_hartid 按 ctx_id 紧凑索引, 不含 U/VS 槽 — U/VS 不分配 ctx_id; 跟
+    //  plic_ctx_map 那张 hartid<<2|priv 表的"U/VS 槽永远 -1"是两码事。)
     //
     // ctx_id 顺序: plic_init 体例 ctx 2h = hart h M-mode, ctx 2h+1 = hart h S-mode
     // (即 ctx_id 越小 priv 越高); plic_recompute_all_ctx_eip_locked 按 ctx_id 升序
@@ -267,14 +290,22 @@ static void plic_recompute_ctx_eip_locked(uint32_t ctx_id) {
     //       trap_check_interrupt 也是先选 MEIP, 跟 kick 顺序自然对齐
     if (v_old == 0 && v_new != 0) {
         int8_t h = plic.plic_ctx_to_hartid[ctx_id];
-        if (h >= 0) {
+        if (h < 0) {
+            // 持 plic.lock wrlock 调入 — runtime_fatal non-_Noreturn / 不 abort,
+            // 正常返回让调用栈出锁 (详 runtime.h)。fatal 后不 kick (无合法 hart 可 kick)。
+            runtime_fatal(__func__, "ctx_to_hartid[ctx_id] < 0", (long)ctx_id);
+        } else {
             wfi_kick((uint32_t)h);
         }
     }
 }
 
 static void plic_recompute_all_ctx_eip_locked(void) {
-    for (uint32_t c = 0; c < PLIC_N_CONTEXTS; c++) {
+    // 只扫真实 ctx (0 .. 2*n_harts-1; 每 hart M+S 两 ctx)。phantom ctx (hart >=
+    // n_harts) 的 enable 被 plic_write drop 永远全 0, recompute 也恒 0 = 空转;
+    // 用 2*n_harts 既省空转又是纵深防御 (phantom ctx 根本不进 recompute → 不会
+    // 撞 plic_recompute_ctx_eip_locked 的 ctx_to_hartid<0 fatal)。
+    for (uint32_t c = 0; c < 2u * n_harts; c++) {
         plic_recompute_ctx_eip_locked(c);
     }
 }
@@ -377,7 +408,9 @@ static int plic_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
         uint32_t bo         = off - (uint32_t)PLIC_CONTEXT_OFF;
         uint32_t ctx_id     = bo / (uint32_t)PLIC_CONTEXT_STRIDE;
         uint32_t off_in_ctx = bo % (uint32_t)PLIC_CONTEXT_STRIDE;
-        if (ctx_id < PLIC_N_CONTEXTS) {
+        /* 第 2 类: phantom ctx (hart >= n_harts) 读 threshold/claim 一律返 0 silent
+           (value 初值 0 直接 memcpy 返); claim 不进仲裁 = 不 set claimed 副作用。 */
+        if (ctx_id < PLIC_N_CONTEXTS && !plic_ctx_is_phantom(ctx_id)) {
             if (off_in_ctx == 0u) {
                 /* threshold */
                 plic_rdlock();
@@ -432,7 +465,11 @@ static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
         uint32_t ctx_id    = bo / (uint32_t)PLIC_ENABLE_STRIDE;
         uint32_t word_idx  = (bo % (uint32_t)PLIC_ENABLE_STRIDE) / 4u;
         if (ctx_id < PLIC_N_CONTEXTS &&
-            word_idx < (PLIC_N_SOURCES + 31u) / 32u) {
+            word_idx < (PLIC_N_SOURCES + 31u) / 32u &&
+            !plic_ctx_is_phantom(ctx_id)) {        /* 第 2 类: phantom ctx 写 silent drop。
+                                                      **硬前置**: phantom enable 不写进 →
+                                                      phantom ctx eip 永不 0→1 → 不撞
+                                                      recompute 的 ctx_to_hartid<0 fatal */
             plic_wrlock();
             plic.contexts[ctx_id].enable[word_idx] = value;
             /* word 0 bit 0 = source 0 (保留), 软件写也由仲裁 src 从 1 起遍历过滤掉 */
@@ -444,7 +481,10 @@ static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
         uint32_t bo         = off - (uint32_t)PLIC_CONTEXT_OFF;
         uint32_t ctx_id     = bo / (uint32_t)PLIC_CONTEXT_STRIDE;
         uint32_t off_in_ctx = bo % (uint32_t)PLIC_CONTEXT_STRIDE;
-        if (ctx_id < PLIC_N_CONTEXTS) {
+        /* 第 2 类: phantom ctx (hart >= n_harts) 的 threshold/complete 写一律 silent
+           drop (跟 enable 写 + QEMU sifive_plic silent ignore 对齐; 纵深防御 — 即便
+           enable 已 drop, threshold/complete 也不该碰 phantom ctx 字段 + recompute)。 */
+        if (ctx_id < PLIC_N_CONTEXTS && !plic_ctx_is_phantom(ctx_id)) {
             if (off_in_ctx == 0u) {
                 /* threshold */
                 plic_wrlock();
@@ -495,16 +535,27 @@ static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
 // 之前提前 return 0.
 
 int is_plic_meip_pending(uint32_t hartid) {
-    if (hartid >= MAX_HARTS) return 0;
+    if (hartid >= MAX_HARTS) return 0;       /* 内存安全防御 (内部 helper; hartid 来自
+                                                cpu_t wired, 不是反查表 -1, 保留 cap) */
     int8_t ctx = plic.plic_ctx_map[(hartid << 2) | PRIV_M];
-    if (ctx < 0) return 0;
+    if (ctx < 0) {
+        // 第 3 类: 存在的 hart 的 M ctx 必有硬连线 (M-mode + M 外部中断), 读到 -1 =
+        // emulator bug → fatal。return 0 防下行 plic_ctx_eip[ctx] 二次负索引。
+        runtime_fatal(__func__, "ctx_map[M] < 0", (long)ctx);
+        return 0;
+    }
     return atomic_load_explicit(&plic_ctx_eip[ctx], memory_order_acquire) ? 1 : 0;
 }
 
 int is_plic_seip_pending(uint32_t hartid) {
-    if (hartid >= MAX_HARTS) return 0;
+    if (hartid >= MAX_HARTS) return 0;       /* 同 meip: 内存安全防御, 保留 cap */
     int8_t ctx = plic.plic_ctx_map[(hartid << 2) | PRIV_S];
-    if (ctx < 0) return 0;
+    if (ctx < 0) {
+        // 第 3 类: 调到本函数 = 该 hart 是 S-capable (M-only hart 不合成 SEIP),
+        // 故 S ctx 必存在; 读到 -1 = emulator bug → fatal。return 0 防二次负索引。
+        runtime_fatal(__func__, "ctx_map[S] < 0", (long)ctx);
+        return 0;
+    }
     return atomic_load_explicit(&plic_ctx_eip[ctx], memory_order_acquire) ? 1 : 0;
 }
 
@@ -558,17 +609,21 @@ int plic_init(void) {
     /* 字段 0 init — BSS 已经 0, 显式 memset 仅 lifecycle 可读 (跟 clint_init 同体例)。 */
     memset(&plic, 0, sizeof(plic));
 
-    /* plic_ctx_map 全 -1 init, 然后按 v1 假定全 MSU 覆盖 M/S 槽 (U/VS 保持 -1)。
+    /* plic_ctx_map 全 -1 init (整张表清, 用 cap): U/VS 槽永远 -1 + phantom hart
+       (h >= n_harts) 的 M/S 槽也保持 -1。
        ctx_id 顺序 M 小 S 大 (跟 QEMU virt sifive_plic 一致): hart h → ctx (2h, 2h+1)
        = (M, S)。未来 dtb 接入后这段换成解析后调 plic_set_ctx_map 接口。 */
     for (uint32_t i = 0; i < MAX_HARTS * 4u; i++) {
         plic.plic_ctx_map[i] = -1;
     }
-    /* 反查表 plic_ctx_to_hartid 全 -1 init, 服务 wfi_kick on eip 0→1 */
+    /* 反查表 plic_ctx_to_hartid 全 -1 init (整张表清, 用 cap); phantom ctx 保持 -1 =
+       plic_ctx_is_phantom 判定 + recompute fatal 前置的根。服务 wfi_kick on eip 0→1 */
     for (uint32_t c = 0; c < PLIC_N_CONTEXTS; c++) {
         plic.plic_ctx_to_hartid[c] = -1;
     }
-    for (uint32_t h = 0; h < MAX_HARTS; h++) {
+    /* 只给真实 hart (0..n_harts-1) 填实连线; phantom hart 的 M/S 槽 + 对应 ctx_to_hartid
+       保持上面填的 -1 = 第 2 类 phantom 判定的根 (cap 内 [n_harts, cap) 逻辑不存在)。 */
+    for (uint32_t h = 0; h < n_harts; h++) {
         plic.plic_ctx_map[(h << 2) | PRIV_M] = (int8_t)(2u * h);
         plic.plic_ctx_map[(h << 2) | PRIV_S] = (int8_t)(2u * h + 1u);
         /* 反查表同处填: ctx 2h ↔ hart h (M), ctx 2h+1 ↔ hart h (S) */

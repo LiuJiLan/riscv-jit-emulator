@@ -92,6 +92,9 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure);
 
 // wfi_kick — 唤醒可能在 wfi_wait 的 hart (lock + cond_signal + unlock)。
 //
+// 作用: 主要为了唤醒**某个** wfi 的 hart (中断源 CLINT/PLIC pending 0→1 翻转时
+// 点对点唤醒该 hart, 让它 re-check predicate 决定继续跑还是接中断)。
+//
 // hartid: 索引 wfi_slots[]; 越界 do nothing
 //
 // 幂等: hart 未在 wait → cond_signal 是 noop (glibc 空 waitqueue 跳 syscall);
@@ -100,15 +103,23 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure);
 // 调用约束: 普通线程上下文; signal handler 不能调 (pthread_mutex_*)。
 void wfi_kick(uint32_t hartid);
 
-// wfi_kick_all — 唤醒所有 hart (for 循环逐个调 wfi_kick)。
+// wfi_kick_all — 紧急停机专用: 让**所有** hart 尽快看到 SRS (区别于 wfi_kick 的
+// "唤醒某个有中断 pending 的 hart" — 这里不是去唤醒某个具体中断目标, 而是整机
+// 要停了, 把所有可能在睡的 hart 全叫醒去 re-check predicate 第一条的 SRS 退出)。
 //
-// shutdown 路径不调本函数, 接受 hart 在 wfi 时 cond_timedwait
-// WFI_TIMEOUT_NS (config.h 500ms) 兜底自醒 + predicate 重检 SRS 退出 (详 main.c
-// dispatcher 返回后占位段 trail). 当前无调用者, 函数保留备多 hart / 灵感 — 候选
-// (a) hart 自治 kick (先醒 hart kick 其余) (b) source 端 kick
-// (CLINT/PLIC stop / main spawn-join 范围内 kick; 早期方案均撤). 真撞延迟
-// 问题再回看. 线程安全: for 循环展开 N 个 per-slot mutex kick, 多线程并发调
-// 同 slot 自动串行 (pthread_mutex), 无冲突。
+// 唯一调用方 = runtime.c runtime_fatal (emulator 内部一致性违例的紧急全机停机)。
+// 循环用 cap (MAX_HARTS) 不是 n_harts (fatal 宁可多 kick phantom slot 也不漏真
+// hart; 详 wfi.c 实现段)。正因用 cap, 理论上不应被正常路径调用; 未来正常状态下
+// 按 n_harts 的 kick_all 需求, 另分一个函数, 不复用本函数。
+//
+// 为什么正常 shutdown 不用本函数 (历史 a_03 #194/#198 撤所有调用点): 正常 shutdown
+// 下 predicate 第一条已查 SRS + cond_timedwait WFI_TIMEOUT_NS (config.h 500ms)
+// 兜底自醒, ≤500ms tail 可接受, 不值得引入 kick_all。fatal 场景语义相反 ("别睡了
+// 立刻停"), tail 不可接受 → 是 kick_all 唯一站得住的调用点。
+//
+// 线程安全: for 循环展开 N 个 per-slot mutex kick, 多线程并发调同 slot 自动串行
+// (pthread_mutex), 无冲突。runtime_fatal 可能持 plic.lock wrlock 调入, 但本函数只
+// 碰 wfi_slots[].mutex, 不回头碰 plic/clint 锁 → 不构成锁环。
 //
 // 调用约束: 同 wfi_kick (非 signal handler)。
 void wfi_kick_all(void);

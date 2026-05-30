@@ -85,12 +85,20 @@
 #define BLOCK_INST_LIMIT  64U
 
 // ----------------------------------------------------------------------------
-// hart 数量
+// hart 数量 (编译期 cap; 运行期实际数 = n_harts, 见 src/core/cpu.h)
 // ----------------------------------------------------------------------------
 //
-// v1 单 hart; SMP 真接时改这个宏, clint.msip[] / mtimecmps[] 等数组自动跟随。
-// 不放运行期变量 (跟 GUEST_RAM_* 同性质 — 编译期已知, 数组形态稳定)。
-#define MAX_HARTS         1U
+// 两数 hart 模型 (跟 QEMU MAX_CPUS + -smp 一致; 详 dummy.txt §15):
+//   MAX_HARTS (本宏)      = 编译期 cap; per-hart 静态数组 [MAX_HARTS] 分配
+//                           (clint.msip / mtimecmps / clint_per_hart / wfi_slots /
+//                           plic.plic_ctx_map 等); 形态编译期稳定。lifecycle
+//                           init/destroy 配对必须按 cap 循环 (§15 判据)。
+//   n_harts (cpu.{c,h})   = 运行期实际数 (main 解析 --smp N 写; 默认 1; 约束
+//                           1..MAX_HARTS); 用于存在性遍历 / MMIO 边界 / 实连线填表
+//                           (§15 判据)。
+//
+// cap=8: 跟 QEMU virt 默认量级一致, 项目 v1 足够; 真起多 hart 触发上限再加。
+#define MAX_HARTS         8U
 
 // ----------------------------------------------------------------------------
 // CLINT (Core-Local Interruptor) MMIO 地址布局

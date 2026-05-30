@@ -146,6 +146,14 @@ void wfi_kick(uint32_t hartid) {
     pthread_mutex_unlock(&s->mutex);
 }
 
+// wfi_kick_all — 紧急停机专用: 让所有 hart 尽快看到 SRS (区别于 wfi_kick 的
+// "唤醒某个有中断 pending 的 hart")。当前唯一调用方 = runtime_fatal (整机紧急
+// 停机)。详 wfi.h 顶段声明注释 + runtime.c runtime_fatal。
+//
+// 循环用 cap (MAX_HARTS) 不是 n_harts: fatal 是"出大事了", 宁可多 kick phantom
+// slot (空 waitqueue 近零成本, glibc 跳 futex syscall; kick 幂等) 也不漏 kick
+// 真 hart。正因为用 cap, 本函数理论上不应被正常路径调用 (正常路径只 kick 真实
+// hart); 未来若出现正常状态下按 n_harts 的 kick_all 需求, 另分一个函数, 不复用本函数。
 void wfi_kick_all(void) {
     // 逐 slot signal (不用单全局 cond_broadcast — 用 per-hart 没意义, 但既然
     // 体例已经 per-hart, kick_all 就是 for 循环)。

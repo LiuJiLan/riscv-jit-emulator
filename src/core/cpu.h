@@ -41,6 +41,26 @@
 #include "trap.h"  // trap_csrs_t 内嵌字段类型 (trap.h forward decl cpu_t,
                    // 单向链 trap.h ← cpu.h, 不循环)
 
+// ----------------------------------------------------------------------------
+// n_harts — 运行期实际 hart 数 (两数 hart 模型; cap = config.h MAX_HARTS)
+// ----------------------------------------------------------------------------
+//
+// 跟 QEMU MAX_CPUS 编译上限 + -smp 运行值一致:
+//   MAX_HARTS (config.h) = 编译期 cap; 所有 per-hart 静态数组按 [MAX_HARTS] 分配,
+//                          形态编译期稳定。
+//   n_harts (本变量)     = 运行期实际 hart 数 (main 解析 --smp N, 默认 1,
+//                          约束 1..MAX_HARTS)。cap 之内未使用的 hart 槽
+//                          (idx ∈ [n_harts, cap)) 逻辑上不存在 ("phantom")。
+//
+// 暴露形态跟 ram.h 的 host_ram_base 同体例 (模块定义全局 + 头文件 extern;
+// 不走函数传参 — 这是程序启动后所有模块都遵守的进程级运行期常量, 没有用函数
+// 传的意义)。归 cpu 模块 (hart 数量是 cpu 概念; runtime 只管整机 SRS/SDS 线程
+// 控制流, 不持 hart 数)。
+//
+// 不是 _Atomic: main 在线程 spawn 之前写一次 (--smp 解析后), 之后只读 — 写/读
+// 之间有线程 spawn 的 happens-before 屏障, 多 hart 并发只读安全。
+extern uint32_t n_harts;
+
 // struct tag "cpu_s" 是为了让 trap.h 能 forward typedef cpu_t (trap.h helper 签名要 cpu_t*,
 // 但 trap.h 不能 #include cpu.h 形成循环)。tag 名 cpu_s 仅服务 forward decl, 没人直接用
 // "struct cpu_s" 这个写法; 项目代码全用 cpu_t typedef。零运行时成本 (struct 加 tag 不改

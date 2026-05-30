@@ -24,6 +24,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+// n_harts — 运行期实际 hart 数 (两数 hart 模型; cap = config.h MAX_HARTS)。
+// 暴露形态跟 ram.c 的 host_ram_base 同体例 (模块定义全局 + cpu.h extern)。
+// 默认 1; main 解析 --smp N 后覆盖。详 cpu.h n_harts 段 doc。
+// 非 _Atomic: main 在线程 spawn 之前写一次, 之后只读 (spawn 屏障保证多 hart 并发读安全)。
+uint32_t n_harts = 1u;
+
 // cpu_info_shared_default — 多 hart 共享出场信息 RO CSR (cpu_t::shared_info 指向)
 //
 // 制造商信息 (mvendorid/marchid/mimpid) 是机器整体属性, 不区分 hart; 当前 open-source
@@ -182,8 +188,12 @@ void cpu_reset(cpu_t *hart) {
 // ----------------------------------------------------------------------------
 static void cpu_dump(const cpu_t *hart) {
 #ifdef DEBUG_CPU_DUMP_ON
+    // 多 hart dump: 每行前缀 [cpu h%u] 加 hartid, grep / 视觉分组都友好
+    // (n_harts=1 时跟单 hart 输出形态一致, 只多 1 个 ' h0' 字段)。
+    uint32_t hid = hart->hartid;
+
     fprintf(stderr,
-            "[cpu] reg dec:" EOL
+            "[cpu h%u] reg dec:" EOL
             "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u" EOL
             "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u" EOL
             "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u" EOL
@@ -192,6 +202,7 @@ static void cpu_dump(const cpu_t *hart) {
             "\tx21(s5)   = %11u  |  x22(s6)   = %11u  |  x23(s7)   = %11u  |  x24(s8)   = %11u" EOL
             "\tx25(s9)   = %11u  |  x26(s10)  = %11u  |  x27(s11)  = %11u  |  x28(t3)   = %11u" EOL
             "\tx29(t4)   = %11u  |  x30(t5)   = %11u  |  x31(t6)   = %11u" EOL,
+            hid,
             hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
             hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
             hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
@@ -202,7 +213,7 @@ static void cpu_dump(const cpu_t *hart) {
             hart->regs[29], hart->regs[30], hart->regs[31]);
 
     fprintf(stderr,
-            "[cpu] reg hex:" EOL
+            "[cpu h%u] reg hex:" EOL
             "\tx1(ra)    = 0x%08X  |  x2(sp)    = 0x%08X  |  x3(gp)    = 0x%08X  |  x4(tp)    = 0x%08X" EOL
             "\tx5(t0)    = 0x%08X  |  x6(t1)    = 0x%08X  |  x7(t2)    = 0x%08X  |  x8(s0/fp) = 0x%08X" EOL
             "\tx9(s1)    = 0x%08X  |  x10(a0)   = 0x%08X  |  x11(a1)   = 0x%08X  |  x12(a2)   = 0x%08X" EOL
@@ -211,6 +222,7 @@ static void cpu_dump(const cpu_t *hart) {
             "\tx21(s5)   = 0x%08X  |  x22(s6)   = 0x%08X  |  x23(s7)   = 0x%08X  |  x24(s8)   = 0x%08X" EOL
             "\tx25(s9)   = 0x%08X  |  x26(s10)  = 0x%08X  |  x27(s11)  = 0x%08X  |  x28(t3)   = 0x%08X" EOL
             "\tx29(t4)   = 0x%08X  |  x30(t5)   = 0x%08X  |  x31(t6)   = 0x%08X" EOL,
+            hid,
             hart->regs[1],  hart->regs[2],  hart->regs[3],  hart->regs[4],
             hart->regs[5],  hart->regs[6],  hart->regs[7],  hart->regs[8],
             hart->regs[9],  hart->regs[10], hart->regs[11], hart->regs[12],
@@ -225,20 +237,23 @@ static void cpu_dump(const cpu_t *hart) {
     // double-trap 升级 (Smdbltrp/Ssdbltrp). S 槽 mtval2 显示 double-trap 升级时
     // 原本要写 stval 的值 (S-trap unexpected 路径).
     fprintf(stderr,
-            "[cpu] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X" EOL,
+            "[cpu h%u] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X" EOL,
+            hid,
             (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M],
             hart->trap.mtval2);
     fprintf(stderr,
-            "[cpu] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X" EOL,
+            "[cpu h%u] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X" EOL,
+            hid,
             (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
             hart->trap.xepc[PRIV_S],   hart->trap.xtvec[PRIV_S]);
 
     // state dump: pc + priv + mstatus 低 32 位 + mstatush (含 MDT bit10)。
     fprintf(stderr,
-            "[cpu] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X" EOL,
+            "[cpu h%u] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X" EOL,
+            hid,
             hart->regs[0],
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu),

@@ -13,10 +13,17 @@
 //                              SRS-controlled 设备); ABORT
 //   bit 16 = HART_MDT          HART M-mode double fault (mstatus.MDT 触发, NMI
 //                              不实现, 按 QEMU 实践 abort); ABORT
+//   bit 17 = INTERNAL_FATAL    emulator 内部一致性违例 (runtime_fatal; 反查表 -1
+//                              等真 emulator bug, 跟 guest 无关); ABORT。独立 bit
+//                              (不借道 SHUTDOWN_TRIGGER) 让 SRS join 时一眼看到自己
+//                              出了大问题, 详 runtime_fatal 段。
+//   bit 18 = HART_SPAWN_FAIL   per-hart pthread_create 失败 (main 端 set); ABORT。
+//                              已 spawn 的 hart 看 SRS 退 dispatcher → join 完 →
+//                              cleanup chain; 跟 HART_MDT 同 hart-level bit 段。
 //   bit 24 = TEST_RESET        0x7777 sifive_test reset; 非 ABORT, main 走
 //                              system_reset continue 路径
-//   ABORT_MASK = bit0 | bit2 | bit16 — 命中其中任一 bit 时 main 走 cleanup +
-//   return exit_code; 不命中 (即 TEST_RESET) 时 main 走 try_clear + continue。
+//   ABORT_MASK = bit0 | bit2 | bit16 | bit17 | bit18 — 命中其中任一 bit 时 main 走
+//   cleanup + return exit_code; 不命中 (即 TEST_RESET) 时 main 走 try_clear + continue。
 //   未来新增"允许 system reset" 的 bit 放 ABORT_MASK 外即可。
 //
 // shutdown_signal bit 分配:
@@ -28,6 +35,8 @@
 //                              语义 = "外部介入, 不是模拟器自己决定退出"; 配套
 //                              external_signal_no 字段携带 signum, main 末段
 //                              按 POSIX 惯例返 128 + signum (130/143/129)
+//   bit 6  = INTERNAL_FATAL    emulator 内部一致性违例 (runtime_fatal); 跟 SRS 侧
+//                              同名 bit 配套, 走顺序 B (详 runtime_fatal 段)
 //
 // 写路径协议:
 //   - set 路径 — atomic_fetch_or RMW, 不允许覆盖别人 bit。HART (M-mode double
@@ -114,11 +123,15 @@
 #define SYSRESET_BIT_SHUTDOWN_TRIGGER  (1u << 0)
 #define SYSRESET_BIT_DEVICE_FAIL       (1u << 2)
 #define SYSRESET_BIT_HART_MDT          (1u << 16)
+#define SYSRESET_BIT_INTERNAL_FATAL    (1u << 17)   /* emulator 内部一致性违例 (runtime_fatal); ABORT */
+#define SYSRESET_BIT_HART_SPAWN_FAIL   (1u << 18)   /* per-hart pthread_create 失败; main 端 set; ABORT */
 #define SYSRESET_BIT_TEST_RESET        (1u << 24)
 
 #define SYSRESET_ABORT_MASK            (SYSRESET_BIT_SHUTDOWN_TRIGGER | \
                                         SYSRESET_BIT_DEVICE_FAIL      | \
-                                        SYSRESET_BIT_HART_MDT)
+                                        SYSRESET_BIT_HART_MDT         | \
+                                        SYSRESET_BIT_INTERNAL_FATAL   | \
+                                        SYSRESET_BIT_HART_SPAWN_FAIL)
 
 // ----------------------------------------------------------------------------
 // shutdown_signal bit 编码
@@ -126,6 +139,7 @@
 #define SHUTDOWN_BIT_NORMAL_EXIT       (1u << 0)
 #define SHUTDOWN_BIT_DEVICE_FAIL       (1u << 2)
 #define SHUTDOWN_BIT_EXTERNAL_SIGNAL   (1u << 4)
+#define SHUTDOWN_BIT_INTERNAL_FATAL    (1u << 6)   /* emulator 内部一致性违例 (runtime_fatal) */
 
 extern _Atomic uint32_t system_reset_signal;
 extern _Atomic uint32_t shutdown_signal;
@@ -150,6 +164,39 @@ void system_reset_signal_set_bit(uint32_t mask);
 //   - test_dev 0x5555/0x3333    → shutdown_signal_set_bit(SHUTDOWN_BIT_NORMAL_EXIT);
 //   - timer/uart/virtio_blk fail → shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL).
 void shutdown_signal_set_bit(uint32_t mask);
+
+// runtime_fatal — emulator 内部一致性违例的紧急全机停机 (唯一的"跨类例外"包装)。
+//
+// 语义: 当 emulator 内部检测到不该发生的状态 (例如 PLIC 反查表 plic_ctx_to_hartid /
+// plic_ctx_map 读到 -1 = 存在的 hart/ctx 丢了硬连线 = 真 emulator bug, 不是 guest
+// 的错), 调本函数 → fprintf 诊断 + 全机停机 + main 还能走 cleanup/dump 定位。
+//
+// **唯一可由 SRS 类设备 (dispatcher/hart/trap) 和 SDS 类设备 (timer/uart/virtio)
+// 都直接调用的停机函数** — 这是有意的跨类例外, 不违反 dummy.txt §7 monitor 分层:
+//   - 正常生命周期分层 (SRS 类 = 每 system reset 起停 / SDS 类 = 跨 reset 持续) 约束
+//     的是"正常运行"; fatal 是"异常退出", 跟"你属于哪条生命周期"正交 — 内部 bug 可能
+//     发生在任何模块。
+//   - monitor 封装原则贯彻到底: 调用方只调 runtime_fatal, 拿到契约"全机停 + main
+//     dump", **不需要也不知道**内部戳了 SDS 还是 SRS (consumer/producer 接口)。
+//
+// 走 SDS 路径 (顺序 B): set SHUTDOWN_BIT_INTERNAL_FATAL + SYSRESET_BIT_INTERNAL_FATAL。
+// SRS/SDS 各用独立 INTERNAL_FATAL bit (不借道 SHUTDOWN_TRIGGER) 的理由: 原理上 SRS
+// 会观察 SDS, 但流程是"SRS 先检查自己没问题, 才在清空自己前检查 SDS"。FATAL 的语义是
+// 这个错误严重到 SRS 自己就该知道出了大问题, 不能"觉得自己没问题、等到 SDS 语义才停";
+// 所以 SRS 侧必须有独立 INTERNAL_FATAL bit, join 时一眼看到自己出了大问题。
+//
+// 之后再调 wfi_kick_all 紧急唤醒所有可能在 WFI 的 hart (fatal "别睡了立刻停", 不接受
+// 正常 shutdown 那 ≤500ms cond_timedwait tail; runtime → core/wfi 方向依赖, 见 runtime.c)。
+//
+// **non-_Noreturn / 不 abort**: 某些 call site (plic.c recompute_ctx_eip) 持 plic.lock
+// wrlock 调入, _Noreturn/abort 会带锁跳走死锁。本函数只 fprintf + set bit + kick + 返回;
+// call site 负责在调用后安全 return / 跳过副作用 (防用 -1 二次越界索引)。
+//
+// where:     caller 函数名 (诊断用; **推荐直接传 `__func__`** 让编译器维护, 防
+//            rename 时 hardcode 字符串漏改导致 fatal 日志骗人)。
+// detail:    出事的具体上下文 (例 "ctx_to_hartid[ctx_id] < 0"; 跟 where 拼成完整线索)。
+// bad_value: 读到的非法值 (例 -1 / 越界 idx)。
+void runtime_fatal(const char *where, const char *detail, long bad_value);
 
 // 仅 main 端调: atomic { if shutdown==0 then system_reset=0 } CAS-loop。
 // 返 true  = 清成功 (system_reset 已 0; main while 可 continue 进下一 iter);

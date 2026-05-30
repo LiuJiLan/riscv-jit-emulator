@@ -686,6 +686,33 @@ M 态 / S 态的 bare 模式下,gva == pa(恒等映射)。一种朴素实现可�
 
 
 --------------------------------------------------------------------------------
+运行中内部一致性违例 — runtime_fatal (跟启动期失败码两条路)
+--------------------------------------------------------------------------------
+
+  上面整套 (return 码 + why/where 两行) 针对的是 *启动期* 失败 (lifecycle 早期、
+  单线程、调用方能决定退不退)。**运行中** 检测到 emulator 内部一致性违例 (不该
+  发生的状态 = 真 host 侧 bug, 例: PLIC 反查表 plic_ctx_to_hartid / plic_ctx_map
+  读到 -1, 见 §15 第 3 类越界) 是另一条路: 此时多线程已起、调用栈可能持锁, 返码
+  上抛没意义 (没人能"决定不退"), 必须主动停全机 + 留 dump 定位。
+
+  走 runtime_fatal(where, detail, bad_value) (runtime.{c,h}; where 传 __func__):
+    - fprintf 一行诊断 (where = 出事函数名, bad_value = 读到的非法值);
+    - 紧急全机停机: SDS + SRS 各 set INTERNAL_FATAL bit (走顺序 B = SDS 先 SRS 后,
+      详 runtime.h 顶段 "顺序 B 防 race" 段);
+    - wfi_kick_all 叫醒所有可能在 WFI 的 hart (让它们 re-check predicate 看 SRS 退);
+    - main while 退出 → 正常 cleanup chain + cpu_dump (定位现场)。
+
+  约束 (跟 "模块不调 exit" 同源精神, 但更强):
+    - **non-_Noreturn / 不 abort()**: call site 可能持锁 (plic recompute 持
+      plic.lock wrlock), C abort()/longjmp 会带锁跳走死锁; 必须正常返回让栈
+      unwind 出锁, call site 调用后自行安全 return (防 -1 二次越界索引)。
+      真正的 abort() (core dump) 不引入 — 协同停机保住 main 的 cleanup 控制权,
+      跟本协议 "调 exit 由 main 决定" 初衷一致。
+    - runtime_fatal 是唯一可由 SRS 类 (dispatcher/hart/trap) 和 SDS 类 (timer/
+      uart/virtio) 设备都直接调的跨类停机包装 (有意的跨类例外, 详 runtime.h)。
+
+
+--------------------------------------------------------------------------------
 stderr vs stdout
 --------------------------------------------------------------------------------
 
@@ -1520,11 +1547,13 @@ vs 标注式" 的策略选择。
 
 涉及文件:
   - src/main.c                (当前所有 host thread 的 spawn / join 责任)
-  - src/runtime.{c,h}         (system_reset_signal / shutdown_signal extern flag)
+  - src/runtime.{c,h}         (system_reset_signal / shutdown_signal extern flag;
+                               runtime_fatal 紧急停机 + wfi_kick_all)
   - src/platform/clint.{c,h}  (clint_start_timer_thread / clint_join_timer_thread 对偶)
   - src/device/uart.{c,h}     (uart_start_rx_thread / uart_join_rx_thread 对偶)
   - src/device/virtio_blk.{c,h} (virtio_blk_start_io_worker_thread /
                                   virtio_blk_join_io_worker_thread 对偶)
+  - src/core/wfi.{c,h}        (wfi_kick 点对点唤醒 / wfi_kick_all 紧急叫醒所有 hart)
   - 未来任何 spawn host thread 的模块
 
 
@@ -1566,6 +1595,31 @@ destroy 反过来)。
 
 例外: 模块内部临时异步任务 (模块自己起的) 由模块自己 join, 但要在 sheet 写明
 "此线程模块内部 lifecycle"。
+
+
+--------------------------------------------------------------------------------
+唤醒 vs 紧急叫醒 (core/wfi) + runtime → core/wfi 方向依赖
+--------------------------------------------------------------------------------
+
+wfi_kick(hartid) — 唤醒**某个**在 WFI cond_wait 的 hart (中断源 CLINT/PLIC
+  pending 0→1 翻转时点对点; hart 醒来 re-check predicate 决定继续跑还是接中断)。
+
+wfi_kick_all() — 让**所有** hart 尽快看到 SRS, **紧急停机专用** (唯一调用方 =
+  runtime_fatal)。循环用 cap (MAX_HARTS) 不是 n_harts: fatal 是"出大事了", 宁可
+  多 kick phantom slot (空 waitqueue 近零成本, glibc 跳 futex syscall; kick 幂等)
+  也不漏 kick 真 hart。
+  - 正常 shutdown **不**用 kick_all: predicate 第一条已查 SRS + cond_timedwait
+    WFI_TIMEOUT_NS (500ms) 兜底自醒, ≤500ms tail 可接受 (a_03 #194/#198 撤所有
+    正常调用点; trade_off_log §T.8)。fatal 场景语义相反 ("别睡了立刻停"), tail
+    不可接受 → 是 kick_all 唯一站得住的调用点。
+  - 未来正常状态下按 n_harts 的 kick_all 需求 (例多 hart 协同), 另分一个函数,
+    不复用 wfi_kick_all (它语义已定死为紧急停机)。
+
+runtime → core/wfi 方向依赖: runtime_fatal 调 wfi_kick_all。runtime 本是最底层
+degenerate monitor (谁都依赖它、它不依赖别人), 但 fatal 是"贯穿整机的紧急停机
+控制流", 调别模块的"紧急停止函数"不破坏 runtime 定位。死锁安全: wfi_kick_all 只
+碰 wfi_slots[].mutex, 不回头碰 plic/clint 锁 → 持锁 call site (plic recompute 持
+plic.lock) 调入无锁环。
 
 
 --------------------------------------------------------------------------------
@@ -1763,11 +1817,14 @@ bug。注: -Wconversion 当前不在项目 build flag 内, 此收益要等真加
 --------------------------------------------------------------------------------
 
   - Sstc stimecmp: clint 内复制 mtip 路径, 加 _Atomic u8 stip[MAX_HARTS] +
-    stip_lock[MAX_HARTS]; 跟 mtip 同处 recompute + kick (推 plan §2 deferred)
+    stip_lock[MAX_HARTS]; 跟 mtip 同处 recompute + kick (推 plan §2 deferred)。
+    (注: MAX_HARTS 现已是编译期 cap 语义, 见 §15; 这里数组按 cap 分配正确)
   - F/D fcsr per-hart 缓存: 真需要 cross-hart 观察时按本节体例落地, 否则
     fcsr 是单 hart 私有字段直存 cpu_t 即可
-  - SMP 真激活时 PLIC ctx_eip 数组应该补 padding (当前是 _Atomic u8 紧凑
-    数组, MAX_HARTS=1 时不重要; SMP 上线时回头 sweep)
+  - PLIC ctx_eip 数组 padding: 当前是 _Atomic u8 紧凑数组。SMP s2 已把 MAX_HARTS
+    从 1 切成 cap 语义 (数组按 cap 分配, 见 §15), 但 cache-line padding 防 false
+    sharing 仍 deferred — 真起多 hart 多线程 (s3+) 跑 TSan 看 ctx_eip 是否成 false
+    sharing 热点时再补 (smp_todo_list F 节调试方法论)。
 
 
 --------------------------------------------------------------------------------
@@ -1782,5 +1839,166 @@ bug。注: -Wconversion 当前不在项目 build flag 内, 此收益要等真加
   - cache line 大小不抽 BUILD_CACHE_LINE_SIZE 宏。当前 hardcode 64
     (x86_64 / aarch64 主流值); 真上 Apple M (128) / 老 ARM (32) 需要切换
     时再加, 不预测。
+
+
+================================================================================
+## §15. hart 两数模型 (cap = MAX_HARTS / 运行期 n_harts) + 三类越界语义
+================================================================================
+
+涉及文件:
+  - src/core/cpu.{c,h}        (n_harts 全局; cpu.h extern + cpu.c 定义 = 1u)
+  - src/config.h              (MAX_HARTS = 编译期 cap; 当前 1U, SMP s2 末步切 8U)
+  - src/main.c                (--smp N CLI 解析 + s2 阶段钳死 n_harts=1)
+  - src/platform/clint.c      (4 处 MMIO 边界 + recompute_all_mtip 用 n_harts;
+                               lifecycle 配对 + 内部 helper 防御边界保 cap)
+  - src/platform/plic.c       (phantom drop helper + recompute_all_ctx_eip + plic_init
+                               实连线填充用 n_harts; ctx_map/ctx_to_hartid 整张清表 +
+                               单 rwlock + 内部 helper 防御保 cap; 反查表 < 0 fatal)
+  - src/core/wfi.c            (数组定义 + mutex/cond init/destroy 配对 + kick_all 全 cap)
+  - src/runtime.{c,h}         (runtime_fatal 紧急停机 — 第 3 类越界的落地; 详 §5 末段)
+
+
+--------------------------------------------------------------------------------
+背景与目的
+--------------------------------------------------------------------------------
+
+SMP 起拆 MAX_HARTS 原有的双重身份 — v1 单 hart 时 MAX_HARTS 同时是 "数组上限"
+跟 "实际 hart 数"; 多 hart 起来后必须区分。本节钉死两数模型 + 三类越界语义 +
+逐场景 cap-vs-n_harts 判据, 防 s3 真起多线程后边界条件出错 / fatal 假阳性 /
+lifecycle 配对错位泄漏。
+
+跟 QEMU MAX_CPUS + -smp 同形态 (编译期上限 + 运行期实际值)。
+
+
+--------------------------------------------------------------------------------
+两数模型
+--------------------------------------------------------------------------------
+
+  MAX_HARTS (config.h)  = 编译期 cap。所有 per-hart 静态数组按 [MAX_HARTS] 分配,
+                          形态编译期稳定。lifecycle init/destroy 配对必须用 cap
+                          (否则 cap 改 8 后 lifecycle 配对错位 → 资源泄漏 / UAF)。
+
+  n_harts   (cpu.{c,h}) = 运行期实际 hart 数。main 解析 --smp N 后写定一次, 之后
+                          只读。约束 1..MAX_HARTS。默认 1。
+                          - 非 _Atomic: spawn-before-read happens-before 屏障保证
+                            多 hart 只读安全 (跟 ram.h host_ram_base 同体例)。
+                          - 暴露 = cpu.h extern + cpu.c 全局定义; 不走函数传参 (是
+                            进程级运行期常量, 跟 RAM 起点同性质)。
+                          - 归 cpu 模块 (hart 数量是 cpu 概念); 不进 runtime
+                            (runtime 只管整机 SRS/SDS 线程控制流, 不持 hart 数)。
+
+  phantom hart           = cap 之内未使用的 hart 槽 (idx ∈ [n_harts, cap))。逻辑
+                          上不存在; 任何对 phantom 的访问按下面 "三类越界语义"
+                          其中一类处理 (谁是访问者决定走哪类)。
+
+
+--------------------------------------------------------------------------------
+三类越界语义 (按 "谁是访问者" 分)
+--------------------------------------------------------------------------------
+
+第 1 类 — guest 经 MMIO 访问 idx >= n_harts 的 CLINT hart
+  - 性质: guest 软件 bug (越界访问 reserved hart)
+  - 回应: 返 RV access fault (CAUSE_*_ACCESS_FAULT), trap 回 guest; 不拖停模拟器
+  - 原因: 否则 buggy guest 可 DoS host
+  - 落地: CLINT 4 处 MMIO 边界 (read msip/mtimecmp + write msip/mtimecmp) 用
+    `if (idx >= n_harts) return CAUSE_*_ACCESS_FAULT;`, return 在碰字段 /
+    atomic_store / wfi_kick / recompute 之前 → 无副作用
+
+第 2 类 — guest 经 MMIO 访问 PLIC 的 phantom ctx (对应 hart >= n_harts)
+  - 性质: guest 软件 bug (跟第 1 类同源, 但 PLIC 历来对 region 内越界/reserved
+    是 silent ignore 政策, 跟 QEMU sifive_plic 对齐)
+  - 回应: silent drop — read 返 0, write 丢; 不 fault, 不 set 字段, 不进仲裁,
+    不触发 recompute
+  - 落地: helper `plic_ctx_is_phantom(ctx_id)` = `plic_ctx_to_hartid[ctx_id] < 0`
+    (phantom hart 槽 plic_init 保持 -1)。落点:
+       plic_write enable  — 硬前置 (phantom enable 不写进 → phantom ctx eip 永不
+                            0→1 → 不会撞第 3 类的 fatal)
+       plic_write threshold / complete — 纵深防御
+       plic_read claim / threshold      — 纵深防御 + 不进仲裁
+    plic_read priority / pending / enable 按 source/word 索引 (跟 hart 数无关),
+    不需 phantom drop。
+
+第 3 类 — emulator 内部读反查表 plic_ctx_to_hartid / plic_ctx_map 读到 -1
+  - 性质: 真 emulator bug (存在的 ctx / hart 丢了硬连线 = 内部一致性违例, 跟
+    guest 无关)
+  - 回应: loud fatal — 调 runtime_fatal(where, detail, bad_value) (详 §5 末段;
+    where 传 __func__ 让编译器维护); fprintf 诊断 + SDS+SRS 各 set INTERNAL_FATAL
+    bit + wfi_kick_all 紧急叫醒所有 hart
+  - 约束: non-_Noreturn / 不 abort — 某些 call site (plic.c recompute_ctx_eip)
+    持 wrlock 调入, abort/longjmp 会带锁跳走死锁; call site 在 fatal 后正常返回
+    让栈 unwind 出锁, 并自行 return / 跳过副作用 (防 -1 二次越界索引)
+  - 落地:
+       plic_recompute_ctx_eip_locked      — h<0 调 fatal, 不 else kick (持 wrlock)
+       is_plic_meip_pending               — ctx<0 调 fatal, return 0 防二次负索引
+       is_plic_seip_pending               — 同上 (注: 隐含 "调本函数 = S-capable
+                                            hart" 假设; 当前所有 hart 都 MSU 成立,
+                                            未来 hart heterogeneity 引入时回看)
+
+`-1` 哨兵在 "填表/init" 层仍合法保留 (phantom hart 槽 = -1 + U/VS 槽 = -1);
+只在 "使用" 层遇到才 fatal — 区分 phantom 还是 emulator bug 由调用上下文决定
+(第 2 类 phantom drop 帮 plic_write 路径不会让第 3 类发生)。
+
+
+--------------------------------------------------------------------------------
+cap-vs-n_harts 判据 (新代码加哪边的判据)
+--------------------------------------------------------------------------------
+
+用 cap (MAX_HARTS):
+  - 数组定义 / 字段长度 (clint.{mtimecmps,msip}[MAX_HARTS], clint_per_hart
+    [MAX_HARTS], wfi_slots[MAX_HARTS], plic.plic_ctx_map[MAX_HARTS*4],
+    plic.plic_ctx_to_hartid[PLIC_N_CONTEXTS = MAX_HARTS*2]) — 编译期形态稳定
+  - lifecycle 配对循环 (init/destroy mutex/cond, init/destroy 填哨兵) — 必须 cap,
+    漏一个 → cap 改 8 后泄漏 7 把锁 / 7 个 slot 未清; s2 测不出, s3 才爆
+  - 内部 helper 防御边界 (is_clint_*_pending / is_plic_*_pending / wfi_wait /
+    wfi_kick 防御 hartid 越界) — hartid 来自 cpu_t wired 不是反查表 -1, 跟第 3
+    类正交; 不改 fatal
+  - wfi_kick_all 循环 — 紧急停机专用, 宁可多 kick phantom 空 slot (近零成本)
+    也不漏真 hart; 详 §12 末段
+  - phantom 判定的根表清空 (plic_init 全 -1 填 ctx_map + ctx_to_hartid) — 整张
+    表清, 用 cap
+
+用 n_harts:
+  - 存在性遍历 (clint_recompute_all_mtip, plic_recompute_all_ctx_eip_locked 用
+    `2*n_harts`) — 只算存在的 hart, 省 phantom 空转 + 避免 spurious kick 空 slot
+  - 实连线填充 (plic_init 给真实 hart 填 ctx_map + ctx_to_hartid) — phantom hart
+    的槽留 -1 = phantom 判定的根
+  - 第 1 类 MMIO 边界 (clint 4 处 `if idx >= n_harts return fault`) — guest 视角
+    "idx 之外的 hart 不存在"
+  - 第 2 类 phantom drop (隐式: plic_ctx_is_phantom 间接判 n_harts 内/外)
+
+
+--------------------------------------------------------------------------------
+s2 钳死 (SMP 中间态 — 行为恒等变换验收)
+--------------------------------------------------------------------------------
+
+main 强制 `n_harts = 1u` 忽略 --smp 解析值; config.h MAX_HARTS 仍 1U。改完后:
+  - n_harts == 1 == MAX_HARTS → `for i<n_harts` ≡ `for i<MAX_HARTS`,
+    `idx>=n_harts` ≡ `idx>=MAX_HARTS`, `2*n_harts (=2)` ≡ `PLIC_N_CONTEXTS (=2)`
+  - phantom 判定 plic_ctx_is_phantom 永返 false (ctx 0/1 都被填实)
+  - 第 3 类 fatal 永不触发 (ctx_to_hartid 没有 -1 项可读)
+  - 全量存量 fixture 100% 绿 + 输出逐字节一致 = s2 验收信号
+  - 行为恒等变换成立的前提: 上面 "cap-vs-n_harts 判据" 全场景判对 (尤其 lifecycle
+    配对没误用 n_harts; 漏在 s2 不可见, s3 cap 改 8 才爆 → s2 是测不出的雷)
+
+s2 末步 (单独一轮): config.h MAX_HARTS 1U → 8U + 删 main 钳死; 此时 n_harts 仍
+默认 1 → 单核仍恒等; 用 --smp 2 等手测 cap 放开后多核数据结构就位 (真起多线程
+是 s3, 本步只验数组 / 边界 / init 在 cap=8 下不崩 + 单核不回归)。
+
+s3: main 循环 cpu_create n_harts 个 + per-hart dispatcher pthread + dump 打 hartid。
+此时 n_harts 写为 smp_req (解钳); kick_all 仍专用紧急停机不动 (未来正常状态
+n_harts kick_all 需求另分函数, 详 §12 末段)。
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 不引入运行期 hart 数动态变化 (热插拔)。spawn 后 n_harts 只读, 单 store
+    happens-before 屏障一次定终生; v1 不规划 hot-add/remove。
+  - 不引入 misa heterogeneity 的 hart (M-only / S-capable 混合)。当前 v1 所有
+    hart 都 MSU; is_plic_seip_pending 的 fatal 假设依赖此条; 引入 heterogeneity
+    时回看 (S-capable 子集要单独追踪, 不再 = 全集)。
+  - 不引入 hartid 复用 / GC。hartid ∈ [0, n_harts) 程序内常住, pthread 退出后
+    idx 不腾给新 hart (跟 ASID 那种"环形复用"是两码事)。
 
 

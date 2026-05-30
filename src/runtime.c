@@ -11,6 +11,9 @@
 #include "runtime.h"
 
 #include "config.h"               // EOL (项目级 stderr 输出体例)
+#include "core/wfi.h"             // wfi_kick_all (runtime_fatal 紧急唤醒所有 hart;
+                                  //   runtime → core/wfi 唯一方向依赖, 详 runtime.h
+                                  //   runtime_fatal 段 + wfi.h wfi_kick_all 段)
 
 #include <errno.h>
 #include <signal.h>
@@ -35,6 +38,28 @@ void shutdown_signal_set_bit(uint32_t mask) {
     atomic_fetch_or_explicit(&system_reset_signal,
                              SYSRESET_BIT_SHUTDOWN_TRIGGER,
                              memory_order_release);
+}
+
+void runtime_fatal(const char *where, const char *detail, long bad_value) {
+    // emulator 内部一致性违例 → 紧急全机停机 + main 仍可 dump。语义/分层/bit 选择
+    // 详 runtime.h runtime_fatal 段。non-_Noreturn / 不 abort (call site 可能持锁)。
+    fprintf(stderr, "[runtime] FATAL internal bug at %s: %s (bad value %ld) "
+            "(emulator bug, not guest)" EOL, where, detail, bad_value);
+
+    // 走顺序 B (SDS 先 SRS 后) 防 main 看 SRS!=0 走 join 时 SDS 未设 → 线程不退 hang。
+    // 两侧都用独立 INTERNAL_FATAL bit (不借道 SHUTDOWN_TRIGGER; 理由见 runtime.h)。
+    atomic_fetch_or_explicit(&shutdown_signal,
+                             SHUTDOWN_BIT_INTERNAL_FATAL,
+                             memory_order_release);
+    atomic_fetch_or_explicit(&system_reset_signal,
+                             SYSRESET_BIT_INTERNAL_FATAL,
+                             memory_order_release);
+
+    // 紧急唤醒所有可能在 WFI cond_wait 的 hart, 让它们立即 re-check predicate
+    // (wfi_should_wake 第一条查 SRS != 0 → 退 wfi 退 main loop); fatal 不接受正常
+    // shutdown 那 ≤500ms cond_timedwait tail。wfi_kick_all 用 cap, 只碰 wfi slot
+    // mutex 不碰 plic/clint 锁 → 持锁 call site 调入无锁环 (详 wfi.h)。
+    wfi_kick_all();
 }
 
 bool system_reset_signal_try_clear_if_shutdown_zero(void) {

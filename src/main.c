@@ -59,6 +59,7 @@
 #include "riscv.h"
 #include "runtime.h"
 
+#include <pthread.h>    // pthread_create / pthread_join (s3 per-hart dispatcher 线程)
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>     // strtoul (--load ADDR= 解析)
@@ -325,6 +326,17 @@ static int decode_test(void) {
     return fail;
 }
 
+// hart_exec_run — per-hart pthread routine (file-static; 适配 pthread void *(void *)
+// ABI ↔ dispatcher void(cpu_t *) 签名). cpu_t 是 hart 的"数据部分", 本函数是
+// "执行部分" — 即每个 hart 启动一个本 routine 的 pthread, 内部调一次 dispatcher
+// 跑到 hart halt (dispatcher 内部 while(SRS==0) 自带 hart 主循环 + sigsetjmp 落点)。
+// 跟 timer_run / io_worker_run / uart_reader_run / uart_tx_drain_run 同 file-static
+// wrapper 体例 (project 里所有 pthread routine 都走这层 ABI 适配)。
+static void *hart_exec_run(void *arg) {
+    dispatcher((cpu_t *)arg);
+    return NULL;
+}
+
 // Debug 构建带 -fsanitize=address (含 LSan 的 exit-time 内存泄漏扫描)。
 // 在 CLion Debug / gdb / strace 等 ptrace 环境下跑本程序, 必须设
 //   ASAN_OPTIONS=abort_on_error=1:detect_leaks=0
@@ -364,6 +376,10 @@ int main(int argc, char **argv) {
     struct { uint64_t addr; const char *file; int as_elf; } load_ops[LOAD_OP_MAX];
     int load_count = 0;
     const char *blk_path = NULL;
+    // n_harts 是 cpu.{c,h} 的全局 (core/cpu.h extern; 默认 1)。--smp 解析进临时
+    // smp_req 做语法+范围校验, 通过后写全局 n_harts (见 while 前)。不再用局部
+    // 变量 (避免 shadow 全局)。
+    unsigned smp_req = 1;  // --smp N 解析结果 (语法/范围校验用; 校验通过后写全局)
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -439,17 +455,45 @@ int main(int argc, char **argv) {
             }
             blk_path = argv[i];
 
+        } else if (strcmp(arg, "--smp") == 0) {
+            // 运行期 hart 数 (QEMU -smp 同义); 不给 = 默认 1。校验 1..MAX_HARTS,
+            // 越界提前退出 (dummy.txt §5)。解析进 smp_req; 真写全局 n_harts 在
+            // while 前。s2 末步形态: 单 hart 仍直调 dispatcher (真起多线程留 s3)。
+            if (++i >= argc) {
+                fprintf(stderr, "--smp needs N (1..%u)" EOL, MAX_HARTS);
+                return 1;
+            }
+            // strtoul base=0: 接受十进制 / 0x 十六进制; end 须停在 '\0' (整串是数字)。
+            char *end = NULL;
+            unsigned long v = strtoul(argv[i], &end, 0);
+            smp_req = (unsigned)v;
+            // 范围用 smp_req 判; v != smp_req 兜底 64→32 截断把超大值绕过上界。
+            if (*end != '\0' || end == argv[i] || v != smp_req ||
+                smp_req < 1u || smp_req > MAX_HARTS) {
+                fprintf(stderr, "--smp: N must be 1..%u (got '%s')" EOL, MAX_HARTS, argv[i]);
+                return 1;
+            }
+
         } else {
             fprintf(stderr, "unknown arg: %s" EOL, arg);
-            fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]" EOL, argv[0]);
+            fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE] [--smp N]" EOL, argv[0]);
             return 1;
         }
     }
 
     if (load_count == 0) {
-        fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE]" EOL, argv[0]);
+        fprintf(stderr, "usage: %s --bios FILE [--load [ADDR=]FILE]... [--blk FILE] [--smp N]" EOL, argv[0]);
         return 1;
     }
+
+    // 写运行期 hart 数 (cpu.{c,h} 全局; --smp 解析值, 默认 1 if 未给)。必须在任何
+    // 线程 spawn (最早 clint_start_timer_thread) 之前写定 — n_harts 非 atomic, 靠
+    // spawn happens-before 屏障保证多 hart 只读安全 (详 cpu.h n_harts 段)。
+    //
+    // s2 末步形态 (cap=8 + n_harts=smp_req 默认 1): 单 hart 单线程仍是恒等; 用
+    // --smp 2..8 触发 cap 放开后多核数据结构 (数组/边界/init/phantom drop/fatal
+    // 路径) 在 cap=8 下不崩。真起多线程在 s3 (本处仍单 hart 直调 dispatcher)。
+    n_harts = smp_req;
 
     // UART TX 走 tx_drain thread → write(STDOUT_FILENO) 直接 syscall, 不经 stdio
     // buffer; emulator 内部其他位置无 stdout 写路径 (fprintf 走 stderr / snprintf
@@ -526,15 +570,28 @@ int main(int argc, char **argv) {
         }
     }
 
-    // hart 构造: misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
-    // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的
-    // entries 由 dispatcher 懒分配。cpu_create 内部已写入硬件 reset 后默认状态
-    // (regs[0]=GUEST_RAM_START / priv=PRIV_M / satp=0 / regs[10]=hartid),
-    // 跟 cpu_reset 序列一致, 不需要 main 端再写 hart 字段。
-    cpu_t *hart = cpu_create(/*misa*/0, /*mhartid*/(uxlen_t)0);
-    if (hart == NULL) {  // cpu_create 内部已 fprintf "why"
-        fprintf(stderr, "cpu_create failed" EOL);
-        return 1;
+    // hart 构造: per-hart cpu_t 指针数组初始全 NULL, for 循环 cpu_create n_harts 个,
+    // 每个传 mhartid=i (cpu_create 内部双存储 per_hart_info.mhartid CSR mirror +
+    // cpu_t.hartid index)。失败回滚: 前 j<i 已 alloc 的 cpu_destroy 后 return 1。
+    //
+    // misa 参数当前未读取, 仅作 misa 驱动初始化预留 (cpu.h 已 doc)。
+    // tlb 容器 + M 共享 leaf 已由 cpu_create eager alloc; [PRIV_S][asid] 的 entries
+    // 由 dispatcher 懒分配。cpu_create 内部已写入硬件 reset 后默认状态 (regs[0]=
+    // GUEST_RAM_START / priv=PRIV_M / satp=0 / regs[10]=hartid), 跟 cpu_reset 序列
+    // 一致, 不需要 main 端再写 hart 字段。
+    //
+    // pthread_t 句柄按 cap 静态分配 (跟 lifecycle 配对体例; spawn 路径只用
+    // 0..n_harts-1)。harts 数组同, 但只 cpu_create 0..n_harts-1, 余下保 NULL
+    // (cleanup 循环按 NULL 跳过 — 兜底未来 lazy alloc 路径)。
+    cpu_t *harts[MAX_HARTS] = { NULL };
+    pthread_t hart_threads[MAX_HARTS] = { 0 };
+    for (uint32_t i = 0; i < n_harts; i++) {
+        harts[i] = cpu_create(/*misa*/0, /*mhartid*/(uxlen_t)i);
+        if (harts[i] == NULL) {  // cpu_create 内部已 fprintf "why"
+            fprintf(stderr, "cpu_create(hart %u) failed" EOL, i);
+            for (uint32_t j = 0; j < i; j++) cpu_destroy(harts[j]);
+            return 1;
+        }
     }
 
     // WFI 唤醒框架 init (core/wfi.h; 每 hart 一 pthread_mutex + cond)。
@@ -545,7 +602,7 @@ int main(int argc, char **argv) {
     // 但保险起见也放在 plic_init 之后。
     if (wfi_init() != 0) {
         fprintf(stderr, "wfi_init failed" EOL);
-        cpu_destroy(hart);
+        for (uint32_t i = 0; i < n_harts; i++) cpu_destroy(harts[i]);
         return 1;
     }
 
@@ -600,11 +657,19 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     // 主 while: system reset 每 iter 进一次
     //
-    // 当前单 hart 直调 dispatcher; 未来多 hart 这里 pthread_create per hart +
-    // join (受 SRS 控制的线程 spawn / join 占位见下方注释段)。
+    // per-hart dispatcher 走 pthread_create + pthread_join 循环 (main while 内
+    // spawn N pthread + 全 join, 跟 SRS-controlled "占位段" 对偶): system_reset
+    // trigger 后所有 hart 跑到 SRS != 0 自然退 dispatcher → join 完 → cpu_reset
+    // + 各设备 reset + 重 spawn 下一 iter (sifive 0x7777 路径); ABORT 路径下
+    // join 完 break → cleanup chain。
+    //
+    // spawn fail 处理: 中途某 hart pthread_create 失败 → set SYSRESET_BIT_HART_
+    // SPAWN_FAIL → break spawn for; 已 spawn 的看 SRS 自然退 dispatcher → join 完
+    // → break main while → cleanup。HART_SPAWN_FAIL 在 ABORT_MASK 内 (runtime.h)。
     // ------------------------------------------------------------------------
     while (atomic_load_explicit(&system_reset_signal, memory_order_acquire) == 0u) {
-        cpu_reset(hart);
+        // per-hart cpu_reset (idempotent, 保留 hartid/mhartid; 详 cpu.c cpu_reset)
+        for (uint32_t i = 0; i < n_harts; i++) cpu_reset(harts[i]);
         (void)clint_reset();
         (void)plic_reset();
         (void)test_dev_reset();
@@ -612,31 +677,42 @@ int main(int argc, char **argv) {
         (void)virtio_blk_reset();
 
         // ====================================================================
-        // 占位: 所有 SRS-controlled 线程 spawn — 每 iter spawn / join, 跟
-        // system reset 同步起停。
+        // SRS-controlled 线程 spawn — per-hart pthread_create, 跟 system reset
+        // 周期绑定 (跟 SDS-controlled "跨 system reset 持续运行" 的 timer/uart/
+        // io_worker 分开 — 那类在 POR 段 spawn / POR 收尾段 join, 不在本 while 内)。
         //
-        // 范围 = 所有"跟 system reset 周期绑定" 的线程, 不限于 hart:
-        //   - 未来多 hart 走 pthread_create per hart (主要 case)
-        //   - 其他受 SRS 控制的辅助线程也走这里 (跟 timer/monitor 类受 SDS
-        //     控制的"跨 system reset 持续运行" 辅助线程分开 — 那类在 POR
-        //     段 spawn / POR 收尾段 join, 不在本 while 内)
+        // pthread routine = hart_exec_run (file-static wrapper, 适配 pthread void *(void *)
+        // ABI ↔ dispatcher void(cpu_t *) 签名; 详顶部 hart_exec_run 段)。
         //
-        // 当前单 hart 直调 dispatcher。
+        // spawn fail: 中途某 i 失败 → set SYSRESET_BIT_HART_SPAWN_FAIL (ABORT) +
+        // break for; 已 spawn 的 0..spawned-1 看 SRS 自然退 dispatcher。spawned 记
+        // 真起成功的数, 下面 join 段按 spawned 跑 (失败时只 join 已 spawn 的, 防
+        // 用 hart_threads[i>=spawned] 的 0 句柄撞 pthread_join)。
         // ====================================================================
-        dispatcher(hart);
+        uint32_t spawned = 0;
+        for (uint32_t i = 0; i < n_harts; i++) {
+            int rc = pthread_create(&hart_threads[i], NULL, hart_exec_run, harts[i]);
+            if (rc != 0) {
+                fprintf(stderr, "pthread_create(hart %u) failed: %s" EOL, i, strerror(rc));
+                system_reset_signal_set_bit(SYSRESET_BIT_HART_SPAWN_FAIL);
+                break;
+            }
+            spawned++;
+        }
         // ====================================================================
-        // 占位: 所有 SRS-controlled 线程 join — 跟上面 spawn 对偶, 同范围
-        // (hart 线程 + 其他受 SRS 控制的辅助线程都在这里 join, 不限于 hart)。
+        // SRS-controlled 线程 join — 跟上面 spawn 对偶。spawn 全部成功时
+        // spawned == n_harts; 部分失败时 spawned < n_harts, 只 join 已 spawn 的。
         //
-        // 单 hart 同步现状: 上面 dispatcher(hart) 返回 ≡ hart
-        // 退 wfi 退 main loop, 退化的 join 形式. 哲学 = "所有人 self-poll SRS/SDS
-        // 自己停" — shutdown 路径下 hart 在 wfi 时靠 wfi.c cond_timedwait 兜底
+        // 哲学 = "所有 hart self-poll SRS 自己停" (dispatcher 内部 while(SRS==0)
+        // 退); shutdown 路径下 hart 在 wfi 时靠 wfi.c cond_timedwait 兜底
         // WFI_TIMEOUT_NS (config.h 500ms) 自醒 + predicate 重检 SRS 退出, 接受
         // 此 tail latency. signal handler / 非 signal handler 路径无差异, 没有
-        // "通知者" 角色. 多 hart 未来如需缩短 shutdown tail, 见 wfi.h 顶段 +
-        // wfi_kick_all 函数 doc (候选: hart 自治 kick / source 端 kick — 真撞
-        // 延迟问题再回看).
+        // "通知者" 角色. 真撞 shutdown tail 延迟问题再回看 wfi.h 顶段 +
+        // wfi_kick_all (当前唯一活调用点 = runtime_fatal 紧急停机)。
         // ====================================================================
+        for (uint32_t i = 0; i < spawned; i++) {
+            pthread_join(hart_threads[i], NULL);
+        }
 
         // ====================================================================
         // 区分 system reset 重 iter vs cleanup-and-exit
@@ -725,7 +801,11 @@ int main(int argc, char **argv) {
     // 必须在所有 wfi_kick 来源 (timer thread / io workers 已 join + clint/plic destroy
     // 也已 atomic 清字段) 之后 — clint_destroy / plic_destroy 都不再调 wfi_kick。
     wfi_destroy();
-    cpu_destroy(hart);
+    // per-hart cpu_destroy. NULL 跳过 — 当前 cpu_create 失败时已 early return,
+    // 这里循环只跑成功初始化的; NULL 检查兜底未来 lazy alloc 路径。
+    for (uint32_t i = 0; i < n_harts; i++) {
+        if (harts[i] != NULL) cpu_destroy(harts[i]);
+    }
     ram_destroy();
 
     // 还原 SIG_DFL — main 退出后子进程 / 后续 process state 干净。

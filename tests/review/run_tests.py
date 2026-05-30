@@ -19,6 +19,7 @@
 #   # RUN-EXPECT-EXIT: 42        → opt-in 断言, 比对实际 exit code 出 PASS/FAIL
 #   # RUN-RELEASE                → 用 release 冻结二进制 (debug 太慢/必须 release)
 #   # RUN-TIMEOUT: 5             → 覆盖默认 timeout (秒); 不写默认 3.0
+#   # RUN-SMP: 2                 → 追加 --smp N (1..8; 多 hart fixture 用)
 # 没声明 tag → sensible default (debug 二进制 / 无 stdin / 无 blk / exit 仅记录
 # 不断言 / timeout=3.0)。tag 残缺 (未知名 / 缺值 / 布尔带值 / 文件不存在 / 数值
 # 解析失败 / RUN-RELEASE 但 release 二进制缺失) → fail loud: 该 fixture 标
@@ -60,7 +61,7 @@ CHILD_ENV = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1")
 # stub.S banner 内的运行参数 tag (方案 A explicit declaration)。
 # 两种形态: 带值 `# RUN-XXX: value` (group val) 或布尔裸 `# RUN-XXX` (val=None)。
 RUN_TAG_RE = re.compile(r'^\s*#\s*(RUN-[A-Z-]+)\s*(?::\s*(\S+)\s*)?$')
-VALUE_TAGS = ("RUN-BLK", "RUN-STDIN", "RUN-EXPECT-EXIT", "RUN-TIMEOUT")
+VALUE_TAGS = ("RUN-BLK", "RUN-STDIN", "RUN-EXPECT-EXIT", "RUN-TIMEOUT", "RUN-SMP")
 BOOL_TAGS = ("RUN-RELEASE",)
 KNOWN_TAGS = VALUE_TAGS + BOOL_TAGS
 
@@ -93,7 +94,7 @@ def parse_run_config(test_dir):
     timeout=TIMEOUT)。残缺 → raise ConfigError。路径值相对 fixture 目录解析;
     文件不存在即报错。"""
     cfg = {"blk": None, "stdin": None, "expect_exit": None,
-           "release": False, "timeout": TIMEOUT}
+           "release": False, "timeout": TIMEOUT, "smp": None}
     stub = os.path.join(test_dir, "stub.S")
     if not os.path.isfile(stub):
         return cfg
@@ -137,6 +138,14 @@ def parse_run_config(test_dir):
                     raise ConfigError(f"RUN-TIMEOUT not a number: {val!r}")
             elif tag == "RUN-RELEASE":
                 cfg["release"] = True
+            elif tag == "RUN-SMP":
+                try:
+                    n = int(val)
+                except ValueError:
+                    raise ConfigError(f"RUN-SMP not an int: {val!r}")
+                if n < 1 or n > 8:
+                    raise ConfigError(f"RUN-SMP out of range 1..8: {n}")
+                cfg["smp"] = n
     return cfg
 
 def discover():
@@ -190,6 +199,8 @@ def run_one(test_dir):
     cmd = [emu, "--bios", art_rel]
     if cfg["blk"] is not None:
         cmd += ["--blk", os.path.relpath(cfg["blk"], REPO)]
+    if cfg["smp"] is not None:
+        cmd += ["--smp", str(cfg["smp"])]
 
     stdin_bytes = None
     if cfg["stdin"] is not None:
