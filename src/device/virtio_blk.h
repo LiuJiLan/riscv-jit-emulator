@@ -26,8 +26,8 @@
 //     新 avail entry"); hart 在 queue 满时 cond_timedwait(not_full, 100ms) +
 //     SDS 检 (cooperative shutdown 体例, dummy.txt §12)
 //   - worker 循环 cond_timedwait(not_empty, 100ms) + SDS 检 → 拉 1 token →
-//     drain avail ring (按 QueueNum 上限循环) → 解析 desc 链 → pread/pwrite
-//     → 写 used ring → 设 InterruptStatus.bit0 → device_set_pending(
+//     drain avail ring (按 QueueNum 上限循环) → 解析 desc 链 → pread/pwrite/fsync
+//     (FLUSH) → 写 used ring → 设 InterruptStatus.bit0 → device_set_pending(
 //     VIRTIO_BLK_PLIC_IRQ)
 //   - shutdown_signal 非 0 自然退出 (跟 uart_reader_run 同体例)
 //
@@ -62,8 +62,8 @@
 //   0x004 Version           R = 1 (legacy)
 //   0x008 DeviceID          R = 2 (block)
 //   0x00C VendorID          R = 0x554d4551 (QEMU 一致)
-//   0x010 DeviceFeatures    R = 0 (无可选 feature; driver 不需要 negotiate)
-//   0x014 DeviceFeaturesSel W (silent accept; DeviceFeatures 永远返 0)
+//   0x010 DeviceFeatures    R = F_FLUSH (bit9, bank0); bank1 返 0
+//   0x014 DeviceFeaturesSel W (选 bank0/bank1; DeviceFeatures 读按此分页)
 //   0x020 DriverFeatures    W (silent accept; 不强校验 driver 写入)
 //   0x024 DriverFeaturesSel W
 //   0x028 GuestPageSize     W (legacy, silent accept; 假设 4 KB)
@@ -82,16 +82,17 @@
 //   0x104 Config:cap_hi     R = (uint32_t)(capacity_sectors >> 32)
 //   其他 off: 读 silent 返 0 / 写 silent 吞 (跟 PLIC reserved 区体例)
 //
-// 后端 = host file (pread/pwrite; destroy 时 fsync 一次, 不 mmap):
+// 后端 = host file (pread/pwrite; FLUSH / destroy 时 fsync, 不 mmap):
 //   - virtio_blk_init(path) 时 open(O_RDWR) + fstat 取 capacity (st_size/512)
-//   - 完成 IO 不每笔 fsync (write-back: 进 host page cache); virtio_blk_destroy
-//     关 fd 前 fsync 一次 (= 常规 flush-on-close)。
-//   - [TODO 持久化一致性, plan §2 #51] DeviceFeatures=0 = 向 guest 声称 write-
-//     through (无易失写缓存, spec: 写完成即 durable), 但实现是 write-back + 仅
-//     destroy flush → 不兑现该承诺 (断电/强杀丢最近写)。两条修法 (a_04+ 真接 OS 拍):
-//       (a) offer VIRTIO_BLK_F_FLUSH + 处理 VIRTIO_BLK_T_FLUSH (收 FLUSH → fsync,
-//           按需非每笔; 把持久化时机交 guest — 推荐, 对应真盘 cache flush 命令)
-//       (b) 真 write-through (每笔 fsync / O_DSYNC) 兑现 feat=0 声称 — 慢但合法
+//   - 完成 IO 不每笔 fsync (write-back: 进 host page cache)。
+//   - 持久化一致性 (plan §2 #51, 方案 a 已落地): offer VIRTIO_BLK_F_FLUSH (bit9) +
+//     处理 VIRTIO_BLK_T_FLUSH (收 FLUSH → io_worker 内 fsync, 按需非每笔; 把持久化
+//     时机交 guest, 对应真盘 cache flush 命令)。这兑现了 feature 语义: 设备声称
+//     有易失写缓存 (F_FLUSH), guest 要持久化点就发 FLUSH。单 io_worker + FIFO work
+//     queue → FLUSH 必在前序 OUT 的 pwrite 完成后才 fsync ("write→flush" 成立)。
+//   - virtio_blk_destroy 关 fd 前仍 fsync 一次 (flush-on-close 兜底)。
+//   - 不走方案 b (每笔 fsync / O_DSYNC 真 write-through): 慢, 且已 offer F_FLUSH
+//     不再声称 write-through, 无需兑现。
 //   - mmap backend 留 TODO (plan §2 #52)
 //   - st_size 必须 512 对齐 (否则 init 返 -1)
 //

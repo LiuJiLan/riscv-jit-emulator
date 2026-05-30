@@ -43,7 +43,7 @@
 #define VBLK_REG_VERSION          0x004u   /* R 1 (legacy) */
 #define VBLK_REG_DEVICE_ID        0x008u   /* R 2 (block) */
 #define VBLK_REG_VENDOR_ID        0x00Cu   /* R QEMU 一致 */
-#define VBLK_REG_DEVICE_FEAT      0x010u   /* R 0 (no optional feature) */
+#define VBLK_REG_DEVICE_FEAT      0x010u   /* R F_FLUSH (bit9); bank1 返 0 */
 #define VBLK_REG_DEVICE_FEAT_SEL  0x014u   /* W silent accept */
 #define VBLK_REG_DRIVER_FEAT      0x020u   /* W silent accept */
 #define VBLK_REG_DRIVER_FEAT_SEL  0x024u   /* W silent accept */
@@ -68,9 +68,13 @@
 
 #define VBLK_INT_VRING            0x1u          /* InterruptStatus bit0 */
 
+/* virtio-blk feature bits (spec §5.2.3) — 只 offer F_FLUSH (持久化一致性, .h 顶段) */
+#define VIRTIO_BLK_F_FLUSH        9u            /* device 支持 VIRTIO_BLK_T_FLUSH */
+
 /* virtio-blk request header type (spec §5.2.6.1) */
 #define VIRTIO_BLK_T_IN           0u            /* read from device → guest buf */
 #define VIRTIO_BLK_T_OUT          1u            /* write from guest buf → device */
+#define VIRTIO_BLK_T_FLUSH        4u            /* flush 易失写缓存 → fsync 落盘 */
 
 /* virtio-blk status byte (spec §5.2.6.2) */
 #define VIRTIO_BLK_S_OK           0u
@@ -80,7 +84,7 @@
 /* virtq desc flags (spec §2.6.5) */
 #define VRING_DESC_F_NEXT         0x1u
 #define VRING_DESC_F_WRITE        0x2u
-#define VRING_DESC_F_INDIRECT     0x4u   /* 不支持 — DeviceFeatures=0 不宣告 */
+#define VRING_DESC_F_INDIRECT     0x4u   /* 不支持 — DeviceFeatures 不宣告 INDIRECT */
 
 /* desc 链 hop 上限 (防恶意 cycle / 长链卡死 worker) */
 #define VBLK_DESC_CHAIN_MAX       16u
@@ -216,7 +220,9 @@ static void drain_one_avail_round_locked(void) {
         /* 跑 desc 链: 第一段必须是 header (16 byte); 中间是 data; 末段是 1 byte
            status (no NEXT)。VRING_DESC_F_WRITE 标 device-writable (即 IN/读 IO
            的 data + status 必为 W=1; OUT/写 IO 的 data 必为 W=0, status 仍为 W=1)。
-           简化: fixture 守规矩, 不做严格 W bit 校验, 只按 type + NEXT/last 链结构走. */
+           简化: fixture 守规矩, 不做严格 W bit 校验, 只按 type + NEXT/last 链结构走.
+           FLUSH (type=4): 两段链 header→status, 无 data 段 (data 分支不执行);
+           fsync 在 for 循环跑完后补 (见下). */
         uint8_t  status_byte   = VIRTIO_BLK_S_OK;
         uint8_t *status_addr   = NULL;
         uint64_t sector        = 0;
@@ -236,7 +242,7 @@ static void drain_one_avail_round_locked(void) {
             memcpy(&next,  desc + 14, 2);
 
             if (flags & VRING_DESC_F_INDIRECT) {
-                /* DeviceFeatures=0 没宣告 INDIRECT, 但 driver 误用时拒绝 */
+                /* DeviceFeatures 没宣告 INDIRECT, driver 误用时拒绝 */
                 status_byte = VIRTIO_BLK_S_UNSUPP; break;
             }
 
@@ -301,6 +307,20 @@ static void drain_one_avail_round_locked(void) {
             sector += (uint64_t)len / VIRTIO_BLK_SECTOR_SIZE;
 
             cur = next;
+        }
+
+        /* FLUSH (type=4): 链是 header→status 两段, 无 data 段, 上面 for 循环
+           不触发任何 IO; 在此 fsync 落盘. 单 io_worker + FIFO work queue 保证
+           本 FLUSH 入队在前序 OUT 之后, 那些 pwrite 都已完成 → fsync 必看到全部
+           前序写 ("write→flush" 语义成立). 前面已出错 (IOERR/UNSUPP, 含误带
+           data 段的 FLUSH) 不 fsync. (持久化一致性方案 a, .h 顶段) */
+        if (header_parsed && req_type == VIRTIO_BLK_T_FLUSH &&
+            status_byte == VIRTIO_BLK_S_OK) {
+            if (fsync(g_vblk.image_fd) != 0) {
+                fprintf(stderr, "[virtio_blk] FLUSH fsync failed: %s" EOL,
+                        strerror(errno));
+                status_byte = VIRTIO_BLK_S_IOERR;
+            }
         }
 
         if (status_addr != NULL) {
@@ -492,7 +512,14 @@ static int virtio_blk_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
       case VBLK_REG_VERSION:         value = VBLK_VERSION;     break;
       case VBLK_REG_DEVICE_ID:       value = VBLK_DEVICE_ID;   break;
       case VBLK_REG_VENDOR_ID:       value = VBLK_VENDOR_ID;   break;
-      case VBLK_REG_DEVICE_FEAT:     value = 0u;               break;   /* 无可选 feature; 持久化一致性 TODO 见 .h 顶段 (feat=0=声称 write-through 但实现 write-back) */
+      case VBLK_REG_DEVICE_FEAT:
+        /* 只 offer F_FLUSH (bit9, 落 bank0); bank1 (sel=1, bit32-63) 返 0.
+           guest ack 后会发 VIRTIO_BLK_T_FLUSH, worker 收到做 fsync (持久化
+           一致性, .h 顶段). device_feat_sel 受 state_mutex 保护. */
+        vblk_state_lock();
+        value = (g_vblk.device_feat_sel == 0u) ? (1u << VIRTIO_BLK_F_FLUSH) : 0u;
+        vblk_state_unlock();
+        break;
       case VBLK_REG_QUEUE_NUM_MAX:   value = VIRTIO_BLK_QUEUE_NUM_MAX; break;
 
       case VBLK_REG_QUEUE_PFN:
