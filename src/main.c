@@ -45,6 +45,7 @@
 //
 
 #include "config.h"
+#include "debug.h"              // debug_flush_local_trace (hart_exec_run 末尾兜底)
 #include "device/test_dev.h"
 #include "device/uart.h"
 #include "device/virtio_blk.h"
@@ -333,7 +334,10 @@ static int decode_test(void) {
 // 跟 timer_run / io_worker_run / uart_reader_run / uart_tx_drain_run 同 file-static
 // wrapper 体例 (project 里所有 pthread routine 都走这层 ABI 适配)。
 static void *hart_exec_run(void *arg) {
-    dispatcher((cpu_t *)arg);
+    cpu_t *hart = (cpu_t *)arg;
+    hartid_self = hart->hartid;  /* 给 debug_flush_local_trace 拿来打 "[hart N trace] " prefix */
+    dispatcher(hart);
+    debug_flush_local_trace();   /* 兜底 flush (dispatcher 内 DEBUG_NEWLINE 已 flush; 空 buffer no-op) */
     return NULL;
 }
 

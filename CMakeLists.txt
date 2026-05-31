@@ -40,6 +40,19 @@ add_link_options(
     $<$<CONFIG:Debug>:-fsanitize=address,undefined>
 )
 
+# TSan (跟 Debug / Release 并列为第三 build type; -DCMAKE_BUILD_TYPE=Tsan 启用).
+# 跟 ASan 互斥(都用 shadow memory), 所以独立 build_type 不能跟 Debug 叠加;
+# UBSan 跟 TSan 兼容, 这里一并带上让 UB 检查在 Tsan build 里仍有效.
+add_compile_options(
+    $<$<CONFIG:Tsan>:-fsanitize=thread,undefined>
+    $<$<CONFIG:Tsan>:-fno-omit-frame-pointer>
+    $<$<CONFIG:Tsan>:-O1>
+    $<$<CONFIG:Tsan>:-g3>
+)
+add_link_options(
+    $<$<CONFIG:Tsan>:-fsanitize=thread,undefined>
+)
+
 # Release
 add_compile_options(
     $<$<CONFIG:Release>:-O2>

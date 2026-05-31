@@ -1,13 +1,16 @@
 //
 // Created by liujilan on 2026/5/12.
-// debug 模块: 全局 trace tick counter + DEBUG_XXX 宏 (单字符流式输出到 stderr)。
+// debug 模块: per-hart trace buffer + DEBUG_XXX 宏 (字符 append 到 buffer,
+// flush 时一把 fwrite 到 stderr; SMP per-thread 隔离免 race)。
 //
-// 设计目的: dispatcher / trap / 中断 路径上的"重新取指 / 异常 / 中断"事件流式
-// 输出单字符到 stderr; 配合 fixture 人工观察跨页 / 中断密度, 不接入正式 unit test。
-// 换行时机由调用方拍 (典型: dispatcher 退出 dump 前打一次 fputs(EOL, stderr))。
+// 设计目的: dispatcher / trap / 中断 路径上的"重新取指 / 异常 / 中断"事件以
+// 单字符形式累积到 per-hart trace_buf; 配合 fixture 人工观察跨页 / 中断密度,
+// 不接入正式 unit test。
 //
-// debug_cnt 不是 trap nesting / count_out; 是开发期 tick 累加, 仅作"已发生多少
-// trace 事件"参考。
+// flush 时机:
+//   - dispatcher 退出前 (主 while 结束后) DEBUG_NEWLINE 触发 flush + EOL,
+//     让 trace 流跟后面 [perf] / [dispatcher] halted 各占干净一行;
+//   - hart_exec_run 末尾再调一次 debug_flush_local_trace 兜底 (空 buffer no-op)。
 //
 // ----------------------------------------------------------------------------
 // 多线程 vs 多 HART 术语 (本项目协议; 跟 dummy.txt §7 镜像, 内容一致两边都看)
@@ -25,9 +28,10 @@
 //                 线程读写, 不需 atomic。
 //   shared      : clint.mtime / clint.mtimecmps[N] / page_dirty bitmap / jit_cache
 //                 表头。多 hart 线程 + 辅助线程都可能读写, 需 atomic。
-//   thread-local: debug_cnt 等 host trace 状态。当前 hart 线程独占 (单 hart);
-//                 SMP 多 hart 时若要"全局密度"需 atomic / 若要"per-hart 密度"
-//                 改 per-hart 字段 (SMP 真做时确认)。
+//   thread-local: trace_buf / trace_idx (本文件) 等 host trace 状态。__thread
+//                 storage class, 每 hart 线程自动一份独立 buffer; hart 退出前
+//                 flush 一把到 stderr。timer / monitor 等辅助线程不调 trace 宏,
+//                 各自的 __thread 实例永远为空, 仅占少量 TLS (~4 KB/线程)。
 //
 // 关键: "多 hart" ≠ "多线程"。timer / monitor 等辅助线程数不算 hart 数 (它们不持
 // cpu_t, 不影响 misa / mhartid 等 hart-counting 属性)。
@@ -36,23 +40,43 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
-#include <stdint.h>
+#include <stddef.h>   // size_t
+#include <stdint.h>   // uint32_t (hartid_self)
 #include <stdio.h>
 
 #include "config.h"   // EOL 宏 (项目级 stderr 输出体例 = "\r\n")
 
-// 全局 trace tick counter。单 hart 单线程下安全; SMP 多 hart 时按上方
-// "thread-local"分类策略改 atomic 或 per-hart 字段 (SMP 真做时确认)。
-extern uint32_t debug_cnt;
+// per-hart trace buffer (__thread storage)。trace_buf 满 (idx == DEBUG_BUF_SIZE)
+// 时丢字符不报错, trace 是 best-effort 辅助信息 — 真要看完整密度调大 DEBUG_BUF_SIZE。
+#define DEBUG_BUF_SIZE 4096
 
-// EOL 宏定义在 config.h (项目级输出体例, 跨模块广泛使用); 这里靠 #include
-// "config.h" (上方) 拿到。debug.h 内 DEBUG_NEWLINE / DEBUG_TICK 用 fputs(EOL, ...)。
+extern __thread char trace_buf[DEBUG_BUF_SIZE];
+extern __thread size_t trace_idx;
+
+// hartid_self — 当前 hart 线程的 hart id, 给 debug_flush_local_trace 打 prefix。
+// 在 hart_exec_run 入口 set 一次 (hartid_self = ((cpu_t *)arg)->hartid)。主线程 /
+// 辅助线程 (timer / uart_reader / virtio_io_worker) 不调 trace 宏, hartid_self
+// 默认 0 也不被读 — 不影响其他 hart。
+extern __thread uint32_t hartid_self;
+
+// debug_buf_putc — append 单字符到当前线程的 trace_buf; 满了丢字符 (best-effort)。
+// inline 让各 DEBUG_XXX 宏调用零开销 (编译器内联 + __thread 寻址)。
+static inline void debug_buf_putc(char ch) {
+    if (trace_idx < DEBUG_BUF_SIZE) {
+        trace_buf[trace_idx++] = ch;
+    }
+}
+
+// debug_flush_local_trace — flush 当前线程 trace_buf 到 stderr + EOL 分块,
+// 重置 idx。空 buffer no-op。实装在 debug.c。
+extern void debug_flush_local_trace(void);
+
 
 // ----------------------------------------------------------------------------
 // 调试打印编译标志 (5 个; 由 CMakeLists.txt 按 build type 定义, 不在源码内 #define)
 //
-//   DEBUG_TRACE_ON       — DEBUG_TICK / DEBUG_REFETCH / DEBUG_EXCEPTION /
-//                          DEBUG_INT_CHECK / DEBUG_TIME/SOFT/EXT_INTR / DEBUG_NEWLINE
+//   DEBUG_TRACE_ON       — DEBUG_REFETCH / DEBUG_EXCEPTION / DEBUG_INT_CHECK /
+//                          DEBUG_TIME/SOFT/EXT_INTR / DEBUG_NEWLINE
 //                          (instruction-level fetch / interrupt fire trace 字符流;
 //                           dispatcher / trap 用; 密集, 跟主循环每 iter 同频)
 //   DEBUG_TRACE_WFI_ON   — DEBUG_WFI_ISSUE / DEBUG_WFI_SLEEP / DEBUG_WFI_WAKE
@@ -65,7 +89,7 @@ extern uint32_t debug_cnt;
 //   DEBUG_CLINT_TIMER_ON — [clint timer] stopped 行 (clint.c timer_log_stop)
 //
 // 机制: CMakeLists.txt add_compile_definitions 按配置发 -D ——
-//   非 Release 配置 (Debug 等): 五个全开 (GUI build, 全打印, 给人工观察)。
+//   非 Release 配置 (Debug / Tsan 等): 五个全开 (GUI build, 全打印, 给人工观察)。
 //   Release 配置: 只开 DEBUG_PERF_ON —— 自动化 perf 套件读 [perf] 的纯主循环 MIPS,
 //     trace / WFI / CPU dump / [clint timer] 关掉, stderr 写入不污染 [perf] 计时。
 //
@@ -73,24 +97,8 @@ extern uint32_t debug_cnt;
 //   [main] elapsed / [decode_test] —— 那些是诊断 / 报错输出, 常开。
 // ----------------------------------------------------------------------------
 
-// DEBUG_TICK_TH: trace 流自动换行阈值 (每 N 个事件后 fputs(EOL, stderr))。80 按
-// 经典终端宽度, 不强制; 改大改小看 fixture 密度调。
-#define DEBUG_TICK_TH  80
-
-// DEBUG_TICK(): 内部 tick — 累加 debug_cnt + 到阈值打 EOL。各字符事件宏内部统一
-// 调它, 不作"用户事件"独立暴露。
-//
-// 下方 DEBUG_TICK / DEBUG_XXX / DEBUG_NEWLINE 全部受 DEBUG_TRACE_ON gate (见上方 doc):
-// 开 → 正常输出; 关 → 退化为 do {} while (0) no-op。
-#ifdef DEBUG_TRACE_ON
-
-#define DEBUG_TICK()   do {                                       \
-    debug_cnt++;                                                  \
-    if ((debug_cnt % DEBUG_TICK_TH) == 0) fputs(EOL, stderr);     \
-} while (0)
-
-// DEBUG_XXX 字符事件宏: 写单字符到 stderr + DEBUG_TICK (tick 内部判换行 → EOL
-// 跟在字符后, 即"本行末尾"位置)。
+// DEBUG_XXX 字符事件宏: append 单字符到 per-hart trace_buf (debug_buf_putc)。
+// flush 由 DEBUG_NEWLINE / debug_flush_local_trace 控制, macro 内不直接 stderr。
 //
 // 事件 ↔ 字符映射 (字符可视觉调整, 不影响语义; 各 fixture 注释里仍用 fetch/check 概念
 // 词描述 trace, 字符层是实现细节):
@@ -102,7 +110,7 @@ extern uint32_t debug_cnt;
 //   external ('e')            — external interrupt fire
 //
 // (WFI trace 字符 'w' / 'S' / 'W' 由 DEBUG_TRACE_WFI_ON gate 控制, 见下方独立段;
-//  跟本组 trace 解耦.)
+//  共享同一 trace_buf, 跟主组字符夹在一起, 按 in-thread 时序排列。)
 //
 // 字符选取依据 (调整时考虑视觉密度):
 //   - fetch 是真"做事" (块执行), 给粗字符 ('_') 让动作可见
@@ -116,27 +124,28 @@ extern uint32_t debug_cnt;
 //   随后:
 //     check 返 0 → dispatcher 调 DEBUG_REFETCH 打 fetch 字符 ('_')
 //     check 返非 0 → dispatcher continue 跳过 DEBUG_REFETCH, 本 iter 只一个 fire 字符
-//   即每 iter 至少 1 字符 (fire 单字符) 至多 2 字符 (check + fetch).
+//   即每 iter 至少 1 字符 (fire 单字符) 至多 2 字符 (check + fetch)。
 //
 //   trace 形态示例 (用字符):
 //     '._._._._._.t._._.' = N 轮无 fire (check+fetch 对) → 一轮 timer fire (只 't', 无后续 fetch
 //                            因 continue) → 下一轮 N+1 又 check+fetch (handler 内 MIE=0 → check
-//                            no fire).
-#define DEBUG_REFETCH()    do { fputc('_', stderr); DEBUG_TICK(); } while (0)
-#define DEBUG_EXCEPTION()  do { fputc('E', stderr); DEBUG_TICK(); } while (0)
-#define DEBUG_INT_CHECK()  do { fputc('.', stderr); DEBUG_TICK(); } while (0)
-#define DEBUG_TIME_INTR()  do { fputc('t', stderr); DEBUG_TICK(); } while (0)
-#define DEBUG_SOFT_INTR()  do { fputc('s', stderr); DEBUG_TICK(); } while (0)
-#define DEBUG_EXT_INTR()   do { fputc('e', stderr); DEBUG_TICK(); } while (0)
+//                            no fire)。
+#ifdef DEBUG_TRACE_ON
 
-// DEBUG_NEWLINE(): trace 字符流尾部换行。dispatcher 退出前打一次, 把无换行的 trace
-// 字符流跟后面的 [dispatcher] halted 分开。不走 DEBUG_TICK (不是 trace 事件, 只是收尾
-// 分隔); 受 DEBUG_TRACE_ON gate — trace 关时没有字符流, 换行同步退化 no-op。
-#define DEBUG_NEWLINE()    do { fputs(EOL, stderr); } while (0)
+#define DEBUG_REFETCH()    do { debug_buf_putc('_'); } while (0)
+#define DEBUG_EXCEPTION()  do { debug_buf_putc('E'); } while (0)
+#define DEBUG_INT_CHECK()  do { debug_buf_putc('.'); } while (0)
+#define DEBUG_TIME_INTR()  do { debug_buf_putc('t'); } while (0)
+#define DEBUG_SOFT_INTR()  do { debug_buf_putc('s'); } while (0)
+#define DEBUG_EXT_INTR()   do { debug_buf_putc('e'); } while (0)
+
+// DEBUG_NEWLINE() — 触发当前线程 trace_buf flush 到 stderr + EOL 分块。
+// dispatcher 退出前调一次, 让 trace 流跟后面 [perf] / [dispatcher] halted 各占
+// 干净一行。hart_exec_run 末尾再调 debug_flush_local_trace 兜底 (空 buffer no-op)。
+#define DEBUG_NEWLINE()    debug_flush_local_trace()
 
 #else  /* DEBUG_TRACE_ON 未定义 — trace 全部退化为 no-op (零开销, 不进 .text) */
 
-#define DEBUG_TICK()       do { } while (0)
 #define DEBUG_REFETCH()    do { } while (0)
 #define DEBUG_EXCEPTION()  do { } while (0)
 #define DEBUG_INT_CHECK()  do { } while (0)
@@ -149,7 +158,7 @@ extern uint32_t debug_cnt;
 
 
 // ----------------------------------------------------------------------------
-// DEBUG_TRACE_WFI_ON gate — WFI 事件 trace 字符 (独立于 DEBUG_TRACE_ON)
+// DEBUG_TRACE_WFI_ON gate — WFI 事件 trace 字符 (独立 gate, 共享 trace_buf)
 // ----------------------------------------------------------------------------
 //
 // 独立 gate, 因 WFI 事件 (case OP_WFI 入口 / 进 cond_wait / wfi_wait 返回)
@@ -174,14 +183,14 @@ extern uint32_t debug_cnt;
 //             — 需 DEBUG_TRACE_ON 也开才看见)
 //   'w' 后无 W 出现 = 真 bug (wfi_wait 永没返回)
 //
-// 实装: 不走 DEBUG_TICK (WFI 事件稀疏, 不需要 80-char 换行; 也避免对 debug_cnt
-// 的依赖, 让 WFI trace 真独立). 跟 DEBUG_TRACE_ON 都开时, WFI 字符夹在 fetch/check
-// 字符流里但不计入 tick counter — line 长度略超 80 可接受 (WFI 事件每行至多几个).
+// 实装: 跟主组完全同构 — append 到 trace_buf, hart 退出 flush。SMP per-thread
+// 隔离免 race。跟 DEBUG_TRACE_ON 都开时, WFI 字符跟 fetch/check 字符夹在同一
+// per-hart trace_buf 里, 按 in-thread 时序排列 (hart 视角内顺序正确)。
 #ifdef DEBUG_TRACE_WFI_ON
 
-#define DEBUG_WFI_ISSUE()  do { fputc('w', stderr); } while (0)
-#define DEBUG_WFI_SLEEP()  do { fputc('S', stderr); } while (0)
-#define DEBUG_WFI_WAKE()   do { fputc('W', stderr); } while (0)
+#define DEBUG_WFI_ISSUE()  do { debug_buf_putc('w'); } while (0)
+#define DEBUG_WFI_SLEEP()  do { debug_buf_putc('S'); } while (0)
+#define DEBUG_WFI_WAKE()   do { debug_buf_putc('W'); } while (0)
 
 #else  /* DEBUG_TRACE_WFI_ON 未定义 — WFI trace no-op */
 

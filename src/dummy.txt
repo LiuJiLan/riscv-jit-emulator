@@ -1027,13 +1027,18 @@ host thread — OS 级 pthread, 包括两类:
   per-hart    : cpu_t (regs / trap_csrs / tlb_table / satp / per_hart_info 等)。
                 只本 hart 线程读写, 不需 atomic。
   shared      : clint.mtime / clint.mtimecmps[N] / page_dirty bitmap /
-                jit_cache 表头 / 未来 LR/SC reservation table 等。多 hart 线程
+                jit_cache 表头 / 未来 LR/SC reservation table / SV32 PT 内
+                PTE.A/D bit (mmu_walk 路径 atomic_fetch_or relaxed; session 024
+                落地, 详 mmu.h "为什么 atomic_fetch_or" 段) 等。多 hart 线程
                 + 辅助线程都可能读写, 用 C11 atomic (memory_order_relaxed 起步,
                 fence 按需加)。
-  thread-local: debug.c::debug_cnt 等 host trace 状态。当前 hart 线程独占
-                (单 hart); timer 辅助线程不打 trace, 不动用 debug 文件 (真要
-                debug 是临时 fprintf 用完删)。真 SMP 落地时再拍是否要 per-hart
-                密度 vs 全局密度, 前者改 atomic, 后者改 per-hart 字段。
+  thread-local: debug.c::trace_buf / trace_idx / hartid_self 等 host trace 状态。
+                __thread storage class, 每 hart 线程自动一份独立 buffer; hart 退出
+                前 flush 一把到 stderr (DEBUG_NEWLINE 在 dispatcher 退出前触发 +
+                hart_exec_run 末尾兜底), 输出带 "[hart%u trace] " prefix 让块
+                之间能拎清; 整 hart join 阶段 (trace + perf + halted) 在 halted
+                行后加一个 EOL 收尾, 跟下一 hart / 销毁阶段视觉分开。timer 辅助
+                线程不打 trace, 其 __thread 实例永远为空, 仅占少量 TLS (~4 KB/线程)。
 
 
 --------------------------------------------------------------------------------

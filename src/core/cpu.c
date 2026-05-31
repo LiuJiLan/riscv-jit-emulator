@@ -188,12 +188,12 @@ void cpu_reset(cpu_t *hart) {
 // ----------------------------------------------------------------------------
 static void cpu_dump(const cpu_t *hart) {
 #ifdef DEBUG_CPU_DUMP_ON
-    // 多 hart dump: 每行前缀 [cpu h%u] 加 hartid, grep / 视觉分组都友好
-    // (n_harts=1 时跟单 hart 输出形态一致, 只多 1 个 ' h0' 字段)。
+    // 多 hart dump: 每行前缀 [hart%u xxx] 加 hartid, grep / 视觉分组都友好
+    // (跟 [hart%u trace] / [hart%u perf] / [hart%u halted] 等输出体例一致)。
     uint32_t hid = hart->hartid;
 
     fprintf(stderr,
-            "[cpu h%u] reg dec:" EOL
+            "[hart%u reg dec]" EOL
             "\tx1(ra)    = %11u  |  x2(sp)    = %11u  |  x3(gp)    = %11u  |  x4(tp)    = %11u" EOL
             "\tx5(t0)    = %11u  |  x6(t1)    = %11u  |  x7(t2)    = %11u  |  x8(s0/fp) = %11u" EOL
             "\tx9(s1)    = %11u  |  x10(a0)   = %11u  |  x11(a1)   = %11u  |  x12(a2)   = %11u" EOL
@@ -213,7 +213,7 @@ static void cpu_dump(const cpu_t *hart) {
             hart->regs[29], hart->regs[30], hart->regs[31]);
 
     fprintf(stderr,
-            "[cpu h%u] reg hex:" EOL
+            "[hart%u reg hex]" EOL
             "\tx1(ra)    = 0x%08X  |  x2(sp)    = 0x%08X  |  x3(gp)    = 0x%08X  |  x4(tp)    = 0x%08X" EOL
             "\tx5(t0)    = 0x%08X  |  x6(t1)    = 0x%08X  |  x7(t2)    = 0x%08X  |  x8(s0/fp) = 0x%08X" EOL
             "\tx9(s1)    = 0x%08X  |  x10(a0)   = 0x%08X  |  x11(a1)   = 0x%08X  |  x12(a2)   = 0x%08X" EOL
@@ -237,14 +237,14 @@ static void cpu_dump(const cpu_t *hart) {
     // double-trap 升级 (Smdbltrp/Ssdbltrp). S 槽 mtval2 显示 double-trap 升级时
     // 原本要写 stval 的值 (S-trap unexpected 路径).
     fprintf(stderr,
-            "[cpu h%u] trap dump (M): MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X" EOL,
+            "[hart%u trap M] MDT=%u mcause=%u mtval=0x%08X mepc=0x%08X mtvec=0x%08X mtval2=0x%08X" EOL,
             hid,
             (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             hart->trap.xcause[PRIV_M], hart->trap.xtval[PRIV_M],
             hart->trap.xepc[PRIV_M],   hart->trap.xtvec[PRIV_M],
             hart->trap.mtval2);
     fprintf(stderr,
-            "[cpu h%u] trap dump (S): SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X" EOL,
+            "[hart%u trap S] SDT=%u scause=%u stval=0x%08X sepc=0x%08X stvec=0x%08X" EOL,
             hid,
             (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             hart->trap.xcause[PRIV_S], hart->trap.xtval[PRIV_S],
@@ -252,12 +252,13 @@ static void cpu_dump(const cpu_t *hart) {
 
     // state dump: pc + priv + mstatus 低 32 位 + mstatush (含 MDT bit10)。
     fprintf(stderr,
-            "[cpu h%u] state dump: pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X" EOL,
+            "[hart%u state] pc=0x%08X  priv=%u  mstatus=0x%08X mstatush=0x%08X" EOL,
             hid,
             hart->regs[0],
             (uint32_t)hart->priv,
             (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu),
             (uint32_t)((hart->trap._mstatus >> 32) & 0xFFFFFFFFu));
+    fputs(EOL, stderr);   /* 大块尾部空行: 让每 hart 整块 cpu dump 跟下一 hart 分开 */
 #else
     (void)hart;
 #endif

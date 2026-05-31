@@ -301,10 +301,11 @@ void dispatcher(cpu_t *hart) {
 #endif
     // === end perf timing ===
 
-    // DEBUG trace 流尾部换行: dispatcher 在 while 体内通过 DEBUG_XXX 宏写入单字符流
-    // (无换行)。while 退出 = trace 流到此为止, 立刻打一次 " EOL " 收尾, 让后面的 [perf] /
-    // [dispatcher] halted 各占干净一行。放 t_end 之后 (fputc 的 I/O 不算进 [perf] 计时
-    // 窗口)。受 DEBUG_TRACE_ON gate (DEBUG_NEWLINE; trace 关时无字符流, 换行同步退化 no-op)。
+    // DEBUG trace flush: dispatcher 在 while 体内通过 DEBUG_XXX 宏 append 字符到
+    // per-hart trace_buf (__thread)。while 退出 = trace 流到此为止, 立刻 flush 整个
+    // buffer 到 stderr + EOL 收尾, 让后面的 [perf] / [dispatcher] halted 各占干净
+    // 一行。放 t_end 之后 (fwrite 的 I/O 不算进 [perf] 计时窗口)。受 DEBUG_TRACE_ON
+    // gate (DEBUG_NEWLINE; trace 关时退化 no-op)。
     DEBUG_NEWLINE();
 
     // 退出循环后再做一次扫尾累加 — 最后一轮 block 的 local_count 还没进 total_count
@@ -317,8 +318,8 @@ void dispatcher(cpu_t *hart) {
         double perf_elapsed = (double)(t_end.tv_sec  - t_start.tv_sec)
                             + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
         fprintf(stderr,
-                "[perf] elapsed=%.6f s  total_count=%" PRIu64 "  MIPS=%.3f" EOL,
-                perf_elapsed, total_count,
+                "[hart%u perf] elapsed=%.6f s  total_count=%" PRIu64 "  MIPS=%.3f" EOL,
+                hart->hartid, perf_elapsed, total_count,
                 perf_elapsed > 0.0
                     ? (double)total_count / perf_elapsed / 1e6
                     : 0.0);
@@ -327,10 +328,12 @@ void dispatcher(cpu_t *hart) {
     // === end perf timing ===
 
     fprintf(stderr,
-            "[dispatcher] halted: mstatus.MDT=%u sstatus.SDT=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "" EOL,
+            "[hart%u halted] mstatus.MDT=%u sstatus.SDT=%u total_count=%" PRIu64 " pc=0x%08" PRIx32 "" EOL,
+            hart->hartid,
             (uint32_t)((hart->trap._mstatus & MSTATUS_MDT_BIT64) != 0u),
             (uint32_t)((hart->trap._mstatus & (uint64_t)MSTATUS_SDT) != 0u),
             total_count, hart->regs[0]);
+    fputs(EOL, stderr);   /* 大块尾部空行: 让 [perf] / [halted] 跟下一大块视觉分开 */
 
     // ========================================================================
     // M-mode critical-error (Smdbltrp) → 整机 abort, 不 per-hart restart
