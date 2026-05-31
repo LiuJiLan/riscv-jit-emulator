@@ -551,8 +551,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 hart->priv = (uint8_t)((mstatus_lo >> MSTATUS_MPP_SHIFT) & MSTATUS_MPP_MASK);
 
                 /* mstatus.MIE = mstatus.MPIE */
-                if (mstatus_lo & MSTATUS_MPIE) mstatus_lo |=  MSTATUS_MIE;
-                else                           mstatus_lo &= ~MSTATUS_MIE;
+                if (mstatus_lo & MSTATUS_MPIE) { mstatus_lo |=  MSTATUS_MIE; }
+                else { mstatus_lo &= ~MSTATUS_MIE; }
 
                 /* mstatus.MPIE = 1 (RV spec) */
                 mstatus_lo |= MSTATUS_MPIE;
@@ -600,8 +600,8 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 hart->priv = (uint8_t)((mstatus_lo & MSTATUS_SPP) >> MSTATUS_SPP_SHIFT);
 
                 /* mstatus.SIE = mstatus.SPIE */
-                if (mstatus_lo & MSTATUS_SPIE) mstatus_lo |=  MSTATUS_SIE;
-                else                           mstatus_lo &= ~MSTATUS_SIE;
+                if (mstatus_lo & MSTATUS_SPIE) { mstatus_lo |=  MSTATUS_SIE; }
+                else { mstatus_lo &= ~MSTATUS_SIE; }
 
                 /* mstatus.SPIE = 1 (RV spec) */
                 mstatus_lo |= MSTATUS_SPIE;
@@ -805,13 +805,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
         // 拿新 page 的 hva (SV32 下 walker 重做权限检查)。跟 BLOCK_INST_LIMIT 同性质 (软
         // 边界), 块入口指令必跑一次 (即使 hva_pc & 0xFFF 在 page 末) — entry_page 由块入口
         // 算出, 第一次进 fetch loop 时必命中本 page。
-        if (((uintptr_t)hva_pc & page_mask) != entry_page) goto out;
+        if (((uintptr_t)hva_pc & page_mask) != entry_page) { goto out; }
 
         // 硬边界判定: branch/jal/jalr 类 op 已在上方 case 内写好新 pc, 此处
         // 退出 fetch loop, 让 dispatcher 重新 mmu_translate_pc 拿新入口的 hva 进下一块。
         // boundary 那条指令计入 count (precise: 已成功执行); trap 路径走 WRITE_PC_OR_TRAP
         // 内 goto out, 不到此处, count 不含 trap 那条。
-        if (is_block_boundary_inst(&d)) goto out;
+        if (is_block_boundary_inst(&d)) { goto out; }
     }
 
 out:

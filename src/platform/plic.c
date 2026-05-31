@@ -207,10 +207,10 @@ static uint32_t plic_arbitrate_locked(uint32_t ctx_id) {
 
     for (uint32_t src = 1; src < PLIC_N_SOURCES; src++) {
         uint32_t enable_bit = (plic.contexts[ctx_id].enable[src / 32u] >> (src % 32u)) & 0x1u;
-        if (!enable_bit)                            continue;
-        if (!plic.sources[src].device_line)         continue;
-        if ( plic.sources[src].claimed)             continue;
-        if ( plic.sources[src].priority <= threshold) continue;
+        if (!enable_bit) { continue; }
+        if (!plic.sources[src].device_line) { continue; }
+        if ( plic.sources[src].claimed) { continue; }
+        if ( plic.sources[src].priority <= threshold) { continue; }
 
         if (plic.sources[src].priority > best_prio) {
             best_prio = plic.sources[src].priority;
@@ -226,10 +226,10 @@ static int plic_ctx_has_pending_locked(uint32_t ctx_id) {
     uint32_t threshold = plic.contexts[ctx_id].threshold;
     for (uint32_t src = 1; src < PLIC_N_SOURCES; src++) {
         uint32_t enable_bit = (plic.contexts[ctx_id].enable[src / 32u] >> (src % 32u)) & 0x1u;
-        if (!enable_bit)                            continue;
-        if (!plic.sources[src].device_line)         continue;
-        if ( plic.sources[src].claimed)             continue;
-        if ( plic.sources[src].priority <= threshold) continue;
+        if (!enable_bit) { continue; }
+        if (!plic.sources[src].device_line) { continue; }
+        if ( plic.sources[src].claimed) { continue; }
+        if ( plic.sources[src].priority <= threshold) { continue; }
         return 1;
     }
     return 0;
@@ -366,8 +366,8 @@ static void plic_recompute_pending_bitmap_locked(void) {
 
 static int plic_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u)              return CAUSE_LOAD_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u)      return CAUSE_LOAD_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_LOAD_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_LOAD_ACCESS_FAULT; }
 
     uint32_t value = 0;
 
@@ -442,8 +442,8 @@ static int plic_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
 
 static int plic_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u)              return CAUSE_STORE_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u)      return CAUSE_STORE_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_STORE_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_STORE_ACCESS_FAULT; }
 
     uint32_t value;
     memcpy(&value, buf, 4);
@@ -583,7 +583,7 @@ int is_plic_seip_pending(uint32_t hartid) {
 // src/device/test_dev.{h,c}.
 
 void device_set_pending(uint32_t source_id) {
-    if (source_id == 0u || source_id >= PLIC_N_SOURCES) return;
+    if (source_id == 0u || source_id >= PLIC_N_SOURCES) { return; }
     plic_wrlock();
     plic.sources[source_id].device_line = 1;
     plic_recompute_all_ctx_eip_locked();
@@ -592,7 +592,7 @@ void device_set_pending(uint32_t source_id) {
 }
 
 void device_clear_pending(uint32_t source_id) {
-    if (source_id == 0u || source_id >= PLIC_N_SOURCES) return;
+    if (source_id == 0u || source_id >= PLIC_N_SOURCES) { return; }
     plic_wrlock();
     plic.sources[source_id].device_line = 0;
     plic_recompute_all_ctx_eip_locked();

@@ -64,7 +64,7 @@ uxlen_t mmio_read_helper(cpu_t *hart, uxlen_t pa, uxlen_t gva, uint32_t size) {
             int cause = bus_table[i].read(bus_table[i].ctx,
                                           pa - bus_table[i].gpa_start,
                                           &value, size);
-            if (cause == 0) return value;
+            if (cause == 0) { return value; }
             // device 拒绝: cause 由 device 自决, bus 透传
             trap_raise_exception(hart, (uint32_t)cause, gva);  // _Noreturn longjmp
         }
@@ -80,7 +80,7 @@ void mmio_write_helper(cpu_t *hart, uxlen_t pa, uxlen_t gva,
             int cause = bus_table[i].write(bus_table[i].ctx,
                                            pa - bus_table[i].gpa_start,
                                            &value, size);
-            if (cause == 0) return;
+            if (cause == 0) { return; }
             trap_raise_exception(hart, (uint32_t)cause, gva);  // _Noreturn longjmp
         }
     }

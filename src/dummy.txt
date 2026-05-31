@@ -1852,8 +1852,9 @@ bug。注: -Wconversion 当前不在项目 build flag 内, 此收益要等真加
 
 涉及文件:
   - src/core/cpu.{c,h}        (n_harts 全局; cpu.h extern + cpu.c 定义 = 1u)
-  - src/config.h              (MAX_HARTS = 编译期 cap; 当前 1U, SMP s2 末步切 8U)
-  - src/main.c                (--smp N CLI 解析 + s2 阶段钳死 n_harts=1)
+  - src/config.h              (MAX_HARTS = 编译期 cap; 当前 8U)
+  - src/main.c                (--smp N CLI 解析 + n_harts = smp_req; per-hart
+                               pthread spawn/join)
   - src/platform/clint.c      (4 处 MMIO 边界 + recompute_all_mtip 用 n_harts;
                                lifecycle 配对 + 内部 helper 防御边界保 cap)
   - src/platform/plic.c       (phantom drop helper + recompute_all_ctx_eip + plic_init
@@ -1973,25 +1974,31 @@ cap-vs-n_harts 判据 (新代码加哪边的判据)
 
 
 --------------------------------------------------------------------------------
-s2 钳死 (SMP 中间态 — 行为恒等变换验收)
+SMP s1/s2/s3 落地链路 (trail; 行为恒等变换 → cap 放开 → 真起多线程)
 --------------------------------------------------------------------------------
 
-main 强制 `n_harts = 1u` 忽略 --smp 解析值; config.h MAX_HARTS 仍 1U。改完后:
+s1 (CLI 解析): --smp N CLI parse + 1..MAX_HARTS 校验; n_harts 默认 1。
+
+s2 (cap-vs-n_harts 判据全场景落地, 行为恒等验收): 把每处边界判据用上节 "cap-
+vs-n_harts 判据" 拍正确, main 阶段性钳死 `n_harts = 1u` 忽略 --smp 解析值;
+config.h MAX_HARTS 仍 1U。此时:
   - n_harts == 1 == MAX_HARTS → `for i<n_harts` ≡ `for i<MAX_HARTS`,
     `idx>=n_harts` ≡ `idx>=MAX_HARTS`, `2*n_harts (=2)` ≡ `PLIC_N_CONTEXTS (=2)`
   - phantom 判定 plic_ctx_is_phantom 永返 false (ctx 0/1 都被填实)
   - 第 3 类 fatal 永不触发 (ctx_to_hartid 没有 -1 项可读)
   - 全量存量 fixture 100% 绿 + 输出逐字节一致 = s2 验收信号
-  - 行为恒等变换成立的前提: 上面 "cap-vs-n_harts 判据" 全场景判对 (尤其 lifecycle
+  - 行为恒等变换成立的前提: "cap-vs-n_harts 判据" 全场景判对 (尤其 lifecycle
     配对没误用 n_harts; 漏在 s2 不可见, s3 cap 改 8 才爆 → s2 是测不出的雷)
 
-s2 末步 (单独一轮): config.h MAX_HARTS 1U → 8U + 删 main 钳死; 此时 n_harts 仍
+s2 末步 (cap 放开): config.h MAX_HARTS 1U → 8U + 删 main 钳死; 此时 n_harts 仍
 默认 1 → 单核仍恒等; 用 --smp 2 等手测 cap 放开后多核数据结构就位 (真起多线程
 是 s3, 本步只验数组 / 边界 / init 在 cap=8 下不崩 + 单核不回归)。
 
-s3: main 循环 cpu_create n_harts 个 + per-hart dispatcher pthread + dump 打 hartid。
-此时 n_harts 写为 smp_req (解钳); kick_all 仍专用紧急停机不动 (未来正常状态
-n_harts kick_all 需求另分函数, 详 §12 末段)。
+s3 (真起多线程, 已落地): main 循环 cpu_create n_harts 个 + per-hart dispatcher
+pthread spawn/join (file-static hart_exec_run wrapper + harts[MAX_HARTS] +
+hart_threads[MAX_HARTS]) + dump 打 hartid。n_harts 写为 smp_req (解钳); spawn
+失败走 SYSRESET_BIT_HART_SPAWN_FAIL 进 ABORT_MASK; kick_all 仍专用紧急停机不动
+(未来正常状态 n_harts kick_all 需求另分函数, 详 §12 末段)。
 
 
 --------------------------------------------------------------------------------

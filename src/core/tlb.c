@@ -35,7 +35,7 @@ void tlb_clear(tlb_t *tlb) {
 }
 
 void tlb_table_reset(cpu_t *hart) {
-    if (hart == NULL) return;
+    if (hart == NULL) { return; }
 
     // [PRIV_S] S 槽 ASID 容器: 遍历每个 ASID 调 tlb_clear (entries 清; tlb_clear(NULL)
     // 是 no-op, 未懒分配的 entry 天然跳过)。

@@ -72,7 +72,7 @@
 static int has_suffix(const char *s, const char *suffix) {
     size_t ns = strlen(s);
     size_t nsuf = strlen(suffix);
-    if (ns < nsuf) return 0;
+    if (ns < nsuf) { return 0; }
     return strcmp(s + ns - nsuf, suffix) == 0;
 }
 
@@ -462,7 +462,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(arg, "--smp") == 0) {
             // 运行期 hart 数 (QEMU -smp 同义); 不给 = 默认 1。校验 1..MAX_HARTS,
             // 越界提前退出 (dummy.txt §5)。解析进 smp_req; 真写全局 n_harts 在
-            // while 前。s2 末步形态: 单 hart 仍直调 dispatcher (真起多线程留 s3)。
+            // while 前。多 hart 时 main 起 n_harts 个 pthread 各跑 dispatcher
+            // (详 main while 内 spawn/join + hart_exec_run wrapper)。
             if (++i >= argc) {
                 fprintf(stderr, "--smp needs N (1..%u)" EOL, MAX_HARTS);
                 return 1;
@@ -494,9 +495,9 @@ int main(int argc, char **argv) {
     // 线程 spawn (最早 clint_start_timer_thread) 之前写定 — n_harts 非 atomic, 靠
     // spawn happens-before 屏障保证多 hart 只读安全 (详 cpu.h n_harts 段)。
     //
-    // s2 末步形态 (cap=8 + n_harts=smp_req 默认 1): 单 hart 单线程仍是恒等; 用
-    // --smp 2..8 触发 cap 放开后多核数据结构 (数组/边界/init/phantom drop/fatal
-    // 路径) 在 cap=8 下不崩。真起多线程在 s3 (本处仍单 hart 直调 dispatcher)。
+    // cap (MAX_HARTS=8) 编译期上限 + n_harts 运行期实际; 单 hart 时 n_harts=1
+    // 仍走多线程路径 (单 pthread spawn/join), 跟 SMP 路径同构。详 dummy.txt §15
+    // 两数模型 + cap-vs-n_harts 判据。
     n_harts = smp_req;
 
     // UART TX 走 tx_drain thread → write(STDOUT_FILENO) 直接 syscall, 不经 stdio
@@ -593,7 +594,7 @@ int main(int argc, char **argv) {
         harts[i] = cpu_create(/*misa*/0, /*mhartid*/(uxlen_t)i);
         if (harts[i] == NULL) {  // cpu_create 内部已 fprintf "why"
             fprintf(stderr, "cpu_create(hart %u) failed" EOL, i);
-            for (uint32_t j = 0; j < i; j++) cpu_destroy(harts[j]);
+            for (uint32_t j = 0; j < i; j++) { cpu_destroy(harts[j]); }
             return 1;
         }
     }
@@ -606,7 +607,7 @@ int main(int argc, char **argv) {
     // 但保险起见也放在 plic_init 之后。
     if (wfi_init() != 0) {
         fprintf(stderr, "wfi_init failed" EOL);
-        for (uint32_t i = 0; i < n_harts; i++) cpu_destroy(harts[i]);
+        for (uint32_t i = 0; i < n_harts; i++) { cpu_destroy(harts[i]); }
         return 1;
     }
 
@@ -673,7 +674,7 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------------
     while (atomic_load_explicit(&system_reset_signal, memory_order_acquire) == 0u) {
         // per-hart cpu_reset (idempotent, 保留 hartid/mhartid; 详 cpu.c cpu_reset)
-        for (uint32_t i = 0; i < n_harts; i++) cpu_reset(harts[i]);
+        for (uint32_t i = 0; i < n_harts; i++) { cpu_reset(harts[i]); }
         (void)clint_reset();
         (void)plic_reset();
         (void)test_dev_reset();
@@ -808,7 +809,7 @@ int main(int argc, char **argv) {
     // per-hart cpu_destroy. NULL 跳过 — 当前 cpu_create 失败时已 early return,
     // 这里循环只跑成功初始化的; NULL 检查兜底未来 lazy alloc 路径。
     for (uint32_t i = 0; i < n_harts; i++) {
-        if (harts[i] != NULL) cpu_destroy(harts[i]);
+        if (harts[i] != NULL) { cpu_destroy(harts[i]); }
     }
     ram_destroy();
 

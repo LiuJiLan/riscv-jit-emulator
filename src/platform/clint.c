@@ -163,8 +163,8 @@ static void clint_recompute_all_mtip(void) {
 
 static int clint_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u) return CAUSE_LOAD_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u) return CAUSE_LOAD_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_LOAD_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_LOAD_ACCESS_FAULT; }
 
     uint32_t value = 0;
     if (off < (uint32_t)CLINT_MTIMECMP_OFF) {
@@ -172,7 +172,7 @@ static int clint_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
         uint32_t idx = off / 4u;
         // 第 1 类: guest 访问 idx >= n_harts 的 hart = guest bug, 返 access fault
         // (不 silent, 不拖停模拟器); return 在碰字段前 → 无副作用。用 n_harts 不 cap。
-        if (idx >= n_harts) return CAUSE_LOAD_ACCESS_FAULT;
+        if (idx >= n_harts) { return CAUSE_LOAD_ACCESS_FAULT; }
         value = atomic_load_explicit(&clint.msip[idx], memory_order_relaxed);
     } else if (off < (uint32_t)CLINT_MTIME_OFF) {
         // mtimecmp[N]: 8 byte/hart; 低半 / 高半由 (bo & 0x4) 决定
@@ -196,8 +196,8 @@ static int clint_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
 
 static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u) return CAUSE_STORE_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u) return CAUSE_STORE_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_STORE_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_STORE_ACCESS_FAULT; }
 
     uint32_t value;
     memcpy(&value, buf, 4);
@@ -206,7 +206,7 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
         uint32_t idx = off / 4u;
         // 第 1 类: guest 访问 idx >= n_harts = guest bug, 返 access fault。return 在
         // atomic_store + wfi_kick 之前 → 不会给不存在的 slot 写 msip / kick 空 slot。
-        if (idx >= n_harts) return CAUSE_STORE_ACCESS_FAULT;
+        if (idx >= n_harts) { return CAUSE_STORE_ACCESS_FAULT; }
         // msip 只低 1 位有效 (RV spec §3.1.9)
         atomic_store_explicit(&clint.msip[idx], value & 0x1u, memory_order_relaxed);
         // msip 不 cache (已经是 1 atomic load), 但 wake 钩子要直接调 — hart 可能
@@ -218,7 +218,7 @@ static int clint_write(void *ctx, uint32_t off, const void *buf, uint32_t size) 
         uint32_t bo  = off - (uint32_t)CLINT_MTIMECMP_OFF;
         uint32_t idx = bo / 8u;
         // 第 1 类: guest fault; return 在 load-modify-store + clint_recompute_mtip 之前。
-        if (idx >= n_harts) return CAUSE_STORE_ACCESS_FAULT;
+        if (idx >= n_harts) { return CAUSE_STORE_ACCESS_FAULT; }
         // 8B 字段拆 RV32 2 条 sw: load-modify-store (atomic 加载现值, 改一半, atomic
         // store 回去); 中间瞬态值不一致是 guest 责任 (见顶部 doc)。
         u64_t    cur = atomic_load_explicit(&clint.mtimecmps[idx], memory_order_relaxed);
@@ -470,12 +470,12 @@ void clint_join_timer_thread(void) {
 // ----------------------------------------------------------------------------
 
 int is_clint_msip_pending(uint32_t hartid) {
-    if (hartid >= MAX_HARTS) return 0;
+    if (hartid >= MAX_HARTS) { return 0; }
     return atomic_load_explicit(&clint.msip[hartid], memory_order_acquire) ? 1 : 0;
 }
 
 int is_clint_timer_pending(uint32_t hartid) {
-    if (hartid >= MAX_HARTS) return 0;
+    if (hartid >= MAX_HARTS) { return 0; }
     // 单 atomic_load: writer (timer thread / clint_write mtime|mtimecmp)
     // 都接了 clint_recompute_mtip 钩子维护 mtip cache, reader 不再每次比 mtime/mtimecmps,
     // 跟 PLIC ctx_eip 同体例 (dummy.txt §14 + trade_off_log §T.6 同源思路)。

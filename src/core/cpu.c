@@ -140,7 +140,7 @@ void cpu_reset(cpu_t *hart) {
     // reset 依赖 misa (future) — 真硬件 reset 后哪些字段清 / 哪些保留按 misa 决定
     // (例 misa.F=0 时 fcsr 不存在不需清; misa.H=0 时 [PRIV_H] tlb 容器不存在不需
     // tlb_table_reset 内遍历)。当前不实装运行时 misa 切换, 全 hart 同 reset 序。
-    if (hart == NULL) return;
+    if (hart == NULL) { return; }
 
     // regs: 全清 0, 然后写 RV-spec reset 后的启动协议字段。
     // (顺序: 先 memset, 再写需要非 0 的 — regs[0]=pc / regs[10]=a0)
@@ -265,7 +265,7 @@ static void cpu_dump(const cpu_t *hart) {
 }
 
 void cpu_destroy(cpu_t *hart) {
-    if (hart == NULL) return;
+    if (hart == NULL) { return; }
 
     // 销毁前 dump 终态 (DEBUG_CPU_DUMP_ON gate; Release 不打)。放 free 之前 hart 字段
     // 仍完整可读。注: cpu_create 失败回滚路径也走 cpu_destroy, 那时 hart 只半初始化,

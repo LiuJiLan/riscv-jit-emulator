@@ -220,7 +220,7 @@ static decoded_inst_t decode_rvc(uint16_t inst) {
             if (sub == 0x2) {
                 // C.ANDI (rd', rd', sign-ext imm6); imm 解码跟 C.ADDI 同
                 int32_t imm = (int32_t)(imm5 << 5 | imm4_0);
-                if (imm5) imm |= (int32_t)0xFFFFFFC0u;
+                if (imm5) { imm |= (int32_t)0xFFFFFFC0u; }
                 d.kind = OP_ANDI;
                 d.rd   = rd_p;
                 d.rs1  = rd_p;

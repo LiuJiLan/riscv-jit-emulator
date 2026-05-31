@@ -302,7 +302,7 @@ int mmu_walk(cpu_t *hart, uxlen_t gva, mmu_perm_t perm,
         *pte_pa_out = pte0_pa;
         // pte_flags_out 反映建议 set 后状态 (caller TLB 用 pte_flags 的 A/D bit)
         pte0 |= PTE_A;
-        if (perm == MMU_PERM_W) pte0 |= PTE_D;
+        if (perm == MMU_PERM_W) { pte0 |= PTE_D; }
 
         // 算 PA: leaf PPN<<12 | offset
         const uint32_t leaf_ppn = (pte0 >> 10);          /* 22 位 PPN */
@@ -329,7 +329,7 @@ int mmu_walk(cpu_t *hart, uxlen_t gva, mmu_perm_t perm,
     // hw-managed A/D: superpage 形态跟 level=0 leaf 同 (walker 输出 PA, caller atomic OR)
     *pte_pa_out = pte1_pa;
     pte1 |= PTE_A;
-    if (perm == MMU_PERM_W) pte1 |= PTE_D;
+    if (perm == MMU_PERM_W) { pte1 |= PTE_D; }
 
     // 算 4MB superpage PA: PTE.PPN[1] (12 位) | VPN[0] (来自 vaddr) | offset (12 位)
     const uint32_t pte1_ppn1 = (pte1 >> 20) & 0xFFFu;    /* PTE bits[31:20] = PPN[1] 12 位 */

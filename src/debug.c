@@ -17,7 +17,7 @@ __thread uint32_t hartid_self;
 // 收尾整 hart join 块。空 buffer 时 no-op。
 // 调用点: dispatcher 退出前 (DEBUG_NEWLINE 触发) + hart_exec_run 末尾兜底。
 void debug_flush_local_trace(void) {
-    if (trace_idx == 0) return;
+    if (trace_idx == 0) { return; }
     fprintf(stderr, "[hart%u trace] ", hartid_self);
     fwrite(trace_buf, 1, trace_idx, stderr);
     fputs(EOL, stderr);

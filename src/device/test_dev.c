@@ -59,8 +59,8 @@ static _Atomic int test_dev_exit_code = TEST_DEV_EXIT_SENTINEL;
 
 static int test_dev_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u)              return CAUSE_LOAD_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u)      return CAUSE_LOAD_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_LOAD_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_LOAD_ACCESS_FAULT; }
 
     uint32_t value = 0;
     memcpy(buf, &value, 4);
@@ -69,8 +69,8 @@ static int test_dev_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
 
 static int test_dev_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u)              return CAUSE_STORE_ACCESS_FAULT;
-    if ((off & 0x3u) != 0u)      return CAUSE_STORE_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_STORE_ACCESS_FAULT; }
+    if ((off & 0x3u) != 0u) { return CAUSE_STORE_ACCESS_FAULT; }
 
     uint32_t value;
     memcpy(&value, buf, 4);

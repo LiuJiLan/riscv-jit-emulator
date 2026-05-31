@@ -138,7 +138,7 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure) {
 // 调用约束: 普通线程上下文 (pthread_mutex_* 不是 async-signal-safe; signal
 // handler 不能调本函数)。signal handler 触发 SRS 走 timeout 兜底 (500ms) 自愈。
 void wfi_kick(uint32_t hartid) {
-    if (hartid >= MAX_HARTS) return;
+    if (hartid >= MAX_HARTS) { return; }
 
     wfi_slot_t *s = &wfi_slots[hartid];
     pthread_mutex_lock(&s->mutex);

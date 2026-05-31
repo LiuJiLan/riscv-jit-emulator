@@ -148,10 +148,10 @@ static void uart_compute_device_line_locked(void) {
                       !uart.thr_empty_pending_acked;
     uint8_t want    = (rx_int || thr_int) ? 1u : 0u;
 
-    if (want == uart.device_line) return;
+    if (want == uart.device_line) { return; }
     uart.device_line = want;
-    if (want) device_set_pending  ((uint32_t)UART_PLIC_IRQ);
-    else      device_clear_pending((uint32_t)UART_PLIC_IRQ);
+    if (want) { device_set_pending  ((uint32_t)UART_PLIC_IRQ); }
+    else { device_clear_pending((uint32_t)UART_PLIC_IRQ); }
 }
 
 
@@ -206,7 +206,7 @@ static uint8_t uart_iir_readout_locked(void) {
 
 static int uart_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 1u) return CAUSE_LOAD_ACCESS_FAULT;
+    if (size != 1u) { return CAUSE_LOAD_ACCESS_FAULT; }
     if (off >= 8u) {
         *(uint8_t *)buf = 0;
         return 0;
@@ -258,7 +258,7 @@ static int uart_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
 
 static int uart_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 1u) return CAUSE_STORE_ACCESS_FAULT;
+    if (size != 1u) { return CAUSE_STORE_ACCESS_FAULT; }
     if (off >= 8u)  return 0;                       /* reserved silent ignore */
 
     uint8_t v = *(const uint8_t *)buf;
@@ -343,18 +343,18 @@ static void *uart_reader_run(void *arg) {
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
         int rc = poll(&pfd, 1, 100);            /* 100 ms timeout cooperative shutdown */
         if (rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) { continue; }
             fprintf(stderr, "[uart reader] poll failed: %s" EOL, strerror(errno));
             break;
         }
         if (rc == 0) continue;                  /* timeout — 再判 SDS */
-        if (!(pfd.revents & POLLIN)) continue;
+        if (!(pfd.revents & POLLIN)) { continue; }
 
         uint8_t c;
         ssize_t n = read(STDIN_FILENO, &c, 1);
         if (n == 0) break;                      /* EOF; stdin closed / pipe 跑完 */
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) { continue; }
             fprintf(stderr, "[uart reader] read failed: %s" EOL, strerror(errno));
             break;
         }
@@ -450,7 +450,7 @@ static void *uart_tx_drain_run(void *arg) {
             while (written < n) {
                 ssize_t w = write(STDOUT_FILENO, batch + written, n - written);
                 if (w < 0) {
-                    if (errno == EINTR) continue;
+                    if (errno == EINTR) { continue; }
                     fprintf(stderr, "[uart tx_drain] write failed: %s" EOL,
                             strerror(errno));
                     shutdown_signal_set_bit(SHUTDOWN_BIT_DEVICE_FAIL);
@@ -489,13 +489,13 @@ static void *uart_tx_drain_run(void *arg) {
         while (written < n) {
             ssize_t w = write(STDOUT_FILENO, batch + written, n - written);
             if (w < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) { continue; }
                 fprintf(stderr, "[uart tx_drain] tail-drain write failed: %s" EOL,
                         strerror(errno));
                 /* shutdown 路径已在, 不再 set DEVICE_FAIL — 仅 log */
                 break;
             }
-            if (w == 0) break;
+            if (w == 0) { break; }
             written += (size_t)w;
         }
     } else {

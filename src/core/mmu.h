@@ -276,10 +276,10 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 
     /* priv + PTE.U 检查 */
     if (hart->priv == PRIV_U) {
-        if (!pte_u) return 0;
+        if (!pte_u) { return 0; }
     } else if (hart->priv == PRIV_S) {
         if (pte_u) {
-            if (!sum) return 0;
+            if (!sum) { return 0; }
             if (perm == MMU_PERM_X) return 0;     /* S+SUM 不允许 X-on-U-page */
         }
     }
@@ -288,14 +288,14 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
     /* R/W/X 位检查 — switch on perm 跟 mmu_perm_t enum 配 -Wswitch-enum 联动 */
     switch (perm) {
         case MMU_PERM_R:
-            if ((pte & PTE_R) == 0 && !(mxr && (pte & PTE_X))) return 0;
+            if ((pte & PTE_R) == 0 && !(mxr && (pte & PTE_X))) { return 0; }
             break;
         case MMU_PERM_W:
-            if ((pte & PTE_W) == 0) return 0;
+            if ((pte & PTE_W) == 0) { return 0; }
             /* W=1+R=0 RV spec reserved; 项目跟 spike 风格不查 */
             break;
         case MMU_PERM_X:
-            if ((pte & PTE_X) == 0) return 0;
+            if ((pte & PTE_X) == 0) { return 0; }
             break;
     }
     return 1;

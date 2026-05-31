@@ -105,16 +105,16 @@ int trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
         if (deliver_priv == PRIV_M) {
             mstatus_lo &= ~MSTATUS_MPP;
             mstatus_lo |= ((uint32_t)hart->priv << MSTATUS_MPP_SHIFT) & MSTATUS_MPP;
-            if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
-            else                          mstatus_lo &= ~MSTATUS_MPIE;
+            if (mstatus_lo & MSTATUS_MIE) { mstatus_lo |=  MSTATUS_MPIE; }
+            else { mstatus_lo &= ~MSTATUS_MPIE; }
             mstatus_lo &= ~MSTATUS_MIE;
             ms |= MSTATUS_MDT_BIT64;                          /* M-trap entry: MDT=1 */
         } else {
             /* deliver_priv == PRIV_S; caller 必为 U/S */
-            if (hart->priv == PRIV_S) mstatus_lo |=  MSTATUS_SPP;
-            else                      mstatus_lo &= ~MSTATUS_SPP;
-            if (mstatus_lo & MSTATUS_SIE) mstatus_lo |=  MSTATUS_SPIE;
-            else                          mstatus_lo &= ~MSTATUS_SPIE;
+            if (hart->priv == PRIV_S) { mstatus_lo |=  MSTATUS_SPP; }
+            else { mstatus_lo &= ~MSTATUS_SPP; }
+            if (mstatus_lo & MSTATUS_SIE) { mstatus_lo |=  MSTATUS_SPIE; }
+            else { mstatus_lo &= ~MSTATUS_SPIE; }
             mstatus_lo &= ~MSTATUS_SIE;
             mstatus_lo |= MSTATUS_SDT;                        /* S-trap entry: SDT=1 */
         }
@@ -202,15 +202,15 @@ int trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
         if (deliver_priv == PRIV_M) {
             mstatus_lo &= ~MSTATUS_MPP;
             mstatus_lo |= ((uint32_t)hart->priv << MSTATUS_MPP_SHIFT) & MSTATUS_MPP;
-            if (mstatus_lo & MSTATUS_MIE) mstatus_lo |=  MSTATUS_MPIE;
-            else                          mstatus_lo &= ~MSTATUS_MPIE;
+            if (mstatus_lo & MSTATUS_MIE) { mstatus_lo |=  MSTATUS_MPIE; }
+            else { mstatus_lo &= ~MSTATUS_MPIE; }
             mstatus_lo &= ~MSTATUS_MIE;
             ms |= MSTATUS_MDT_BIT64;                          /* M-trap entry: MDT=1 */
         } else {
-            if (hart->priv == PRIV_S) mstatus_lo |=  MSTATUS_SPP;
-            else                      mstatus_lo &= ~MSTATUS_SPP;
-            if (mstatus_lo & MSTATUS_SIE) mstatus_lo |=  MSTATUS_SPIE;
-            else                          mstatus_lo &= ~MSTATUS_SPIE;
+            if (hart->priv == PRIV_S) { mstatus_lo |=  MSTATUS_SPP; }
+            else { mstatus_lo &= ~MSTATUS_SPP; }
+            if (mstatus_lo & MSTATUS_SIE) { mstatus_lo |=  MSTATUS_SPIE; }
+            else { mstatus_lo &= ~MSTATUS_SPIE; }
             mstatus_lo &= ~MSTATUS_SIE;
             mstatus_lo |= MSTATUS_SDT;                        /* S-trap entry: SDT=1 */
         }
@@ -276,12 +276,12 @@ int trap_check_interrupt(cpu_t *hart) {
 
     /* RV Priv Spec §3.1.9 优先级: M_EXT > M_SOFT > M_TIMER > S_EXT > S_SOFT > S_TIMER */
     uint32_t irq;
-    if      (ready & (1u << IRQ_M_EXT))   irq = IRQ_M_EXT;
-    else if (ready & (1u << IRQ_M_SOFT))  irq = IRQ_M_SOFT;
-    else if (ready & (1u << IRQ_M_TIMER)) irq = IRQ_M_TIMER;
-    else if (ready & (1u << IRQ_S_EXT))   irq = IRQ_S_EXT;
-    else if (ready & (1u << IRQ_S_SOFT))  irq = IRQ_S_SOFT;
-    else                                  irq = IRQ_S_TIMER;
+    if (ready & (1u << IRQ_M_EXT)) { irq = IRQ_M_EXT; }
+    else if (ready & (1u << IRQ_M_SOFT)) { irq = IRQ_M_SOFT; }
+    else if (ready & (1u << IRQ_M_TIMER)) { irq = IRQ_M_TIMER; }
+    else if (ready & (1u << IRQ_S_EXT)) { irq = IRQ_S_EXT; }
+    else if (ready & (1u << IRQ_S_SOFT)) { irq = IRQ_S_SOFT; }
+    else { irq = IRQ_S_TIMER; }
 
     // 透传 trap_set_interrupt_state 返值 (恒 1: deliver-OK / critical-error 同值,
     // caller dispatcher 不区分, 都 continue 让 while(SRS==0) 接管)。透传比

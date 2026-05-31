@@ -130,9 +130,9 @@ int runtime_install_signal_handlers(void) {
        SIGTERM kill 默认 / CLion 停止 → exit 128+15 = 143
        SIGHUP  父进程关闭 / 网页断    → exit 128+1  = 129
        SIGQUIT 不挂 — raw mode 关 ISIG 后 ^\ 进 guest, 由 guest 处理 */
-    if (runtime_install_one(SIGINT)  != 0) return -1;
-    if (runtime_install_one(SIGTERM) != 0) return -1;
-    if (runtime_install_one(SIGHUP)  != 0) return -1;
+    if (runtime_install_one(SIGINT)  != 0) { return -1; }
+    if (runtime_install_one(SIGTERM) != 0) { return -1; }
+    if (runtime_install_one(SIGHUP)  != 0) { return -1; }
     return 0;
 }
 
@@ -194,7 +194,7 @@ void runtime_stdin_enter_raw(void) {
 void runtime_stdin_exit_raw(void) {
     /* enter 退化路径 (isatty=0 / tcgetattr-tcsetattr fail) tio_saved 仍 0,
        skip restore; abort path (assert/segfault) 走不到此调, user 需 stty sane. */
-    if (!runtime_stdin_state.tio_saved) return;
+    if (!runtime_stdin_state.tio_saved) { return; }
 
     if (tcsetattr(STDIN_FILENO, TCSANOW, &runtime_stdin_state.saved_tio) != 0) {
         fprintf(stderr, "runtime_stdin_exit_raw: tcsetattr(restore) failed (%s); "

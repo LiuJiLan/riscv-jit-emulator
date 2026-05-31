@@ -192,7 +192,7 @@ int guest_load_elf(const char *path) {
             return -1;
         }
 
-        if (phdr.p_type != PT_LOAD) continue;
+        if (phdr.p_type != PT_LOAD) { continue; }
 
         if (phdr.p_filesz > phdr.p_memsz) {
             fprintf(stderr,
@@ -240,7 +240,7 @@ int guest_load_elf(const char *path) {
 int guest_is_elf(const char *path) {
     // 探测函数: silently return 0 表示"不是 / 不可读"。不 fprintf。
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
+    if (fd < 0) { return 0; }
 
     unsigned char m[4];
     ssize_t n;
@@ -248,7 +248,7 @@ int guest_is_elf(const char *path) {
         n = pread(fd, m, 4, 0);
     } while (n < 0 && errno == EINTR);
     close(fd);
-    if (n != 4) return 0;
+    if (n != 4) { return 0; }
     return (m[0] == ELFMAG0 && m[1] == ELFMAG1 &&
             m[2] == ELFMAG2 && m[3] == ELFMAG3) ? 1 : 0;
 }

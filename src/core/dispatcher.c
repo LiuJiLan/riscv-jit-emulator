@@ -158,7 +158,7 @@ void dispatcher(cpu_t *hart) {
     // 返非 0 = 已 set_interrupt_state, dispatcher continue 跳回 while 顶 (走 dummy.txt
     // §9 路径 2b 浅栈 return-based, 不长跳 — 跟 mmu_translate_pc 失败路径同形态).
     // ========================================================================
-    if (trap_check_interrupt(hart) != 0) continue;
+    if (trap_check_interrupt(hart) != 0) { continue; }
 
     // 每轮 while 体进入 = 一次"重新派发取指" (块边界自然推进 / 跨页退块重派 / helper
     // longjmp 跳回 sigsetjmp 落点都走这里)。fixture 跨页 / 中断密度人工观察 (debug.h)。
@@ -233,8 +233,8 @@ void dispatcher(cpu_t *hart) {
             current_tlb = tlb_alloc();
             if (current_tlb == NULL) {
                 fprintf(stderr,
-                        "[dispatcher] tlb_alloc failed for priv=%u asid=%u" EOL,
-                        (uint32_t)hart->priv, asid);
+                        "[hart%u dispatcher] tlb_alloc failed for priv=%u asid=%u" EOL,
+                        hart->hartid, (uint32_t)hart->priv, asid);
                 system_reset_signal_set_bit(SYSRESET_BIT_HART_MDT);
                 break;
             }
@@ -264,7 +264,7 @@ void dispatcher(cpu_t *hart) {
     // 接管 (trap 已 deliver 或 M-mode critical-error 已 set HART_MDT, while 退出)。
     // dummy.txt §1 路径 C (mmu fetch trap 不长跳)。
     // ========================================================================
-    if (rc != 0) continue;
+    if (rc != 0) { continue; }
 
     // ========================================================================
     // block 3: 派发到 jit / interpreter

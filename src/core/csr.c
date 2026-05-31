@@ -470,7 +470,7 @@ static uxlen_t csr_stvec_read(cpu_t *hart) {
 static void csr_stvec_write(cpu_t *hart, uxlen_t v) {
     /* WARL MODE 处理跟 mtvec 同 (Direct + Vectored 都支持, 2/3 reserved → 0; 详 csr_mtvec_write) */
     uint32_t mode = v & 0x3u;
-    if (mode >= 2u) mode = 0u;
+    if (mode >= 2u) { mode = 0u; }
     hart->trap.xtvec[PRIV_S] = (v & ~0x3u) | mode;
 }
 
@@ -695,8 +695,8 @@ uxlen_t csr_op(cpu_t *hart, uint32_t csr_addr, uxlen_t new_val,
         case CSR_PRIVRD:   read_old = csr_privrd_read  (hart); break;   /* 临时 RO; RO 写 trap 由入口判 */
         default:
             fprintf(stderr,
-                    "[csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2" EOL,
-                    csr_addr);
+                    "[hart%u csr] unknown csr addr=0x%03" PRIx32 " → trap cause 2" EOL,
+                    hart->hartid, csr_addr);
             trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst);  // _Noreturn longjmp
     }
 

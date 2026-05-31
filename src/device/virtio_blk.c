@@ -185,8 +185,8 @@ static inline uint32_t vblk_used_off(uint32_t qnum, uint32_t qalign) {
 // QueueNotify, happens-before 已由 worker thread cond_signal 边界保证).
 
 static void drain_one_avail_round_locked(void) {
-    if (g_vblk.queue_pfn == 0u || g_vblk.queue_num == 0u) return;
-    if (g_vblk.queue_num > VIRTIO_BLK_QUEUE_NUM_MAX)     return;
+    if (g_vblk.queue_pfn == 0u || g_vblk.queue_num == 0u) { return; }
+    if (g_vblk.queue_num > VIRTIO_BLK_QUEUE_NUM_MAX) { return; }
 
     uint32_t qnum     = g_vblk.queue_num;
     uint32_t qalign   = (g_vblk.queue_align != 0u) ? g_vblk.queue_align : 4096u;
@@ -503,7 +503,7 @@ static void vblk_enqueue_work_token(void) {
 
 static int virtio_blk_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u) return CAUSE_LOAD_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_LOAD_ACCESS_FAULT; }
 
     uint32_t value = 0;
 
@@ -559,7 +559,7 @@ static int virtio_blk_read(void *ctx, uint32_t off, void *buf, uint32_t size) {
 
 static int virtio_blk_write(void *ctx, uint32_t off, const void *buf, uint32_t size) {
     (void)ctx;
-    if (size != 4u) return CAUSE_STORE_ACCESS_FAULT;
+    if (size != 4u) { return CAUSE_STORE_ACCESS_FAULT; }
 
     uint32_t value;
     memcpy(&value, buf, 4);
@@ -570,8 +570,8 @@ static int virtio_blk_write(void *ctx, uint32_t off, const void *buf, uint32_t s
 
       case VBLK_REG_DRIVER_FEAT:
         vblk_state_lock();
-        if (g_vblk.driver_feat_sel == 0u) g_vblk.driver_feat_lo = value;
-        else                              g_vblk.driver_feat_hi = value;
+        if (g_vblk.driver_feat_sel == 0u) { g_vblk.driver_feat_lo = value; }
+        else { g_vblk.driver_feat_hi = value; }
         vblk_state_unlock();
         break;
 
@@ -587,7 +587,7 @@ static int virtio_blk_write(void *ctx, uint32_t off, const void *buf, uint32_t s
 
       case VBLK_REG_QUEUE_NUM:
         vblk_state_lock();
-        if (value <= VIRTIO_BLK_QUEUE_NUM_MAX) g_vblk.queue_num = value;
+        if (value <= VIRTIO_BLK_QUEUE_NUM_MAX) { g_vblk.queue_num = value; }
         vblk_state_unlock();
         break;
 
@@ -614,7 +614,7 @@ static int virtio_blk_write(void *ctx, uint32_t off, const void *buf, uint32_t s
         vblk_state_lock();
         uint32_t before = g_vblk.interrupt_status;
         g_vblk.interrupt_status &= ~value;
-        if (before != 0u && g_vblk.interrupt_status == 0u) cleared = 1;
+        if (before != 0u && g_vblk.interrupt_status == 0u) { cleared = 1; }
         vblk_state_unlock();
         if (cleared) {
             device_clear_pending((uint32_t)VIRTIO_BLK_PLIC_IRQ);
@@ -744,7 +744,7 @@ int virtio_blk_init(const char *image_path) {
 }
 
 int virtio_blk_reset(void) {
-    if (g_vblk.image_fd < 0) return 0;
+    if (g_vblk.image_fd < 0) { return 0; }
 
     vblk_state_lock();
     g_vblk.status            = 0;
@@ -768,7 +768,7 @@ int virtio_blk_reset(void) {
 }
 
 void virtio_blk_destroy(void) {
-    if (g_vblk.image_fd < 0) return;
+    if (g_vblk.image_fd < 0) { return; }
 
     /* 关 fd 前 fsync 一次 — pwrite 后内核 page cache 没刷盘, 极端情况 (host 强杀
        / 断电) 可能丢最近 sector write. fsync fail 仅 log 不 fatal (destroy 在
