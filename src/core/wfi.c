@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
@@ -39,6 +40,39 @@ typedef struct {
 } wfi_slot_t;
 
 static wfi_slot_t wfi_slots[MAX_HARTS];
+
+// ----------------------------------------------------------------------------
+// kick_sticky[MAX_HARTS] — sticky-pending flag, 闭合 lost-wakeup race
+// ----------------------------------------------------------------------------
+//
+// 背景: pthread_cond_signal 是 edge-triggered, 落到无 waiter 的瞬间即丢失。
+// race 场景 (session 026 排查 + 027 trace 确认):
+//   T1 worker: drain_done → plic device_set_pending → ctx_eip 0→1 → wfi_kick(h)
+//              (此时 hart h 还在 dispatcher 主循环跑 inst, 不在 cond_wait —
+//               signal 落空丢失)
+//   dispatcher: trap_check_interrupt 见 mip MEIP=1 → deliver trap (mepc = wfi inst)
+//   handler:    vblk_irq_ack → device_clear_pending → MEIP=0 → done=1 → mret
+//   hart h:     mret 回 wfi inst → wfi_wait → predicate 读 mip=0 → false →
+//               cond_timedwait → 永远没有新的 signal (device line 已 clear, 不再
+//               有 0→1 翻转) → 500ms 兜底醒来 predicate 仍 false → 又 cond_wait
+//               → forever hang
+//
+// 闭合方式: sticky flag, 把 edge-triggered signal 升级为 level-triggered:
+//   wfi_kick:  atomic_store(sticky[h]=1, release) 先, 再 lock/cond_signal/unlock
+//   wfi_wait:  lock 后 atomic_exchange(sticky[h]=0, acquire) — 消费; 命中 (非零)
+//              直接 unlock+return, 跳过 cond_wait。while loop 内每轮也重读 sticky
+//              (cond_wait 期间 kick 可能再设, 醒来要消费; 跟 predicate 并列条件)。
+//
+// happens-before 链:
+//   T1 wfi_kick store(release)  → T2 wfi_wait exchange(acquire)  直接配对 (atomic)
+//   T1 cond_signal              → T2 cond_wait return            mutex 协议保证
+//   两条独立, sticky 路径不依赖 cond_var 的 edge 语义, race 消失。
+//
+// 不影响正常 (非 race) 路径: kick 在 wait 之后 → wait 进 cond_wait, kick signal
+// 唤醒 wait, 重测 predicate (true 因 mip set) → 退出。sticky 仍 set 但下次 wait
+// 时被消费 (或永不再进 wait 留着, 不影响正确性 — sticky=1 只让"下一次"wait 立即退,
+// 等价 spurious wake 一次, spec 允许)。
+static _Atomic uint32_t kick_sticky[MAX_HARTS];
 
 
 // ----------------------------------------------------------------------------
@@ -103,7 +137,12 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure) {
     wfi_slot_t *s = &wfi_slots[hartid];
     pthread_mutex_lock(&s->mutex);
 
-    while (!pred(closure)) {
+    /* sticky-kick 消费: 进 cond_wait 之前看是否有未投递的 wfi_kick。命中即退,
+     * 等价 spurious wake (RV spec §3.3.2 允许)。详 kick_sticky 顶段注释。 */
+    bool sticky_seen = atomic_exchange_explicit(&kick_sticky[hartid], 0u,
+                                                memory_order_acquire) != 0u;
+
+    while (!sticky_seen && !pred(closure)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         // 加 WFI_TIMEOUT_NS, normalize tv_sec / tv_nsec
@@ -116,8 +155,10 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure) {
                                 predicate 仍 false 时多次 cond_timedwait → 多次 'w' */
         int rc = pthread_cond_timedwait(&s->cond, &s->mutex, &ts);
         // rc: 0 (signaled) / ETIMEDOUT (兜底) / EINTR (信号; spurious 同处理) —
-        // 任何返回都重 check predicate, while loop 已涵盖, 不分流。
+        // 任何返回都重 check predicate + sticky, while loop 涵盖, 不分流。
         (void)rc;
+        sticky_seen = atomic_exchange_explicit(&kick_sticky[hartid], 0u,
+                                               memory_order_acquire) != 0u;
     }
 
     pthread_mutex_unlock(&s->mutex);
@@ -139,6 +180,11 @@ void wfi_wait(uint32_t hartid, wfi_predicate_fn pred, void *closure) {
 // handler 不能调本函数)。signal handler 触发 SRS 走 timeout 兜底 (500ms) 自愈。
 void wfi_kick(uint32_t hartid) {
     if (hartid >= MAX_HARTS) { return; }
+
+    /* sticky-kick set: 必须先于 lock+signal (release 跟 wait 端 acquire 配对独立
+     * 于 mutex 协议)。即使 hart 不在 cond_wait, sticky=1 留下, 下次 wfi_wait 入口
+     * 消费 + 立即退, 闭合 lost-wakeup race。详 kick_sticky 顶段注释。 */
+    atomic_store_explicit(&kick_sticky[hartid], 1u, memory_order_release);
 
     wfi_slot_t *s = &wfi_slots[hartid];
     pthread_mutex_lock(&s->mutex);
