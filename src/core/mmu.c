@@ -440,7 +440,7 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
 
 
 // ============================================================================
-// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程 (a_04 T2; Zaamo)
+// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程 (Zaamo)
 // ============================================================================
 //
 // 完整流程 doc + 跟 store walker 严格对偶 + MMIO 拒 cause 7 (不开 mmio_amo_helper) 见 mmu.h.
@@ -501,7 +501,7 @@ AMO_DEFINE_WALKER(maxu_w)
 
 
 // ============================================================================
-// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (a_04 T3; Zalrsc)
+// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (Zalrsc)
 // ============================================================================
 //
 // 完整流程 doc 见 mmu.h. 跟 store/amo walker 严格对偶, 末调 lrsc_lr_w / lrsc_sc_w

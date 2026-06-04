@@ -2,7 +2,7 @@
 // Created by liujilan on 2026/6/4.
 // isa/lrsc —— RV32 A 扩展 LR.W / SC.W (Zalrsc) + 全局 reservation 数据结构。
 //
-// T3 实装 (lrsc_amo_decision.md "(主方案) 走向 c"):
+// 实装形态 (主方案 c, 决议见 trade_off_log §T LR/SC + lrsc_amo_decision.md):
 //   - per-hart _Atomic uxlen_t reservation_addr[MAX_HARTS] static 数组 (cap 分配,
 //     n_harts 扫; 哨兵 LRSC_INVALID_ADDR = ~(uxlen_t)0). 字段挂 lrsc.c 内不嵌
 //     cpu_t (跟 PLIC plic_ctx_eip / CLINT mtimecmp/msip 体例对齐; 决策表 #39 +
@@ -30,9 +30,9 @@
 //   1. context switch / trap → trap_set_*_state 入口
 //   2. sfence.vma            → sfence_vma_helper 末段
 //   3. wfi 醒来               → wfi_wait 后立刻
-//   4. fence.i               → isa/fence.c fence_i_helper (T1 真接通)
+//   4. fence.i               → isa/fence.c fence_i_helper
 //   5. 普通 store 命中 reservation → lsu.c store_helper 末段调 lrsc_on_store
-//   6. AMO 命中 reservation  → amo.c 9 apply 末段调 lrsc_on_store (T2 已埋, T3 真生效)
+//   6. AMO 命中 reservation  → amo.c 9 apply 末段调 lrsc_on_store
 //   7. device DMA / virtio_blk 写 RAM → io_worker 完成段调 lrsc_on_device_write
 //
 // trap 协议: 本模块不抛 trap (LR/SC misalign / access fault 在 caller 路径
@@ -42,9 +42,11 @@
 //   PA = uxlen_t (XLEN-tied; RV32 = uint32_t / RV64 切时一起变 uint64_t)。本文件
 //   所有 pa 参数 + reservation_addr 字段 + LRSC_INVALID_ADDR 哨兵均按此体例。
 //
-// fast/slow path framing T3 后重评估 trail: 见 amo.h §55-59 + a_04_session_002.
-//   本模块按 sacred 原则走 helper 颗粒度; T3 完工后独立 session 重评估 (输入: lrsc_
-//   on_store 真实 bucket_lock 体量 + 跨 hart 扫描成本 + JIT code size 影响).
+// fast/slow path framing 已评估维持 sacred 原则 (trade_off_log §T fast-slow-framing +
+//   access_helper_call_graph.md §8). helper call ~5-10 cycle vs lrsc_on_store
+//   ~100-300 cycle, call 占 ~3-5%; inline 进 JIT 会失去 host -O3 优化机会
+//   (AsmJit 低级 builder, gcc 看不到 runtime emit). apply 层不消除, 跟 sacred fast/
+//   slow path 原则一致.
 //
 
 #ifndef ISA_LRSC_H

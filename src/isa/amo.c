@@ -3,9 +3,9 @@
 // isa/amo —— 9 个 amo_xxx_apply 实现 (extern, HVA-based; 副作用 = host atomic RMW + lrsc_on_store).
 //
 // 顶部接口 doc + 3-layer 模型 + funct5 mapping + 编码字段 + memory_order/cause 选择 + fast/slow
-// framing T3 重评估 trail 全部见 amo.h. 本文件只放 9 个 apply 实现, 不重复 doc.
+// framing 维持决议 全部见 amo.h. 本文件只放 9 个 apply 实现, 不重复 doc.
 //
-// 实装策略 (Q16 a 路径, T2 user 拍):
+// 实装策略 (Q16 a 路径):
 //   5 ops (ADD/SWAP/XOR/OR/AND) - macro AMO_DEFINE_APPLY_DIRECT 注入, 一行映射到对应
 //                                  C11 atomic_fetch_*/atomic_exchange 函数
 //   4 ops (MIN/MAX/MINU/MAXU)   - macro AMO_DEFINE_APPLY_CAS 注入手写 CAS loop (C11 无
@@ -17,7 +17,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
-#include "lrsc.h"            // lrsc_on_store (T1 占位真调; T3 上 reservation 字段后生效)
+#include "lrsc.h"            // lrsc_on_store (七类清除时机 #6 AMO 命中)
 #include "platform/ram.h"    // gpa_to_hva_offset (pa 反推; Q10 实装备注同模式)
 
 
@@ -36,11 +36,11 @@
 #define AMO_DEFINE_APPLY_DIRECT(name, c11_fn)                                           \
 uxlen_t amo_##name##_apply(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,             \
                            uxlen_t value) {                                             \
-    (void)gva_for_tval;  /* T1/T2 不消费; T3 reservation 真做后接通当 trap tval */      \
+    (void)gva_for_tval;  /* 当前未消费; 未来 reservation 触发 trap 时当 tval 用 */     \
     _Atomic uint32_t *target = (_Atomic uint32_t *)hva;                                 \
     uint32_t old = c11_fn(target, (uint32_t)value, memory_order_seq_cst);               \
     uxlen_t  pa  = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);            \
-    lrsc_on_store(hart, pa);  /* T3 真扫所有 hart reservation, 锁内清匹配 */            \
+    lrsc_on_store(hart, pa);  /* bucket lock 内扫所有 hart reservation 清匹配 */        \
     return old;                                                                         \
 }
 

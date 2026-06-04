@@ -722,3 +722,22 @@ agent 加 `1: j 1b` 自旋守卫不一致 (A1/B1 加了, C1 + 参考件 a01_5/04
   `mip.MTIP=(mtime>=mtimecmp)` 连续条件、靠 timer 线程**异步**推 mtime, 其余 5 源瞬时置位 →
   轮到 M_TIMER 时 mtime 还没被推过 mtimecmp, 编码器跳过, 等异步推过才垫底 fire。根因 (C) 类
   (mtime 异步化)。改期望注释说明即可 (s3=6 handler 进入次数正确, 非 fall-through 污染)。
+
+---
+
+## a_04 收尾 — 2026-06-05
+
+范围: a_04 期间新加 11 fixture (a04_1/01-02 fence + a04_2/01-02 Zaamo + a04_3/01-05
+Zalrsc + virtio_blk DMA hook 端到端) + a_03 期间 a03_14 新加 2 fixture (02_mmu_pte_a_
+atomic_smoke + 03_wfi_irq_wakeup_race). 全部按现行体例写 (test_dev FINISHER PASS +
+RUN-EXPECT-EXIT:0 + 必要 fall-through 守卫 + 三段式 stub.S banner), 无 trail 沉淀.
+
+全量批 (跨 build_type debug+ASan + release + tsan 三轮): **134 fixture, 0 FAIL /
+0 TIMEOUT / 0 CONFIG-ERROR** (跟 a_03 session_019 末批 121 比, +13 = 11 a_04 + 2 a03_14).
+
+无新加待校准清单 / 无新加演进 trail (a_04 没改老 fixture, 老 fixture 不漂).
+
+唯一接受的 latent race:
+- a04_3/02_lr_sc_spinlock — TSan 报 cross-hart plain RAM access race (lrsc_lr_w
+  memcpy *pa vs store_helper memcpy 同源), 跟 a_03 SMP latent race 同源, ARM64 host
+  兼容时跟 lsu 一起升 atomic (plan §2 #50). stub.S 顶段已加 TSan note 说明.

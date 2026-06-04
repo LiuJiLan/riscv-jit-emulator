@@ -368,7 +368,7 @@ typedef enum {
     //   funct5 = 0x14 → AMOMAX.W  (signed max, CAS loop 手写)
     //   funct5 = 0x18 → AMOMINU.W (unsigned min, CAS loop 手写)
     //   funct5 = 0x1C → AMOMAXU.W (unsigned max, CAS loop 手写)
-    //   funct5 = 0x02 LR.W / 0x03 SC.W 是 Zalrsc 子扩展, T3 落地; 当前仍 OP_UNSUPPORTED.
+    //   funct5 = 0x02 LR.W / 0x03 SC.W 是 Zalrsc 子扩展, OP_LR_W / OP_SC_W (见下段).
     //   其他 funct5 → OP_UNSUPPORTED (reserved by spec)
     //
     // 字段约定:
@@ -401,7 +401,7 @@ typedef enum {
     OP_AMO_MAXU_W,
 
     // ---- A 扩展 Zalrsc (LR.W / SC.W), opcode 0x2F + funct3=010 + funct5=0x02/0x03 ----
-    // RV Unprivileged Spec Vol I "A" extension Zalrsc 子扩展 (a_04 T3).
+    // RV Unprivileged Spec Vol I "A" extension Zalrsc 子扩展.
     //
     // 字段约定:
     //   d.rd       = inst[11:7]
@@ -420,7 +420,7 @@ typedef enum {
     //   MMIO 拒 (cause 5/7) / walker fault 经 _Noreturn longjmp 不走 boundary 路径.
     //
     // 实际访问 case 内调 lrsc_lr_helper / lrsc_sc_helper (interpreter case 走类似 lsu/amo
-    //   的 BARE/SV32 分流 + IS_GPA_RAM check, 最终调 lrsc_lr_w / lrsc_sc_w; T3 实).
+    //   的 BARE/SV32 分流 + IS_GPA_RAM check, 最终调 lrsc_lr_w / lrsc_sc_w).
     OP_LR_W,
     OP_SC_W,
 

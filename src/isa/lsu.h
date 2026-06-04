@@ -275,18 +275,19 @@ static inline void lsu_store_helper(cpu_t *hart, tlb_t *current_tlb,
 // 参数:
 //   hart           — 调用 hart
 //   hva            — host 虚拟地址 (已确认 RAM)
-//   gva_for_tval   — guest 虚拟地址, 仅供未来 LR/SC reservation 触发的 trap_raise
-//                     当 tval 用 (当前 reservation 占位 noop, gva 实际未消费, 加
+//   gva_for_tval   — guest 虚拟地址, 仅供未来副作用触发的 trap_raise 当 tval 用
+//                     (当前 lrsc_on_store 路径无 trap, gva 实际未消费, 加
 //                     (void)gva_for_tval 抑制 unused warning)
 //   value          — 要写入的值 (低 size 字节有效)
 //   size           — 1 / 2 / 4
 //
 // 内部:
 //   (a) host store: memcpy(hva, &value, size)
-//   (b) reservation 清除占位 (LR/SC, A 扩展真做时填)
+//   (b) lrsc_on_store(hart, pa): bucket lock 内扫所有 hart 清匹配 reservation
+//       (七类清除时机 #5; pa 反推 = (uxlen_t)(hva - gpa_to_hva_offset))
 //   (c) SMC page_dirty 占位 (jit/smc.c, JIT 真做时填)
 //
-// 错误路径: 当前无 (RAM 写 memcpy 不会失败; 未来 reservation/SMC 真做时可能 trap)
+// 错误路径: 当前无 (RAM 写 memcpy 不会失败; 未来 SMC 真做时可能 trap)
 //
 // 注: 实际 prototype 声明在本文件顶段 (forward decl, 解 lsu_store_helper inline
 // 内调用的 C 顺序依赖); 本段只放完整 doc, 不重复声明。

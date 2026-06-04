@@ -802,7 +802,7 @@ decoded_inst_t decode(u32_t inst) {
         }
 
         // ---- A 扩展 Zaamo (9 op) + Zalrsc (LR.W / SC.W), opcode 0x2F ----
-        // RV Unprivileged Spec Vol I "A" extension (a_04 T2 Zaamo + T3 Zalrsc).
+        // RV Unprivileged Spec Vol I "A" extension (Zaamo + Zalrsc).
         // 同 opcode + funct3=010 (.W; RV32) 由 funct5 (bits[31:27]) 区分:
         //   funct5 = 0x00 → AMOADD.W       funct5 = 0x01 → AMOSWAP.W
         //   funct5 = 0x02 → LR.W           funct5 = 0x03 → SC.W

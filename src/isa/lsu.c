@@ -6,7 +6,7 @@
 //
 // store_helper 形态:
 //   - HVA-based 接口, 不做 BARE/SV32 / IS_GPA_RAM 分流; 只做 RAM 写 + 副作用
-//     (LR/SC + SMC 占位)
+//     (LR/SC reservation 清匹配 + SMC 占位)
 //   - 调用方 (lsu_store_helper BARE/SV32 hit / mmu_walker_helper_store RAM) 已确认
 //     PA 落 RAM, 算好 hva 传入
 //   - MMIO 路径 caller 直接调 mmio_write_helper, 不经 store_helper (跳过 LR/SC +
@@ -19,7 +19,7 @@
 #include <stdint.h>
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
-#include "lrsc.h"            // lrsc_on_store (Q5 #5; T3 真接通)
+#include "lrsc.h"            // lrsc_on_store (七类清除时机 #5 普通 store)
 #include "platform/ram.h"    // gpa_to_hva_offset (hva → pa 反推)
 
 

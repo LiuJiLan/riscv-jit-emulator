@@ -3,16 +3,16 @@
 // isa/amo —— RV32 A 扩展 Zaamo 9 个 AMO ops (AMOADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU.W)
 //
 // 跟 LR/SC (Zalrsc) 拆开 (lrsc_amo_decision.md Q12): A 扩展 RV spec 已拆 Zaamo/Zalrsc 子
-// 扩展, 实装跟 spec 子扩展边界对齐。LR/SC 见 isa/lrsc.{c,h} (T3 实)。
+// 扩展, 实装跟 spec 子扩展边界对齐。LR/SC 见 isa/lrsc.{c,h}。
 //
-// 3-layer 模型 (跟 isa/lsu 严格对偶, T2 user 拍):
+// 3-layer 模型 (跟 isa/lsu 严格对偶):
 //   顶层 inline (本文件 amo.h) — 9 个 amo_xxx_helper, 跟 lsu_store_helper 体例; BARE/SV32
 //     分流, SV32 TLB hit fast path inline (跟 store 同形态; sacred fast/slow path 原则).
 //   中间 RAM 端副作用入口 (amo.c) — 9 个 amo_xxx_apply (extern, HVA-based), 内做 host C11
-//     atomic_fetch_xxx + lrsc_on_store(hart, pa) (T3 已生效: bucket lock + 扫所有 hart
-//     清匹配 reservation) + 返 sext32(old). 跟 store_helper 一对一对偶, 但**不复用
-//     store_helper** — store_helper 内 memcpy 跟 AMO RMW 不兼容 (user T2 拍
-//     "amo 不直接调用 store").
+//     atomic_fetch_xxx + lrsc_on_store(hart, pa) (bucket lock + 扫所有 hart 清匹配
+//     reservation) + 返 sext32(old). 跟 store_helper 一对一对偶, 但**不复用
+//     store_helper** — store_helper 内 memcpy 跟 AMO RMW 不兼容
+//     ("amo 不直接调用 store").
 //   慢路径 walker (mmu.c) — 9 个 mmu_walker_helper_amo_xxx, 跟 mmu_walker_helper_store
 //     体例; walk + PTE A+D OR + TLB fill + 末调 amo_xxx_apply.
 //
@@ -26,7 +26,7 @@
 //   funct5=0x14 AMOMAX.W   - signed max;  同 CAS loop
 //   funct5=0x18 AMOMINU.W  - unsigned min; 同 CAS loop
 //   funct5=0x1C AMOMAXU.W  - unsigned max; 同 CAS loop
-// funct5=0x02 LR.W / 0x03 SC.W 是 Zalrsc, 不在本文件 (见 isa/lrsc.{c,h} T3 实).
+// funct5=0x02 LR.W / 0x03 SC.W 是 Zalrsc, 不在本文件 (见 isa/lrsc.{c,h}).
 //
 // 编码字段:
 //   bits[6:0]=opcode 0x2F   bits[14:12]=funct3 010 (.W)
@@ -53,11 +53,11 @@
 //   分流; 拆 9 op helper 跟 dummy.txt §10 "helper 颗粒度 per RV 指令" 对齐, JIT 翻译时
 //   helper 地址静态绑定 emit 出的 call 指令.
 //
-// fast/slow path framing 评估: 本模块按 CLAUDE.md "Performance discipline" sacred 原则
-//   走 helper 颗粒度 (AMO 在 atomics list, "Never inline these into JIT-emitted code").
-//   **此原则在 T3 lrsc 真实装后重评估** — 评估输入 = lrsc_on_store 真实 bucket_lock 体量
-//   + 跨 hart 扫描成本 (有实数据). 翻 framing 的话 amo 跟 store 同步重构 (TLB hit 改
-//   inline body). trail 见 a_04_session_001 + 后续 session. 现 T2 实装不动 framing.
+// fast/slow path framing 已评估维持 sacred 原则 (trade_off_log §T fast-slow-framing +
+//   access_helper_call_graph.md §8). 本模块按 helper 颗粒度走 (AMO 在 atomics list,
+//   "Never inline these into JIT-emitted code"). helper call 开销 ~5-10 cycle vs
+//   apply 内 lrsc_on_store 100-300 cycle, call 占 ~3-5%; inline 进 JIT 会失去 host -O3
+//   优化机会 (AsmJit 低级 builder, gcc 看不到 runtime emit). apply 层不消除.
 //
 
 #ifndef ISA_AMO_H
@@ -188,15 +188,15 @@ AMO_DEFINE_INLINE_HELPER(maxu_w)
 // MMIO 路径在 caller 各自拒 (顶层 inline BARE / walker SV32 各自 trap_raise cause 7),
 // 不经 apply.
 //
-// 签名带 gva_for_tval 是跟 store_helper 对齐 (T2 user 拍 "通用性 + 方便未来考虑 TLB
-// 命中的修改问题"; 当前 LR/SC reservation 占位无 trap, gva 实际未消费 — 加
+// 签名带 gva_for_tval 是跟 store_helper 对齐 ("通用性 + 方便未来考虑 TLB
+// 命中的修改问题"; 当前 reservation 协议路径无 trap, gva 实际未消费 — 加
 // (void)gva_for_tval 抑制 unused).
 //
 // 参数:
 //   hart           — 调用 hart
 //   hva            — host 虚拟地址 (已确认 RAM, 4-byte aligned)
 //   gva_for_tval   — guest 虚拟地址, 仅供未来 reservation 触发的 trap_raise 当 tval 用
-//                     (当前占位 noop, (void)gva 抑制 unused)
+//                     (当前 reservation 协议路径无 trap, (void)gva 抑制 unused)
 //   value          — rs2 寄存器值, 32-bit (AMO 各 op 含义不同)
 //
 // 返回: 32-bit old value at hva (sext32 在 RV32 下跟原值等价; uxlen_t = uint32_t).
@@ -206,8 +206,8 @@ AMO_DEFINE_INLINE_HELPER(maxu_w)
 //   (a) ADD/SWAP/XOR/OR/AND: 直调 host C11 atomic_fetch_xxx / atomic_exchange (seq_cst),
 //        macro 注入避免重复
 //   (b) MIN/MAX/MINU/MAXU: 手写 CAS loop (C11 无 atomic_fetch_min/max), seq_cst
-//   (c) 末段 lrsc_on_store(hart, pa) (T1 占位真调; T3 reservation 字段加上后生效)
-//        pa 反推: pa = (uint32_t)(hva - gpa_to_hva_offset) (跟 Q10 实装备注同)
+//   (c) 末段 lrsc_on_store(hart, pa) — bucket lock 内扫所有 hart 清匹配 reservation
+//        pa 反推: pa = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset)
 //
 // 错误路径: 当前无 (host atomic RMW 不会失败; 未来 reservation 真做时可能 trap, 用
 //   gva_for_tval 当 tval)

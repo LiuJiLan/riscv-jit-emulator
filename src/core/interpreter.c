@@ -809,7 +809,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 fence_i_helper(hart);
                 break;
 
-            // ---- A 扩展 Zaamo 9 op (a_04 T2) ----
+            // ---- A 扩展 Zaamo 9 op ----
             //
             // 每个 AMO case 体一致, 只换调的 amo_xxx_helper; 用 macro AMO_CASE 注入.
             // ea = READ_REG(d.rs1) (AMO 无 imm offset, gva 直接是 rs1 寄存器值).
@@ -840,7 +840,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             AMO_CASE(MAXU_W, maxu_w)
             #undef AMO_CASE
 
-            // ---- A 扩展 Zalrsc 2 op (a_04 T3) ----
+            // ---- A 扩展 Zalrsc 2 op ----
             //
             // LR.W / SC.W 跟 AMO 同形态 (BARE/SV32 分流 + TLB hit fast path):
             //   - LR.W: load 语义 → LOAD_MISALIGN_CHECK cause 4 → lrsc_lr_helper →

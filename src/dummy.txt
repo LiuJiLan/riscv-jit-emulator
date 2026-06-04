@@ -2014,3 +2014,137 @@ hart_threads[MAX_HARTS]) + dump 打 hartid。n_harts 写为 smp_req (解钳); sp
     idx 不腾给新 hart (跟 ASID 那种"环形复用"是两码事)。
 
 
+================================================================================
+## §16. LR/SC reservation 协议 (c 主方案; per-PA hash 锁 + per-hart atomic 数组)
+================================================================================
+
+涉及文件:
+  - isa/lrsc.{c,h}        (reservation 数据 + 函数族; bucket lock 数组)
+  - isa/lsu.c             (store_helper 末段 #5)
+  - isa/amo.c             (9 apply 末段 #6)
+  - isa/fence.c           (fence_i_helper #4)
+  - isa/sfence.c          (sfence_vma_helper 末段 #2)
+  - core/trap.c           (trap_set_exception/interrupt_state 入口 #1)
+  - core/interpreter.c    (case OP_WFI 醒后 #3)
+  - device/virtio_blk.c   (io_worker drain 完成段 #7)
+  - main.c                (lrsc_init / lrsc_destroy lifecycle)
+
+机制:
+
+(1) 数据结构 (lrsc.c file-static, 不嵌 cpu_t — 跟 PLIC plic_ctx_eip / CLINT
+    mtimecmp 体例对齐 §7 "shared 数据封装在自己模块内 + cacheline 友好"):
+
+  - per-hart `_Atomic uxlen_t lrsc_reservations[MAX_HARTS]` — 跨 hart 共享的协议状态
+    字段; 字粒度 word-aligned PA (`pa & ~3u`); 哨兵 `LRSC_INVALID_ADDR = ~(uxlen_t)0`
+    (全 1 永远非法 PA, RV32/RV64 都安全, 不留 RV64 review 债)
+  - global `pthread_mutex_t lrsc_buckets[K]` (K = 1 << LRSC_BUCKET_BITS = 64,
+    config.h); Fibonacci hash 散列 pa_word: `(uint32_t)pa_word * 2654435761u >>
+    (32 - LRSC_BUCKET_BITS)`
+
+  注意: 32-bit 乘法 wrap-around 关键 (不能 cast uint64_t 后再乘 shift — 64-bit
+  乘积 shift 26 给 38-bit idx OOB; UBSan 会报). 详 lrsc.c bucket_lock doc.
+
+(2) 七类清除时机 (RV Priv Spec §14.2.1 "Reserved Memory Locations"):
+
+  | # | 触发                            | 入口函数                  | 形态            |
+  |---|---------------------------------|---------------------------|-----------------|
+  | 1 | context switch / trap           | lrsc_clear_self           | lock-free       |
+  | 2 | sfence.vma                      | lrsc_clear_self           | lock-free       |
+  | 3 | wfi 醒来                         | lrsc_clear_self           | lock-free       |
+  | 4 | fence.i                         | lrsc_clear_self           | lock-free       |
+  | 5 | 普通 store 命中 reservation     | lrsc_on_store             | bucket 锁内     |
+  | 6 | AMO 命中 reservation            | lrsc_on_store             | bucket 锁内     |
+  | 7 | device DMA / virtio_blk 写 RAM  | lrsc_on_device_write      | 锁外 blanket    |
+
+  #1-#4 (lrsc_clear_self): 自己写自己字段 atomic_store INVALID release, 无 race;
+    其它路径 atomic_load acquire 读 — 跟"扫所有 hart 清匹配"路径无 happens-before
+    依赖 (清 INVALID 单向, 不参与 RV 内存模型 ordering).
+
+  #5-#6 (lrsc_on_store): 拿 bucket(pa) 锁 + 扫 `n_harts` 范围 (§15 第 1 类越界判据,
+    cap 数组 / n_harts 扫); reservation == pa_word 则 atomic_store INVALID. 含自己
+    (RV spec line 116-118 implementation discretion 选清; Spike/QEMU 同选, 主方案
+    "严格不留 spec 漏口" 宗旨一致).
+
+  #7 (lrsc_on_device_write): blanket clear 所有 hart reservation (按 n_harts 扫,
+    不查 PA 粒度). 不拿 bucket 锁理由: 单向 atomic_store INVALID (不读不存在 race);
+    任何并发 SC 拿 bucket 锁后 atomic_load 看 INVALID 失败, 自然合规.
+
+(3) LR.W / SC.W 函数族 (PA-based, caller 已走 lsu/mmu 路径转换 + perm/MMIO check):
+
+  - `lrsc_lr_w(hart, pa)`: lock-free; memcpy *pa (plain RAM read, 跟 lsu 体例 — 见
+    §13 + §15 印证) + atomic_store self.reservation = pa_word; 返 zero-ext value.
+  - `lrsc_sc_w(hart, pa, value)`: 拿 bucket lock; 比对 self.reservation:
+      不匹配 → atomic_store self.res = INVALID + 释锁 + 返 1
+      匹配   → memcpy *pa ← value (plain RAM write) + 扫 n_harts 清匹配 (含自己,
+              自然清自己) + 释锁 + 返 0
+    无论成败 self.reservation 都被清 INVALID (spec line 59-60 强制).
+
+  *pa access 走 plain memcpy 跟 lsu_load_helper / store_helper 同体例 (不用
+  atomic_load/atomic_store_explicit): LR + SC sequence atomicity 由 reservation 协议
+  保证 (SC 拿 bucket lock 查 self.reservation), 不由 *pa load/store 那一刀 host-atomic
+  保证. amo apply 仍 atomic_fetch_xxx 因 RMW 必须 host-atomic (拆 read+modify+write
+  会 lost-update); LR (read-only) + SC (write-only, 锁内) 都不需要这层保证.
+
+  跟 §13 typedef family 印证: PA 字段全部 uxlen_t XLEN-tied (reservation_addr /
+  lrsc_on_store signature / amo apply pa 反推); RV64 切换时一起升 uint64_t.
+
+(4) 三层模型 (跟 §8 PMP/MMU/内存三层关系 + 各 isa/* 顶段对偶):
+
+  顶层 inline helper (lrsc.h / amo.h / lsu.h):
+    BARE/SV32 分流 + TLB hit fast path; caller 已查 misalign.
+
+  RAM 端副作用入口 (extern, HVA-based; lrsc.c / amo.c / lsu.c):
+    lrsc_lr_w / lrsc_sc_w / amo_xxx_apply / store_helper; 三处 caller (顶层 BARE+RAM /
+    顶层 SV32 hit / walker RAM) 共用; 末调 lrsc_on_store (store/AMO/SC) 或建/查
+    reservation (LR/SC).
+
+  慢路径 walker (mmu.c):
+    mmu_walker_helper_load / store / amo_xxx / lr_w / sc_w; TLB miss / 权限不齐
+    fall back; walk + atomic OR PTE.A/D + fill TLB + 末调 apply.
+
+  详 access_helper_call_graph.md (7 张 mermaid sequence) + amo.h / lrsc.h 顶段
+  3-layer 模型 doc.
+
+  fast/slow path framing 维持 sacred 原则 (a_04 T5 议题已评估; trade_off_log §T.14):
+  apply 层不消除 — apply 是 lrsc_on_store + 未来 SMC 锚点 + JIT 块出口 helper 颗粒度
+  边界; helper call ~5-10 cycle vs lrsc_on_store ~100-300 cycle, call 占 ~3-5%;
+  inline 进 JIT 会失去 host -O3 优化机会 (AsmJit 低级 builder, gcc 看不到 runtime
+  emit). 真要降 hot path 攻 lrsc_on_store 内 bucket lock (plan §2 #57).
+
+设计选择 + 理由:
+
+- **per-PA hash 锁 + per-hart atomic 数组** (c 主方案) — b 路径 host CAS 等价 SC 被
+  拒, 因 ABA + AA 是 spec rationale 直接禁止的 (zalrsc_manual line 64-77), 不是
+  ARM-style implementation latitude. 详 trade_off_log §T.13.
+
+- **reservation 字段放 lrsc 模块 static, 不嵌 cpu_t** — cpu_t 保持 per-hart 私有数据
+  集合; 跨 hart 协议状态封装在自己模块内 (§7 monitor model 体例).
+
+- **bucket lock K=64** — 撞桶率 ~5% (Fibonacci hash); 跑 OpenSBI / Linux 实测 lock
+  contention 时按 plan §2 #57 升 (spinlock 替 mutex / bucket 数变大 / per-hart
+  cacheline 隔离).
+
+- **七类清除时机分流 lock-free vs 锁内 vs 锁外** — #1-#4 自清不需要协议保证, 走
+  lock-free 最便宜; #5-#6 真清匹配需保证"同 PA 上 SC vs lrsc_on_store" 串行化, 走
+  bucket 锁内; #7 device DMA blanket 不查 PA 不存在 race, 走锁外避免拿无关 bucket.
+
+- **PA 类型 uxlen_t** (跟 §13 印证) — RV64 切换时哨兵 / 字段 / signature 一起升;
+  当前 uint32_t 实际值 OK, 但类型不一致就漏 RV64 review trail.
+
+未来改进点:
+
+- aq/rl 精确化 (plan §2 #8) — 当前全 seq_cst, 真做大量 acquire/release sequence
+  时按 RV 指令位映射 relaxed/acquire/release/acq_rel.
+
+- bucket lock 性能优化 (plan §2 #57) — spinlock 替 mutex / bucket 数变大降撞 /
+  per-hart cacheline 隔离; 真撞 contention 瓶颈时升.
+
+- ARM64 host 兼容 (plan §2 #50) — *pa plain memcpy 跟 lsu 同源 latent race
+  (cross-hart RAM access 不走同步原语); TSan 02_lr_sc_spinlock 已报 (项目接受, stub.S
+  顶段说明). ARM64 host 切换时跟 lsu 一起升 atomic.
+
+- LR/SC 跨 reservation set 的非法操作检测 — RV spec 禁止 LR/SC 之间出现 load/store/
+  其他原子/跨页跳转/超过 16 指令. 当前不主动检查 (出现时 reservation 自然被清,
+  SC 自然失败, 语义自洽); 真要 audit guest 行为时加.
+
+

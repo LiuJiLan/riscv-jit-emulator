@@ -16,8 +16,8 @@
 // helper 颗粒度 / may-longjmp 边界协议
 // ============================================================================
 //
-// mmu_walker_helper_load / store + mmu_walker_helper_amo_* (9 个 Zaamo, a_04 T2)
-// + mmu_walker_helper_amo_lr / amo_sc (Zalrsc, T3 实) 这一族函数,
+// mmu_walker_helper_load / store + mmu_walker_helper_amo_* (9 个 Zaamo)
+// + mmu_walker_helper_lr_w / sc_w (Zalrsc) 这一族函数,
 // **不只是 TLB miss 时的 fallback**, 而是 by design 给 JIT 块出口准备的"不同
 // 颗粒度的助手函数" — 每条访问指令对应一个 helper 入口, JIT 不合并成统一大
 // 入口。完整协议见 dummy.txt §10。
@@ -627,7 +627,7 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
 
 
 // ============================================================================
-// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程; helper 长跳风格 (a_04 T2, Zaamo)
+// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程; helper 长跳风格 (Zaamo)
 // ============================================================================
 //
 // 9 个 walker (跟 mmu_walker_helper_store 体例同 + 末调对应 amo_xxx_apply 而非 store_helper):
@@ -667,7 +667,7 @@ uxlen_t mmu_walker_helper_amo_maxu_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gv
 
 
 // ============================================================================
-// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (a_04 T3; Zalrsc)
+// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (Zalrsc)
 // ============================================================================
 //
 // 跟 mmu_walker_helper_store 严格对偶, 末调 lrsc_lr_w / lrsc_sc_w (PA-based; lrsc.h):

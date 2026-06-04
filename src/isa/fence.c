@@ -7,7 +7,7 @@
 
 #include "fence.h"
 
-#include "lrsc.h"            // lrsc_clear_self (T1 占位真调; T3 上 reservation 字段后生效)
+#include "lrsc.h"            // lrsc_clear_self (七类清除时机 #4 fence.i)
 
 
 void fence_helper(cpu_t *hart) {
