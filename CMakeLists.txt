@@ -100,8 +100,6 @@ add_executable(riscv_jit_emulator
         src/core/trap.h
         src/core/csr.c
         src/core/csr.h
-        src/core/wfi.c
-        src/core/wfi.h
         src/isa/lsu.c
         src/isa/lsu.h
         src/isa/sfence.c
@@ -123,7 +121,14 @@ add_executable(riscv_jit_emulator
         src/device/virtio_blk.c
         src/device/virtio_blk.h
         src/core/wfi.c
-        src/core/wfi.h)
+        src/core/wfi.h
+        src/isa/fence.c
+        src/isa/fence.h
+        src/isa/lrsc.c
+        src/isa/lrsc.h
+        src/isa/amo.c
+        src/isa/amo.h
+)
 
 # Test
 enable_testing()

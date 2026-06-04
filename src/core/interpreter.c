@@ -13,6 +13,8 @@
 #include "csr.h"        // csr_op + csr_op_t + csr_mip_read (wfi_should_wake)
 #include "debug.h"      // DEBUG_WFI ('w' trace; WFI 进 cond_wait 标记)
 #include "decode.h"
+#include "isa/amo.h"    // amo_xxx_helper (9 inline 顶层; Zaamo)
+#include "isa/fence.h"  // fence_helper / fence_i_helper (FENCE / FENCE.I)
 #include "isa/lsu.h"    // lsu_load_helper / lsu_store_helper (inline 顶层) + store_helper (extern, HVA-based)
 #include "isa/sfence.h" // sfence_vma_helper (extern)
 #include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M]) / MSTATUS_TW (WFI 检查)
@@ -165,6 +167,13 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 trap_raise_exception(hart, CAUSE_LOAD_ADDR_MISALIGNED, (ea));   \
         } while (0)
     #define STORE_MISALIGN_CHECK(ea, size)                                      \
+        do { if (((ea) & ((size) - 1u)) != 0u)                                  \
+                trap_raise_exception(hart, CAUSE_STORE_ADDR_MISALIGNED, (ea));  \
+        } while (0)
+    // AMO_MISALIGN_CHECK —— AMO 跟 store 同 cause 6 (CAUSE_STORE_ADDR_MISALIGNED;
+    // RV spec §4.6 "Store/AMO address misaligned"). Zaamo size 永远 4 (.W RV32), 但形式
+    // 保留 size 参数, 跟 LOAD/STORE_MISALIGN_CHECK 同模板 (Q8 拍).
+    #define AMO_MISALIGN_CHECK(ea, size)                                        \
         do { if (((ea) & ((size) - 1u)) != 0u)                                  \
                 trap_raise_exception(hart, CAUSE_STORE_ADDR_MISALIGNED, (ea));  \
         } while (0)
@@ -779,6 +788,53 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 lsu_store_helper(hart, current_tlb, ea, READ_REG(d.rs2), 4u);
                 break;
             }
+
+            // ---- MISC-MEM (FENCE / FENCE.I) ----
+            //
+            // FENCE   = memory ordering NOP (host x86 TSO + helper atomic 双重 cover; 详见
+            //           isa/fence.h 顶段). 非块边界, 同 block 继续译; 走 fetch loop 末段
+            //           PC_STEP_RV 自推进.
+            // FENCE.I = i-cache flush, 副作用 lrsc_clear_self (RV spec 七类清除 #4; 未来
+            //           a_05+ 加 JIT cache invalidate). 是块边界 (is_block_boundary_inst → 1),
+            //           走 fetch loop 末 += PC_STEP_RV → goto out 退块, dispatcher 重派发.
+            // 两个 helper 都 pure (无 longjmp 路径), 不需 SYNC_COUNT.
+            case OP_FENCE:
+                fence_helper(hart);
+                break;
+            case OP_FENCE_I:
+                fence_i_helper(hart);
+                break;
+
+            // ---- A 扩展 Zaamo 9 op (a_04 T2) ----
+            //
+            // 每个 AMO case 体一致, 只换调的 amo_xxx_helper; 用 macro AMO_CASE 注入.
+            // ea = READ_REG(d.rs1) (AMO 无 imm offset, gva 直接是 rs1 寄存器值).
+            //
+            // 顺序: SYNC_COUNT → AMO_MISALIGN_CHECK (cause 6) → amo_xxx_helper inline 顶层
+            //   分流 BARE/SV32 + TLB hit → 返 sext32(old) → WRITE_REG(rd, old). pc_step 默认
+            //   PC_STEP_RV (+4), 非块边界 (is_block_boundary_inst → 0).
+            //
+            // may-trap 边界: AMO_MISALIGN_CHECK 触发前必须 SYNC_COUNT 已调; amo_xxx_helper
+            //   内部 BARE MMIO 拒 / SV32 walker fault / MMIO 拒 都经 trap_raise_exception
+            //   _Noreturn longjmp, 不返回 caller.
+            #define AMO_CASE(UPPER, lower)                                                          \
+                case OP_AMO_##UPPER: {                                                              \
+                    uxlen_t ea = READ_REG(d.rs1);                                                   \
+                    SYNC_COUNT();                                                                   \
+                    AMO_MISALIGN_CHECK(ea, 4u);                                                     \
+                    WRITE_REG(d.rd, amo_##lower##_helper(hart, current_tlb, ea, READ_REG(d.rs2))); \
+                    break;                                                                          \
+                }
+            AMO_CASE(ADD_W,  add_w)
+            AMO_CASE(SWAP_W, swap_w)
+            AMO_CASE(XOR_W,  xor_w)
+            AMO_CASE(OR_W,   or_w)
+            AMO_CASE(AND_W,  and_w)
+            AMO_CASE(MIN_W,  min_w)
+            AMO_CASE(MAX_W,  max_w)
+            AMO_CASE(MINU_W, minu_w)
+            AMO_CASE(MAXU_W, maxu_w)
+            #undef AMO_CASE
 
             // ---- 兜底 ----
             case OP_UNSUPPORTED:

@@ -13,6 +13,7 @@
 #include "mmu.h"
 
 #include "config.h"
+#include "isa/amo.h"        // amo_xxx_apply (9 op; walker 末调; HVA-based, atomic RMW + lrsc_on_store)
 #include "isa/lsu.h"        // store_helper (HVA-based, RAM 写 + LR/SC + SMC 副作用)
 #include "platform/bus.h"   // mmio_read/write_helper (MMIO 派发, _Noreturn-on-failure)
 #include "platform/ram.h"
@@ -435,3 +436,64 @@ void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
     // + dummy.txt §1 末段)。MMIO 路径不调 store_helper, 已在上面分流直走 mmio_write_helper。
     store_helper(hart, host_ptr, /*gva for tval*/gva, value, size);
 }
+
+
+// ============================================================================
+// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程 (a_04 T2; Zaamo)
+// ============================================================================
+//
+// 完整流程 doc + 跟 store walker 严格对偶 + MMIO 拒 cause 7 (不开 mmio_amo_helper) 见 mmu.h.
+//
+// 9 walker 体几乎一致, 只换末段调的 amo_xxx_apply; 用 macro AMO_DEFINE_WALKER 注入.
+// 跟 mmu_walker_helper_store 段一致的样板抽出 (mmu_walk + fault → MMIO 拒 → PTE A+D OR
+// + TLB fill), 末段一行 `return amo_##name##_apply(...)` 是唯一变量.
+
+#define AMO_DEFINE_WALKER(name)                                                          \
+uxlen_t mmu_walker_helper_amo_##name(cpu_t *hart, tlb_t *current_tlb,                    \
+                                     uxlen_t gva, uxlen_t value) {                       \
+    uxlen_t  pa;                                                                         \
+    u32_t    pte_flags;                                                                  \
+    uint32_t fault_cause;                                                                \
+    uxlen_t  pte_pa;                                                                     \
+    if (mmu_walk(hart, gva, MMU_PERM_W, &pa, &pte_flags, &fault_cause, &pte_pa) != 0) {  \
+        trap_raise_exception(hart, fault_cause, /*tval*/gva);                            \
+    }                                                                                    \
+                                                                                         \
+    /* PA 不在 RAM 区 → AMO MMIO 拒 (跟 store walker 不同; spec implementation-defined,  \
+     * 我们拒, 不开 mmio_amo_helper. cause 7 store access fault, 跟 Spike/QEMU 同) */    \
+    if (!IS_GPA_RAM(pa)) {                                                               \
+        trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);               \
+    }                                                                                    \
+                                                                                         \
+    uint8_t *host_ptr       = gpa_to_hva_offset + pa;                                    \
+    uint8_t *page_host_base = host_ptr - (gva & 0xFFFu);                                 \
+                                                                                         \
+    /* RAM 路径 atomic set PTE.A+D (跟 store walker 同位置; relaxed; 多 hart 并发 walk \
+     * safe; 不跟 guest 数据访问建立 happens-before) */                                  \
+    atomic_fetch_or_explicit((_Atomic uint32_t *)(gpa_to_hva_offset + pte_pa),           \
+                             PTE_A | PTE_D, memory_order_relaxed);                       \
+                                                                                         \
+    /* Fill TLB entry (含建议 set 的 D=1, 跟 store walker 同形态) */                     \
+    const uint32_t vpn   = gva >> 12;                                                    \
+    const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);                                  \
+    tlb_e_t *entry = &current_tlb->e[index];                                             \
+    entry->gva_tag   = vpn;                                                              \
+    entry->pte_flags = (uint16_t)pte_flags;                                              \
+    entry->host_ptr  = page_host_base;                                                   \
+                                                                                         \
+    /* AMO host atomic RMW + lrsc_on_store 委托 amo_##name##_apply (HVA-based). 跟 store \
+     * walker 末调 store_helper 同形态 — 但 AMO 9 op 各自 apply, 不用统一 helper. */    \
+    return amo_##name##_apply(hart, host_ptr, /*gva for tval*/gva, value);               \
+}
+
+AMO_DEFINE_WALKER(add_w)
+AMO_DEFINE_WALKER(swap_w)
+AMO_DEFINE_WALKER(xor_w)
+AMO_DEFINE_WALKER(or_w)
+AMO_DEFINE_WALKER(and_w)
+AMO_DEFINE_WALKER(min_w)
+AMO_DEFINE_WALKER(max_w)
+AMO_DEFINE_WALKER(minu_w)
+AMO_DEFINE_WALKER(maxu_w)
+
+#undef AMO_DEFINE_WALKER

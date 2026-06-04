@@ -781,8 +781,73 @@ decoded_inst_t decode(u32_t inst) {
             break;
         }
 
+        // ---- MISC-MEM (FENCE / FENCE.I), opcode 0x0F ----
+        // funct3 分流:
+        //   000 = FENCE   (memory ordering hint; fm/pred/succ 字段不解 — 256 种组合都退化
+        //                    为同一空 helper, 详见 isa/fence.h 双重 cover 论证)
+        //   001 = FENCE.I (i-cache flush, Zifencei; 副作用 lrsc_clear_self)
+        //   其他 funct3   = reserved → OP_UNSUPPORTED
+        //
+        // 字段约定: rd / rs1 / rs2 / imm 都不用 (interpreter case 不读); pc_step = PC_STEP_RV.
+        // 块边界判定 (is_block_boundary_inst): FENCE → 0, FENCE.I → 1.
+        case 0x0F: {
+            switch (funct3) {
+                case 0: d.kind = OP_FENCE;   break;
+                case 1: d.kind = OP_FENCE_I; break;
+                default:
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
+        // ---- A 扩展 Zaamo (9 op), opcode 0x2F ----
+        // RV Unprivileged Spec Vol I "A" extension Zaamo (a_04 T2).
+        // 同 opcode + funct3=010 (.W; RV32) 由 funct5 (bits[31:27]) 区分 9 op:
+        //   funct5 = 0x00 → AMOADD.W       funct5 = 0x01 → AMOSWAP.W
+        //   funct5 = 0x04 → AMOXOR.W       funct5 = 0x08 → AMOOR.W
+        //   funct5 = 0x0C → AMOAND.W       funct5 = 0x10 → AMOMIN.W
+        //   funct5 = 0x14 → AMOMAX.W       funct5 = 0x18 → AMOMINU.W
+        //   funct5 = 0x1C → AMOMAXU.W
+        //   funct5 = 0x02 LR.W / 0x03 SC.W 是 Zalrsc (T3 实); 当前 OP_UNSUPPORTED.
+        //   其他 funct5    reserved → OP_UNSUPPORTED.
+        //
+        // funct3 = 011 (.D, RV64) → OP_UNSUPPORTED (项目 RV32, 不实).
+        // funct3 其他   reserved → OP_UNSUPPORTED.
+        //
+        // bits[26:25] aq/rl 字段 Q11 拍全 seq_cst, decode 不读 (op_kind 选择跟 aq/rl 无关).
+        //
+        // 字段约定 (跟 decode.h AMO 段一致):
+        //   d.rd / d.rs1 / d.rs2 — 顶部统一提取, 含义见 decode.h
+        //   d.imm = 0           AMO 无 imm; raw_inst 供 mtval 用
+        //   d.pc_step = PC_STEP_RV (默认; AMO 不改控制流)
+        case 0x2F: {
+            const uint32_t funct5 = (inst >> 27) & 0x1Fu;     // bits[31:27]
+            if (funct3 != 0x2u) {
+                // .D 或 reserved funct3 — RV32 Zaamo 仅 .W
+                d.kind = OP_UNSUPPORTED;
+                break;
+            }
+            switch (funct5) {
+                case 0x00: d.kind = OP_AMO_ADD_W;   break;
+                case 0x01: d.kind = OP_AMO_SWAP_W;  break;
+                case 0x04: d.kind = OP_AMO_XOR_W;   break;
+                case 0x08: d.kind = OP_AMO_OR_W;    break;
+                case 0x0C: d.kind = OP_AMO_AND_W;   break;
+                case 0x10: d.kind = OP_AMO_MIN_W;   break;
+                case 0x14: d.kind = OP_AMO_MAX_W;   break;
+                case 0x18: d.kind = OP_AMO_MINU_W;  break;
+                case 0x1C: d.kind = OP_AMO_MAXU_W;  break;
+                // 0x02 LR.W / 0x03 SC.W (Zalrsc, T3) + 其他 funct5 (reserved) 都走兜底
+                default:
+                    d.kind = OP_UNSUPPORTED;
+                    break;
+            }
+            break;
+        }
+
         // ---- 其他 opcode ----
-        // 0x0F FENCE / 0x2F AMO / 真非法 opcode 全部走默认的 OP_UNSUPPORTED。
+        // 真非法 opcode 全部走默认的 OP_UNSUPPORTED.
         default:
             // 已经初始化为 OP_UNSUPPORTED, 保持。
             break;

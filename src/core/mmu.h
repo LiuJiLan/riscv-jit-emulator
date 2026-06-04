@@ -16,19 +16,20 @@
 // helper 颗粒度 / may-longjmp 边界协议
 // ============================================================================
 //
-// mmu_walker_helper_load / store (现) + mmu_walker_helper_amo_lr / amo_sc / amo_*
-// (未来) 这一族函数, **不只是 TLB miss 时的 fallback**, 而是 by design 给 JIT 块
-// 出口准备的"不同颗粒度的助手函数" — 每条访问指令对应一个 helper 入口, JIT 不
-// 合并成统一大入口。完整协议见 dummy.txt §10。
+// mmu_walker_helper_load / store + mmu_walker_helper_amo_* (9 个 Zaamo, a_04 T2)
+// + mmu_walker_helper_amo_lr / amo_sc (Zalrsc, T3 实) 这一族函数,
+// **不只是 TLB miss 时的 fallback**, 而是 by design 给 JIT 块出口准备的"不同
+// 颗粒度的助手函数" — 每条访问指令对应一个 helper 入口, JIT 不合并成统一大
+// 入口。完整协议见 dummy.txt §10。
 //
 // ============================================================================
 // misalign check 隐式契约
 // ============================================================================
 //
 // misalign (gva & (size-1) != 0) 由 caller (interpreter case 入口
-// LOAD/STORE_MISALIGN_CHECK 宏 / 未来 JIT translator emit 段) 已查; 本文件所有
-// helper (mmu_walker_helper_load/store) 都信任 caller 已查, 不重复。详 src/isa/lsu.h
-// 顶段。
+// LOAD/STORE/AMO_MISALIGN_CHECK 宏 / 未来 JIT translator emit 段) 已查; 本文件所有
+// helper (mmu_walker_helper_load/store + mmu_walker_helper_amo_*) 都信任 caller 已查,
+// 不重复。详 src/isa/lsu.h 顶段 + src/isa/amo.h 顶段。
 //
 // ============================================================================
 // 执行 regime —— 项目内部的"两套硬件逻辑"分类
@@ -623,5 +624,45 @@ uxlen_t mmu_walker_helper_load(cpu_t *hart, tlb_t *current_tlb,
 // 错误路径 trap_raise_exception 长跳, 不返回 caller。
 void mmu_walker_helper_store(cpu_t *hart, tlb_t *current_tlb,
                              uxlen_t gva, uxlen_t value, uint32_t size);
+
+
+// ============================================================================
+// mmu_walker_helper_amo_* —— SV32 AMO 路径完整流程; helper 长跳风格 (a_04 T2, Zaamo)
+// ============================================================================
+//
+// 9 个 walker (跟 mmu_walker_helper_store 体例同 + 末调对应 amo_xxx_apply 而非 store_helper):
+//
+//   调用方: isa/amo.h amo_xxx_helper SV32 路径 TLB miss / 权限不齐 / D=0 时; 未来 JIT
+//            翻译产物 emit `call mmu_walker_helper_amo_xxx` 作 JIT 块出口.
+//
+//   流程 (跟 mmu_walker_helper_store 严格对偶, perm = MMU_PERM_W):
+//     1. mmu_walk(hart, gva, MMU_PERM_W) → pa + pte_flags + fault_cause + pte_pa
+//        失败 → trap_raise_exception(15/cause 7, gva)  /* page fault / access fault */
+//     2. PA 落 MMIO → trap_raise(7, gva) — cause 7 store access fault.
+//        **不开 mmio_amo_helper** (跟 store walker 不同 — store walker 调 mmio_write_helper;
+//        AMO 拒 MMIO, RV spec implementation-defined, Spike/QEMU 同).
+//     3. PA 落 RAM:
+//        a. host_ptr = gpa_to_hva_offset + pa
+//        b. **atomic OR PTE.A+D** (RAM 路径; relaxed; 跟 store walker 同位置)
+//        c. fill TLB entry (pte_flags 含 set 后的 D=1)
+//        d. **amo_xxx_apply(hart, host_ptr, gva, value)** — 委托 amo 层做 host atomic RMW
+//            + lrsc_on_store, 返 sext32(old).
+//            (跟 store walker 末调 store_helper 同形态, **但用 9 个独立 apply 而非统一
+//             store_helper** — 因 AMO 各 op atomic 操作不同, 不能用 size 分流; 见
+//             amo.h 顶段)
+//   返回: 32-bit old value (rd 写回值; 跟 amo_xxx_apply 返回值同).
+//   错误路径: trap_raise_exception 长跳, 不返回 caller (跟 walker_helper_store 同模式).
+//
+// 9 个 walker 体几乎一致, mmu.c 用 macro AMO_DEFINE_WALKER 注入避免重复.
+// ============================================================================
+uxlen_t mmu_walker_helper_amo_add_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_swap_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_xor_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_or_w  (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_and_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_min_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_max_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_minu_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+uxlen_t mmu_walker_helper_amo_maxu_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
 
 #endif //CORE_MMU_H

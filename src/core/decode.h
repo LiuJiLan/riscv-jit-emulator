@@ -14,8 +14,10 @@
 //   - CSR: 6 (CSRRW/RS/RC + I 变体 RWI/RSI/RCI)
 //   - SYSTEM: 6 (ECALL / EBREAK / MRET / SRET / SFENCE_VMA / WFI)
 //   - LOAD / STORE: 8 (5 LB/LH/LW/LBU/LHU + 3 SB/SH/SW)
-//   共 57 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 58 个 op_kind。
-//   不在此范围的 opcode (FENCE / AMO / LR/SC / F/D / 等) decode 全部归 OP_UNSUPPORTED。
+//   - MISC-MEM (RVI base + Zifencei): 2 (FENCE / FENCE.I; opcode 0x0F)
+//   - A 扩展 Zaamo: 9 (AMOADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU.W; opcode 0x2F)
+//   共 68 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 69 个 op_kind。
+//   不在此范围的 opcode (Zalrsc LR/SC / F/D / 等) decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -180,7 +182,9 @@ typedef enum {
     //   imm[11:0] = 0x102 → SRET     (Supervisor-mode Return; 见下方 SRET 段)
     //   funct7=0x09       → SFENCE.VMA (见下方 SFENCE.VMA 段)
     //   imm[11:0] = 0x105 → WFI         (Wait For Interrupt; 见下方 WFI 段)
-    //   其他 (FENCE.I / 等) 仍归 OP_UNSUPPORTED, 真做时再加
+    //   其他保留 imm/funct7 组合仍归 OP_UNSUPPORTED, 真做时再加
+    //   (注: FENCE / FENCE.I 不在 SYSTEM opcode 下, 它们在 MISC-MEM opcode 0x0F, 见下方
+    //   MISC-MEM 段)
     //
     // 字段约定:
     //   d.imm = 0 (ECALL/EBREAK 的 imm[11:0] 已用于区分 op_kind, interpreter case 不读此字段;
@@ -330,9 +334,74 @@ typedef enum {
     OP_SH,
     OP_SW,
 
+    // ---- MISC-MEM (2), opcode 0x0F ----
+    // RV Unprivileged Spec: FENCE (RVI base "Memory Ordering"), FENCE.I (Zifencei).
+    // 同 opcode 0x0F 由 funct3 区分:
+    //   funct3 = 000 → FENCE   (memory ordering hint; fm/pred/succ 字段不解, 全 NOP)
+    //   funct3 = 001 → FENCE.I (i-cache flush; 副作用 lrsc_clear_self)
+    //   其他 funct3 → OP_UNSUPPORTED (reserved)
+    //
+    // 跟 SYSTEM 段 SFENCE.VMA 拆开的原因 (Q19): opcode 不同 + 手册不同卷 + 语义不同族.
+    // 详见 isa/fence.h 顶段.
+    //
+    // 字段约定:
+    //   d.rd / d.rs1 / d.rs2 / d.imm  不用 (interpreter case 不读; fence 字段全弃)
+    //   d.pc_step                       = PC_STEP_RV (普通 +4)
+    //
+    // 是块边界:
+    //   FENCE   - 否 (memory ordering 不动指令流, 块内可继续译; is_block_boundary_inst → 0)
+    //   FENCE.I - 是 (i-cache flush + reservation 清, 块内后续指令可能跟新视图不一致;
+    //              → 1, 同 SFENCE.VMA 体例 — 都是"动状态后块边界")
+    OP_FENCE,
+    OP_FENCE_I,
+
+    // ---- A 扩展 Zaamo (9), opcode 0x2F ----
+    // RV Unprivileged Spec Vol I "A" extension Zaamo 子扩展.
+    // 同 opcode 0x2F + funct3=010 (.W; RV32 only) 由 funct5 区分:
+    //   funct5 = 0x00 → AMOADD.W  (atomic_fetch_add)
+    //   funct5 = 0x01 → AMOSWAP.W (atomic_exchange)
+    //   funct5 = 0x04 → AMOXOR.W  (atomic_fetch_xor)
+    //   funct5 = 0x08 → AMOOR.W   (atomic_fetch_or)
+    //   funct5 = 0x0C → AMOAND.W  (atomic_fetch_and)
+    //   funct5 = 0x10 → AMOMIN.W  (signed min, CAS loop 手写)
+    //   funct5 = 0x14 → AMOMAX.W  (signed max, CAS loop 手写)
+    //   funct5 = 0x18 → AMOMINU.W (unsigned min, CAS loop 手写)
+    //   funct5 = 0x1C → AMOMAXU.W (unsigned max, CAS loop 手写)
+    //   funct5 = 0x02 LR.W / 0x03 SC.W 是 Zalrsc 子扩展, T3 落地; 当前仍 OP_UNSUPPORTED.
+    //   其他 funct5 → OP_UNSUPPORTED (reserved by spec)
+    //
+    // 字段约定:
+    //   d.rd       = inst[11:7]  写目标寄存器 (sext32(old) 写入; rd=x0 dead store)
+    //   d.rs1      = inst[19:15] gva 基址寄存器 (AMO 无 imm offset; ea = READ_REG(d.rs1))
+    //   d.rs2      = inst[24:20] AMO 操作 "源" 值寄存器 (ADD/AND/OR/XOR 是位级源, SWAP
+    //                  覆盖, MIN/MAX 比较值)
+    //   d.imm      = 0           AMO 无 imm (decode 不提取; 字段位置被 funct5/funct3/rs2
+    //                  占用; raw_inst 字段供 mtval 用)
+    //   d.pc_step  = PC_STEP_RV (普通 +4; AMO 不改控制流)
+    //
+    // bits[26:25] aq/rl 字段 Q11 拍全 seq_cst 不精确化, decode 不读 (op_kind 选择不依赖
+    //   aq/rl, 9 op 直接由 funct5 决定).
+    //
+    // 是块边界: 否 (AMO 不改 pc, 不改全局 TLB 状态; 跟普通 store 同; is_block_boundary_inst → 0).
+    //   misalign / MMIO 拒 / walker fault 经 trap_raise_exception _Noreturn longjmp 跳回
+    //   dispatcher, 不走 boundary 路径.
+    //
+    // 实际访问 case 内调 amo_xxx_helper (isa/amo.h, inline 顶层): BARE 内联 RAM/MMIO 分流
+    //   (MMIO 拒 cause 7) / SV32 TLB hit 调 amo_xxx_apply / miss 调 mmu_walker_helper_amo_xxx.
+    //   3-layer 模型见 amo.h 顶段; 跟 store 严格对偶但**不复用 store_helper** (RMW vs memcpy).
+    OP_AMO_ADD_W,
+    OP_AMO_SWAP_W,
+    OP_AMO_XOR_W,
+    OP_AMO_OR_W,
+    OP_AMO_AND_W,
+    OP_AMO_MIN_W,
+    OP_AMO_MAX_W,
+    OP_AMO_MINU_W,
+    OP_AMO_MAXU_W,
+
     // ---- 兜底 ----
-    // 不在当前范围的 opcode (fence 0x0F / amo 0x2F / 真非法 opcode / 真非法 funct3 子段)
-    // 全部归这里。interpreter 走 trap_raise_exception(cause=2 Illegal Instruction,
+    // 不在当前范围的 opcode (Zalrsc LR.W/SC.W / 真非法 opcode / 真非法 funct3 / funct5 子段) 全部归这里。
+    // interpreter 走 trap_raise_exception(cause=2 Illegal Instruction,
     // mtval=decoded.raw_inst) _Noreturn longjmp 跳回 dispatcher (RV 规范规定 illegal trap
     // 的 mtval = 触发指令本身)。
     OP_UNSUPPORTED,
@@ -394,9 +463,11 @@ decoded_inst_t decode(u32_t inst);
 //
 // 当前归类:
 //   非 boundary: 算术 / 逻辑 / 立即数 (LUI/AUIPC + 9 OP-IMM + 10 OP) + LOAD/STORE 8 个;
+//                AMO 9 个 (Zaamo, 不改 pc 不动 TLB, 跟 store 同性质);
+//                FENCE 1 个 (memory ordering 不动指令流);
 //                OP_UNSUPPORTED (走 trap_raise + longjmp, 不经"块边界"路径)
 //   boundary:    控制流 8 个 (6 branch + JAL + JALR) + CSR 6 变体 + SYSTEM 4 (ECALL/
-//                EBREAK/MRET/SRET) + SFENCE.VMA 1 + WFI 1
+//                EBREAK/MRET/SRET) + SFENCE.VMA 1 + WFI 1 + FENCE.I 1 (i-cache flush)
 //
 // CSR 一刀切策略: 6 变体全视为硬边界 (plan §1.6 简化策略 "过度刷新允许")。实际上 CSRRS
 // rd, csr, x0 = 纯读不写, 不一定要 boundary; 但保险起见统一视为 boundary, 未来真细化时
@@ -467,6 +538,27 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         // cause 5/7) 经 trap_raise_exception _Noreturn longjmp 跳回 dispatcher, 不走 boundary。
         case OP_LB:  case OP_LH:  case OP_LW:  case OP_LBU: case OP_LHU:
         case OP_SB:  case OP_SH:  case OP_SW:
+            return 0;
+
+        // ---- MISC-MEM 2 个 ----
+        // FENCE   非 boundary: memory ordering 不动指令流, 同 block 继续译 (x86 TSO 双重
+        //                       cover 论证见 isa/fence.h)
+        // FENCE.I 是 boundary:  i-cache flush + lrsc_clear_self 副作用; 块内后续指令译码
+        //                       视图变 (同 SFENCE.VMA 体例 — "动状态后块边界")
+        case OP_FENCE:
+            return 0;
+        case OP_FENCE_I:
+            return 1;
+
+        // ---- A 扩展 Zaamo 9 个 (非 boundary) ----
+        // AMO 不改 pc, 不改全局 TLB / 控制状态 (只改单 word memory + LR/SC reservation
+        // 表); 跟普通 store 同性质. trap 路径 (misalign cause 6 / MMIO 拒 cause 7 /
+        // walker fault cause 15) 经 trap_raise_exception _Noreturn longjmp 跳回 dispatcher,
+        // 不走 boundary 路径.
+        case OP_AMO_ADD_W:  case OP_AMO_SWAP_W: case OP_AMO_XOR_W:
+        case OP_AMO_OR_W:   case OP_AMO_AND_W:
+        case OP_AMO_MIN_W:  case OP_AMO_MAX_W:
+        case OP_AMO_MINU_W: case OP_AMO_MAXU_W:
             return 0;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法
