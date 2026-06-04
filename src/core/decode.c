@@ -801,16 +801,20 @@ decoded_inst_t decode(u32_t inst) {
             break;
         }
 
-        // ---- A 扩展 Zaamo (9 op), opcode 0x2F ----
-        // RV Unprivileged Spec Vol I "A" extension Zaamo (a_04 T2).
-        // 同 opcode + funct3=010 (.W; RV32) 由 funct5 (bits[31:27]) 区分 9 op:
+        // ---- A 扩展 Zaamo (9 op) + Zalrsc (LR.W / SC.W), opcode 0x2F ----
+        // RV Unprivileged Spec Vol I "A" extension (a_04 T2 Zaamo + T3 Zalrsc).
+        // 同 opcode + funct3=010 (.W; RV32) 由 funct5 (bits[31:27]) 区分:
         //   funct5 = 0x00 → AMOADD.W       funct5 = 0x01 → AMOSWAP.W
+        //   funct5 = 0x02 → LR.W           funct5 = 0x03 → SC.W
         //   funct5 = 0x04 → AMOXOR.W       funct5 = 0x08 → AMOOR.W
         //   funct5 = 0x0C → AMOAND.W       funct5 = 0x10 → AMOMIN.W
         //   funct5 = 0x14 → AMOMAX.W       funct5 = 0x18 → AMOMINU.W
         //   funct5 = 0x1C → AMOMAXU.W
-        //   funct5 = 0x02 LR.W / 0x03 SC.W 是 Zalrsc (T3 实); 当前 OP_UNSUPPORTED.
         //   其他 funct5    reserved → OP_UNSUPPORTED.
+        //
+        // LR.W (funct5=0x02): rs2 字段 spec 强制为 0 (RV ISA Vol I §8.2);
+        //   非 0 行为 implementation-defined. 项目当前不强制 reject (跟 QEMU 一致),
+        //   decode 不读 rs2 也不报 illegal — interpreter LR_W case 也不消费 rs2.
         //
         // funct3 = 011 (.D, RV64) → OP_UNSUPPORTED (项目 RV32, 不实).
         // funct3 其他   reserved → OP_UNSUPPORTED.
@@ -831,6 +835,8 @@ decoded_inst_t decode(u32_t inst) {
             switch (funct5) {
                 case 0x00: d.kind = OP_AMO_ADD_W;   break;
                 case 0x01: d.kind = OP_AMO_SWAP_W;  break;
+                case 0x02: d.kind = OP_LR_W;        break;
+                case 0x03: d.kind = OP_SC_W;        break;
                 case 0x04: d.kind = OP_AMO_XOR_W;   break;
                 case 0x08: d.kind = OP_AMO_OR_W;    break;
                 case 0x0C: d.kind = OP_AMO_AND_W;   break;
@@ -838,7 +844,7 @@ decoded_inst_t decode(u32_t inst) {
                 case 0x14: d.kind = OP_AMO_MAX_W;   break;
                 case 0x18: d.kind = OP_AMO_MINU_W;  break;
                 case 0x1C: d.kind = OP_AMO_MAXU_W;  break;
-                // 0x02 LR.W / 0x03 SC.W (Zalrsc, T3) + 其他 funct5 (reserved) 都走兜底
+                // 其他 funct5 reserved 走兜底
                 default:
                     d.kind = OP_UNSUPPORTED;
                     break;

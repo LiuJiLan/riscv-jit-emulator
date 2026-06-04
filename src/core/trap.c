@@ -17,6 +17,7 @@
 #include "cpu.h"        // cpu_t 完整定义 (trap.h 只 forward, 这里要访问字段)
 #include "csr.h"        // csr_mip_read (trap_check_interrupt 合成读 mip)
 #include "debug.h"      // DEBUG_EXCEPTION / DEBUG_INT_CHECK / DEBUG_TIME/SOFT/EXT_INTR
+#include "isa/lrsc.h"   // lrsc_clear_self (trap entry 清 reservation; Q5 B1)
 #include "riscv.h"      // PRIV_M / CAUSE_INTERRUPT_BIT / IRQ_* / MIE_VALID_MASK / SIE_MASK / MSTATUS_*
 #include "runtime.h"    // system_reset_signal_set_bit (M-mode double trap critical-error)
 
@@ -44,6 +45,13 @@ int trap_set_exception_state(cpu_t *hart, uint32_t cause, uxlen_t tval) {
     //   (b) mmu_translate_pc fetch fault 非长跳 (dispatcher 主帧, 路径 2b)
     //   (c) dispatcher 循环顶 pc IALIGN 兜底非长跳 (cause 0, 跟 (b) 同形态; 见 §9)
     DEBUG_EXCEPTION();
+
+    // LR/SC reservation 清自己 — RV spec §14.2.1 "Reserved Memory Locations"
+    // 推荐 trap entry 清 (B1, implementation discretion; 我们选清). 在 deliver_priv
+    // 算 / MDT-SDT 检查之前清是安全的 — lock-free atomic_store INVALID, 不影响后续
+    // architectural state 翻转. critical-error (HART_MDT) 路径下虽然 hart 后续会退,
+    // 但顶部清也无害.
+    lrsc_clear_self(hart);
 
     // ------------------------------------------------------------------------
     // deliver_priv 按 _medeleg 真生效 (RV Privileged Spec §3.1.8)
@@ -146,6 +154,9 @@ int trap_set_interrupt_state(cpu_t *hart, uint32_t cause_low) {
         case IRQ_M_EXT:   case IRQ_S_EXT:   DEBUG_EXT_INTR();  break;
         default: break;  /* 不应到 (trap_check_interrupt 内 priority encoder 只产 6 个合法 IRQ) */
     }
+
+    /* LR/SC reservation 清自己 (跟 trap_set_exception_state 顶部对偶; Q5 B1). */
+    lrsc_clear_self(hart);
 
     // ------------------------------------------------------------------------
     // deliver_priv 按 mideleg 真生效 (RV Privileged Spec §3.1.8 跟 medeleg 对偶)

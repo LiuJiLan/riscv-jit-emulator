@@ -12,6 +12,7 @@
 
 #include "config.h"          // ASID_MAX, ASID_MASK
 #include "core/tlb.h"        // tlb_clear
+#include "lrsc.h"            // lrsc_clear_self (sfence.vma 末段清 reservation; Q5 B3)
 #include "riscv.h"           // PRIV_S, PRIV_H
 
 
@@ -65,4 +66,9 @@ void sfence_vma_helper(cpu_t *hart,
             }
         }
     }
+
+    /* LR/SC reservation 清自己 — sfence.vma 是地址映射改后的同步点, 旧 reservation
+     * 跨 VA→PA 重映射后语义可疑 (虽然项目 PA-based 实际不受影响, 仍按 spec
+     * recommended 清 Q5 B3; lock-free). */
+    lrsc_clear_self(hart);
 }

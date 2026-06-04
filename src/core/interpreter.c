@@ -15,6 +15,7 @@
 #include "decode.h"
 #include "isa/amo.h"    // amo_xxx_helper (9 inline 顶层; Zaamo)
 #include "isa/fence.h"  // fence_helper / fence_i_helper (FENCE / FENCE.I)
+#include "isa/lrsc.h"   // lrsc_clear_self (WFI 醒后清 reservation; Q5 B4)
 #include "isa/lsu.h"    // lsu_load_helper / lsu_store_helper (inline 顶层) + store_helper (extern, HVA-based)
 #include "isa/sfence.h" // sfence_vma_helper (extern)
 #include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M]) / MSTATUS_TW (WFI 检查)
@@ -687,6 +688,9 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 DEBUG_WFI_WAKE();               /* trace 'W' — wfi_wait 返回后打 (不管真假醒).
                                                    'wW' = predicate 即真没睡; 'wSW' = 真睡过
                                                    一次; 'wSSW'+ = spurious/timeout 多睡几次. */
+                /* LR/SC reservation 清自己 — wfi 睡的期间可能 ms 级长, reservation
+                 * 已 stale (Q5 B4; spec implementation discretion 我们选清). lock-free. */
+                lrsc_clear_self(hart);
                 hart->regs[0] += 4u;            /* PC_STEP_NONE → 自推进 */
                 break;
 
@@ -835,6 +839,34 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             AMO_CASE(MINU_W, minu_w)
             AMO_CASE(MAXU_W, maxu_w)
             #undef AMO_CASE
+
+            // ---- A 扩展 Zalrsc 2 op (a_04 T3) ----
+            //
+            // LR.W / SC.W 跟 AMO 同形态 (BARE/SV32 分流 + TLB hit fast path):
+            //   - LR.W: load 语义 → LOAD_MISALIGN_CHECK cause 4 → lrsc_lr_helper →
+            //           WRITE_REG rd = zero-ext(*pa) 32-bit + 建 reservation
+            //   - SC.W: store 语义 → STORE_MISALIGN_CHECK cause 6 → lrsc_sc_helper →
+            //           WRITE_REG rd = 0=success / 1=fail
+            //
+            // may-trap 边界: misalign check 触发前必须 SYNC_COUNT 已调; helper 内 BARE
+            //   MMIO 拒 (LR cause 5 / SC cause 7) / SV32 walker fault / MMIO 拒经
+            //   trap_raise_exception _Noreturn longjmp, 不返回 caller.
+            //
+            // 非块边界 (跟 AMO 同; LR/SC 不改 pc, is_block_boundary_inst → 0).
+            case OP_LR_W: {
+                uxlen_t ea = READ_REG(d.rs1);
+                SYNC_COUNT();
+                LOAD_MISALIGN_CHECK(ea, 4u);
+                WRITE_REG(d.rd, lrsc_lr_helper(hart, current_tlb, ea));
+                break;
+            }
+            case OP_SC_W: {
+                uxlen_t ea = READ_REG(d.rs1);
+                SYNC_COUNT();
+                STORE_MISALIGN_CHECK(ea, 4u);
+                WRITE_REG(d.rd, lrsc_sc_helper(hart, current_tlb, ea, READ_REG(d.rs2)));
+                break;
+            }
 
             // ---- 兜底 ----
             case OP_UNSUPPORTED:

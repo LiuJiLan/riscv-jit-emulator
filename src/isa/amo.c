@@ -27,10 +27,11 @@
 // macro 体一致, 只换 C11 函数名. 全部 memory_order_seq_cst (Q11; aq/rl 精确化推迟 plan
 // §2 #8). x86 host 上 atomic_fetch_* seq_cst 退化为 LOCK 前缀 + 原子 RMW, perf 损失小.
 //
-// pa 反推: pa = (uint32_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset)
+// pa 反推: pa = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset)
 //   gpa_to_hva_offset 是 ram_init 时算出的常量指针 (host RAM 基址), 减法得 guest PA.
 //   uintptr_t cast 是为消除 pointer arithmetic 的 sign-extension 边界 (gpa_to_hva_offset
 //   有时是大正数, 直接 ptr 减可能溢出 ptrdiff_t).
+//   pa 类型 uxlen_t — PA 是 XLEN-tied 字段 (dummy.txt §13; lrsc_on_store 签名同).
 // ----------------------------------------------------------------------------
 #define AMO_DEFINE_APPLY_DIRECT(name, c11_fn)                                           \
 uxlen_t amo_##name##_apply(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,             \
@@ -38,8 +39,8 @@ uxlen_t amo_##name##_apply(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,     
     (void)gva_for_tval;  /* T1/T2 不消费; T3 reservation 真做后接通当 trap tval */      \
     _Atomic uint32_t *target = (_Atomic uint32_t *)hva;                                 \
     uint32_t old = c11_fn(target, (uint32_t)value, memory_order_seq_cst);               \
-    uint32_t pa  = (uint32_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);           \
-    lrsc_on_store(hart, pa);  /* T1 占位真调; T3 真扫所有 hart reservation */           \
+    uxlen_t  pa  = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);            \
+    lrsc_on_store(hart, pa);  /* T3 真扫所有 hart reservation, 锁内清匹配 */            \
     return old;                                                                         \
 }
 
@@ -94,7 +95,7 @@ uxlen_t amo_##name##_apply(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,     
         /* CAS 失败: atomic_compare_exchange_weak 已把当前 *target 真值写回 &old,      \
          * 直接 retry (不需 re-load) */                                                  \
     }                                                                                   \
-    uint32_t pa = (uint32_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);            \
+    uxlen_t pa = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);              \
     lrsc_on_store(hart, pa);                                                            \
     return old;                                                                         \
 }

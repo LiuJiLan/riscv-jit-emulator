@@ -19,29 +19,32 @@
 #include <stdint.h>
 #include <string.h>     // memcpy: 防 strict-aliasing / unaligned 风险
 
+#include "lrsc.h"            // lrsc_on_store (Q5 #5; T3 真接通)
+#include "platform/ram.h"    // gpa_to_hva_offset (hva → pa 反推)
+
 
 void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
                   uxlen_t value, uint32_t size) {
-    (void)hart;          /* 当前 reservation/SMC 占位未真做, hart 未消费 */
-    (void)gva_for_tval;  /* 同上, gva 仅供未来副作用 trap_raise 当 tval 透传 */
+    (void)gva_for_tval;  /* gva 仅供未来副作用 trap_raise 当 tval 透传 */
 
     // host store: memcpy size 字节 (低 size 字节进 hva; SB 写 1 字节 / SH 写 2 字节 /
     // SW 写 4 字节)。memcpy 防 strict-aliasing / unaligned 风险。
     memcpy(hva, &value, size);
 
     // ----------------------------------------------------------------------
-    // reservation 清除 (LR/SC 语义) —— 占位
+    // LR/SC reservation 清除 (Q5 #5)
     //
-    // RV A 扩展: 任何 store (普通 SW 或 AMO) 都可能让某 hart 的 LR-reserved 地址失效。
-    // 真做 isa/amo.c 时:
-    //   - 清当前 hart 的 reservation (如果存在)
-    //   - SMP 时 (本项目预留, 不实现): 跨 hart 同步 reservation table (atomic 字段)
-    // 当前没有 LR/SC, reservation_t struct 也未定; 占位等真做。
+    // hva → pa 反推: pa = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset)
+    //   (跟 amo.c 9 apply 同模式; pa 是 uxlen_t XLEN-tied)。
+    // 调 lrsc_on_store(hart, pa) — 拿 bucket lock + 扫所有 hart, reservation 命中
+    //   pa & ~3u 的全清 (含自己, RV spec §14.2.1 line 116-118 implementation
+    //   discretion 选清; Spike/QEMU 同选, c 主方案严格不留漏口)。
     //
     // 注: 本 helper 只服务 RAM 写 — MMIO 路径不调本 helper (mmio_write_helper 直接,
-    // 不经此处), 因 LR/SC 对 MMIO RV spec implementation-defined 一般 access fault,
-    // 不会建 reservation, 也就不需要清。
+    // 不经此处), 因 LR/SC 对 MMIO 一般 access fault, 不会建 reservation。
     // ----------------------------------------------------------------------
+    uxlen_t pa = (uxlen_t)((uintptr_t)hva - (uintptr_t)gpa_to_hva_offset);
+    lrsc_on_store(hart, pa);
 
     // ----------------------------------------------------------------------
     // SMC 检测 (page_dirty bitmap) —— 占位

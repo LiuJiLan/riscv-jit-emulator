@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "config.h"          // VIRTIO_BLK_* / VIRTIO_BLK_PLIC_IRQ
+#include "isa/lrsc.h"        // lrsc_on_device_write (DMA 写 RAM 完成后清 reservation; Q15)
 #include "platform/bus.h"    // mmio_dev_t / bus_register_mmio
 #include "platform/plic.h"   // device_set_pending / device_clear_pending
 #include "platform/ram.h"    // IS_GPA_RAM / gpa_to_hva_offset
@@ -424,6 +425,24 @@ static void *io_worker_run(void *arg) {
             }
         }
         vblk_state_unlock();
+
+        /* LR/SC reservation clear (Q5 #7 / Q15; lrsc_amo_decision.md):
+         *   drain 已完成 pread/pwrite + 写 used ring, RAM 可能被 device DMA 改过
+         *   (pread 路径 host file → guest RAM). RV spec §14.2.1 line 108-109 强制
+         *   "device 写 LR-accessed bytes 必须 invalidate reservation, 否则后续 SC
+         *   可能虚假成功".
+         *
+         *   blanket clear (不查 PA range): DMA write byte range 可能很大 (整 sector
+         *   512 byte+), 全清 n_harts atomic_store ~10-20 ns 影响忽略, 比 spec 最小
+         *   要求 (只清 overlap LR-accessed bytes) 更严但合规 (落 line 221-237
+         *   spurious failure latitude). pwrite 路径不写 RAM (只读 guest buf 写
+         *   host file), 严格说不需要清 — 但 round 末段统一调更简洁 (Q15 拍).
+         *
+         *   位置: drain 之后 + device_set_pending 之前 — guest 收到 IRQ 时
+         *   reservation 已 clear, "device 写 RAM 必须先于 SC 失败" 时序成立.
+         *   lock-free, 不需要任何锁 (lrsc_on_device_write 内是单向 atomic_store
+         *   INVALID, 无 race). */
+        lrsc_on_device_write();
 
         if (need_irq) {
             device_set_pending((uint32_t)VIRTIO_BLK_PLIC_IRQ);

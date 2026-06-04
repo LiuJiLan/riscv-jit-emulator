@@ -101,6 +101,18 @@
 #define MAX_HARTS         8U
 
 // ----------------------------------------------------------------------------
+// LR/SC reservation bucket 锁数组 (isa/lrsc; A 扩展 Zalrsc c 主方案)
+// ----------------------------------------------------------------------------
+//
+// per-PA hash 锁桶数, K = 1 << LRSC_BUCKET_BITS (lrsc_amo_decision.md Q17 拍 K=64).
+// Fibonacci hash (Q18, lrsc.c bucket_lock inline 实装) 散列 pa_word → idx; K 必须
+// 2 的幂 (mask 操作隐式由 hash shift 替, 但 K 大小算 cacheline 友好仍要 2 幂).
+//
+// 8 hart 撞概率 ~12.5%, 锁竞争可控; K=64 占 ~2.5KB (~40 cacheline); 实装时跑
+// fixture 测 K=32/64/128 的 spinlock micro-benchmark 后可调.
+#define LRSC_BUCKET_BITS  6U
+
+// ----------------------------------------------------------------------------
 // CLINT (Core-Local Interruptor) MMIO 地址布局
 // ----------------------------------------------------------------------------
 //

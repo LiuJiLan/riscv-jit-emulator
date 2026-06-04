@@ -16,8 +16,9 @@
 //   - LOAD / STORE: 8 (5 LB/LH/LW/LBU/LHU + 3 SB/SH/SW)
 //   - MISC-MEM (RVI base + Zifencei): 2 (FENCE / FENCE.I; opcode 0x0F)
 //   - A 扩展 Zaamo: 9 (AMOADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU.W; opcode 0x2F)
+//   - A 扩展 Zalrsc: 2 (LR.W / SC.W; opcode 0x2F + funct5=0x02/0x03)
 //   共 68 个真 op + 1 个 OP_UNSUPPORTED 兜底 = 69 个 op_kind。
-//   不在此范围的 opcode (Zalrsc LR/SC / F/D / 等) decode 全部归 OP_UNSUPPORTED。
+//   不在此范围的 opcode (F/D / 等) decode 全部归 OP_UNSUPPORTED。
 //
 // op_kind_t 增长策略: 真要支持新 op 时再加 enum case + interpreter switch case + (未来)
 //   translator emit case; -Wswitch-enum + -Werror 强制 switch 一致性, 增量加新 op_kind
@@ -399,8 +400,32 @@ typedef enum {
     OP_AMO_MINU_W,
     OP_AMO_MAXU_W,
 
+    // ---- A 扩展 Zalrsc (LR.W / SC.W), opcode 0x2F + funct3=010 + funct5=0x02/0x03 ----
+    // RV Unprivileged Spec Vol I "A" extension Zalrsc 子扩展 (a_04 T3).
+    //
+    // 字段约定:
+    //   d.rd       = inst[11:7]
+    //                  LR.W: 写 zero-ext(*pa) 32-bit 值
+    //                  SC.W: 写 0=success / 1=fail
+    //   d.rs1      = inst[19:15] gva 基址寄存器 (AMO 同; LR/SC 也无 imm offset)
+    //   d.rs2      = inst[24:20]
+    //                  LR.W: spec 强制 0, 非 0 implementation-defined (decode 不读)
+    //                  SC.W: 写源值寄存器 (atomic_store *pa = READ_REG(d.rs2))
+    //   d.imm      = 0
+    //   d.pc_step  = PC_STEP_RV
+    //
+    // bits[26:25] aq/rl: 跟 AMO 一致, decode 不读 (全 seq_cst, Q11).
+    //
+    // 是块边界: 否 (LR/SC 不改 pc, 跟 AMO/store 同). misalign (LR cause 4 / SC cause 6) /
+    //   MMIO 拒 (cause 5/7) / walker fault 经 _Noreturn longjmp 不走 boundary 路径.
+    //
+    // 实际访问 case 内调 lrsc_lr_helper / lrsc_sc_helper (interpreter case 走类似 lsu/amo
+    //   的 BARE/SV32 分流 + IS_GPA_RAM check, 最终调 lrsc_lr_w / lrsc_sc_w; T3 实).
+    OP_LR_W,
+    OP_SC_W,
+
     // ---- 兜底 ----
-    // 不在当前范围的 opcode (Zalrsc LR.W/SC.W / 真非法 opcode / 真非法 funct3 / funct5 子段) 全部归这里。
+    // 不在当前范围的 opcode (真非法 opcode / 真非法 funct3 / funct5 子段) 全部归这里。
     // interpreter 走 trap_raise_exception(cause=2 Illegal Instruction,
     // mtval=decoded.raw_inst) _Noreturn longjmp 跳回 dispatcher (RV 规范规定 illegal trap
     // 的 mtval = 触发指令本身)。
@@ -559,6 +584,13 @@ static inline int is_block_boundary_inst(const decoded_inst_t *d) {
         case OP_AMO_OR_W:   case OP_AMO_AND_W:
         case OP_AMO_MIN_W:  case OP_AMO_MAX_W:
         case OP_AMO_MINU_W: case OP_AMO_MAXU_W:
+            return 0;
+
+        // ---- A 扩展 Zalrsc 2 个 (非 boundary; 跟 AMO/store 同性质) ----
+        // LR.W / SC.W 不改 pc, 不改 TLB; 操作 *pa + reservation 字段, 跟 AMO/store 同;
+        // trap 路径 (misalign cause 4/6 / MMIO 拒 cause 5/7 / walker fault) 经
+        // trap_raise_exception _Noreturn longjmp 跳回 dispatcher, 不走 boundary 路径.
+        case OP_LR_W: case OP_SC_W:
             return 0;
     }
     return 0;  // -Wswitch-enum 下不可达 (所有 enum 必须在 switch 列出); 防御写法

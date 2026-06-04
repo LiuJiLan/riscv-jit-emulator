@@ -53,6 +53,7 @@
 #include "core/decode.h"
 #include "core/dispatcher.h"
 #include "core/wfi.h"          // wfi_init / wfi_destroy (WFI 唤醒框架; wfi_kick_all 不调用, 见 wfi.h doc)
+#include "isa/lrsc.h"          // lrsc_init / lrsc_destroy (A 扩展 reservation 数据结构; bucket 锁数组 cap 配对)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -611,6 +612,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // lrsc 模块 init (A 扩展 reservation 数据结构 + bucket 锁数组 K=64).
+    // 必须在 hart 线程 spawn (clint_start_timer_thread 之前) 之前 — 任何 hart 跑
+    // LR/SC/store/AMO 都要锁/扫 reservation 数组. lrsc_init 内部 fprintf + 不
+    // propagate fail (跟 wfi_init 一致); 真 init fail (pthread_mutex_init OOM 之类)
+    // 路径下后续 hart 跑到 pthread_mutex_lock 会撞 EINVAL 暴露问题.
+    lrsc_init();
+
     // ------------------------------------------------------------------------
     // POR runtime lifecycle 初始化 (cpu_create 之后, while 之前)
     //
@@ -806,6 +814,9 @@ int main(int argc, char **argv) {
     // 必须在所有 wfi_kick 来源 (timer thread / io workers 已 join + clint/plic destroy
     // 也已 atomic 清字段) 之后 — clint_destroy / plic_destroy 都不再调 wfi_kick。
     wfi_destroy();
+    // lrsc destroy (bucket 锁数组 destroy; 跟 wfi_destroy 同顺位 — 都是 cap 配对
+    // pure cleanup 不发线程不 join, 在所有 hart 线程已 join 之后调).
+    lrsc_destroy();
     // per-hart cpu_destroy. NULL 跳过 — 当前 cpu_create 失败时已 early return,
     // 这里循环只跑成功初始化的; NULL 检查兜底未来 lazy alloc 路径。
     for (uint32_t i = 0; i < n_harts; i++) {

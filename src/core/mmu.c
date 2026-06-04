@@ -14,6 +14,7 @@
 
 #include "config.h"
 #include "isa/amo.h"        // amo_xxx_apply (9 op; walker 末调; HVA-based, atomic RMW + lrsc_on_store)
+#include "isa/lrsc.h"       // lrsc_lr_w / lrsc_sc_w (PA-based; LR/SC walker 末调)
 #include "isa/lsu.h"        // store_helper (HVA-based, RAM 写 + LR/SC + SMC 副作用)
 #include "platform/bus.h"   // mmio_read/write_helper (MMIO 派发, _Noreturn-on-failure)
 #include "platform/ram.h"
@@ -497,3 +498,84 @@ AMO_DEFINE_WALKER(minu_w)
 AMO_DEFINE_WALKER(maxu_w)
 
 #undef AMO_DEFINE_WALKER
+
+
+// ============================================================================
+// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (a_04 T3; Zalrsc)
+// ============================================================================
+//
+// 完整流程 doc 见 mmu.h. 跟 store/amo walker 严格对偶, 末调 lrsc_lr_w / lrsc_sc_w
+// (PA-based, lrsc.h). 不用 macro (只 2 op + LR / SC 函数体不一致: perm 不同 / MMIO
+// 拒 cause 不同 / set A vs A+D / 末调函数不同).
+
+uxlen_t mmu_walker_helper_lr_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva) {
+    uxlen_t  pa;
+    u32_t    pte_flags;
+    uint32_t fault_cause;
+    uxlen_t  pte_pa;
+    if (mmu_walk(hart, gva, MMU_PERM_R, &pa, &pte_flags, &fault_cause,
+                 &pte_pa) != 0) {
+        trap_raise_exception(hart, fault_cause, /*tval*/gva);
+    }
+
+    /* PA 不在 RAM → LR 拒 MMIO cause 5 LOAD_ACCESS_FAULT (spec implementation-defined,
+     * Spike/QEMU 同). */
+    if (!IS_GPA_RAM(pa)) {
+        trap_raise_exception(hart, CAUSE_LOAD_ACCESS_FAULT, /*tval*/gva);
+    }
+
+    uint8_t *host_ptr       = gpa_to_hva_offset + pa;
+    uint8_t *page_host_base = host_ptr - (gva & 0xFFFu);
+
+    /* RAM 路径 atomic set PTE.A (LR 是 load 类, 不 set D; 跟 load walker 同位置). */
+    atomic_fetch_or_explicit((_Atomic uint32_t *)(gpa_to_hva_offset + pte_pa),
+                             PTE_A, memory_order_relaxed);
+
+    /* Fill TLB entry (跟 load walker 同形态; 下条普通 load 同 page 可命中). */
+    const uint32_t vpn   = gva >> 12;
+    const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
+    tlb_e_t *entry = &current_tlb->e[index];
+    entry->gva_tag   = vpn;
+    entry->pte_flags = (uint16_t)pte_flags;
+    entry->host_ptr  = page_host_base;
+
+    /* 末调 lrsc_lr_w (PA-based; atomic_load *pa + atomic_store self.reservation = pa_word).
+     * 返 zero-ext 32-bit value. */
+    return lrsc_lr_w(hart, pa);
+}
+
+
+uxlen_t mmu_walker_helper_sc_w(cpu_t *hart, tlb_t *current_tlb,
+                               uxlen_t gva, uxlen_t value) {
+    uxlen_t  pa;
+    u32_t    pte_flags;
+    uint32_t fault_cause;
+    uxlen_t  pte_pa;
+    if (mmu_walk(hart, gva, MMU_PERM_W, &pa, &pte_flags, &fault_cause,
+                 &pte_pa) != 0) {
+        trap_raise_exception(hart, fault_cause, /*tval*/gva);
+    }
+
+    /* PA 不在 RAM → SC 拒 MMIO cause 7 STORE_ACCESS_FAULT (跟 AMO/store walker 同). */
+    if (!IS_GPA_RAM(pa)) {
+        trap_raise_exception(hart, CAUSE_STORE_ACCESS_FAULT, /*tval*/gva);
+    }
+
+    uint8_t *host_ptr       = gpa_to_hva_offset + pa;
+    uint8_t *page_host_base = host_ptr - (gva & 0xFFFu);
+
+    /* RAM 路径 atomic set PTE.A+D (SC 是 store 类). */
+    atomic_fetch_or_explicit((_Atomic uint32_t *)(gpa_to_hva_offset + pte_pa),
+                             PTE_A | PTE_D, memory_order_relaxed);
+
+    const uint32_t vpn   = gva >> 12;
+    const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
+    tlb_e_t *entry = &current_tlb->e[index];
+    entry->gva_tag   = vpn;
+    entry->pte_flags = (uint16_t)pte_flags;
+    entry->host_ptr  = page_host_base;
+
+    /* 末调 lrsc_sc_w (PA-based; bucket lock + 检 reservation + atomic_store *pa +
+     * 扫所有 hart 清匹配). 返 0=success / 1=fail. */
+    return lrsc_sc_w(hart, pa, value);
+}

@@ -9,9 +9,10 @@
 //   顶层 inline (本文件 amo.h) — 9 个 amo_xxx_helper, 跟 lsu_store_helper 体例; BARE/SV32
 //     分流, SV32 TLB hit fast path inline (跟 store 同形态; sacred fast/slow path 原则).
 //   中间 RAM 端副作用入口 (amo.c) — 9 个 amo_xxx_apply (extern, HVA-based), 内做 host C11
-//     atomic_fetch_xxx + lrsc_on_store(hart, pa) (T1 占位真调; T3 上 reservation 字段后
-//     生效) + 返 sext32(old). 跟 store_helper 一对一对偶, 但**不复用 store_helper** —
-//     store_helper 内 memcpy 跟 AMO RMW 不兼容 (user T2 拍 "amo 不直接调用 store").
+//     atomic_fetch_xxx + lrsc_on_store(hart, pa) (T3 已生效: bucket lock + 扫所有 hart
+//     清匹配 reservation) + 返 sext32(old). 跟 store_helper 一对一对偶, 但**不复用
+//     store_helper** — store_helper 内 memcpy 跟 AMO RMW 不兼容 (user T2 拍
+//     "amo 不直接调用 store").
 //   慢路径 walker (mmu.c) — 9 个 mmu_walker_helper_amo_xxx, 跟 mmu_walker_helper_store
 //     体例; walk + PTE A+D OR + TLB fill + 末调 amo_xxx_apply.
 //

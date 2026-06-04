@@ -665,4 +665,36 @@ uxlen_t mmu_walker_helper_amo_max_w (cpu_t *hart, tlb_t *current_tlb, uxlen_t gv
 uxlen_t mmu_walker_helper_amo_minu_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
 uxlen_t mmu_walker_helper_amo_maxu_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
 
+
+// ============================================================================
+// mmu_walker_helper_lr_w / sc_w —— SV32 LR/SC 路径完整流程 (a_04 T3; Zalrsc)
+// ============================================================================
+//
+// 跟 mmu_walker_helper_store 严格对偶, 末调 lrsc_lr_w / lrsc_sc_w (PA-based; lrsc.h):
+//
+//   lr_w walker (perm = MMU_PERM_R):
+//     1. mmu_walk(hart, gva, MMU_PERM_R, ...) → pa / pte_flags / fault_cause / pte_pa
+//        失败 → trap_raise_exception(fault_cause, gva)
+//     2. PA 不在 RAM → trap_raise(CAUSE_LOAD_ACCESS_FAULT=5, gva)
+//        (LR 落 MMIO spec implementation-defined, 项目拒 cause 5; 跟 Spike/QEMU 同)
+//     3. RAM:
+//        a. atomic OR PTE.A (R-only walk, 不 set D)
+//        b. fill TLB entry (跟 load walker 同形态)
+//        c. 末调 lrsc_lr_w(hart, pa) — PA-based, 返 zero-ext *pa 32-bit
+//
+//   sc_w walker (perm = MMU_PERM_W):
+//     1. mmu_walk(hart, gva, MMU_PERM_W, ...) → 同上
+//        失败 → trap_raise_exception(fault_cause, gva)
+//     2. PA 不在 RAM → trap_raise(CAUSE_STORE_ACCESS_FAULT=7, gva)
+//        (SC 落 MMIO 拒, 跟 AMO/store walker 同)
+//     3. RAM:
+//        a. atomic OR PTE.A+D
+//        b. fill TLB entry
+//        c. 末调 lrsc_sc_w(hart, pa, value) — 返 0=success / 1=fail
+//
+// 错误路径 trap_raise_exception 长跳, 不返回 caller (跟 walker_helper_store 同模式).
+// ============================================================================
+uxlen_t mmu_walker_helper_lr_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva);
+uxlen_t mmu_walker_helper_sc_w(cpu_t *hart, tlb_t *current_tlb, uxlen_t gva, uxlen_t value);
+
 #endif //CORE_MMU_H
