@@ -104,7 +104,7 @@ uxlen_t amo_maxu_w_apply(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval, uxlen_
 //
 // 参数:
 //   hart        - 调用 hart
-//   current_tlb - NULL = REGIME_BARE / 非 NULL = REGIME_SV32 (dispatcher 选定的叶 TLB)
+//   current_tlb - NULL = REGIME_BARE / 非 NULL = REGIME_SV32_S 或 _U (dispatcher 选定的叶 TLB)
 //   gva         - guest 虚拟地址 = ea = READ_REG(rs1); AMO 无 imm offset; caller 已查
 //                  misalign (AMO_MISALIGN_CHECK 宏, cause 6)
 //   value       - rs2 寄存器值 (AMO 操作的 "源" 值; 不同 op 含义不同 — ADD/AND/OR/XOR
@@ -142,7 +142,7 @@ static inline uxlen_t amo_##name##_helper(cpu_t *hart, tlb_t *current_tlb,      
         return 0;                                                                       \
     }                                                                                   \
                                                                                         \
-    /* REGIME_SV32: TLB hit fast path (跟 lsu_store_helper SV32 段同形 — V + tag + D + \
+    /* REGIME_SV32_S/_U: TLB hit fast path (跟 lsu_store_helper SV32 段同形 — V + tag + D + \
      * check_perm(W); AMO 需要 W 权限因为是 RMW). 命中后调 apply (跟 store 命中调       \
      * store_helper 同体例; 副作用入口 helper, sacred fast/slow path 原则). */          \
     {                                                                                   \

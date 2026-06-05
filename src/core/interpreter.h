@@ -36,7 +36,7 @@
 //
 // 参数:
 //   hart        - 调用 hart (regs / x0 特殊路径都通过它)
-//   current_tlb - dispatcher 算好的派发包 (NULL = REGIME_BARE; 非 NULL = REGIME_SV32);
+//   current_tlb - dispatcher 算好的派发包 (NULL = REGIME_BARE; 非 NULL = REGIME_SV32_S 或 _U);
 //                 透传给 lsu_load_helper / lsu_store_helper (interpreter 自感知 priv,
 //                 通过 current_tlb NULL/非NULL 化简表达)。
 //   hva_pc      - dispatcher 通过 mmu_translate_pc 得出的本块入口 HVA, 解释器从这里读

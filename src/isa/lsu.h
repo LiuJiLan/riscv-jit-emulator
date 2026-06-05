@@ -124,7 +124,7 @@ void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
 //
 // 参数:
 //   hart        — 调用 hart
-//   current_tlb — NULL = REGIME_BARE / 非 NULL = REGIME_SV32 (dispatcher 选定的叶 TLB)
+//   current_tlb — NULL = REGIME_BARE / 非 NULL = REGIME_SV32_S 或 _U (dispatcher 选定的叶 TLB)
 //   gva         — guest 虚拟地址 = ea (READ_REG(rs1) + imm); caller 已查 misalign
 //   size        — 1 / 2 / 4 (LB/LBU = 1, LH/LHU = 2, LW = 4)
 //
@@ -155,7 +155,7 @@ static inline uxlen_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
         return mmio_read_helper(hart, gva, /*gva for tval*/gva, size);
     }
 
-    /* REGIME_SV32: TLB hit fast path */
+    /* REGIME_SV32_S/_U: TLB hit fast path */
     //
     // 命中条件: V + tag + check_perm(R) — check_perm 是 mmu.h 的 static inline, 跟
     //   walker 同源, 完整查 priv/PTE_U/SUM/MXR + R-or-(MXR&&X)。
@@ -198,7 +198,7 @@ static inline uxlen_t lsu_load_helper(cpu_t *hart, tlb_t *current_tlb,
 //
 // 参数:
 //   hart        — 调用 hart
-//   current_tlb — NULL = REGIME_BARE / 非 NULL = REGIME_SV32
+//   current_tlb — NULL = REGIME_BARE / 非 NULL = REGIME_SV32_S 或 _U
 //   gva         — guest 虚拟地址 = ea (READ_REG(rs1) + imm); caller 已查 misalign
 //   value       — 要 store 的值 (32 位); SB 写 value 低 8 位, SH 写低 16 位, SW
 //                  写全 32 位, 由 size 决定写多少字节
@@ -228,7 +228,7 @@ static inline void lsu_store_helper(cpu_t *hart, tlb_t *current_tlb,
         return;
     }
 
-    /* REGIME_SV32: TLB hit fast path */
+    /* REGIME_SV32_S/_U: TLB hit fast path */
     //
     // 命中条件: V + tag + D + check_perm(W)
     //   D 位必查 — load 路径 walker 不 set D, store 时 D=0 必 fall back walker 重 set

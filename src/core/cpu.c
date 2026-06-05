@@ -4,7 +4,7 @@
 //
 // tlb_table[4] 设计:
 //   - REGIME_BARE 走 identity bypass TLB → [PRIV_M] 槽永远 NULL, 不分配
-//   - REGIME_SV32 走 [priv][asid] 二级索引 → [PRIV_S] 容器 eager 分配, entries 懒 (walker 填)
+//   - REGIME_SV32_S/_U 走 [priv][asid] 二级索引 → [PRIV_S] 容器 eager 分配, entries 懒 (walker 填)
 //   - [PRIV_U] alias [PRIV_S] (MSU 默认; U 共享 S 的 ASID 命名空间)
 //   - [PRIV_H] VS 占位, NULL (未来 H 扩展)
 //

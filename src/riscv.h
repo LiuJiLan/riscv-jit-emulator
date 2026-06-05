@@ -31,6 +31,36 @@
 #include <stdint.h>
 
 // ============================================================================
+// C/C++ portability shim (b_01 起加; api/ 头被 C++ 端 include 时需要)
+// ============================================================================
+//
+// 触发场景: backend_asmjit.cc (C++ 实现) #include "api/helpers.h" → transitive
+// include 既有 .h (mmu.h / cpu.h / trap.h / ...), 这些既有 .h 内用了 C11 关键字
+// _Noreturn / _Alignas (cpu.h L106 _Alignas / trap.h L255 _Noreturn), g++
+// -std=gnu++17 不识别这两个 keyword. 本段在 C++ 编译时把 C11 keyword macro 包
+// 成 C++ 等价物, 让既有头能透明被 C++ 端 include.
+//
+// 限制 #ifdef __cplusplus scope — C 端不动 C11 keyword 原生行为.
+//
+// 已知未覆盖 (未来可能问题, b_01 暂回避; 真撞再处理):
+//   1. _Atomic 关键字 C++ 端无简单 macro 等价 (std::atomic<T> 是 template 不是
+//      storage class). 当前回避方式: api/helpers.h 不转发 runtime.h (后者
+//      extern _Atomic uint32_t ...; backend 用不到 runtime extern 字段).
+//      未来 backend 真需要 atomic 字段时选项:
+//        (a) 既有头 _Atomic 字段抽到 .c 文件 + 暴露 getter/setter 接口
+//        (b) C++ 端用 __atomic_* GNU builtin 直接操作字段
+//        (c) 全 codebase 改 std::atomic 兼容封装 (大手术, 不推荐)
+//   2. 既有头新加 _Atomic / _Generic 等 C11-only 用法时本 shim 不自动覆盖,
+//      要么扩 shim, 要么让 helpers.h 不转发那条头. 加 C11 关键字到既有 .h
+//      时记得评估 C++ 兼容性 (plan §1.12 跨语言边界约束的扩展).
+// ============================================================================
+#ifdef __cplusplus
+  #define _Noreturn [[noreturn]]
+  #define _Alignas(x) alignas(x)
+#endif
+
+
+// ============================================================================
 // 寄存器宽度 typedef family (跨文件类型规约见 dummy.txt §13)
 //
 // 目的: 不是引入运行期 XLEN 抽象 —— 项目当前 v1 = RV32 单 XLEN (MXLEN = SXLEN =

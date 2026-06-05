@@ -155,7 +155,7 @@ void lrsc_on_device_write(void);
 //
 // 参数:
 //   hart        - 调用 hart
-//   current_tlb - NULL = REGIME_BARE / 非 NULL = REGIME_SV32 (dispatcher 选定叶 TLB)
+//   current_tlb - NULL = REGIME_BARE / 非 NULL = REGIME_SV32_S 或 _U (dispatcher 选定叶 TLB)
 //   gva         - guest 虚拟地址 = ea = READ_REG(rs1); LR/SC 无 imm offset; caller 已查
 //                  misalign (LR cause 4 / SC cause 6)
 //   value (SC)  - rs2 寄存器值, SC 写入 *pa
@@ -185,7 +185,7 @@ static inline uxlen_t lrsc_lr_helper(cpu_t *hart, tlb_t *current_tlb, uxlen_t gv
         return 0;  /* _Noreturn longjmp; 消除编译器警告 */
     }
 
-    /* REGIME_SV32: TLB hit fast path (V + tag + R perm; 跟 lsu_load_helper 同形态) */
+    /* REGIME_SV32_S/_U: TLB hit fast path (V + tag + R perm; 跟 lsu_load_helper 同形态) */
     {
         const uint32_t vpn   = gva >> 12;
         const uint32_t index = vpn & (TLB_NUM_ENTRIES - 1);
@@ -224,7 +224,7 @@ static inline uxlen_t lrsc_sc_helper(cpu_t *hart, tlb_t *current_tlb,
         return 0;
     }
 
-    /* REGIME_SV32: TLB hit fast path (V + tag + D + W perm; 跟 lsu_store_helper /
+    /* REGIME_SV32_S/_U: TLB hit fast path (V + tag + D + W perm; 跟 lsu_store_helper /
      * amo_xxx_helper SV32 段同形态 — SC 是 store 类需要 W 权限 + D=1) */
     {
         const uint32_t vpn   = gva >> 12;

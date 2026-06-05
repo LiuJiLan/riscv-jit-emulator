@@ -187,20 +187,24 @@ void dispatcher(cpu_t *hart) {
     // block 1: 算派发包 (regime, current_tlb)
     //
     // 派发包概念上是两件:
-    //   regime       : 执行 regime, 决定 "用哪套 PTE 检查规则"
-    //                    REGIME_BARE  = Trust  (M-mode 或任何 priv 带 bare satp)
-    //                    REGIME_SV32  = Checked (S/U + Sv32)
+    //   regime       : 执行 regime + priv 视角, 决定 "用哪套 PTE 检查规则" (b_01 起 3 状态)
+    //                    REGIME_BARE   = Trust  (M-mode 或任何 priv 带 bare satp)
+    //                    REGIME_SV32_S = Checked S (priv=S + Sv32; PTE_U=0 默认; SUM/MXR 联动)
+    //                    REGIME_SV32_U = Checked U (priv=U + Sv32; PTE_U=1 强制)
     //   current_tlb  : 走 TLB 时用哪个叶 TLB
     //                    NULL          = Trust 不需要 TLB
     //                    非 NULL       = Sv32 用 hart->tlb_table[priv][asid] 选定的叶
     //
-    // 接口层简化: regime 与 current_tlb 是否为 NULL 现阶段严格 1:1 一致 (NULL ↔ BARE,
-    //   非 NULL ↔ SV32), 故下游 mmu_translate_pc / interpret_one_block 只吃 current_tlb
-    //   即可 (NULL 编码 regime); 详见 mmu.h regime_t doc 段。
+    // 接口层 by design 拍法分裂 (详 mmu.h 顶段 "执行 regime" 段):
+    //   interpreter 路径 (mmu_translate_pc / interpret_one_block): 只吃 current_tlb,
+    //     NULL 编码 BARE / 非 NULL 编码 SV32_S 或 SV32_U; interpreter case 内按
+    //     cpu->priv 分支判 PTE_U / SUM/MXR。
+    //   JIT 路径 (jit_cache key = (PA, regime); b_01 T4 fork 点真做后): 真显式吃
+    //     regime_t enum; (PA, SV32_S) 跟 (PA, SV32_U) 是两个独立槽; 块体编译时
+    //     baked priv 视角的 PTE_U / SUM/MXR check。
     //
-    // 落地修订: dispatcher 内部仍把 regime 显式算出, 表达 "这是两个独立的派发概念, 现阶段
-    //   恰好一致" + 未来 H 扩展真打破 1:1 时这里不需要重新引入变量。两个本地变量在同一
-    //   if/else 内一同赋值, 没有 inconsistent state 风险。
+    // 落地修订: dispatcher 内部仍把 regime 显式算出 (3 状态), 即使当前 interpreter 接口只
+    //   消费 current_tlb —— 是为 T4 jit_cache fork 点接入时不需要重新引入变量。
     //
     // xatp 抽象层 (有意保留): 初版 = satp; 未来 H 扩展 V=1 时 = vsatp。
     //
@@ -219,10 +223,12 @@ void dispatcher(cpu_t *hart) {
         regime      = REGIME_BARE;
         current_tlb = NULL;
     } else {
-        // Checked regime: 走 [priv][asid]
+        // Checked regime: priv == S → REGIME_SV32_S; priv == U → REGIME_SV32_U;
+        // 两 regime 共享 current_tlb 算法 (走 [priv][asid] 选叶); regime 三元区分用于
+        // JIT 一侧 baked priv (interpreter 路径仍只看 current_tlb, 不感知 S/U)。
         // satp.ASID 字段在 Sv32 中位于 bit 22..30; csr.c 的 satp 写 helper 已 WARL 截断到
         // ASID_MASK 位 (dummy.txt §3 satp 合法性契约), 所以这里直接索引安全。
-        regime      = REGIME_SV32;
+        regime      = (hart->priv == PRIV_S) ? REGIME_SV32_S : REGIME_SV32_U;
         uint32_t asid = (xatp >> 22) & ASID_MASK;
         current_tlb = hart->tlb_table[hart->priv][asid];
         // SV32 路径需 current_tlb 非 NULL 才走 walker; NULL 时走懒分配 (tlb_alloc 写回)。
@@ -241,17 +247,20 @@ void dispatcher(cpu_t *hart) {
             hart->tlb_table[hart->priv][asid] = current_tlb;
         }
     }
-    // regime 显式算出表达"两个独立的派发概念, 现阶段恰好一致, 未来 H 扩展真打破 1:1 时
-    // 这里不重新引入变量" 的设计意图; 当前下游只吃 current_tlb (NULL 编码 regime),
-    // regime 在本函数没有运行时消费者, 抑制 unused 警告。
+    // regime 显式算出 (3 状态: BARE / SV32_S / SV32_U); 当前 interpreter 路径下游只
+    // 吃 current_tlb (NULL 编码 BARE, 非 NULL 编码 SV32_S/_U; interpreter case 内按
+    // cpu->priv 分支 S/U), regime 在本函数没有运行时消费者; T4 jit_cache fork 点接入
+    // 后真消费 (key = (PA, regime)); 当前抑制 unused 警告。
     (void)regime;
 
     // ========================================================================
     // block 2: 取指路径 (mmu_translate_pc)
     //
-    // dispatcher 内部得出 (regime, current_tlb) 两件; 下游只吃 current_tlb (NULL 编码
-    // regime)。这是 mmu_translate_pc / interpret_one_block 的接口形态; JIT 一侧不同
-    // (block 编译时 baked regime, jit_cache key = (PA, regime))。
+    // dispatcher 内部得出 (regime, current_tlb) 两件; 下游 (interpreter 路径) 只吃
+    // current_tlb (NULL = BARE; 非 NULL = SV32_S 或 SV32_U, interpreter case 内按
+    // cpu->priv 分支)。这是 mmu_translate_pc / interpret_one_block 的接口形态;
+    // JIT 一侧不同 (block 编译时 baked regime, jit_cache key = (PA, regime),
+    // (PA, SV32_S) 跟 (PA, SV32_U) 是两个独立槽)。
     // ========================================================================
     uxlen_t  pa;
     uint8_t *hva;

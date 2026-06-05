@@ -32,10 +32,10 @@
 // 不重复。详 src/isa/lsu.h 顶段 + src/isa/amo.h 顶段。
 //
 // ============================================================================
-// 执行 regime —— 项目内部的"两套硬件逻辑"分类
+// 执行 regime —— 项目内部的"硬件逻辑"分类 (b_01 起 3 状态; 历史 2 状态 BARE/SV32 已扩)
 // ============================================================================
 //
-// 我们项目把所有运行时上下文按"权限规则是否 inline 检查 PTE 位"二分:
+// 我们项目把所有运行时上下文按"权限规则 + priv 视角"三分:
 //
 //   REGIME_BARE (Trust):
 //      触发条件: priv == M, 或 任何 priv 带 satp.MODE == bare
@@ -46,29 +46,52 @@
 //                       不走 TLB, 不查权限位
 //            interpreter: 同上
 //
-//   REGIME_SV32 (Checked):
-//      触发条件: priv != M 且 satp.MODE == Sv32
-//      含义: 有页表, 有 PTE 权限位; 必须按 priv + SUM/MXR 检查
-//      实现: 走 hart->tlb_table[priv][asid] 的叶 TLB
-//            mmu_translate_pc: TLB hit → 检查 PTE_X (S/U 还要 PTE_U + SUM/MXR);
+//   REGIME_SV32_S (Checked, S-priv view):
+//      触发条件: priv == S 且 satp.MODE == Sv32
+//      含义: 有页表, 有 PTE 权限位; S-priv 视角 PTE_U=0 默认; PTE_U=1 仅 SUM=1 时允许
+//            R/W (X 永不享 SUM); MXR=1 时 X-page 当 readable
+//      实现: 走 hart->tlb_table[PRIV_S][asid] 的叶 TLB
+//            mmu_translate_pc: TLB hit → check_perm(MMU_PERM_X);
 //                              miss → mmu_walk 走页表 + walker fill TLB
-//            JIT block: fast path 包含 PTE_R/W/X + PTE_U + SUM/MXR 检查 (compile-time
-//                       baked per priv; SUM/MXR 运行时 inline 读 mstatus)
-//            interpreter: 内部 switch 走对应权限规则
+//            JIT block: fast path baked S-priv 视角的 PTE_U + SUM/MXR check
+//                       (compile-time baked; SUM/MXR 运行时 inline 读 mstatus)
+//            interpreter: 内部 switch 按 cpu->priv 走 S-priv 权限规则
 //
-// dispatcher 的派发逻辑 (block 1): 概念上算出 (regime, current_tlb) 两件派发包 ——
-// regime 决定 "用哪套 PTE 检查规则", current_tlb 决定 "走 TLB 时用哪个叶"。接口层简化:
-// 下游函数只吃 current_tlb (NULL 编码 regime); dispatcher 内部仍把 regime 显式算出, 表达
-// "两个独立的派发概念, 现阶段恰好 1:1 一致" + 未来 H 扩展若打破 1:1 时不需要重新引入变量。
-// NULL 编码的可靠性: cpu_create 后 [PRIV_M] 永远 NULL (Trust 不走 TLB), dispatcher SV32
-// 路径 lazy alloc 后必非 NULL —— 调用方不可能传出 inconsistent state。
-// JIT 一侧不同: jit_cache key = (PA, regime), regime 在 JIT 块编译时 baked in 块体,
-// 选块即选 regime; 那时候用 regime_t enum 显式更安全 (是 by design 的拍法分裂)。
+//   REGIME_SV32_U (Checked, U-priv view):
+//      触发条件: priv == U 且 satp.MODE == Sv32
+//      含义: 有页表, 有 PTE 权限位; U-priv 视角 PTE_U=1 强制 (PTE_U=0 page 不可访问)
+//      实现: 走 hart->tlb_table[PRIV_U][asid] (副本于 [PRIV_S] 容器, 见 tlb.h 顶段)
+//            mmu_translate_pc: 同 SV32_S 但 perm check 走 U-priv 规则
+//            JIT block: fast path baked U-priv 视角的 PTE_U=1 forced check
+//            interpreter: 内部 switch 按 cpu->priv 走 U-priv 权限规则
 //
-// 未来扩展 (占位):
-//   - REGIME_VS (H 扩展): VS-mode 翻译 (V=1 时); cpu_create 阶段已按 misa 派发 [PRIV_U]
-//     副本, dispatcher 这里只看 priv + xatp.mode 选 regime, 不需要 misa 分支 (cpu.c
-//     [PRIV_U] 段)。当前默认 MSU 三态。
+// dispatcher 的派发逻辑 (block 1): 算出 (regime, current_tlb) 两件派发包 —— regime 决定
+// "用哪套 PTE 检查规则 + 哪种 priv 视角", current_tlb 决定 "走 TLB 时用哪个叶"。
+//
+// 接口层 by design 拍法分裂 (interpreter 路径 vs JIT 路径不一样):
+//
+//   interpreter 路径 (mmu_translate_pc / interpret_one_block): 只吃 current_tlb,
+//     NULL 编码 BARE / 非 NULL 编码 SV32_S 或 SV32_U; interpreter 不区分 S/U, 本来就
+//     runtime case 内按 cpu->priv 分支判 PTE_U / SUM/MXR; 慢路径不在 fast path, 不亏。
+//
+//   JIT 路径 (jit_cache key = (PA, regime); b_01 真起步后): 真显式吃 regime_t 三元
+//     enum; (PA, SV32_S) 跟 (PA, SV32_U) 在 jit_cache 是两个独立槽; 块体 fast path
+//     编译时 baked S 或 U 视角的 PTE_U / SUM/MXR check, 消除运行时 priv 分支跟 PTE_U
+//     检查的运行时开销 (这是 JIT 跟 interpreter 性能差的来源之一)。
+//
+// dispatcher 内部仍把 regime 显式算出, 即使当前 interpreter 接口只消费 current_tlb ——
+// 是为了未来 jit_cache 接 dispatcher 时不需要重新引入变量 (b_01 T4 fork 点真做时复用)。
+//
+// NULL 编码的可靠性 (interpreter 路径): cpu_create 后 [PRIV_M] 永远 NULL (Trust 不走
+// TLB), dispatcher SV32 路径 lazy alloc 后必非 NULL —— 调用方不可能传出 inconsistent
+// state。
+//
+// 未来扩展 (占位, 不实装):
+//   - H 扩展激活: REGIME_VS_SV32_S / _U (VS-mode, V=1 时); cpu_create 阶段已按 misa
+//     派发 [PRIV_U] 副本, dispatcher 这里只看 priv + xatp.mode + V bit 选 regime,
+//     不需要 misa 分支 (cpu.c [PRIV_U] 段)。当前默认 MSU 三态。
+//   - RV64 切换: 新加 REGIME_SV39_S / _U / REGIME_SV48_S / _U (不重命名 SV32_*;
+//     SV32/SV39/SV48 paging scheme 本来不同, enum 镜像 RV spec 真实概念, 不抽象统称)。
 //
 // ============================================================================
 // 错误模型 —— mmu_translate_pc 和 mmu_walker_* 都对接 trap, 但路径不同
@@ -174,29 +197,40 @@
 #include "riscv.h"   // PTE_R/W/X/U / MSTATUS_SUM/MXR / PRIV_U/S/M (check_perm static inline 用)
 
 // ----------------------------------------------------------------------------
-// regime_t —— 执行 regime 的 concept-level 命名 (不作为函数参数)
+// regime_t —— 执行 regime 的 concept-level 命名 (interpreter 接口 NULL/非 NULL 编码;
+//             JIT 接口真显式吃 regime_t enum, 见下)
 //
-// 当前 mmu_translate_pc / interpret_one_block 接口不真吃 regime_t 参数, 而是用
-// current_tlb 的 NULL/非 NULL 编码 (NULL = REGIME_BARE; 非 NULL = REGIME_SV32)。
+// interpreter 路径接口 (mmu_translate_pc / interpret_one_block) 用 current_tlb 的
+// NULL/非 NULL 编码 (NULL = REGIME_BARE; 非 NULL = SV32_S 或 SV32_U); interpreter 不
+// 区分 S/U, 本来就 runtime case 内按 cpu->priv 分支判 PTE_U / SUM/MXR。
 //
-// 设计依据:
-//   - cpu_create 后 hart->tlb_table[PRIV_M] 永远 NULL (Trust 不走 TLB)
-//   - dispatcher 在 SV32 路径上 lazy alloc 后必传非 NULL (dispatcher.c block 1)
-//   两条状态不可伪造, 少一个参数 = 少一个 inconsistent state 的 bug 面。
+//   设计依据:
+//     - cpu_create 后 hart->tlb_table[PRIV_M] 永远 NULL (Trust 不走 TLB)
+//     - dispatcher 在 SV32 路径上 lazy alloc 后必传非 NULL (dispatcher.c block 1)
+//     两条状态不可伪造, 少一个参数 = 少一个 inconsistent state 的 bug 面。
 //
-// regime_t enum 保留, 用途仅限于:
-//   - 模块 doc / 注释里讨论时给概念命名 (写 "REGIME_BARE 路径" 比 "current_tlb == NULL
-//     路径" 表意清楚)
-//   - dispatcher 临时 self-check 输出的 regime label 字符串
-//   - 未来 H 扩展真上时若需要 3 状态 (BARE / SV32 / VS), 再考虑回到显式参数
-//     (NULL 编码不够 3 状态; 那时是大手术, 加参数代价小)
+// JIT 路径接口 (jit_cache key = (PA, regime); b_01 真起步后) 真显式吃 regime_t enum:
+//   - 选块即选 regime (S/U 编译期 baked, jit_cache 内 (PA, SV32_S) 跟 (PA, SV32_U)
+//     是两个独立槽)
+//   - 块体 fast path 编译时 baked PTE_U / SUM/MXR check, 消除运行时 priv 分支
+//   详 src/jit/* 顶段 (T1 真起步后).
 //
-// 见上方"执行 regime"段对两个值的语义说明。
+// regime_t enum 用途:
+//   - 模块 doc / 注释里给概念命名 (写 "REGIME_SV32_S 路径" 比 "(current_tlb != NULL) &&
+//     (priv == S)" 表意清楚)
+//   - dispatcher 临时 self-check / debug trace 的 regime label 字符串
+//   - JIT 接口 (jit_cache key / jit_compile_block 参数) 真显式吃
+//
+// 见上方"执行 regime"段对三个值 (BARE / SV32_S / SV32_U) 的语义说明。
 // ----------------------------------------------------------------------------
 typedef enum {
-    REGIME_BARE = 0,    // Trust: M-mode 或任何 priv 带 bare satp; bypass TLB, identity
-    REGIME_SV32 = 1,    // Checked: S/U + Sv32 satp; via TLB + walker + perm check
-    // 未来 H 扩展: REGIME_VS = 2 (VS-mode, V=1 时)
+    REGIME_BARE   = 0,  // Trust: M-mode 或任何 priv 带 bare satp; bypass TLB, identity
+    REGIME_SV32_S = 1,  // Checked S: priv=S + satp.MODE=Sv32; PTE_U=0 默认禁 (除 SUM=1)
+    REGIME_SV32_U = 2,  // Checked U: priv=U + satp.MODE=Sv32; PTE_U=1 强制
+    // 未来扩展 (不重命名 SV32_*):
+    //   - H 扩展激活: REGIME_VS_SV32_S / _U (VS-mode, V=1 时), 同体例
+    //   - RV64 切换: 新加 REGIME_SV39_S/_U / REGIME_SV48_S/_U (SV32/SV39/SV48 paging
+    //     scheme 本来不同, enum 镜像 RV spec 真实概念, 不抽象统称)
 } regime_t;
 
 
@@ -313,7 +347,7 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 //     pa_to_fetch_hva(pa, &hva): RAM ✓ / 未来 ROM ✓ / 其它 → return 1 (access fault)
 //     不走 TLB, current_tlb 参数被忽略 (调用方可传 NULL)
 //
-//   REGIME_SV32 (Checked):
+//   REGIME_SV32_S/_U (Checked, S 或 U priv):
 //     1. 试图命中 current_tlb (V 位 + tag 比对; 命中再 check X 位):
 //          命中 + check_perm(MMU_PERM_X)=1 → 返回 PA + HVA (PA 由 HVA 反推, RAM-only TLB
 //                                            缓存让 sub 一定有效)
@@ -327,7 +361,7 @@ static inline int check_perm(cpu_t *hart, u32_t pte, mmu_perm_t perm) {
 // 参数:
 //   hart        — 调用 hart (内部读 hart->regs[0] 作为 gva = pc)
 //   current_tlb — NULL = REGIME_BARE (Trust 不走 TLB);
-//                 非 NULL = REGIME_SV32, 必须为 dispatcher 选定的叶 TLB
+//                 非 NULL = REGIME_SV32_S 或 REGIME_SV32_U, 必须为 dispatcher 选定的叶 TLB
 //                          (= hart->tlb_table[priv][asid], dispatcher lazy alloc 后保证非 NULL)
 //   pa_out      — 出参; 成功时填 PA (供 dispatcher 查 jit_cache)
 //   hva_out     — 出参; 成功时填 HVA (供 dispatcher 传 interp_one_block, 解释器直接取字节)

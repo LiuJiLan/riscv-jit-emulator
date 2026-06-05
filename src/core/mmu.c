@@ -90,7 +90,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
     }
 
     // ========================================================================
-    // REGIME_SV32 (Checked): TLB + walker + PTE 权限检查
+    // REGIME_SV32_S/_U (Checked, S 或 U priv): TLB + walker + PTE 权限检查
     //
     // 流程:
     //   1. 试图命中 current_tlb (TLB hit fast path; check_perm 复用 walker 逻辑)

@@ -30,7 +30,7 @@
 //   if (priv == M || xatp.mode == bare) {
 //       regime = REGIME_BARE;  current_tlb = NULL;        // Trust 不查 TLB
 //   } else {
-//       regime = REGIME_SV32;
+//       regime = (priv == S) ? REGIME_SV32_S : REGIME_SV32_U;
 //       current_tlb = cpu->tlb_table[priv][xatp.ASID];
 //       if (current_tlb == NULL) {                        // 仅 S/V 槽会发生
 //           current_tlb = tlb_alloc();

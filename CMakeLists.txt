@@ -128,6 +128,10 @@ add_executable(riscv_jit_emulator
         src/isa/lrsc.h
         src/isa/amo.c
         src/isa/amo.h
+        src/api/jit_api.h
+        src/api/helpers.h
+        src/jit/ir.h
+        src/jit/backend.h
 )
 
 # Test
