@@ -54,6 +54,7 @@
 #include "core/dispatcher.h"
 #include "core/wfi.h"          // wfi_init / wfi_destroy (WFI 唤醒框架; wfi_kick_all 不调用, 见 wfi.h doc)
 #include "isa/lrsc.h"          // lrsc_init / lrsc_destroy (A 扩展 reservation 数据结构; bucket 锁数组 cap 配对)
+#include "jit/jit_cache.h"     // b_01 T2 临时 self-check: jit_cache_* + jit_rcu_* (违 api/ boundary; 跟 jit_cache_selfcheck() 函数一起删)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -62,6 +63,7 @@
 #include "runtime.h"
 
 #include <pthread.h>    // pthread_create / pthread_join (s3 per-hart dispatcher 线程)
+#include <sched.h>      // sched_yield (b_01 T2 临时 self-check; 跟 jit_cache_selfcheck() 一起删)
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>     // strtoul (--load ADDR= 解析)
@@ -328,6 +330,256 @@ static int decode_test(void) {
     return fail;
 }
 
+// ============================================================================
+// jit_cache self-check (b_01 T2 临时段; main 调完 exit, 完事跟 #include 一起删)
+//
+// 覆盖 4 类 case (BLACK 状态机推 T3 jit_api Q11 a 路径真做时加, 需要
+// jit_cache_set_blacklist 接口):
+//   1. 单线程基础: init / install / lookup hit / install idempotent /
+//                  invalidate_page → miss / flush_all → miss
+//   2. per-page 链表: install 5 个不同 (pa, regime) 都同 page; invalidate_page 全清
+//   3. RCU 多 worker race: spawn 4 pthread, lookup/install/invalidate 并发跑 ~3s,
+//                          verify 没崩 (TSan 跑下 0 warning 是真验证)
+//   4. RCU grace period: reader 进 critical + sleep 200ms; writer 调 invalidate_page;
+//                        verify writer wall-clock 等了 ≥ 180ms (留 20ms 调度抖动余量)
+//
+// SELFCHECK_ASSERT: fail 时 fprintf + return -1 (caller main 接 exit 1).
+// 全 pass → return 0 (main 调 exit 0).
+// ============================================================================
+#define SELFCHECK_ASSERT(cond, msg)                                                  \
+    do {                                                                             \
+        if (!(cond)) {                                                               \
+            fprintf(stderr, "[selfcheck] FAIL %s:%d: %s" EOL, __func__, __LINE__, msg); \
+            return -1;                                                               \
+        }                                                                            \
+    } while (0)
+
+// 模拟 hart_id 给 jit_rcu_read_lock/unlock 用 (self-check 自己 spawn 的 worker 不
+// 是 real hart, 借 worker idx 当 hart_id; MAX_HARTS=8 cap 内). main 主线程也借
+// 一个 hart_id (= 0; case 1/2/4 主线程跑 lookup).
+//
+// case 3 worker arg: thread_idx (hart_id) + 测试参数. case 4 reader/writer 同.
+typedef struct {
+    uint32_t  hart_id;
+    _Atomic uint32_t *stop_flag;  // case 3 worker stop signal
+} sc_worker_arg_t;
+
+static void *sc_race_reader(void *arg) {
+    sc_worker_arg_t *a = (sc_worker_arg_t *)arg;
+    while (atomic_load_explicit(a->stop_flag, memory_order_acquire) == 0u) {
+        jit_rcu_read_lock(a->hart_id);
+        /* lookup 一些假 (pa, regime); 不验返值, 只验路径不崩 */
+        (void)jit_cache_lookup(GUEST_RAM_START + 0x1000u, REGIME_BARE);
+        (void)jit_cache_lookup(GUEST_RAM_START + 0x2000u, REGIME_SV32_S);
+        jit_rcu_read_unlock(a->hart_id);
+    }
+    return NULL;
+}
+
+static void *sc_race_writer(void *arg) {
+    sc_worker_arg_t *a = (sc_worker_arg_t *)arg;
+    uint32_t i = 0;
+    while (atomic_load_explicit(a->stop_flag, memory_order_acquire) == 0u) {
+        uxlen_t pa = GUEST_RAM_START + ((uxlen_t)(i & 0xFFu) << 12);  /* 不同 page */
+        (void)jit_cache_install(pa, REGIME_BARE, (void *)(uintptr_t)(0x1000u + i));
+        if ((i & 0x3Fu) == 0u) {
+            jit_cache_invalidate_page(i & 0xFFu);
+        }
+        if ((i & 0xFFu) == 0u) {
+            jit_cache_flush_all();
+        }
+        i++;
+    }
+    return NULL;
+}
+
+/* case 4 reader: 进 critical → 等 reader_ready=1 让 main 起 writer → sleep
+ * 200ms → 出 critical → reader_exited=1 */
+typedef struct {
+    uint32_t           hart_id;
+    _Atomic uint32_t   ready;
+    _Atomic uint32_t   exited;
+} sc_grace_reader_arg_t;
+
+static void *sc_grace_reader(void *arg) {
+    sc_grace_reader_arg_t *a = (sc_grace_reader_arg_t *)arg;
+    jit_rcu_read_lock(a->hart_id);
+    atomic_store_explicit(&a->ready, 1u, memory_order_release);
+
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000L };  /* 200ms */
+    (void)nanosleep(&ts, NULL);
+
+    jit_rcu_read_unlock(a->hart_id);
+    atomic_store_explicit(&a->exited, 1u, memory_order_release);
+    return NULL;
+}
+
+static int jit_cache_selfcheck(void) {
+    /* self-check 起 4 worker (hart_id 0..3) 模拟 RCU race + grace period.
+     * jit_rcu_synchronize 遍历用 n_harts (§15 cap-vs-n_harts 存在性遍历), 默认
+     * n_harts=1 只等 hart_id 0 — reader T2/T3 (hart_id 1/2) 在 critical 时
+     * synchronize 已返, writer 接着 invalidate+install 写 key 跟 reader 读 key
+     * 真 race (TSan 抓得到). 临时设 n_harts=4 让 synchronize 等所有 worker.
+     * self-check 跑完 exit, 不还原 n_harts (无后续路径需要). */
+    n_harts = 4;
+
+    SELFCHECK_ASSERT(jit_cache_init() == 0, "init returned non-zero");
+
+    /* ------------------------------------------------------------------------
+     * case 1: 单线程基础
+     * ---------------------------------------------------------------------- */
+    {
+        uxlen_t pa = GUEST_RAM_START + 0x4000u;
+        void *fake_host = (void *)(uintptr_t)0xCAFEBABE;
+
+        SELFCHECK_ASSERT(jit_cache_install(pa, REGIME_BARE, fake_host) == 0,
+                         "case1 install failed");
+
+        jit_rcu_read_lock(0);
+        jit_cache_entry_t *e = jit_cache_lookup(pa, REGIME_BARE);
+        SELFCHECK_ASSERT(e != NULL, "case1 lookup miss after install");
+        SELFCHECK_ASSERT(e->host_code_ptr == fake_host, "case1 host_code_ptr mismatch");
+        jit_rcu_read_unlock(0);
+
+        /* idempotent install (同 key 返 0, 不重复装) */
+        SELFCHECK_ASSERT(jit_cache_install(pa, REGIME_BARE, fake_host) == 0,
+                         "case1 install idempotent returned non-zero");
+
+        /* invalidate_page → lookup miss */
+        uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+        jit_cache_invalidate_page(page_idx);
+        jit_rcu_read_lock(0);
+        SELFCHECK_ASSERT(jit_cache_lookup(pa, REGIME_BARE) == NULL,
+                         "case1 lookup hit after invalidate_page");
+        jit_rcu_read_unlock(0);
+
+        /* re-install + flush_all → lookup miss */
+        SELFCHECK_ASSERT(jit_cache_install(pa, REGIME_BARE, fake_host) == 0,
+                         "case1 re-install failed");
+        jit_cache_flush_all();
+        jit_rcu_read_lock(0);
+        SELFCHECK_ASSERT(jit_cache_lookup(pa, REGIME_BARE) == NULL,
+                         "case1 lookup hit after flush_all");
+        jit_rcu_read_unlock(0);
+    }
+    fprintf(stderr, "[selfcheck] case 1 (basic) PASS" EOL);
+
+    /* ------------------------------------------------------------------------
+     * case 2: per-page 链表 (5 个不同 (pa, regime) 都同 page; invalidate_page 全清)
+     * ---------------------------------------------------------------------- */
+    {
+        uxlen_t base = GUEST_RAM_START + 0x8000u;   /* 单页内 5 个不同 PA */
+        for (uint32_t i = 0; i < 5; i++) {
+            uxlen_t pa = base + ((uxlen_t)i << 2);
+            SELFCHECK_ASSERT(
+                jit_cache_install(pa, REGIME_BARE,
+                                  (void *)(uintptr_t)(0xDEAD0000u + i)) == 0,
+                "case2 install failed");
+        }
+        /* 全 lookup hit verify */
+        jit_rcu_read_lock(0);
+        for (uint32_t i = 0; i < 5; i++) {
+            uxlen_t pa = base + ((uxlen_t)i << 2);
+            SELFCHECK_ASSERT(jit_cache_lookup(pa, REGIME_BARE) != NULL,
+                             "case2 lookup miss before invalidate");
+        }
+        jit_rcu_read_unlock(0);
+
+        /* invalidate_page → 5 个全清 */
+        uint32_t page_idx = (uint32_t)((base - GUEST_RAM_START) >> 12);
+        jit_cache_invalidate_page(page_idx);
+
+        jit_rcu_read_lock(0);
+        for (uint32_t i = 0; i < 5; i++) {
+            uxlen_t pa = base + ((uxlen_t)i << 2);
+            SELFCHECK_ASSERT(jit_cache_lookup(pa, REGIME_BARE) == NULL,
+                             "case2 lookup hit after invalidate_page");
+        }
+        jit_rcu_read_unlock(0);
+    }
+    fprintf(stderr, "[selfcheck] case 2 (per-page list) PASS" EOL);
+
+    /* ------------------------------------------------------------------------
+     * case 3: RCU 多 worker race (2 reader + 2 writer, 跑 3s, verify 不崩 +
+     *         TSan 下 0 warning 是更强 verify)
+     * ---------------------------------------------------------------------- */
+    {
+        _Atomic uint32_t stop = 0u;
+        sc_worker_arg_t args[4] = {
+            { .hart_id = 0, .stop_flag = &stop },
+            { .hart_id = 1, .stop_flag = &stop },
+            { .hart_id = 2, .stop_flag = &stop },
+            { .hart_id = 3, .stop_flag = &stop },
+        };
+        pthread_t threads[4];
+        SELFCHECK_ASSERT(pthread_create(&threads[0], NULL, sc_race_reader, &args[0]) == 0, "case3 spawn reader 0");
+        SELFCHECK_ASSERT(pthread_create(&threads[1], NULL, sc_race_reader, &args[1]) == 0, "case3 spawn reader 1");
+        SELFCHECK_ASSERT(pthread_create(&threads[2], NULL, sc_race_writer, &args[2]) == 0, "case3 spawn writer 0");
+        SELFCHECK_ASSERT(pthread_create(&threads[3], NULL, sc_race_writer, &args[3]) == 0, "case3 spawn writer 1");
+
+        struct timespec ts = { .tv_sec = 3, .tv_nsec = 0 };  /* 跑 3s */
+        (void)nanosleep(&ts, NULL);
+        atomic_store_explicit(&stop, 1u, memory_order_release);
+
+        for (uint32_t i = 0; i < 4; i++) {
+            (void)pthread_join(threads[i], NULL);
+        }
+        /* 跑过 = pass (没崩没 TSan 误报); flush_all 收尾让 case 4 起点干净 */
+        jit_cache_flush_all();
+    }
+    fprintf(stderr, "[selfcheck] case 3 (race 3s) PASS" EOL);
+
+    /* ------------------------------------------------------------------------
+     * case 4: RCU grace period (reader 持 critical 200ms; writer 调
+     *         invalidate_page 必须等到 reader 出 critical 才返)
+     * ---------------------------------------------------------------------- */
+    {
+        /* 先装一个 entry 让 invalidate_page 有真链表清 (不然 invalidate_page
+         * 链表是空, 但 jit_rcu_synchronize 仍走 — verify 的是 synchronize
+         * 等候行为, 跟链表内容无关) */
+        uxlen_t pa = GUEST_RAM_START + 0xC000u;
+        SELFCHECK_ASSERT(jit_cache_install(pa, REGIME_BARE,
+                                           (void *)(uintptr_t)0xBEEF) == 0,
+                         "case4 setup install failed");
+
+        sc_grace_reader_arg_t r_arg = { .hart_id = 0, .ready = 0u, .exited = 0u };
+        pthread_t r_thread;
+        SELFCHECK_ASSERT(pthread_create(&r_thread, NULL, sc_grace_reader, &r_arg) == 0,
+                         "case4 spawn reader");
+
+        /* 等 reader 进 critical (ready=1); 自旋, 反正 reader 立即就 ready */
+        while (atomic_load_explicit(&r_arg.ready, memory_order_acquire) == 0u) {
+            sched_yield();
+        }
+
+        /* writer 调 invalidate_page; 计时 */
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+        uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+        jit_cache_invalidate_page(page_idx);  /* 内部调 jit_rcu_synchronize */
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+        double elapsed_ms = (double)(t_end.tv_sec - t_start.tv_sec) * 1000.0
+                          + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1.0e6;
+
+        (void)pthread_join(r_thread, NULL);
+
+        /* invalidate_page 走完时 reader 应该已出 critical (synchronize 等过 200ms) */
+        SELFCHECK_ASSERT(elapsed_ms >= 180.0,
+                         "case4 invalidate_page returned too early (RCU did not wait)");
+        SELFCHECK_ASSERT(atomic_load_explicit(&r_arg.exited, memory_order_acquire) == 1u,
+                         "case4 reader did not exit before invalidate_page returned");
+
+        fprintf(stderr, "[selfcheck] case 4 (grace period; waited %.1f ms) PASS" EOL,
+                elapsed_ms);
+    }
+
+    jit_cache_destroy();
+    fprintf(stderr, "[selfcheck] all 4 cases PASS" EOL);
+    return 0;
+}
+#undef SELFCHECK_ASSERT
+
 // hart_exec_run — per-hart pthread routine (file-static; 适配 pthread void *(void *)
 // ABI ↔ dispatcher void(cpu_t *) 签名). cpu_t 是 hart 的"数据部分", 本函数是
 // "执行部分" — 即每个 hart 启动一个本 routine 的 pthread, 内部调一次 dispatcher
@@ -353,6 +605,19 @@ int main(int argc, char **argv) {
     // 终点在 main return 0 之前; 失败 return 1 路径不打耗时 (无意义且 fail 已 fprintf)。
     struct timespec t_start;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    // ------------------------------------------------------------------------
+    // b_01 T2 临时 jit_cache self-check (跑完直接 exit, 不进 argv parse / emulator
+    // 正常路径). 完事跟顶段 #include "jit/jit_cache.h" + jit_cache_selfcheck()
+    // 函数定义 + 本调用块一起删. T3 backend 真做时 jit_init/shutdown 走
+    // jit_api.cc forward, self-check 段不再需要.
+    // ------------------------------------------------------------------------
+    (void)argc; (void)argv;   /* self-check 不读 argv; 临时压 unused warning */
+    if (jit_cache_selfcheck() != 0) {
+        fprintf(stderr, "jit_cache_selfcheck failed" EOL);
+        exit(1);
+    }
+    exit(0);
 
     // ------------------------------------------------------------------------
     // 命令行参数解析:

@@ -43,10 +43,17 @@
 // ----------------------------------------------------------------------------
 // ir_op_kind_t —— IR op 分类 (b_01 T1 阶段只 2 条占位; b_02 真做时扩)
 //
-// 当前两条占位是块出口必需的 (plan §1.22.6 + §1.23.3):
-//   IR_OP_UNSUPPORTED   — translator 遇到 OP_UNSUPPORTED 截断块, IR 流末加这条;
-//                          dispatcher fork 点看到 host_code 返非 OK 退 interpreter
-//                          兜底 (interpreter 自己 trap_raise(cause 2))
+// 当前两条占位是块出口必需的 (plan §1.22.6 + §1.23.3; b_01 session_003 audit
+// 拍法 Q4 a):
+//   IR_OP_UNSUPPORTED   — ir_op_kind_t enum 完整性占位 (-Wswitch-enum 跟
+//                          decode / translate default case 用); Translator 撞到
+//                          OP_UNSUPPORTED 时**不进 IR buffer**, 只在 buffer 末尾
+//                          emit 一条 IR_OP_DISPATCH_EXIT(target_pc =
+//                          unsupported_inst.pc) 作块出口; 块前缀部分编译成功
+//                          (前 N 条支持指令进 IR + 末加 DISPATCH_EXIT); 运行时
+//                          dispatcher 下一轮 PC = unsupported_inst.pc 时
+//                          jit_cache miss → 调 interpret_one_inst →
+//                          OP_UNSUPPORTED case → trap_raise_exception(cause 2)
 //   IR_OP_DISPATCH_EXIT — 块出口标记, target_pc 字段填新 pc; backend emit 写
 //                          cpu->pc + ret; dispatcher 主循环重派发新 pc
 //

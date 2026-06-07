@@ -132,6 +132,8 @@ add_executable(riscv_jit_emulator
         src/api/helpers.h
         src/jit/ir.h
         src/jit/backend.h
+        src/jit/jit_cache.c
+        src/jit/jit_cache.h
 )
 
 # Test

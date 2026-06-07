@@ -13,9 +13,9 @@
 //   asmjit, plan §1.21 末段也论证过 LLVM 可行性).
 //
 // 接口形态选择 (plan §1.21):
-//   - 自制 IR + C-style vtable (本头)  ✅ 选用
-//   - 直接 RV → host (无 IR)            ❌ 否决 (backend 被迫 RV 化)
-//   - LLVM IR                            ❌ 否决 (锁死 LLVM)
+//   - 自制 IR + C-style vtable (本头)  ✓ 选用
+//   - 直接 RV → host (无 IR)            ✗ 否决 (backend 被迫 RV 化)
+//   - LLVM IR                            ✗ 否决 (锁死 LLVM)
 //
 // ============================================================================
 // 命名 (session_002 拍)
