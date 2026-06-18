@@ -6,10 +6,13 @@
 
 #include "dispatcher.h"
 
+#include "api/jit_api.h"   // b_01 T4: jit_compile_block / jit_status_t (fork 点 miss 路径调)
 #include "config.h"
 #include "cpu.h"
 #include "debug.h"      // DEBUG_REFETCH (块边界 / 跨页 / longjmp 回 sigsetjmp 落点都触发)
 #include "interpreter.h"
+#include "jit/backend.h"   // b_01 T4: jit_block_func_t cast (fork 点 hit 路径调 host_code)
+#include "jit/jit_cache.h" // b_01 T4: jit_cache_lookup / jit_rcu_read_lock/unlock + entry struct
 #include "mmu.h"
 #include "tlb.h"
 #include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
@@ -147,6 +150,15 @@ void dispatcher(cpu_t *hart) {
     total_count += local_count;
     local_count = 0;
 
+    // JIT 状态灯兜底清 (§11 (a) 候选 c; b_01 T4 接入).
+    //   语义同上"迭代头必经"协议 — host_code 内 helper 撞 trap_raise_exception
+    //   longjmp 时跳过 host_code 后续清状态灯, 由本处兜底清; 正常路径 (hit 调
+    //   host_code 跑完 + 块 3 显式清) 是冗余清 NULL release, 重复清不撞 race.
+    //   字段从 cpu_create init 起就是 NULL, hot path (正常 iteration 不跑 JIT 块)
+    //   也是清 NULL → NULL, 单次 atomic store release ~ns 量级开销, 不显著。
+    atomic_store_explicit(&hart->jit_executing_host_code, NULL,
+                          memory_order_release);
+
     // ========================================================================
     // 中断检查 (trap_check_interrupt; 详 dummy.txt §1 路径 2b' / trap.h doc 段)
     //
@@ -247,11 +259,10 @@ void dispatcher(cpu_t *hart) {
             hart->tlb_table[hart->priv][asid] = current_tlb;
         }
     }
-    // regime 显式算出 (3 状态: BARE / SV32_S / SV32_U); 当前 interpreter 路径下游只
-    // 吃 current_tlb (NULL 编码 BARE, 非 NULL 编码 SV32_S/_U; interpreter case 内按
-    // cpu->priv 分支 S/U), regime 在本函数没有运行时消费者; T4 jit_cache fork 点接入
-    // 后真消费 (key = (PA, regime)); 当前抑制 unused 警告。
-    (void)regime;
+    // regime 显式算出 (3 状态: BARE / SV32_S / SV32_U); interpreter 路径下游只吃
+    // current_tlb (NULL 编码 BARE, 非 NULL 编码 SV32_S/_U; interpreter case 内按
+    // cpu->priv 分支 S/U). JIT 一侧 fork 点 (block 3) 真消费 regime 作 jit_cache
+    // key 第二维 — b_01 T4 接入.
 
     // ========================================================================
     // block 2: 取指路径 (mmu_translate_pc)
@@ -265,7 +276,7 @@ void dispatcher(cpu_t *hart) {
     uxlen_t  pa;
     uint8_t *hva;
     int rc = mmu_translate_pc(hart, current_tlb, &pa, &hva);
-    (void)pa;       // 未来给 JIT 查 jit_cache 用, 当前 interpreter 不消费
+    // pa: block 3 fork 点真消费 (jit_cache key 第一维); hva: interpreter 路径取指起点
 
     // ========================================================================
     // mmu_translate_pc 已在内部直调 trap_set_exception_state 设好 xcause/xtval/xepc/regs[0]=xtvec,
@@ -276,29 +287,54 @@ void dispatcher(cpu_t *hart) {
     if (rc != 0) { continue; }
 
     // ========================================================================
-    // block 3: 派发到 jit / interpreter
+    // block 3: 派发到 jit / interpreter (b_01 T4 fork 点真接)
     //
-    // 完整形态 (jit_cache 接入后启用; 当前直接走 interpreter 一路):
-    //   if (jit_cache_hit) {
-    //       jit_block(hart, current_tlb, &local_counter);  // jit_cache 注册的 host_code_ptr
-    //   } else {
-    //       counter[pc]++;                                  // 热度计数 hash
-    //       if (达阈值) trigger_translate(...);              // 触发翻译 (后期改 thread 非阻塞)
-    //       interpret_one_block(hart, current_tlb, hva, &local_counter);
-    //                                                       // 解释器从 hva 直接读字节取指,
-    //                                                       // 依赖块边界保证不跨 4K page
-    //   }
-    // 出块后所有扫尾搬到迭代头 (helper longjmp 跳回 sigsetjmp 落点会跳过迭代尾;
-    // 只有迭代头才能保证一定执行)。
+    // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案):
+    //   1. jit_rcu_read_lock(hartid) — 进 RCU read critical section
+    //   2. jit_cache_lookup(pa, regime) → entry 或 NULL
+    //   3. hit: 取 host_code 指针 + atomic 点亮 cpu->jit_executing_host_code 状态灯
+    //           (RCU 内点亮; 防 backend 在 RCU grace 后立即 unmap)
+    //   4. jit_rcu_read_unlock(hartid) — 立即退 RCU (避免延伸到 host_code 执行期撞
+    //           longjmp 不安全)
+    //   5. hit: jit_block_func_t cast host_code + 调 + 正常路径跑完清状态灯;
+    //           longjmp 路径 sigsetjmp 落点迭代头扫尾兜底清 (见上方迭代头段)
+    //   6. miss: jit_compile_block(pa, regime) — T4 阶段 backend 永返 NOT_IMPLEMENTED,
+    //           jit_entry.cc Q11 a 组合层 set_blacklist + 返错码; 之后该 (PA, regime)
+    //           lookup 永远 BLACK miss → 永走 interpreter (T4 阶段 JIT 路径仍 dead
+    //           code; b_02 backend.compile_block 真编译时才有真 JIT 路径).
+    //   7. miss: interpret_one_block 兜底 — 块边界由解释器末尾 is_block_boundary_inst
+    //           自然产生.
     //
-    // 当前调用 (jit_cache / 热度计数未接): 直接 interpret_one_block, 块边界由解释器
-    // 末尾 is_block_boundary_inst 自然产生 (branch/jal/jalr 命中后退出 fetch loop)。
+    // T4 阶段无 heat counter (D2 a 拍法; b_02 真做 emit 时回头加 — 那时知道真实编译
+    // 延迟才能定阈值). jit_cache_entry_t.counter 字段保留, b_02 时 promote 用.
+    //
+    // local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在
+    // 迭代头处理 (block 1 之前); 这里只做 block 执行调用. (uint64_t *) cast 因
+    // interpret_one_block / jit_block_func_t 接口非 volatile 指针; 调用期间 volatile
+    // 语义不影响 (helper 内部本地操作), 调用前后 dispatcher 端 volatile 读写仍生效.
     // ========================================================================
-    /* local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在迭代头
-     * 处理 (block 1 之前); 这里只做 interpret_one_block 调用本身。(uint32_t *) cast 因
-     * interpret_one_block 接口非 volatile 指针; 调用期间 volatile 语义不影响 (helper 内部
-     * 本地操作), 调用前后 dispatcher 端 volatile 读写仍生效。 */
-    interpret_one_block(hart, current_tlb, hva, (uint64_t *)&local_count);
+    jit_rcu_read_lock(hart->hartid);
+    jit_cache_entry_t *e = jit_cache_lookup(pa, regime);
+    void *host_code = (e != NULL) ? e->host_code_ptr : NULL;
+    if (host_code != NULL) {
+        atomic_store_explicit(&hart->jit_executing_host_code, host_code,
+                              memory_order_release);
+    }
+    jit_rcu_read_unlock(hart->hartid);
+
+    if (host_code != NULL) {
+        jit_block_func_t fn = (jit_block_func_t)host_code;
+        fn(hart, current_tlb, (uint64_t *)&local_count);
+        atomic_store_explicit(&hart->jit_executing_host_code, NULL,
+                              memory_order_release);
+    } else {
+        // jit_compile_block 返码本身 dispatcher 不消费 (走 interpreter 兜底逻辑相同),
+        // void cast 即可. 失败 (NOT_IMPLEMENTED / IR_ERROR / BACKEND_INTERNAL) 走
+        // BLACK 黑名单, 之后 lookup miss 永不触发本路径; 成功 (b_02 后) install 进
+        // cache, 下次 fork 点 lookup hit 走 host_code 路径.
+        (void)jit_compile_block(pa, regime);
+        interpret_one_block(hart, current_tlb, hva, (uint64_t *)&local_count);
+    }
     // perf_advance(hart, local_count);  // 占位, dispatcher 不消费; 真做时也搬迭代头
 
     }  /* while (system_reset_signal == 0) */

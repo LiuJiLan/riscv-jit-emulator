@@ -58,6 +58,12 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     }
     memset(hart, 0, sizeof(*hart));
 
+    // JIT 块执行状态灯 init (§11 (a) c; b_01 T4): memset 0 已等价 NULL 初值, 但
+    // _Atomic 字段写 memset 严格说是 UB (实测全 0 layout 通用所以 work), 显式 atomic
+    // store NULL release 让 init 落到 C11 atomic 模型内. 见 cpu.h 字段顶段 doc.
+    atomic_store_explicit(&hart->jit_executing_host_code, NULL,
+                          memory_order_release);
+
     // dual storage of hartid (015):
     //   per_hart_info.mhartid (uxlen_t) — CSR 镜像; csr_mhartid_read 直读;
     //                                      跟 misa 同 per_hart_info container 走 RV spec

@@ -34,6 +34,12 @@
 #define CORE_CPU_H
 
 #include <setjmp.h>
+#ifndef __cplusplus
+#include <stdatomic.h>   // _Atomic(void *) jit_executing_host_code (§11 (a) c; T4 接入).
+                         // C++ 端 GCC 11 g++ 不接受 _Atomic extension, 整 stdatomic.h
+                         // 撞 fail; 走 C++ 端 forward decl cpu_t opaque struct 同
+                         // jit_cache.h 体例 — 见本文件下方 #ifndef __cplusplus 包.
+#endif
 #include <stdint.h>
 
 #include "riscv.h" // uxlen_t / u32_t (typedef family; dummy.txt §13)
@@ -126,6 +132,37 @@ typedef struct cpu_s {
                                                 // mie/mip_sw/mtval2/xcause/xtval/xepc/xtvec/xscratch
                                                 // 各项); MDT/SDT spec 路径 (Smdbltrp/Ssdbltrp) 替代
                                                 // 早期 in_trap 字段, 详 trap.h 顶部 + trap.c
+    // JIT 块执行状态灯 (§11 (a) 候选 c; b_01 T4 接入):
+    //   持当前正在跑的 host_code 指针 (T3 jit_block_func_t 入口指针, b_02 真做时 backend
+    //   编出的 mmap RX 段地址; NULL = 不在跑 JIT 块). 是 cpu_t 内第一个 _Atomic 字段.
+    //
+    //   dispatcher fork 点协议 (dispatcher.c 真接 in T4):
+    //     - lookup hit: RCU read_lock 内取 host_code_ptr 后 atomic store 状态灯 (release),
+    //                    然后 read_unlock 走出 critical, 调 host_code(hart, tlb, &local_count)
+    //                    在 RCU 外但状态灯保护; host_code 跑完正常路径 atomic store NULL 清.
+    //     - lookup miss: 不点亮状态灯, 走 jit_compile_block + interpret_one_block 兜底.
+    //     - sigsetjmp 落点兜底清 (longjmp 路径 host_code 内 helper trap_raise_exception
+    //       跳过 host_code 后续清状态灯代码时, 由 dispatcher.c sigsetjmp 落点兜底).
+    //
+    //   b_02 backend.invalidate_block 真做时的 caller (T4 阶段无 caller, stub nop):
+    //     按 host_code 指针扫所有 hart 此字段, 等所有 hart 跑出 (字段值不为 待 unmap
+    //     的 host_code) 才能真 unmap mmap RX 段; 跟 jit_rcu_synchronize 同 "存在性遍历
+    //     用 n_harts" 体例 (§15 cap-vs-n_harts).
+    //
+    //   memory_order: 跨 hart 读/写都用 release/acquire 配对; 当前 T4 阶段 dispatcher
+    //   单 hart 自读自写不强求严格 order, 但 release 是 b_02+ 跨 hart 同步的协议预备.
+    //
+    //   C++ 端字段类型条件 typedef 成 `void *` (非 _Atomic): GCC 11 g++ 不接受 _Atomic
+    //   keyword extension, 但 _Atomic(void *) 跟 void * 在常见 ABI 下 layout 兼容
+    //   (size = align = sizeof(void *)). C++ 端 (backend_asmjit.cc / jit_entry.cc) 不
+    //   直接读写此字段 (T4 阶段 backend stub 不接 cpu_t; b_02 真做时若需读, 用 GCC
+    //   __atomic_load_n builtin 替代 atomic_load_explicit; 那时若 layout 出问题再
+    //   reshape 跟 _Atomic 字段分离 sub-struct).
+#ifdef __cplusplus
+    void                    *jit_executing_host_code;
+#else
+    _Atomic(void *)          jit_executing_host_code;
+#endif
     cpu_info_per_hart_t      per_hart_info;     // per-hart 私有 RO CSR (mhartid + misa);
                                                 //   嵌入 (非指针, 跟 cpu_t 走); cpu_create
                                                 //   入参 mhartid + misa 写入. mhartid 同时
