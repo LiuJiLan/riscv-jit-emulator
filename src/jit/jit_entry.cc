@@ -1,0 +1,172 @@
+//
+// Created by liujilan on 2026/6/18.
+// jit/jit_entry.cc —— JIT 子系统对外入口实装 (jit_api.h 5 函数的 .cc 实装).
+//
+// ============================================================================
+// 概念分工 (b_01 session_005 拍法)
+// ============================================================================
+//
+// 本文件 = jit_api.h 入口实装 (backend-agnostic; 不绑具体后端).
+// 跟 backend_asmjit.cc 平行 — backend_asmjit.cc 是 backend 实装细节, jit_entry.cc
+// 通过 backend_get_default() 拿当前 backend_t* 调 vtable. 未来加 backend_llvm.cc
+// 时本文件零改动, backend_get_default() 内部按 build-time flag 切返哪个 backend.
+//
+// plan §1.12 行 553 "未来切换 LLVM 后端, 只是 jit_init 内部 new 不同 class, C 侧零
+// 改动" 的实状形态 — 实状走 C-style vtable + fn pointer (不是 C++ virtual class),
+// 但 "jit_api.h 入口 backend-agnostic" 这一层语义对偶.
+//
+// ============================================================================
+// 5 个 extern "C" 入口 (jit_api.h 声明)
+// ============================================================================
+//
+// jit_init / jit_shutdown — lifecycle (main POR / teardown 一次):
+//   jit_init    顺序: backend.init → jit_cache_init (backend 先 alloc 资源,
+//                                                    cache 再初始化 hash 表)
+//   jit_shutdown 反序: jit_cache_destroy → backend.destroy
+//
+// jit_flush_all (jit_compile_block Q11 a 内部组合也调; dispatcher 不直接调):
+//   jit_cache_flush_all → backend.flush_all (固定顺序; jit_cache 内 RCU sync 等
+//                                            grace period 后才能 backend 真 unmap)
+//
+// jit_invalidate_block — T3 stub nop (跟 jit_api.h 顶段 doc 一致):
+//   SMC 真路径走 jit_cache_invalidate_page (按 page 颗粒度) 不是按 (pa, regime)
+//   单块. 按块颗粒度的 caller 语义留 b_03 真做 SMC + fence.i 双保险时拍.
+//
+// jit_compile_block — Q11 a 组合层 (T4 dispatcher fork 点真做时调):
+//   step 1: backend.compile_block → JIT_OK 时 jit_cache_install + 返 JIT_OK
+//   step 2: JIT_CODE_CACHE_FULL 时 Flush + retry 1 次
+//     - jit_flush_all → backend.compile_block 二次
+//     - 二次 OK → install + 返 OK
+//     - 二次 FULL → set_blacklist + 返 JIT_BACKEND_INTERNAL
+//     - 二次撞别的错码 → 透传 step 3
+//   step 3: 非 FULL 错码 (IR_ERROR / BACKEND_INTERNAL / NOT_IMPLEMENTED):
+//     set_blacklist + 透传错码; dispatcher 看非 OK 退 interpreter
+//
+// T3 stub backend.compile_block 永返 JIT_ERR_NOT_IMPLEMENTED → 走 step 3 →
+// set_blacklist + 返 NOT_IMPLEMENTED. dispatcher fork 点 (T4 未做) 还没接,
+// 实际不触发本路径; T3 阶段骨架完整为 T4 + b_02 备好.
+//
+// ============================================================================
+// translator 占位 (T3 阶段)
+// ============================================================================
+//
+// jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径是
+//   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
+//   size_t n_insts = 0;
+//   translator_translate(pa, regime, ir_buf, &n_insts);  // b_02 真做
+//   backend.compile_block(pa, regime, ir_buf, n_insts, &host_code);
+//
+// T3 stub 阶段 translator 还没建, IR 流传 (nullptr, 0) 占位; stub backend 不读这
+// 两参所以不撞问题. b_02 真做 translator 时这里替换为 translator_translate 调用.
+//
+
+#include "api/jit_api.h"
+#include "jit/backend.h"
+#include "jit/jit_cache.h"
+
+extern "C" {
+
+// ----------------------------------------------------------------------------
+// lifecycle (main POR / teardown 一次配对; jit_cache + backend 都是单例 + 跨
+// system reset 一直跑, 跟 wfi / lrsc 体例同, system reset (while 每 iter) 不调).
+// ----------------------------------------------------------------------------
+
+void jit_init(void) {
+    const backend_t *be = backend_get_default();
+    /* backend.init 跟 jit_cache_init 当前实装都返 0 无失败路径; T3 stub backend.init
+     * 直接返 0; jit_cache_init 内部纯 atomic store 也不失败. 失败语义 (asmjit
+     * Runtime alloc OOM 等) b_02 真做时按 wfi_init / lrsc_init 体例 fprintf +
+     * 不传播 (跟 wfi/lrsc 一致), 那时调整本处签名为接 int 返码 + main 接 fail 退. */
+    (void)be->backend_init();
+    (void)jit_cache_init();
+}
+
+void jit_shutdown(void) {
+    jit_cache_destroy();
+    const backend_t *be = backend_get_default();
+    be->backend_destroy();
+}
+
+
+// ----------------------------------------------------------------------------
+// jit_flush_all — Q11 a 组合层内部用; dispatcher 不直接调 (Q11 a 拍 "dispatcher
+// 不感知 Flush").
+//
+// 顺序固定: jit_cache_flush_all → backend.flush_all
+//   jit_cache_flush_all 内部 jit_rcu_synchronize 等 grace period (旧 host_code
+//   引用全释放), 之后 backend.flush_all 才能真 reset code_cache mmap 区. 反序的话
+//   reader 还在执行旧 host_code 时 mmap 区 unmap → segfault.
+// ----------------------------------------------------------------------------
+void jit_flush_all(void) {
+    jit_cache_flush_all();
+    const backend_t *be = backend_get_default();
+    be->backend_flush_all();
+}
+
+
+// ----------------------------------------------------------------------------
+// jit_invalidate_block — T3 stub nop (跟 jit_api.h 顶段 doc 一致)
+//
+// SMC 真路径 (b_03+) 走 jit_cache_invalidate_page (按 page 颗粒度); 按 (pa,
+// regime) 单块失效语义留 b_03 真做 SMC + fence.i 双保险时拍 (start_plan_b_01
+// [4'.6] B1 user 倾向方案 B 双保险时议).
+// ----------------------------------------------------------------------------
+void jit_invalidate_block(uxlen_t pa, regime_t regime) {
+    (void)pa; (void)regime;
+}
+
+
+// ----------------------------------------------------------------------------
+// jit_compile_block — Q11 a 组合层 (dispatcher fork 点 T4 真做时调)
+//
+// 返码分流见本文件顶段 §"5 个 extern C 入口" jit_compile_block 三 step.
+// ----------------------------------------------------------------------------
+jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
+    const backend_t *be = backend_get_default();
+
+    /* T3 stub IR 流占位 — b_02 真做 translator 时替换为
+     *   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
+     *   size_t n_insts = 0;
+     *   translator_translate(pa, regime, ir_buf, &n_insts);
+     * stub backend 不读 (insts, n_insts), T3 阶段传 (nullptr, 0). */
+    const ir_inst_t *ir_stub = nullptr;
+    size_t n_insts_stub = 0;
+
+    /* step 1: 首次 compile */
+    void *host_code = nullptr;
+    jit_status_t s = be->backend_compile_block(pa, regime,
+                                               ir_stub, n_insts_stub,
+                                               &host_code);
+    if (s == JIT_OK) {
+        (void)jit_cache_install(pa, regime, host_code);
+        return JIT_OK;
+    }
+
+    /* step 2: JIT_CODE_CACHE_FULL → Flush + retry 1 次 */
+    if (s == JIT_CODE_CACHE_FULL) {
+        jit_flush_all();
+        host_code = nullptr;
+        s = be->backend_compile_block(pa, regime,
+                                      ir_stub, n_insts_stub,
+                                      &host_code);
+        if (s == JIT_OK) {
+            (void)jit_cache_install(pa, regime, host_code);
+            return JIT_OK;
+        }
+        if (s == JIT_CODE_CACHE_FULL) {
+            /* 二次 FULL: 单块 host code > 整个 code_cache, 几乎不可能 (RV block
+             * ≤ 64 inst × ~16 byte/inst < 1KB; 1MB+ code_cache) — 真撞是 bug.
+             * 进 BLACK + 返 BACKEND_INTERNAL (跟 IR_ERROR / 真 BACKEND_INTERNAL
+             * 同处理, dispatcher 退 interpreter). */
+            (void)jit_cache_set_blacklist(pa, regime);
+            return JIT_BACKEND_INTERNAL;
+        }
+        /* 二次撞别的错码 (IR_ERROR / BACKEND_INTERNAL / NOT_IMPLEMENTED) 透传 step 3 */
+    }
+
+    /* step 3: 非 FULL 错码透传 — set_blacklist + 透传; dispatcher 退 interpreter */
+    (void)jit_cache_set_blacklist(pa, regime);
+    return s;
+}
+
+}  // extern "C"

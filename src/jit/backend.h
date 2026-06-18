@@ -69,10 +69,41 @@ extern "C" {
 #endif
 
 // ----------------------------------------------------------------------------
+// jit_block_func_t —— JIT 编译产物 (host_code_ptr) 的函数签名 (Q1 a, 统一签名)
+//
+// 跟 interpret_one_block 对偶 (core/interpreter.h):
+//   void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
+//                            uint8_t *hva_pc, uint64_t *count_out);
+// JIT 块入口 = host_code_ptr 自己 (mmap RX 段), 不需 hva_pc 起点 → 减一参; 其他
+// 三参跟 interpreter 完全对偶, dispatcher fork 点 hit/miss 两侧调用代码不分支
+// regime (BARE 块也接 current_tlb, dispatcher 按 BARE 时传 NULL, 跟 interpreter
+// 路径同一 NULL 编码).
+//
+// 统一签名所有 regime (REGIME_BARE / REGIME_SV32_S / REGIME_SV32_U, 未来 H 扩展
+// REGIME_VS_SV32_S/_U, RV64 REGIME_SV39_S/_U 等都同签名); jit_cache entry 简洁
+// (一个 host_code_ptr 字段, 类型 cast 成 jit_block_func_t).
+//
+// 类型: 第二参 tlb_t * + 第三参 uint64_t * 跟 dispatcher.c 102-108 "count 一律
+// 64 bit" 心智一致 (audit 文档写的 tlb_p / uint32_t * 是 plan_sample 占位, 按
+// memory feedback_plan_sample_not_dogma 实际跟 src 对偶取 tlb_t * + uint64_t *).
+//
+// 调用方 (T4 dispatcher fork 点 hit 路径; 未做):
+//   jit_block_func_t fn = (jit_block_func_t)entry->host_code_ptr;
+//   uint64_t local_count = 0;
+//   fn(hart, current_tlb, &local_count);
+//   total_count += local_count;
+// ----------------------------------------------------------------------------
+typedef void (*jit_block_func_t)(cpu_t *hart, tlb_t *current_tlb,
+                                 uint64_t *count_out);
+
+
+// ----------------------------------------------------------------------------
 // backend_t —— JitBackend 抽象接口的 vtable
 //
-// 实例由 backend_asmjit.cc (C++ 实现) 暴露 (extern "C" wrapper); jit_api.cc /
-// jit_api 内部组合代码持有 backend_t * 指针调度.
+// 实例由 backend_asmjit.cc (C++ 实现) 暴露 (extern "C" backend_get_default
+// 返指针); jit_entry.cc (jit_api.h 入口实装, backend-agnostic) 持有 backend_t *
+// 指针调度. 未来加 backend_llvm.cc 时是另一份 .cc 暴露另一 backend_t 实例,
+// jit_entry.cc 零改动.
 //
 // T1 阶段签名占位 (T3 真做时拍最终形态).
 // ----------------------------------------------------------------------------

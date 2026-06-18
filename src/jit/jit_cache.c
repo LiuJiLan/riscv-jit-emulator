@@ -285,6 +285,67 @@ got_slot:
 
 
 /* ============================================================================
+ * jit_cache_set_blacklist — Q11 a 二次 FULL 路径; (PA, regime) 进 BLACK
+ *
+ * 跟 install 同体例 (CAS EMPTY→COUNTING → 填字段 → 挂链表 → store release),
+ * 差异: terminal status = BLACK, host_code_ptr = NULL.
+ *
+ * 撞已有 COMPILED 同 key 直接返 0 (别 hart 已成功 install, 保留 COMPILED 更合理;
+ * BLACK 本意"永远编不出"但别 hart 能编说明这块能编, race 下保留好的). 撞 BLACK
+ * 同 key 也返 0 idempotent. T3 session_005 jit_entry.cc Q11 a 组合层调本接口.
+ * ============================================================================ */
+int jit_cache_set_blacklist(uxlen_t pa, regime_t regime) {
+    size_t idx = jit_cache_hash(pa, regime);
+    uint32_t slot_idx_u32 = 0;
+    jit_cache_entry_t *e = NULL;
+
+    for (uint32_t step = 0; step < JIT_INSTALL_MAX_PROBES; step++) {
+        uint32_t slot = ((uint32_t)idx + step) & JIT_CACHE_MASK;
+        e = &hash_table[slot];
+
+        uint32_t expected = (uint32_t)JIT_CACHE_EMPTY;
+        if (atomic_compare_exchange_strong_explicit(
+                &e->status, &expected,
+                (uint32_t)JIT_CACHE_COUNTING,
+                memory_order_acq_rel, memory_order_acquire)) {
+            slot_idx_u32 = slot;
+            goto got_slot;
+        }
+        if ((expected == (uint32_t)JIT_CACHE_COMPILED
+             || expected == (uint32_t)JIT_CACHE_BLACK)
+            && e->key_pa == pa && e->key_regime == regime) {
+            return 0;
+        }
+    }
+    return -1;   /* 探测耗尽; caller 通常忽略 (退 interpreter). */
+
+got_slot:
+    e->key_pa        = pa;
+    e->key_regime    = regime;
+    e->counter       = 0;
+    e->host_code_ptr = NULL;          /* BLACK 无编译产物 */
+
+    uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+    if (page_idx < GUEST_RAM_NPAGES) {
+        uint16_t old_head = atomic_load_explicit(&page_block_head[page_idx],
+                                                 memory_order_acquire);
+        do {
+            e->next_in_page = old_head;
+        } while (!atomic_compare_exchange_weak_explicit(
+                     &page_block_head[page_idx], &old_head,
+                     (uint16_t)slot_idx_u32,
+                     memory_order_acq_rel, memory_order_acquire));
+    } else {
+        e->next_in_page = JIT_PAGE_HEAD_END;
+    }
+
+    atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_BLACK,
+                          memory_order_release);
+    return 0;
+}
+
+
+/* ============================================================================
  * jit_cache_invalidate_page — RCU modify-side, sync grace period
  *
  * 顺 old_head 链表清 status → synchronize → backend.invalidate_block (T2 stub nop).
@@ -312,10 +373,12 @@ void jit_cache_invalidate_page(uint32_t page_idx) {
      * hart 持有, backend 可安全 unmap host_code mmap 区 (T2 stub nop). */
     jit_rcu_synchronize();
 
-    /* T2 阶段 backend stub nop; b_03 真做后调
+    /* T3 阶段 backend stub nop; b_02+ 真做 emit 后调
      *   const backend_t *be = backend_get_default();
      *   for (清完的每个 slot.host_code_ptr) be->backend_invalidate_block(...);
-     * T2 阶段 host_code_ptr 都是 self-check 假指针, 没真 mmap. */
+     * T3 阶段 host_code_ptr 永是 NULL (stub backend.compile_block 返
+     * NOT_IMPLEMENTED 不真 install); b_02 真做 emit 时 backend 编 host code
+     * 进 mmap RX 段, 这时 backend.invalidate_block 真 unmap. */
 }
 
 

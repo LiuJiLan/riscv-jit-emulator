@@ -46,9 +46,9 @@
 // 接口分两组
 // ============================================================================
 //
-// jit_cache_*    — hash table + per-page list 操作; caller = jit_api.c 组合层
-//                   (jit_init / jit_flush_all forward) + main 临时 self-check
-//                   (T2 阶段直接 #include 进 main; 完事段删)
+// jit_cache_*    — hash table + per-page list 操作; caller = jit_entry.cc 组合层
+//                   (jit_init / jit_flush_all forward); T2 阶段 main self-check
+//                   也作 caller, T3 session_005 删除
 //   jit_cache_init / destroy           — lifecycle (main POR / 退出段调)
 //   jit_cache_lookup                   — RCU read-side (caller 已调 jit_rcu_read_lock)
 //   jit_cache_install                  — RCU modify-side (atomic CAS slot status)
@@ -73,15 +73,24 @@
 #ifndef JIT_JIT_CACHE_H
 #define JIT_JIT_CACHE_H
 
-#include <stdatomic.h>
 #include <stdint.h>
+#ifndef __cplusplus
+#include <stdatomic.h>     // C++ 端 GCC 11 g++ 不接受 _Atomic extension, 整 stdatomic.h
+                           // 在 C++ 编译撞 fail; C++ caller (jit_entry.cc) 不实例化
+                           // entry struct 也不调 jit_rcu_*, 不需要 atomic 类型可见.
+#endif
 
 #include "core/mmu.h"   // regime_t (key 第二维; mmu.h 不重复 include riscv.h)
 #include "riscv.h"      // uxlen_t (key_pa; dummy.txt §13 typedef family)
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
+
+#ifndef __cplusplus
 // ----------------------------------------------------------------------------
-// jit_cache_status_t —— hash entry 状态机 (b_01 T2 4 状态)
+// jit_cache_status_t —— hash entry 状态机 (b_01 T2 4 状态; C 端可见, C++ 端不暴露)
 //
 //   EMPTY    — 空槽; lookup 终止线性探测 (开放寻址 sentinel)
 //   COUNTING — install 进行中 (CAS EMPTY→COUNTING 后填字段中); lookup 视为 miss
@@ -127,7 +136,7 @@ typedef enum {
 //   status = COMPILED 配 lookup acquire load 形成 happens-before, lookup 看到
 //   COMPILED 时其他字段已 visible.
 // ----------------------------------------------------------------------------
-typedef struct {
+typedef struct jit_cache_entry_s {
     uxlen_t           key_pa;
     regime_t          key_regime;
     _Atomic uint32_t  status;          // jit_cache_status_t
@@ -135,6 +144,21 @@ typedef struct {
     void             *host_code_ptr;
     uint16_t          next_in_page;
 } jit_cache_entry_t;
+
+#else
+// ----------------------------------------------------------------------------
+// C++ 端: forward decl entry struct (opaque type)
+//
+// 真做 C++ caller (jit_entry.cc) 只调 lifecycle / install / flush / set_blacklist,
+// 不实例化 entry struct 也不读字段, opaque pointer 够用. jit_cache_lookup 返
+// jit_cache_entry_t * 在 C++ 端是 opaque 指针 (访问字段会撞 incomplete type fail);
+// dispatcher fork 点 T4 真做时调 lookup, 那是 C 文件不撞此问题.
+//
+// 这条避绕是因 GCC 11 g++ 不接受 _Atomic keyword extension (升 GCC 13+ 后可重审).
+// ----------------------------------------------------------------------------
+typedef struct jit_cache_entry_s jit_cache_entry_t;
+
+#endif // ifndef __cplusplus
 
 
 // ----------------------------------------------------------------------------
@@ -194,10 +218,39 @@ jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime);
 //   -1 — install FULL (探测 N 步都没 EMPTY slot → hash table 满 → caller Flush)
 //
 // caller (jit_api 层) 处理 -1 (Q11 a): 调 jit_flush_all + 再调 install 重试 1 次;
-// 二次 -1 进 BLACK (set status = BLACK; 跟 IR_ERROR / BACKEND_INTERNAL 同处理).
-// T2 阶段 jit_api stub backend 跑不通 retry, T3 backend 真做时拍最终形态.
+// 二次 -1 调 jit_cache_set_blacklist (本头下方接口) 让 (PA, regime) 进 BLACK.
 // ----------------------------------------------------------------------------
 int  jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr);
+
+
+// ----------------------------------------------------------------------------
+// jit_cache_set_blacklist —— set (PA, regime) 为 BLACK (Q11 a 二次 FULL 路径)
+//
+// 跟 install 同探测体例 (CAS EMPTY→COUNTING → 填字段 → 挂 page_block_head →
+// store BLACK release); 差异:
+//   - host_code_ptr = NULL (BLACK 无编译产物)
+//   - terminal status = JIT_CACHE_BLACK (lookup 看 BLACK 视 miss + 跳过此 PC)
+//
+// 调用方 (jit_api 层 Q11 a):
+//   s = backend.compile_block(...);  // 二次 FULL
+//   if (s == JIT_CODE_CACHE_FULL) {
+//       jit_cache_set_blacklist(pa, regime);
+//       return JIT_BACKEND_INTERNAL;
+//   }
+//
+// idempotent: 撞到已有 COMPILED 同 key (别 hart 已成功 install) 直接返 0, 不
+//   强制覆盖 — BLACK 本意"该 block 永远编不出", 但其他 hart 编出说明能编, race
+//   情况下保留 COMPILED 更合理; 撞 BLACK 同 key 也返 0 (idempotent).
+//
+// BLACK 也挂 page_block_head 链表 (Q12 c: SMC invalidate_page 顺链清 BLACK →
+//   EMPTY, 给代码改后新机会编译; flush_all 也清 BLACK).
+//
+// 返:
+//   0  — set BLACK 成功 (或 idempotent 撞同 key COMPILED/BLACK)
+//   -1 — 探测 N 步耗尽 (hash table 仍满, 跟 install 一致; caller 通常忽略 — 二次
+//        FULL 已经是兜底, 探测 FULL 也只能退 interpreter 跑这个 PC)
+// ----------------------------------------------------------------------------
+int  jit_cache_set_blacklist(uxlen_t pa, regime_t regime);
 
 
 // ----------------------------------------------------------------------------
@@ -213,7 +266,7 @@ int  jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr);
 //      mmap 区
 //
 // caller: b_03 SMC handler 触发 page_dirty bitmap → dispatcher 主循环顶扫
-// bitmap → 调 jit_cache_invalidate_page(page_idx); T2 阶段 self-check 模拟调用.
+// bitmap → 调 jit_cache_invalidate_page(page_idx); 真触发端到端 verify 推 b_03.
 // ----------------------------------------------------------------------------
 void jit_cache_invalidate_page(uint32_t page_idx);
 
@@ -277,5 +330,8 @@ void jit_rcu_read_lock  (uint32_t hart_id);
 void jit_rcu_read_unlock(uint32_t hart_id);
 void jit_rcu_synchronize(void);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif //JIT_JIT_CACHE_H
