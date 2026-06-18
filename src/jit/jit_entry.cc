@@ -3,7 +3,7 @@
 // jit/jit_entry.cc —— JIT 子系统对外入口实装 (jit_api.h 5 函数的 .cc 实装).
 //
 // ============================================================================
-// 概念分工 (b_01 session_005 拍法)
+// 概念分工
 // ============================================================================
 //
 // 本文件 = jit_api.h 入口实装 (backend-agnostic; 不绑具体后端).
@@ -28,11 +28,11 @@
 //   jit_cache_flush_all → backend.flush_all (固定顺序; jit_cache 内 RCU sync 等
 //                                            grace period 后才能 backend 真 unmap)
 //
-// jit_invalidate_block — T3 stub nop (跟 jit_api.h 顶段 doc 一致):
+// jit_invalidate_block — stub nop (跟 jit_api.h 顶段 doc 一致):
 //   SMC 真路径走 jit_cache_invalidate_page (按 page 颗粒度) 不是按 (pa, regime)
 //   单块. 按块颗粒度的 caller 语义留 b_03 真做 SMC + fence.i 双保险时拍.
 //
-// jit_compile_block — Q11 a 组合层 (T4 dispatcher fork 点真做时调):
+// jit_compile_block — Q11 a 组合层 (dispatcher fork 点 miss 路径调):
 //   step 1: backend.compile_block → JIT_OK 时 jit_cache_install + 返 JIT_OK
 //   step 2: JIT_CODE_CACHE_FULL 时 Flush + retry 1 次
 //     - jit_flush_all → backend.compile_block 二次
@@ -42,12 +42,13 @@
 //   step 3: 非 FULL 错码 (IR_ERROR / BACKEND_INTERNAL / NOT_IMPLEMENTED):
 //     set_blacklist + 透传错码; dispatcher 看非 OK 退 interpreter
 //
-// T3 stub backend.compile_block 永返 JIT_ERR_NOT_IMPLEMENTED → 走 step 3 →
-// set_blacklist + 返 NOT_IMPLEMENTED. dispatcher fork 点 (T4 未做) 还没接,
-// 实际不触发本路径; T3 阶段骨架完整为 T4 + b_02 备好.
+// stub backend.compile_block 永返 JIT_ERR_NOT_IMPLEMENTED → 走 step 3 →
+// set_blacklist + 返 NOT_IMPLEMENTED. 当前实际触发路径 = dispatcher fork 点
+// miss → jit_compile_block → 永走 step 3 进 BLACK; b_02 backend 真编译成功后
+// 才有 step 1 install 路径走通.
 //
 // ============================================================================
-// translator 占位 (T3 阶段)
+// translator 占位
 // ============================================================================
 //
 // jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径是
@@ -56,8 +57,8 @@
 //   translator_translate(pa, regime, ir_buf, &n_insts);  // b_02 真做
 //   backend.compile_block(pa, regime, ir_buf, n_insts, &host_code);
 //
-// T3 stub 阶段 translator 还没建, IR 流传 (nullptr, 0) 占位; stub backend 不读这
-// 两参所以不撞问题. b_02 真做 translator 时这里替换为 translator_translate 调用.
+// 当前 translator 还没建, IR 流传 (nullptr, 0) 占位; stub backend 不读这两参
+// 所以不撞问题. b_02 真做 translator 时这里替换为 translator_translate 调用.
 //
 
 #include "api/jit_api.h"
@@ -117,18 +118,18 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
 
 
 // ----------------------------------------------------------------------------
-// jit_compile_block — Q11 a 组合层 (dispatcher fork 点 T4 真做时调)
+// jit_compile_block — Q11 a 组合层 (dispatcher fork 点 miss 路径调)
 //
 // 返码分流见本文件顶段 §"5 个 extern C 入口" jit_compile_block 三 step.
 // ----------------------------------------------------------------------------
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
     const backend_t *be = backend_get_default();
 
-    /* T3 stub IR 流占位 — b_02 真做 translator 时替换为
+    /* stub IR 流占位 — b_02 真做 translator 时替换为
      *   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
      *   size_t n_insts = 0;
      *   translator_translate(pa, regime, ir_buf, &n_insts);
-     * stub backend 不读 (insts, n_insts), T3 阶段传 (nullptr, 0). */
+     * stub backend 不读 (insts, n_insts), 当前传 (nullptr, 0). */
     const ir_inst_t *ir_stub = nullptr;
     size_t n_insts_stub = 0;
 

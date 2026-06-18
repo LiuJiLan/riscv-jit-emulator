@@ -77,9 +77,9 @@ add_compile_definitions(
 include_directories(src)
 
 # asmjit 第三方库 (JitBackend 抽象的当前唯一实装; backend_asmjit.cc 用).
-# b_01 session_005 拍 FetchContent 方式 (跟项目"无外部 system 依赖"风格一致;
-# 跟 EBR 自实现避免外部依赖同哲学 — asmjit 是 backend 后端不是核心算法, 不需
-# 完全把握, 但要 self-contained build).
+# FetchContent 方式 (跟项目"无外部 system 依赖"风格一致; 跟 EBR 自实现避免外部
+# 依赖同哲学 — asmjit 是 backend 后端不是核心算法, 不需完全把握, 但要 self-
+# contained build).
 #
 # GIT_TAG 钉特定 commit (而非 master) 防 upstream 变化破 build. 当前钉
 # 13eb299 = v1.18 + install missing core/span.h 修复 bug, cmake_minimum_required
@@ -157,8 +157,8 @@ add_executable(riscv_jit_emulator
         src/jit/jit_entry.cc
 )
 
-# asmjit link (backend_asmjit.cc T3 stub 阶段不真用 asmjit symbol; link 路径
-# 提前就位让 cmake configure 期 verify FetchContent + b_02 真 emit 时无 link 改动).
+# asmjit link (backend_asmjit.cc stub 阶段不真用 asmjit symbol; link 路径提前
+# 就位 — cmake configure 期 verify FetchContent + b_02 真 emit 时无 link 改动).
 target_link_libraries(riscv_jit_emulator PRIVATE asmjit)
 
 # Test

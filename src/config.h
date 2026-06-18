@@ -37,7 +37,7 @@
 // 留足空间,后期不用回头改。
 #define GUEST_RAM_SIZE    (128UL * 1024 * 1024)
 
-// guest RAM 4KB page 数 (jit_cache per-page block list 索引上限; b_01 T2 起用).
+// guest RAM 4KB page 数 (jit_cache per-page block list 索引上限).
 // = 128MB / 4KB = 32768 pages; page_block_head[GUEST_RAM_NPAGES] _Atomic uint16_t
 // = 64KB (跟 64MB jit_cache hash table 总体 ~2.06MB, 系统内存可忽略).
 #define GUEST_RAM_NPAGES  (GUEST_RAM_SIZE / 4096UL)

@@ -18,7 +18,7 @@
 //   - LLVM IR                            ✗ 否决 (锁死 LLVM)
 //
 // ============================================================================
-// 命名 (session_002 拍)
+// 命名
 // ============================================================================
 //
 // vtable 函数指针 prefix `backend_*` (不加 jit_ 前缀, jit/ 目录内无歧义):
@@ -32,15 +32,14 @@
 //   backend.*       = 后端实现细节 (jit_api 内部组合用, dispatcher 不直接见)
 //
 // ============================================================================
-// b_01 T1 阶段范围 (本文件)
+// 当前实状
 // ============================================================================
 //
-// T1 阶段只放 vtable struct + 5 fn pointer 签名占位; T3 backend / translator
-// 全 stub 时 backend_asmjit.cc 暴露一个 default backend 实例 (5 个 fn pointer
-// 都填 stub 函数 — compile_block 总返 JIT_ERR_NOT_IMPLEMENTED, 其他 nop).
+// backend_asmjit.cc 暴露一个 default backend 实例 (5 个 fn pointer 都填 stub
+// 函数 — compile_block 永返 JIT_ERR_NOT_IMPLEMENTED, 其他 nop). b_02 真做 emit
+// 时填真 asmjit 翻译路径.
 //
-// 签名细节 (T3 真做时可调整 — 当前是 best guess 占位, 真做时按 backend 真需要
-// 的形态拍):
+// 签名可能演化 (b_02 真做时按 backend 真需要拍, 当前是骨架形态):
 //   - backend_compile_block 当前签名带 (pa, regime, ir 流, n_insts, host_code 出参);
 //     真做时可能拆 host_code 出参为返值 + status 拆出, 或加 hart 参数 baked
 //     mstatus snapshot 等
@@ -84,10 +83,10 @@ extern "C" {
 // (一个 host_code_ptr 字段, 类型 cast 成 jit_block_func_t).
 //
 // 类型: 第二参 tlb_t * + 第三参 uint64_t * 跟 dispatcher.c 102-108 "count 一律
-// 64 bit" 心智一致 (audit 文档写的 tlb_p / uint32_t * 是 plan_sample 占位, 按
-// memory feedback_plan_sample_not_dogma 实际跟 src 对偶取 tlb_t * + uint64_t *).
+// 64 bit" 心智一致 (实状跟 src 对偶取 tlb_t * + uint64_t *, 不是 audit 原稿
+// 的 tlb_p / uint32_t * plan_sample).
 //
-// 调用方 (T4 dispatcher fork 点 hit 路径; 未做):
+// 调用方 (dispatcher fork 点 hit 路径):
 //   jit_block_func_t fn = (jit_block_func_t)entry->host_code_ptr;
 //   uint64_t local_count = 0;
 //   fn(hart, current_tlb, &local_count);
@@ -105,7 +104,7 @@ typedef void (*jit_block_func_t)(cpu_t *hart, tlb_t *current_tlb,
 // 指针调度. 未来加 backend_llvm.cc 时是另一份 .cc 暴露另一 backend_t 实例,
 // jit_entry.cc 零改动.
 //
-// T1 阶段签名占位 (T3 真做时拍最终形态).
+// 签名占位 (b_02 真做 emit 时按 backend 真需要的形态拍).
 // ----------------------------------------------------------------------------
 typedef struct {
     // backend_init: 后端 init (asmjit Runtime 创建 / code_cache mmap 区分配 / ...).
@@ -130,34 +129,34 @@ typedef struct {
     //     JIT_CODE_CACHE_FULL     — code_cache mmap 区满, 调用方触发整体 Flush
     //     JIT_IR_ERROR            — IR 内部不一致 (translator bug); 调用方进黑名单
     //     JIT_BACKEND_INTERNAL    — asmjit 内部错; 调用方进黑名单 / 退 interpreter
-    //     JIT_ERR_NOT_IMPLEMENTED — T3 stub 阶段总返这个
+    //     JIT_ERR_NOT_IMPLEMENTED — stub 阶段总返这个
     //
-    //   T1 stub: 返 JIT_ERR_NOT_IMPLEMENTED, *host_code_out = NULL.
+    //   stub: 返 JIT_ERR_NOT_IMPLEMENTED, *host_code_out = NULL.
     jit_status_t (*backend_compile_block)(uxlen_t pa, regime_t regime,
                                           const ir_inst_t *insts, size_t n_insts,
                                           void **host_code_out);
 
     // backend_invalidate_block: 失效 host_code (从 code_cache mmap 区抹掉 / 标
     //   dead 等). 当前签名按 host_code 索引; T3 真做时可能改按 (pa, regime).
-    //   T1 stub: nop.
+    //   stub: nop.
     void (*backend_invalidate_block)(void *host_code);
 
     // backend_flush_all: 整体 Flush code_cache (CODE_CACHE_FULL 时调).
-    //   T1 stub: nop.
+    //   stub: nop.
     void (*backend_flush_all)(void);
 
     // backend_destroy: 释放 backend 资源 (asmjit Runtime / code_cache mmap unmap).
     //   不含 pthread_join (dummy.txt §12 — destroy 不 join).
-    //   T1 stub: nop.
+    //   stub: nop.
     void (*backend_destroy)(void);
 } backend_t;
 
 
 // ----------------------------------------------------------------------------
-// backend 实例获取 (T3 backend_asmjit.cc extern "C" 暴露)
+// backend 实例获取 (backend_asmjit.cc extern "C" 暴露)
 //
-// T1 阶段函数仅声明; T3 真做时 backend_asmjit.cc 实装返一个 file-static backend_t
-// 实例的指针 (单例; SMP 多 hart 共享一个 backend, 跟 jit_cache 同步)
+// backend_asmjit.cc 实装返一个 file-static backend_t 实例的指针 (单例;
+// SMP 多 hart 共享一个 backend, 跟 jit_cache 同步).
 // ----------------------------------------------------------------------------
 const backend_t *backend_get_default(void);
 

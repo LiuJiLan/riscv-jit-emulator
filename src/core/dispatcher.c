@@ -6,13 +6,13 @@
 
 #include "dispatcher.h"
 
-#include "api/jit_api.h"   // b_01 T4: jit_compile_block / jit_status_t (fork 点 miss 路径调)
+#include "api/jit_api.h"   // jit_compile_block / jit_status_t (fork 点 miss 路径调)
 #include "config.h"
 #include "cpu.h"
 #include "debug.h"      // DEBUG_REFETCH (块边界 / 跨页 / longjmp 回 sigsetjmp 落点都触发)
 #include "interpreter.h"
-#include "jit/backend.h"   // b_01 T4: jit_block_func_t cast (fork 点 hit 路径调 host_code)
-#include "jit/jit_cache.h" // b_01 T4: jit_cache_lookup / jit_rcu_read_lock/unlock + entry struct
+#include "jit/backend.h"   // jit_block_func_t cast (fork 点 hit 路径调 host_code)
+#include "jit/jit_cache.h" // jit_cache_lookup / jit_rcu_read_lock/unlock + entry struct
 #include "mmu.h"
 #include "tlb.h"
 #include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
@@ -150,7 +150,7 @@ void dispatcher(cpu_t *hart) {
     total_count += local_count;
     local_count = 0;
 
-    // JIT 状态灯兜底清 (§11 (a) 候选 c; b_01 T4 接入).
+    // JIT 状态灯兜底清 (§11 (a) 候选 c).
     //   语义同上"迭代头必经"协议 — host_code 内 helper 撞 trap_raise_exception
     //   longjmp 时跳过 host_code 后续清状态灯, 由本处兜底清; 正常路径 (hit 调
     //   host_code 跑完 + 块 3 显式清) 是冗余清 NULL release, 重复清不撞 race.
@@ -211,7 +211,7 @@ void dispatcher(cpu_t *hart) {
     //   interpreter 路径 (mmu_translate_pc / interpret_one_block): 只吃 current_tlb,
     //     NULL 编码 BARE / 非 NULL 编码 SV32_S 或 SV32_U; interpreter case 内按
     //     cpu->priv 分支判 PTE_U / SUM/MXR。
-    //   JIT 路径 (jit_cache key = (PA, regime); b_01 T4 fork 点真做后): 真显式吃
+    //   JIT 路径 (jit_cache key = (PA, regime); fork 点真做): 真显式吃
     //     regime_t enum; (PA, SV32_S) 跟 (PA, SV32_U) 是两个独立槽; 块体编译时
     //     baked priv 视角的 PTE_U / SUM/MXR check。
     //
@@ -262,7 +262,7 @@ void dispatcher(cpu_t *hart) {
     // regime 显式算出 (3 状态: BARE / SV32_S / SV32_U); interpreter 路径下游只吃
     // current_tlb (NULL 编码 BARE, 非 NULL 编码 SV32_S/_U; interpreter case 内按
     // cpu->priv 分支 S/U). JIT 一侧 fork 点 (block 3) 真消费 regime 作 jit_cache
-    // key 第二维 — b_01 T4 接入.
+    // key 第二维.
 
     // ========================================================================
     // block 2: 取指路径 (mmu_translate_pc)
@@ -287,7 +287,7 @@ void dispatcher(cpu_t *hart) {
     if (rc != 0) { continue; }
 
     // ========================================================================
-    // block 3: 派发到 jit / interpreter (b_01 T4 fork 点真接)
+    // block 3: 派发到 jit / interpreter (fork 点)
     //
     // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案):
     //   1. jit_rcu_read_lock(hartid) — 进 RCU read critical section
@@ -298,14 +298,15 @@ void dispatcher(cpu_t *hart) {
     //           longjmp 不安全)
     //   5. hit: jit_block_func_t cast host_code + 调 + 正常路径跑完清状态灯;
     //           longjmp 路径 sigsetjmp 落点迭代头扫尾兜底清 (见上方迭代头段)
-    //   6. miss: jit_compile_block(pa, regime) — T4 阶段 backend 永返 NOT_IMPLEMENTED,
-    //           jit_entry.cc Q11 a 组合层 set_blacklist + 返错码; 之后该 (PA, regime)
-    //           lookup 永远 BLACK miss → 永走 interpreter (T4 阶段 JIT 路径仍 dead
-    //           code; b_02 backend.compile_block 真编译时才有真 JIT 路径).
+    //   6. miss: jit_compile_block(pa, regime) — 当前 stub backend 永返
+    //           NOT_IMPLEMENTED, jit_entry.cc Q11 a 组合层 set_blacklist + 返错码;
+    //           之后该 (PA, regime) lookup 永远 BLACK miss → 永走 interpreter
+    //           (当前 JIT 路径仍 dead code; b_02 backend.compile_block 真编译时才有
+    //           真 JIT 路径).
     //   7. miss: interpret_one_block 兜底 — 块边界由解释器末尾 is_block_boundary_inst
     //           自然产生.
     //
-    // T4 阶段无 heat counter (D2 a 拍法; b_02 真做 emit 时回头加 — 那时知道真实编译
+    // 当前无 heat counter (D2 a 拍法; b_02 真做 emit 时回头加 — 那时知道真实编译
     // 延迟才能定阈值). jit_cache_entry_t.counter 字段保留, b_02 时 promote 用.
     //
     // local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在

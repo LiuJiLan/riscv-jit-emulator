@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/6/7.
-// jit/jit_cache.c —— JIT 块缓存 + EBR RCU 实装 (b_01 T2).
+// jit/jit_cache.c —— JIT 块缓存 + EBR RCU 实装.
 //
 // 顶部接口 doc + 设计依据 全部见 jit_cache.h. 本文件只放实装.
 //
@@ -141,7 +141,7 @@ void jit_cache_destroy(void) {
  * EBR (jit_rcu_read_lock / read_unlock / synchronize)
  *
  * read_lock / read_unlock 实装作 non-inline (jit_cache.h 不暴露 inline 定义) —
- *   T2 阶段不在 fast path; b_02+ dispatcher 真接 fork 点时考虑 inline 化 (改进项).
+ *   真撞 fast path 瓶颈时考虑 inline 化 (改进项; dispatcher fork 点每块进出各一次).
  * ============================================================================ */
 
 void jit_rcu_read_lock(uint32_t hart_id) {
@@ -273,7 +273,7 @@ got_slot:
     } else {
         /* pa 不在 RAM (兜底; caller 应保证). slot 仍进 COMPILED 状态, 但
          * invalidate_page 找不到此 slot (链表外); flush_all 仍能清. 当前实装
-         * b_01 T2 阶段没真路径触发, 仅防御. */
+         * 当前阶段没真路径触发, 仅防御. */
         e->next_in_page = JIT_PAGE_HEAD_END;
     }
 
@@ -292,7 +292,7 @@ got_slot:
  *
  * 撞已有 COMPILED 同 key 直接返 0 (别 hart 已成功 install, 保留 COMPILED 更合理;
  * BLACK 本意"永远编不出"但别 hart 能编说明这块能编, race 下保留好的). 撞 BLACK
- * 同 key 也返 0 idempotent. T3 session_005 jit_entry.cc Q11 a 组合层调本接口.
+ * 同 key 也返 0 idempotent. jit_entry.cc Q11 a 组合层调本接口.
  * ============================================================================ */
 int jit_cache_set_blacklist(uxlen_t pa, regime_t regime) {
     size_t idx = jit_cache_hash(pa, regime);
@@ -370,13 +370,13 @@ void jit_cache_invalidate_page(uint32_t page_idx) {
     }
 
     /* 等所有 hart 出 read critical section, 旧引用 host_code_ptr 不再被任何
-     * hart 持有, backend 可安全 unmap host_code mmap 区 (T2 stub nop). */
+     * hart 持有, backend 可安全 unmap host_code mmap 区 (当前 backend stub nop). */
     jit_rcu_synchronize();
 
-    /* T3 阶段 backend stub nop; b_02+ 真做 emit 后调
+    /* 当前 backend stub nop; b_02 真做 emit 后调
      *   const backend_t *be = backend_get_default();
      *   for (清完的每个 slot.host_code_ptr) be->backend_invalidate_block(...);
-     * T3 阶段 host_code_ptr 永是 NULL (stub backend.compile_block 返
+     * 当前 host_code_ptr 永是 NULL (stub backend.compile_block 返
      * NOT_IMPLEMENTED 不真 install); b_02 真做 emit 时 backend 编 host code
      * 进 mmap RX 段, 这时 backend.invalidate_block 真 unmap. */
 }
@@ -386,7 +386,7 @@ void jit_cache_invalidate_page(uint32_t page_idx) {
  * jit_cache_flush_all — RCU modify-side, sync grace period (整表清)
  *
  * 扫整张 hash_table → 扫 page_block_head → synchronize → backend.flush_all
- * (T2 stub nop).
+ * (当前 backend stub nop).
  * ============================================================================ */
 void jit_cache_flush_all(void) {
     for (uint32_t i = 0; i < JIT_CACHE_SIZE; i++) {
@@ -400,7 +400,7 @@ void jit_cache_flush_all(void) {
 
     jit_rcu_synchronize();
 
-    /* T2 阶段 backend stub nop; b_03 真做后调
+    /* 当前 backend stub nop; b_02 真做后调
      *   const backend_t *be = backend_get_default();
      *   be->backend_flush_all(); */
 }

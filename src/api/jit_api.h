@@ -16,14 +16,16 @@
 //   - api/ 不 include jit/ (单向; jit/ 可以 include api/)
 //
 // ============================================================================
-// JIT 入口 (b_01 T1 阶段接口骨架, T2-T4 真做时填实现)
+// JIT 入口
 // ============================================================================
 //
-// T1 阶段函数仅声明, 不带实现 — backend / translator / code_cache / jit_cache
-// 全 stub 状态 (T2 起 jit_cache 真做, T3 起 backend / translator 真做 stub
-// 形态, T4 起 dispatcher fork 点真接).
+// 5 个对外入口实装在 jit/jit_entry.cc (backend-agnostic 组合层, 通过
+// backend_get_default() 拿 backend_t* 调 vtable). dispatcher fork 点 miss 路径
+// 调 jit_compile_block; lifecycle (jit_init / jit_shutdown) main POR / teardown
+// 配对一次; jit_flush_all / jit_invalidate_block 当前仅作 jit_compile_block
+// 内部 Q11 a 组合用 + 占位 (SMC 真触发在 b_03).
 //
-// 错误码 jit_status_t (T1 阶段 enum 定义, 具体语义 T2/T3 真做时填):
+// 错误码 jit_status_t:
 //   JIT_OK                  — 编译成功 / 接口调用成功
 //   JIT_CODE_CACHE_FULL     — code_cache mmap 区满, 调用方触发整体 Flush
 //                              (plan §1.23.9)
@@ -31,10 +33,10 @@
 //                              编译黑名单 (plan §1.23.8)
 //   JIT_BACKEND_INTERNAL    — backend (asmjit) 内部错; 调用方进黑名单 / 退
 //                              interpreter
-//   JIT_ERR_NOT_IMPLEMENTED — backend stub 阶段返这个; T3 stub backend 总
+//   JIT_ERR_NOT_IMPLEMENTED — backend stub 阶段返这个; 当前 stub backend 永
 //                              返这个, dispatcher fork 点 fall back interpreter
 //
-// 命名 (session_002 拍): jit_* prefix, snake_case (CLAUDE.md "Naming and style").
+// 命名: jit_* prefix, snake_case (CLAUDE.md "Naming and style").
 //
 
 #ifndef API_JIT_API_H
@@ -82,20 +84,22 @@ void jit_shutdown(void);
 //   失败时按返码处理 (CODE_CACHE_FULL → Flush; IR_ERROR / BACKEND_INTERNAL →
 //   黑名单).
 //
-//   T1 阶段 stub: 总返 JIT_ERR_NOT_IMPLEMENTED (T3 backend 真实装前).
+//   当前 stub backend 永返 JIT_ERR_NOT_IMPLEMENTED, jit_entry.cc 三 step 分流后
+//   进 BLACK; backend 真编译 (b_02) 后才有 JIT_OK 路径.
 //
-//   签名细节 (T3 真做时可调整): 当前不带 hart 参数 — translator 编译期 baked
+//   签名细节 (b_02 真做时可调整): 当前不带 hart 参数 — translator 编译期 baked
 //   regime 已涵盖 priv 视角, 不需要具体 hart 上下文 (mstatus.SUM/MXR 等 runtime
 //   inline 读, 不 baked).
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime);
 
 // jit_invalidate_block: 失效 jit_cache 内 (pa, regime) 对应的块.
 //   SMC handler 延迟 invalidate / fence.i / 单块失效路径调.
-//   T1 阶段 stub: nop.
+//   当前 stub: nop (SMC 路径走 jit_cache_invalidate_page 按 page 颗粒度;
+//   按 (pa, regime) 单块语义留 b_03 真做 SMC + fence.i 双保险时拍).
 void jit_invalidate_block(uxlen_t pa, regime_t regime);
 
 // jit_flush_all: 整体 Flush jit_cache + code_cache (CODE_CACHE_FULL 时调).
-//   T1 阶段 stub: nop.
+//   实装: jit_cache_flush_all → backend.flush_all (顺序固定; backend stub nop).
 void jit_flush_all(void);
 
 

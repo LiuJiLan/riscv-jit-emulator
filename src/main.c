@@ -53,7 +53,7 @@
 #include "core/decode.h"
 #include "core/dispatcher.h"
 #include "core/wfi.h"          // wfi_init / wfi_destroy (WFI 唤醒框架; wfi_kick_all 不调用, 见 wfi.h doc)
-#include "api/jit_api.h"       // jit_init / jit_shutdown (b_01 T3 JIT 子系统 lifecycle; 跟 lrsc_init/destroy 对偶位置)
+#include "api/jit_api.h"       // jit_init / jit_shutdown (JIT 子系统 lifecycle; 跟 lrsc_init/destroy 对偶位置)
 #include "isa/lrsc.h"          // lrsc_init / lrsc_destroy (A 扩展 reservation 数据结构; bucket 锁数组 cap 配对)
 #include "loader.h"
 #include "platform/clint.h"
@@ -622,9 +622,9 @@ int main(int argc, char **argv) {
     lrsc_init();
 
     // JIT 子系统 init (jit_entry.cc 实装; backend.init + jit_cache_init 顺序;
-    // T3 stub 阶段 backend.init 返 0 + jit_cache_init 纯 atomic store 也不失败,
-    // 不传播 fail; 真做 emit 时 backend.init 失败语义按 wfi_init / lrsc_init 体例
-    // fprintf + 不传播, 那时改本处签名接 int 返码 + main 接 fail 退).
+    // 当前 stub backend.init 返 0 + jit_cache_init 纯 atomic store 也不失败, 不传
+    // 播 fail; b_02 真做 emit 时 backend.init 失败语义按 wfi_init / lrsc_init
+    // 体例 fprintf + 不传播, 那时改本处签名接 int 返码 + main 接 fail 退).
     // 必须在 hart 线程 spawn 之前 — JIT 子系统是 hart 共享资源 (cap 配对内部数据 +
     // RCU 等 grace period 都依赖 init 完成).
     jit_init();

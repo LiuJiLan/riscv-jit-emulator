@@ -11,7 +11,7 @@
 //   - JitBackend 知道 host, 不知道 RISC-V  → 消费 IR
 //   - 三层之间的接口 = 自制 IR, 这是分层成立的关键
 //
-// IR vs decoded_inst_t (重要区分; b_01 session_002 重审):
+// IR vs decoded_inst_t (重要区分):
 //   - decoded_inst_t (core/decode.h) 是 **RV 视角** 三地址码 — op_kind_t 名字
 //     OP_LUI / OP_AUIPC / OP_BEQ / ... 都是 RV opcode; interpreter / translator
 //     共享 decode
@@ -22,13 +22,13 @@
 //     否决的选项 A "无 IR / backend 被迫 RV 化"
 //
 // ============================================================================
-// b_01 T1 阶段范围 (本文件)
+// 当前骨架范围
 // ============================================================================
 //
-// T1 阶段只放最小骨架: ir_op_kind_t enum 两条占位 + ir_inst_t 最少必要字段.
+// 当前只放最小骨架: ir_op_kind_t enum 两条占位 + ir_inst_t 最少必要字段.
 // 详细 IR op 列表 / 字段细节 / 三地址码完整形态 b_02 真做 emit 时拍.
 //
-// 命名 (session_002 拍):
+// 命名:
 //   - 类型 ir_*_t (ir_op_kind_t / ir_inst_t)
 //   - enum 值 IR_OP_* (IR_OP_UNSUPPORTED / IR_OP_DISPATCH_EXIT)
 //   - 跟 decode.h op_kind_t / OP_* 平行, 区分 RV 视角 vs backend 视角
@@ -41,10 +41,9 @@
 
 
 // ----------------------------------------------------------------------------
-// ir_op_kind_t —— IR op 分类 (b_01 T1 阶段只 2 条占位; b_02 真做时扩)
+// ir_op_kind_t —— IR op 分类 (当前 2 条占位; b_02 真做 emit 时扩)
 //
-// 当前两条占位是块出口必需的 (plan §1.22.6 + §1.23.3; b_01 session_003 audit
-// 拍法 Q4 a):
+// 当前两条占位是块出口必需的 (plan §1.22.6 + §1.23.3; audit 拍法 Q4 a):
 //   IR_OP_UNSUPPORTED   — ir_op_kind_t enum 完整性占位 (-Wswitch-enum 跟
 //                          decode / translate default case 用); Translator 撞到
 //                          OP_UNSUPPORTED 时**不进 IR buffer**, 只在 buffer 末尾
@@ -74,10 +73,10 @@ typedef enum {
 
 
 // ----------------------------------------------------------------------------
-// ir_inst_t —— 单条 IR 指令 (POD; T1 阶段最少必要字段)
+// ir_inst_t —— 单条 IR 指令 (POD; 当前最少必要字段)
 //
-// T1 阶段只放 kind + target_pc (DISPATCH_EXIT 用); b_02 真做时扩 dst / src1 /
-// src2 / imm 等三地址码字段.
+// 当前只放 kind + target_pc (DISPATCH_EXIT 用); b_02 真做 emit 时扩 dst /
+// src1 / src2 / imm 等三地址码字段.
 // ----------------------------------------------------------------------------
 typedef struct {
     ir_op_kind_t kind;

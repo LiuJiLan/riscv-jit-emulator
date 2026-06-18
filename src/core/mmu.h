@@ -79,8 +79,8 @@
 //     编译时 baked S 或 U 视角的 PTE_U / SUM/MXR check, 消除运行时 priv 分支跟 PTE_U
 //     检查的运行时开销 (这是 JIT 跟 interpreter 性能差的来源之一)。
 //
-// dispatcher 内部仍把 regime 显式算出, 即使当前 interpreter 接口只消费 current_tlb ——
-// 是为了未来 jit_cache 接 dispatcher 时不需要重新引入变量 (b_01 T4 fork 点真做时复用)。
+// dispatcher 内部仍把 regime 显式算出 (除了 interpreter 接口只消费 current_tlb,
+// jit_cache fork 点也消费 regime 作 key 第二维)。
 //
 // NULL 编码的可靠性 (interpreter 路径): cpu_create 后 [PRIV_M] 永远 NULL (Trust 不走
 // TLB), dispatcher SV32 路径 lazy alloc 后必非 NULL —— 调用方不可能传出 inconsistent

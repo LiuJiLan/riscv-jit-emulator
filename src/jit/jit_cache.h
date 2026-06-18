@@ -3,10 +3,10 @@
 // jit/jit_cache.h —— JIT 块缓存 (PA, regime) → host_code_ptr 的 hash table.
 //
 // ============================================================================
-// 设计依据 (b_01 session_003 audit 拍法; jit_plan_audit_decision.md Q9/Q10/Q11/Q12)
+// 设计依据 (Q9/Q10/Q11/Q12; 详 notes/context/jit_plan_audit_decision.md)
 // ============================================================================
 //
-// 三个核心拍法 (b_01 T2 一步到位):
+// 三个核心拍法:
 //   Q9 方案 2  — per-page block list: hash entry 加 next_in_page 链表字段 +
 //                全局 page_block_head[GUEST_RAM_NPAGES] 链表头数组; install
 //                CAS 挂头, invalidate_page 顺链表清 (跟 hash table 全扫的方案 1
@@ -16,10 +16,10 @@
 //                grace period 后才允许 backend 真 unmap host_code mmap 区
 //                (b_03 SMC 真触发时 backend.invalidate_block 才真做)
 //   Q11 a    — jit_api 层 Flush + retry 1 次, dispatcher 不感知 Flush;
-//                jit_cache_install 返 -1 (FULL) 时 caller (jit_api) 触发
-//                jit_flush_all + 再 install 重试 1 次 (T2 阶段 backend stub
-//                返 NOT_IMPLEMENTED 跑不通完整 retry 形态, 留 T3 真做时拍)
-//   Q12 c    — invalidate_reason_t 入参 b_01 T2 不带 (audit 拍"不强求"); 现役
+//                jit_cache_install 返 -1 (FULL) 时 caller (jit_entry.cc) 触发
+//                jit_flush_all + 再 install 重试 1 次 (retry 完整路径见
+//                jit/jit_entry.cc; backend 真编译完成前永走 NOT_IMPLEMENTED 路径)
+//   Q12 c    — invalidate_reason_t 入参不带; 现役
 //                两条路径 (SMC invalidate / Flush_all) 都清 BLACK; 未来加
 //                block chaining / SMC 立即重编时 ABI append-only 扩 reason 入参
 //
@@ -47,8 +47,7 @@
 // ============================================================================
 //
 // jit_cache_*    — hash table + per-page list 操作; caller = jit_entry.cc 组合层
-//                   (jit_init / jit_flush_all forward); T2 阶段 main self-check
-//                   也作 caller, T3 session_005 删除
+//                   (jit_init / jit_flush_all forward)
 //   jit_cache_init / destroy           — lifecycle (main POR / 退出段调)
 //   jit_cache_lookup                   — RCU read-side (caller 已调 jit_rcu_read_lock)
 //   jit_cache_install                  — RCU modify-side (atomic CAS slot status)
@@ -62,7 +61,7 @@
 //   jit_rcu_synchronize                — modify-side 等所有 hart 出 critical
 //
 // ============================================================================
-// 命名 (session_002 拍)
+// 命名
 // ============================================================================
 //
 // 类型 jit_cache_*_t (jit_cache_status_t / jit_cache_entry_t); enum 值
@@ -90,7 +89,7 @@ extern "C" {
 
 #ifndef __cplusplus
 // ----------------------------------------------------------------------------
-// jit_cache_status_t —— hash entry 状态机 (b_01 T2 4 状态; C 端可见, C++ 端不暴露)
+// jit_cache_status_t —— hash entry 状态机 (4 状态; C 端可见, C++ 端不暴露)
 //
 //   EMPTY    — 空槽; lookup 终止线性探测 (开放寻址 sentinel)
 //   COUNTING — install 进行中 (CAS EMPTY→COUNTING 后填字段中); lookup 视为 miss
@@ -101,7 +100,7 @@ extern "C" {
 //
 // 状态转换主路径:
 //   EMPTY → COUNTING (install CAS) → COMPILED (install store, release)
-//   EMPTY → BLACK    (backend fail 路径; jit_api 层 set; T3 真做时拍最终路径)
+//   EMPTY → BLACK    (backend fail 路径; jit_entry.cc set_blacklist)
 //   COMPILED → EMPTY (invalidate_page / flush_all RCU grace period 后)
 //   BLACK    → EMPTY (invalidate_page / flush_all; Q12 c)
 //
@@ -117,7 +116,7 @@ typedef enum {
 
 
 // ----------------------------------------------------------------------------
-// jit_cache_entry_t —— 单 hash slot (b_01 T2; ~32 byte; 64K slot × 32 = 2MB)
+// jit_cache_entry_t —— 单 hash slot (~32 byte; 64K slot × 32 = 2MB)
 //
 // 字段:
 //   key_pa         — 块入口 PA (uxlen_t; dummy.txt §13)
@@ -126,8 +125,9 @@ typedef enum {
 //   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; 非 atomic, CAS
 //                     status COUNTING 后 owner 独占写)
 //   host_code_ptr  — backend 编译产物入口 (类型 jit_block_func_t = void (*)
-//                     (cpu_t*, tlb_p, uint32_t*); Q1 a; T2 阶段 stub 假指针, T3
-//                     backend 真做时填真 mmap RX 段)
+//                     (cpu_t*, tlb_t*, uint64_t*); Q1 a; 当前 stub backend
+//                     永返 NOT_IMPLEMENTED 不进 install 路径, b_02 backend
+//                     真做 emit 后填真 mmap RX 段地址)
 //   next_in_page   — per-page block list 链表 next 索引 (uint16_t; JIT_CACHE_SIZE
 //                     = 65536 索引正好用满 uint16_t; 0xFFFF = 链尾哨兵 = JIT_PAGE_HEAD_END)
 //

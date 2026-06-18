@@ -354,6 +354,26 @@ TLB 空间 / MMIO 命中率低"。
     handler 设计)。
 
 
+--------------------------------------------------------------------------------
+JIT 状态灯协议 (b_01 T4; sigsetjmp 协议的扩展)
+--------------------------------------------------------------------------------
+
+cpu_t 加 `_Atomic(void *) jit_executing_host_code` 字段持当前正在跑的 host_code
+指针, 是 sigsetjmp 落点统一清理协议的扩展. dispatcher fork 点 hit 路径在
+read_unlock 之前 atomic store 状态灯 = host_code (release), 跑完 atomic store
+NULL release; longjmp 路径跳过 host_code 后续清状态灯代码, 由 dispatcher 迭代头
+扫尾段 (跟 total_count += local_count 同位置) 兜底清.
+
+b_02 backend.invalidate_block 真做时按 host_code 指针扫所有 hart 此字段 (n_harts
+存在性遍历, 跟 wfi_kick_all / jit_rcu_synchronize 同体例; 详 §15 cap-vs-n_harts),
+全清才 munmap 旧 mmap RX 段.
+
+权威源: trade_off_log §T.15 (三候选 + 拍 c 理由) + plan §1.23.17 末段
+(backend.invalidate_block 状态灯协议) + notes/context/jit_framework_overview.md
+§11 (a) (图书馆类比 + mermaid 序列图) + src/core/cpu.h jit_executing_host_code
+字段顶段 doc.
+
+
 ================================================================================
 ## §2. x0 寄存器的全局编码约定
 ================================================================================

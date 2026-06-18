@@ -3,7 +3,7 @@
 // jit/backend_asmjit.cc —— JitBackend asmjit 实装 (跟 jit_entry.cc 平行).
 //
 // ============================================================================
-// 跟 jit_entry.cc 的概念分工 (b_01 session_005 拍法)
+// 跟 jit_entry.cc 的概念分工
 // ============================================================================
 //
 // 本文件 = backend 实装细节; jit_entry.cc = jit_api.h 入口 (backend-agnostic).
@@ -13,11 +13,11 @@
 //     具体后端
 //
 // ============================================================================
-// T3 stub 阶段范围 (b_01 session_005)
+// stub 阶段范围
 // ============================================================================
 //
 // vtable fn 全 stub:
-//   asmjit_backend_init             返 0 (T3 阶段无资源 alloc)
+//   asmjit_backend_init             返 0 (无资源 alloc)
 //   asmjit_backend_compile_block    永返 JIT_ERR_NOT_IMPLEMENTED + *host_code_out
 //                                    = NULL; caller (jit_compile_block Q11 a)
 //                                    走非 OK 路径 → set_blacklist + 透传错码
@@ -25,7 +25,7 @@
 //   asmjit_backend_flush_all        nop (b_03 真做时 reset code_cache mmap)
 //   asmjit_backend_destroy          nop (b_02+ 真做时 asmjit JitRuntime delete)
 //
-// T3 stub 阶段不 include asmjit header — backend.compile_block 永返 NOT_IMPLEMENTED
+// stub 阶段不 include asmjit header — backend.compile_block 永返 NOT_IMPLEMENTED
 // 跑不通真编译路径, 没必要引 symbol. CMakeLists 已 target_link_libraries asmjit,
 // cmake reconfigure 期 FetchContent 拉源 + 编译 verify link 路径就位.
 //

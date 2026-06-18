@@ -15,7 +15,7 @@
 //   - C/C++ 边界 = extern "C" 包整段 + POD struct + 函数指针
 //
 // ============================================================================
-// 集中声明的 helper 集合 (b_01 T1 阶段 re-export, 不增新逻辑)
+// 集中声明的 helper 集合 (re-export, 不增新逻辑)
 // ============================================================================
 //
 // 本头不真重写 helper 声明, 而是 include 既有头转发 (避免维护两份签名漂移).
@@ -32,13 +32,13 @@
 //   isa/sfence.h  — sfence_vma_helper
 //   isa/fence.h   — fence_helper / fence_i_helper
 //   core/trap.h   — trap_raise_exception (helper longjmp 入口; dummy.txt §1)
-//   core/wfi.h    — wfi_wait (可能 b_03+ JIT 翻译 WFI 时调; T1 阶段先纳入)
+//   core/wfi.h    — wfi_wait (可能 b_03+ JIT 翻译 WFI 时调; 先纳入)
 //
-// T1 阶段 re-export 全套. T3 backend 真做时若需 namespace 精细控制 (只 export
-// 部分) 再拆 — 当前转发简单 + 维护友好.
+// 当前 re-export 全套. backend 真做 emit (b_02) 时若需 namespace 精细控制
+// (只 export 部分) 再拆 — 当前转发简单 + 维护友好.
 //
 // ============================================================================
-// 命名 (session_002 拍)
+// 命名
 // ============================================================================
 //
 // 本头不加 c_ prefix — api/ 目录天然就是 C-compilable 跨语言头 (文件位置已表达),
@@ -54,7 +54,7 @@
 extern "C" {
 #endif
 
-// 既有 helper 头转发 (b_01 T1 阶段 re-export 全套).
+// 既有 helper 头转发 (re-export 全套).
 // 顺序: core → isa (跟 src/ 目录组织一致).
 #include "core/mmu.h"
 #include "core/csr.h"
