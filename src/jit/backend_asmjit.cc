@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/6/18.
-// jit/backend_asmjit.cc —— JitBackend asmjit 实装 (T1 c+ 真做).
+// jit/backend_asmjit.cc —— JitBackend asmjit 实装 (T1+T2 真做).
 //
 // ============================================================================
 // 跟 jit_entry.cc 的概念分工
@@ -13,21 +13,22 @@
 //     具体后端
 //
 // ============================================================================
-// T1 c+ 实状
+// T1+T2 实状
 // ============================================================================
 //
-// 5 vtable 全真填 (b_02_session_002 拍版):
+// 5 vtable 全真填:
 //   asmjit_backend_init             alloc file-static asmjit::JitRuntime
 //   asmjit_backend_compile_block    CodeHolder + Assembler emit (prologue + 块体
 //                                    + DISPATCH_EXIT + epilogue) → JitRuntime::add
 //                                    拿 RX 段地址, 返 jit_block_func_t
 //   asmjit_backend_invalidate_block JitRuntime::release(host_code) (Q8 配合; backend
 //                                    纯 unmap host code; 状态灯扫在 jit_entry.cc)
-//   asmjit_backend_flush_all        delete + new JitRuntime (asmjit 没 reset API)
+//   asmjit_backend_flush_all        JitRuntime::reset() (asmjit v1.18+ 自带 reset)
 //   asmjit_backend_destroy          delete JitRuntime
 //
-// 块体 IR 翻译 (T1 c+ 范围): IR_OP_ADD / IR_OP_ADDI / IR_OP_DISPATCH_EXIT 三 op;
-// IR_OP_UNSUPPORTED 哨兵 default case 写 __builtin_unreachable 兜底.
+// 块体 IR 翻译 (T1+T2 范围): RV32I 算术全集 21 op (U-type 2 + I-imm 9 + R-type 10)
+// + IR_OP_DISPATCH_EXIT; IR_OP_UNSUPPORTED 哨兵 default case 写
+// __builtin_unreachable 兜底.
 //
 // 静态固定映射 (Q2=b): RV x1-x5 (ra/sp/gp/tp/t0) → host callee-saved 32-bit reg
 //   x1 → ebx
@@ -206,23 +207,172 @@ void emit_epilogue(asmjit::x86::Assembler &a) {
     a.ret();
 }
 
-// emit IR 算术 (T1 c+: IR_OP_ADD / IR_OP_ADDI):
-//   IR_OP_ADD  rd = rs1 + rs2: load rs1→eax, load rs2→ecx, add eax,ecx, store eax→rd
-//   IR_OP_ADDI rd = rs1 + imm: load rs1→eax, add eax,imm32, store eax→rd
+// emit IR 算术 (T1+T2 范围: RV32I 算术全集 21 op).
 //
-// 用 eax/ecx 作 scratch (caller-saved; T1 不调 helper 不撞).
+// scratch 用法 (T1+T2 不调 helper 不撞 caller-saved):
+//   eax (caller-saved): 主累加器 (rs1 装 eax, op 后存 rd)
+//   ecx (caller-saved): R-type 的 rs2 / shift count cl 来源
+//   al  (eax 低 8 位):   setcc 目标 (SLT/SLTU/SLTI/SLTIU)
+//   cl  (ecx 低 8 位):   shl/shr/sar 的 shift count (R-type shift)
+//
+// emit pattern 按 RV op 类型分组:
+//   U-type (2):    a.mov(eax, imm); store rd          (translator 端常量已折叠)
+//   I-imm 算术 (4): load rs1→eax; a.OP(eax, imm); store rd     (ADDI/ANDI/ORI/XORI)
+//   I-imm 比较 (2): load rs1→eax; cmp+setcc(al)+movzx(eax,al); store rd  (SLTI/SLTIU)
+//   I-imm shift (3): load rs1→eax; a.SHIFT(eax, imm&0x1F); store rd      (SLLI/SRLI/SRAI)
+//   R-type 算术 (5): load rs1→eax; load rs2→ecx; a.OP(eax,ecx); store rd  (ADD/SUB/AND/OR/XOR)
+//   R-type 比较 (2): load rs1→eax; load rs2→ecx; cmp+setcc+movzx; store  (SLT/SLTU)
+//   R-type shift (3): load rs1→eax; load rs2→ecx; and ecx,0x1F; a.SHIFT(eax,cl); store
+//                     (SLL/SRL/SRA; x86 shift count 必须放 cl; ecx 跟 cl 共享低 8 位;
+//                      `and ecx, 0x1F` 跟 interpreter `& 0x1Fu` 文字对偶, x86 自身也是
+//                      这行为, 不算 redundant)
+//
+// 函数顶引 `using namespace asmjit::x86` 简化 21 个 case 的 reg 引用 (eax/ecx/al/cl);
+// 局部作用域不污染其他 helper.
 void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
-    emit_load_rv_reg(a, asmjit::x86::eax, inst.rs1);
+    using namespace asmjit::x86;
 
-    if (inst.kind == IR_OP_ADD) {
-        emit_load_rv_reg(a, asmjit::x86::ecx, inst.rs2);
-        a.add(asmjit::x86::eax, asmjit::x86::ecx);
-    } else {
-        // IR_OP_ADDI: rs2 不用, imm 走 32-bit signed
-        a.add(asmjit::x86::eax, asmjit::imm(inst.imm));
+    switch (inst.kind) {
+        /* ---- U-type (translator 端 imm 已合并 baked_pc + d.imm) ---- */
+        case IR_OP_LUI:
+        case IR_OP_AUIPC:
+            a.mov(eax, asmjit::imm(inst.imm));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- I-imm 算术 (4: ADDI/ANDI/ORI/XORI) ---- */
+        case IR_OP_ADDI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.add(eax, asmjit::imm(inst.imm));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_ANDI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.and_(eax, asmjit::imm(inst.imm));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_ORI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.or_(eax, asmjit::imm(inst.imm));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_XORI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.xor_(eax, asmjit::imm(inst.imm));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- I-imm 比较 (2: SLTI signed / SLTIU unsigned; imm 先 sext 到 32) ---- */
+        case IR_OP_SLTI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.cmp(eax, asmjit::imm(inst.imm));
+            a.setl(al);                 /* signed less */
+            a.movzx(eax, al);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SLTIU:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.cmp(eax, asmjit::imm(inst.imm));
+            a.setb(al);                 /* unsigned less (below) */
+            a.movzx(eax, al);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- I-imm shift (3: SLLI/SRLI/SRAI; shamt 立即数走 imm & 0x1F) ---- */
+        case IR_OP_SLLI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.shl(eax, asmjit::imm(inst.imm & 0x1F));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SRLI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.shr(eax, asmjit::imm(inst.imm & 0x1F));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SRAI:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.sar(eax, asmjit::imm(inst.imm & 0x1F));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- R-type 算术 (5: ADD/SUB/AND/OR/XOR) ---- */
+        case IR_OP_ADD:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.add(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SUB:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.sub(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_AND:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.and_(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_OR:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.or_(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_XOR:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.xor_(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- R-type 比较 (2: SLT signed / SLTU unsigned) ---- */
+        case IR_OP_SLT:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.cmp(eax, ecx);
+            a.setl(al);
+            a.movzx(eax, al);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SLTU:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.cmp(eax, ecx);
+            a.setb(al);
+            a.movzx(eax, al);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- R-type shift (3: SLL/SRL/SRA; shift count 必须放 cl) ---- */
+        case IR_OP_SLL:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.and_(ecx, asmjit::imm(0x1F));
+            a.shl(eax, cl);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SRL:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.and_(ecx, asmjit::imm(0x1F));
+            a.shr(eax, cl);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        case IR_OP_SRA:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.and_(ecx, asmjit::imm(0x1F));
+            a.sar(eax, cl);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- 哨兵 (emit_ir_arith 不该看到; caller 路径已分流) ---- */
+        case IR_OP_UNSUPPORTED:
+        case IR_OP_DISPATCH_EXIT:
+            __builtin_unreachable();
     }
-
-    emit_store_rv_reg(a, inst.rd, asmjit::x86::eax);
 }
 
 // emit DISPATCH_EXIT (块出口模板):
@@ -292,12 +442,19 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
 
     emit_prologue(a);
 
-    // 块体: 前 n_insts-1 条 (ADD/ADDI), 末 1 条 DISPATCH_EXIT 单独处理
+    // 块体: 前 n_insts-1 条 (RV32I 算术全集 21 op), 末 1 条 DISPATCH_EXIT 单独处理
     for (size_t i = 0; i < n_insts - 1; i++) {
         const ir_inst_t &inst = insts[i];
         switch (inst.kind) {
-            case IR_OP_ADD:
-            case IR_OP_ADDI:
+            /* RV32I 算术全集 21 op → 共用 emit_ir_arith 路径 */
+            case IR_OP_LUI:  case IR_OP_AUIPC:
+            case IR_OP_ADDI: case IR_OP_SLTI: case IR_OP_SLTIU:
+            case IR_OP_XORI: case IR_OP_ORI:  case IR_OP_ANDI:
+            case IR_OP_SLLI: case IR_OP_SRLI: case IR_OP_SRAI:
+            case IR_OP_ADD:  case IR_OP_SUB:  case IR_OP_SLL:
+            case IR_OP_SLT:  case IR_OP_SLTU: case IR_OP_XOR:
+            case IR_OP_SRL:  case IR_OP_SRA:  case IR_OP_OR:
+            case IR_OP_AND:
                 emit_ir_arith(a, inst);
                 break;
             case IR_OP_DISPATCH_EXIT:
