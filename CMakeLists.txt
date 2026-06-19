@@ -155,6 +155,8 @@ add_executable(riscv_jit_emulator
         src/jit/jit_cache.h
         src/jit/backend_asmjit.cc
         src/jit/jit_entry.cc
+        src/jit/translator.c
+        src/jit/translator.h
 )
 
 # asmjit link (backend_asmjit.cc stub 阶段不真用 asmjit symbol; link 路径提前

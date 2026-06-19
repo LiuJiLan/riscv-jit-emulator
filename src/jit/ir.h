@@ -22,68 +22,107 @@
 //     否决的选项 A "无 IR / backend 被迫 RV 化"
 //
 // ============================================================================
-// 当前骨架范围
+// T1 真做范围 (b_02_session_002 拍版 Q4=c+ 真翻译 ADD/ADDI 最小集)
 // ============================================================================
 //
-// 当前只放最小骨架: ir_op_kind_t enum 两条占位 + ir_inst_t 最少必要字段.
-// 详细 IR op 列表 / 字段细节 / 三地址码完整形态 b_02 真做 emit 时拍.
+// IR_OP_UNSUPPORTED   - enum 完整性哨兵 (永不真出现在 IR buffer; -Wswitch-enum
+//                        + -Werror 强制 backend switch 完整, default case 写
+//                        __builtin_unreachable / abort 兜底). 跟 decode.h
+//                        OP_UNSUPPORTED 同名陷阱: decode 端真撞, IR 端哨兵不撞.
+// IR_OP_DISPATCH_EXIT - 块出口模板 (= interpreter is_block_boundary_inst 后
+//                        goto out 的 JIT 对偶); target_pc 字段填下一块入口 pc.
+//                        backend emit 写 cpu->pc + 写 count_out + epilogue + ret.
+//                        每个 IR 流末尾必有一条 IR_OP_DISPATCH_EXIT.
+// IR_OP_ADD           - RV32I ADD; backend emit rd = rs1 + rs2 (judge rd/rs1/rs2
+//                        ∈ x1-x5 走固定 host reg 路径; 否则 load tmp/op/store tmp;
+//                        rd = x0 直接跳过写 — dummy.txt §2 dead store 体例).
+// IR_OP_ADDI          - RV32I ADDI; backend emit rd = rs1 + imm (sext12; rs2 不用).
+//
+// 后续 T2-T6 扩 enum:
+//   T2 RV32I 剩下算术: SUB / SLL / SRL / SRA / AND / OR / XOR / SLT / SLTU + I
+//                       立即数变体 + LUI / AUIPC
+//   T3 helper call:    LOAD/STORE 8 + CSR 6 + AMO 9 + LR/SC 2 + FENCE 2 (backend
+//                       emit `call <static_addr>`; helpers.h re-export)
+//   T4 控制流:         BRANCH 6 + JAL + JALR; backend emit 条件跳 / 块出口模板
+//   T6 M+RVC:          MUL/DIV/REM 8 + RVC 压缩指令
+//
+// IR 流形态 (T1 c+):
+//   [IR_OP_ADD / IR_OP_ADDI 前缀 N 条 (0 ≤ N ≤ BLOCK_INST_LIMIT - 1)]
+//   [IR_OP_DISPATCH_EXIT 收尾 1 条 (target_pc = 下一块入口 pc = 截断指令 PC 或
+//    软边界出块 PC)]
+//
+// 块前缀空 (N=0, 第一条就是非 ADD/ADDI): translator 仍 emit DISPATCH_EXIT 收尾
+// 一条, 但 backend.compile_block 检测到 IR 流只有 DISPATCH_EXIT 时返
+// JIT_ERR_NOT_IMPLEMENTED (块前缀无真翻译指令, 不值得 install), jit_entry.cc
+// 走 set_blacklist 路径; dispatcher 下次 lookup BLACK miss → interpret 兜底真
+// 执行那条 RV 指令.
 //
 // 命名:
 //   - 类型 ir_*_t (ir_op_kind_t / ir_inst_t)
-//   - enum 值 IR_OP_* (IR_OP_UNSUPPORTED / IR_OP_DISPATCH_EXIT)
+//   - enum 值 IR_OP_* (IR_OP_UNSUPPORTED / IR_OP_DISPATCH_EXIT / IR_OP_ADD /
+//                       IR_OP_ADDI)
 //   - 跟 decode.h op_kind_t / OP_* 平行, 区分 RV 视角 vs backend 视角
 //
 
 #ifndef JIT_IR_H
 #define JIT_IR_H
 
+#include <stdint.h>
+
 #include "riscv.h"   // uxlen_t (target_pc 字段; dummy.txt §13 typedef family)
 
 
 // ----------------------------------------------------------------------------
-// ir_op_kind_t —— IR op 分类 (当前 2 条占位; b_02 真做 emit 时扩)
+// ir_op_kind_t —— IR op 分类 (T1 c+ 范围: 2 哨兵/出口 + 2 算术)
 //
-// 当前两条占位是块出口必需的 (plan §1.22.6 + §1.23.3; audit 拍法 Q4 a):
-//   IR_OP_UNSUPPORTED   — ir_op_kind_t enum 完整性占位 (-Wswitch-enum 跟
-//                          decode / translate default case 用); Translator 撞到
-//                          OP_UNSUPPORTED 时**不进 IR buffer**, 只在 buffer 末尾
-//                          emit 一条 IR_OP_DISPATCH_EXIT(target_pc =
-//                          unsupported_inst.pc) 作块出口; 块前缀部分编译成功
-//                          (前 N 条支持指令进 IR + 末加 DISPATCH_EXIT); 运行时
-//                          dispatcher 下一轮 PC = unsupported_inst.pc 时
-//                          jit_cache miss → 调 interpret_one_inst →
-//                          OP_UNSUPPORTED case → trap_raise_exception(cause 2)
-//   IR_OP_DISPATCH_EXIT — 块出口标记, target_pc 字段填新 pc; backend emit 写
-//                          cpu->pc + ret; dispatcher 主循环重派发新 pc
+// IR_OP_UNSUPPORTED   - enum 完整性哨兵 (永不真出现在 IR buffer); backend
+//                        default case 写 __builtin_unreachable / abort 兜底
+// IR_OP_DISPATCH_EXIT - 块出口模板; target_pc 字段填下一 pc
+// IR_OP_ADD           - RV32I ADD;  rd = rs1 + rs2
+// IR_OP_ADDI          - RV32I ADDI; rd = rs1 + imm (sext12)
 //
-// b_02 真做 emit 时扩 (示意, 真做时拍):
-//   IR_OP_ADD / SUB / SLT / XOR / AND / OR / SLL / SRL / SRA / ...
-//   IR_OP_LOAD_8/16/32_S/U (按 size + sext/zext 分; 不按 RV LB/LH/LW 分)
-//   IR_OP_STORE_8/16/32
-//   IR_OP_BRANCH_EQ / LT / LT_U (合并 RV BLT/BGE signed 版, 参数标 signed)
-//   IR_OP_CALL_HELPER (slow path helper call; ID + 参数)
-//   ...
+// 后续 T2-T6 扩 enum 按 RV op 分组追加 (SUB/SLL/... 跟 R-type OP 段; LOAD/STORE
+// 跟 I-type/S-type 段; BRANCH/JAL/JALR 控制流段; CSR/AMO 等).
 // ----------------------------------------------------------------------------
 typedef enum {
     IR_OP_UNSUPPORTED   = 0,
     IR_OP_DISPATCH_EXIT = 1,
-    // 详细 op_kind 列表 b_02 真做时拍 (参考 plan §1.21 / §1.22 / §1.23 + 真做时
-    // backend 角度真需要的最小集)
+    IR_OP_ADD           = 2,
+    IR_OP_ADDI          = 3,
 } ir_op_kind_t;
 
 
 // ----------------------------------------------------------------------------
-// ir_inst_t —— 单条 IR 指令 (POD; 当前最少必要字段)
+// ir_inst_t —— 单条 IR 指令 (POD; 三地址码 + 块出口 target_pc 联合)
 //
-// 当前只放 kind + target_pc (DISPATCH_EXIT 用); b_02 真做 emit 时扩 dst /
-// src1 / src2 / imm 等三地址码字段.
+// 字段使用约定 (按 kind 不同):
+//   kind = IR_OP_DISPATCH_EXIT:
+//     target_pc - 下一块入口 PC (硬边界算 / 软边界出块 PC / 截断指令 PC)
+//     rd/rs1/rs2/imm - 不用
+//   kind = IR_OP_ADD:
+//     rd / rs1 / rs2 - 寄存器号 0..31
+//     target_pc / imm - 不用
+//   kind = IR_OP_ADDI:
+//     rd / rs1 - 寄存器号 0..31
+//     imm      - 12 位符号扩展立即数 (跟 decoded_inst_t.imm 体例对偶)
+//     target_pc / rs2 - 不用
+//   kind = IR_OP_UNSUPPORTED:
+//     永不真出现 — 哨兵, 字段不读
+//
+// 字段类型选 uint8_t 寄存器号 (节省 IR 流内存; RV reg 0..31 占 5 bit, uint8_t
+// 够) + int32_t imm (跟 decoded_inst_t.imm 同类型).
+//
+// future 字段扩 (T3 真翻译 LOAD/STORE/CSR/AMO 时):
+//   funct3 / funct5 / amo aq/rl / csr_addr 等子分类字段; 真做时按需扩 union 或
+//   新加字段 (跟 decoded_inst_t 字段不一一对应, IR 视角融合).
 // ----------------------------------------------------------------------------
 typedef struct {
     ir_op_kind_t kind;
-    uxlen_t      target_pc;   // IR_OP_DISPATCH_EXIT 时 = 下一块入口 pc;
-                              // IR_OP_UNSUPPORTED  时 = 触发指令 pc;
-                              // 其他 op b_02 真做时按需用 (未来可能改成 union /
-                              // 三地址码字段)
+    uxlen_t      target_pc;
+    uint8_t      rd;
+    uint8_t      rs1;
+    uint8_t      rs2;
+    int32_t      imm;
 } ir_inst_t;
 
 

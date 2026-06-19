@@ -306,8 +306,11 @@ void dispatcher(cpu_t *hart) {
     //   7. miss: interpret_one_block 兜底 — 块边界由解释器末尾 is_block_boundary_inst
     //           自然产生.
     //
-    // 当前无 heat counter (D2 a 拍法; b_02 真做 emit 时回头加 — 那时知道真实编译
-    // 延迟才能定阈值). jit_cache_entry_t.counter 字段保留, b_02 时 promote 用.
+    // TODO_T5: 当前无 heat counter (D2 a 拍法; T1 backend 真填后回头 T5 加 + 真
+    // 接 config.h COMPILE_THRESHOLD 宏 + jit_cache_count_or_promote 接口).
+    // jit_cache_entry_t.counter 字段保留 (jit_cache.h doc 同标 TODO_T5),
+    // T5 跟 invalidate_block 状态灯端到端验证一起做更聚焦 (memory
+    // `feedback_one_phase_one_thing` 一阶段一件事).
     //
     // local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在
     // 迭代头处理 (block 1 之前); 这里只做 block 执行调用. (uint64_t *) cast 因
@@ -324,6 +327,7 @@ void dispatcher(cpu_t *hart) {
     jit_rcu_read_unlock(hart->hartid);
 
     if (host_code != NULL) {
+        DEBUG_JIT_HIT();   /* 'J' trace — backend pipeline 真跑通的功能信号 (Q5=a) */
         jit_block_func_t fn = (jit_block_func_t)host_code;
         fn(hart, current_tlb, (uint64_t *)&local_count);
         atomic_store_explicit(&hart->jit_executing_host_code, NULL,

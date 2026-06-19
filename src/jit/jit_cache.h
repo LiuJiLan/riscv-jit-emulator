@@ -123,7 +123,12 @@ typedef enum {
 //   key_regime     — baked priv 视角 (BARE / SV32_S / SV32_U; core/mmu.h)
 //   status         — 状态机 (atomic; load acquire / store release)
 //   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; 非 atomic, CAS
-//                     status COUNTING 后 owner 独占写)
+//                     status COUNTING 后 owner 独占写).
+//                     TODO_T5: T1 阶段未真消费 (Q3=b 拍法; dispatcher fork 点 miss
+//                     直接 jit_compile_block, 不累计 counter). T5 真做时加
+//                     jit_cache_count_or_promote 接口 + 接 config.h
+//                     COMPILE_THRESHOLD 宏 + 跟 invalidate_block 状态灯端到端验证
+//                     一起做 (memory `feedback_one_phase_one_thing` 一阶段一件事).
 //   host_code_ptr  — backend 编译产物入口 (类型 jit_block_func_t = void (*)
 //                     (cpu_t*, tlb_t*, uint64_t*); Q1 a; 当前 stub backend
 //                     永返 NOT_IMPLEMENTED 不进 install 路径, b_02 backend

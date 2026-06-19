@@ -48,22 +48,25 @@
 // 才有 step 1 install 路径走通.
 //
 // ============================================================================
-// translator 占位
+// translator 调用 (T1 c+ 真做)
 // ============================================================================
 //
-// jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径是
+// jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径:
 //   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
 //   size_t n_insts = 0;
-//   translator_translate(pa, regime, ir_buf, &n_insts);  // b_02 真做
+//   translator_translate(pa, regime, ir_buf, &n_insts);
 //   backend.compile_block(pa, regime, ir_buf, n_insts, &host_code);
 //
-// 当前 translator 还没建, IR 流传 (nullptr, 0) 占位; stub backend 不读这两参
-// 所以不撞问题. b_02 真做 translator 时这里替换为 translator_translate 调用.
+// translator_translate 翻译 RV ADD/ADDI 子集 (T1 c+ 范围), 其他截断 emit
+// IR_OP_DISPATCH_EXIT 收尾; 块前缀空时 *n_insts = 1 (仅 DISPATCH_EXIT), backend
+// 端兜底返 NOT_IMPLEMENTED → set_blacklist → dispatcher 兜底走 interpret 真执行.
 //
 
 #include "api/jit_api.h"
+#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
+#include "jit/translator.h"  // translator_translate (RV → IR; T1 c+ 真做)
 
 extern "C" {
 
@@ -125,18 +128,18 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
     const backend_t *be = backend_get_default();
 
-    /* stub IR 流占位 — b_02 真做 translator 时替换为
-     *   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
-     *   size_t n_insts = 0;
-     *   translator_translate(pa, regime, ir_buf, &n_insts);
-     * stub backend 不读 (insts, n_insts), 当前传 (nullptr, 0). */
-    const ir_inst_t *ir_stub = nullptr;
-    size_t n_insts_stub = 0;
+    /* RV → IR 翻译 (T1 c+ 真做; b_01 ir_stub/n_insts_stub 占位已替换).
+     * ir_buf stack 分配 BLOCK_INST_LIMIT slot, translator 写真实长度到 n_insts;
+     * 块前缀空 (i==0) 时 n_insts = 1 (仅 DISPATCH_EXIT), backend.compile_block
+     * 检测后返 NOT_IMPLEMENTED, step 3 set_blacklist 走 interpret 兜底. */
+    ir_inst_t ir_buf[BLOCK_INST_LIMIT];
+    size_t n_insts = 0;
+    translator_translate(pa, regime, ir_buf, &n_insts);
 
     /* step 1: 首次 compile */
     void *host_code = nullptr;
     jit_status_t s = be->backend_compile_block(pa, regime,
-                                               ir_stub, n_insts_stub,
+                                               ir_buf, n_insts,
                                                &host_code);
     if (s == JIT_OK) {
         (void)jit_cache_install(pa, regime, host_code);
@@ -148,7 +151,7 @@ jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
         jit_flush_all();
         host_code = nullptr;
         s = be->backend_compile_block(pa, regime,
-                                      ir_stub, n_insts_stub,
+                                      ir_buf, n_insts,
                                       &host_code);
         if (s == JIT_OK) {
             (void)jit_cache_install(pa, regime, host_code);

@@ -138,6 +138,7 @@ extern void debug_flush_local_trace(void);
 #define DEBUG_TIME_INTR()  do { debug_buf_putc('t'); } while (0)
 #define DEBUG_SOFT_INTR()  do { debug_buf_putc('s'); } while (0)
 #define DEBUG_EXT_INTR()   do { debug_buf_putc('e'); } while (0)
+#define DEBUG_JIT_HIT()    do { debug_buf_putc('J'); } while (0)
 
 // DEBUG_NEWLINE() — 触发当前线程 trace_buf flush 到 stderr + EOL 分块。
 // dispatcher 退出前调一次, 让 trace 流跟后面 [perf] / [dispatcher] halted 各占
@@ -152,6 +153,7 @@ extern void debug_flush_local_trace(void);
 #define DEBUG_TIME_INTR()  do { } while (0)
 #define DEBUG_SOFT_INTR()  do { } while (0)
 #define DEBUG_EXT_INTR()   do { } while (0)
+#define DEBUG_JIT_HIT()    do { } while (0)
 #define DEBUG_NEWLINE()    do { } while (0)
 
 #endif /* DEBUG_TRACE_ON */
