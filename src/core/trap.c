@@ -313,3 +313,87 @@ _Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uxlen_t tval) {
     siglongjmp(*hart->jmp_buf_ptr, 1);
     /* unreachable; siglongjmp 不返回. _Noreturn 标识. */
 }
+
+
+// ----------------------------------------------------------------------------
+// mret_helper —— MRET 状态机 helper (interpreter + JIT backend 共用; 详见 trap.h doc)
+//
+// 归属 trap.c (而非 csr.c / interpreter.c / isa/): MRET/SRET 状态机跟 trap entry 同源,
+// 都改 mstatus xPIE/xIE/xPP/xDT 字段, 方向相反; trap.h 顶段 doc 详.
+//
+// PRIV_CHECK 失败时 trap_raise_exception(CAUSE_ILLEGAL_INSTRUCTION, raw_inst) _Noreturn
+// longjmp; 正常路径 void return.
+//
+// RV Privileged Spec Vol II §3.3.2 + Smdbltrp §3.1.6.2 + Ssdbltrp §4.1.1.5:
+//   priv = MPP                                (从 mstatus 恢复 caller priv)
+//   MIE  = MPIE                               (恢复 interrupt-enable)
+//   MPIE = 1                                  (RV spec)
+//   MPP  = PRIV_U = 0                         (least-priv reset)
+//   pc   = mepc (= trap.xepc[PRIV_M])
+//   mstatus.MDT = 0                           (Smdbltrp §3.1.6.2: MRET 清 MDT)
+//   if (new priv == PRIV_U) sstatus.SDT = 0   (Ssdbltrp §4.1.1.5 联动; 项目无 H,
+//                                              仅 PRIV_U 触发)
+// ----------------------------------------------------------------------------
+void mret_helper(cpu_t *hart, u32_t raw_inst) {
+    if (hart->priv < PRIV_M) {
+        trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, /*tval*/raw_inst);
+        /* _Noreturn longjmp; unreachable */
+    }
+    uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+
+    hart->priv = (uint8_t)((mstatus_lo >> MSTATUS_MPP_SHIFT) & MSTATUS_MPP_MASK);
+
+    if (mstatus_lo & MSTATUS_MPIE) { mstatus_lo |=  MSTATUS_MIE; }
+    else { mstatus_lo &= ~MSTATUS_MIE; }
+    mstatus_lo |= MSTATUS_MPIE;
+    mstatus_lo &= ~MSTATUS_MPP;
+    /* PRIV_U=0 已是清零默认; 显式 `| (PRIV_U << MSTATUS_MPP_SHIFT)` 是 0, 省略 */
+
+    hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+                        | (uint64_t)mstatus_lo;
+
+    hart->trap._mstatus &= ~MSTATUS_MDT_BIT64;
+    if (hart->priv == PRIV_U) {
+        hart->trap._mstatus &= ~(uint64_t)MSTATUS_SDT;
+    }
+
+    hart->regs[0] = hart->trap.xepc[PRIV_M];
+}
+
+
+// ----------------------------------------------------------------------------
+// sret_helper —— SRET 状态机 helper (跟 mret_helper 同形态; S-mode 字段段 + sepc)
+//
+// RV Privileged Spec Vol II §3.3.2 + Ssdbltrp §4.1.1.5:
+//   priv = SPP (1-bit; 0=U, 1=S)
+//   SIE  = SPIE
+//   SPIE = 1
+//   SPP  = PRIV_U = 0                         (least-priv reset; SPP 1-bit, 清 0)
+//   pc   = sepc (= trap.xepc[PRIV_S])
+//   sstatus.SDT = 0                           (Ssdbltrp §4.1.1.5: SRET 清 SDT,
+//                                              regardless of new priv)
+//
+// PRIV_CHECK_OR_TRAP(PRIV_S); 失败 trap_raise_exception(illegal, raw_inst) longjmp.
+// mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2) — TSR 控制位长期 TODO
+// (需要 trap_csrs_t.xxxx 字段同步 + helper 内组合判).
+// ----------------------------------------------------------------------------
+void sret_helper(cpu_t *hart, u32_t raw_inst) {
+    if (hart->priv < PRIV_S) {
+        trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, /*tval*/raw_inst);
+        /* _Noreturn longjmp; unreachable */
+    }
+    uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
+
+    hart->priv = (uint8_t)((mstatus_lo & MSTATUS_SPP) >> MSTATUS_SPP_SHIFT);
+
+    if (mstatus_lo & MSTATUS_SPIE) { mstatus_lo |=  MSTATUS_SIE; }
+    else { mstatus_lo &= ~MSTATUS_SIE; }
+    mstatus_lo |= MSTATUS_SPIE;
+    mstatus_lo &= ~MSTATUS_SPP;
+    mstatus_lo &= ~MSTATUS_SDT;
+
+    hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
+                        | (uint64_t)mstatus_lo;
+
+    hart->regs[0] = hart->trap.xepc[PRIV_S];
+}

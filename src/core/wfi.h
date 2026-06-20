@@ -125,4 +125,24 @@ void wfi_kick(uint32_t hartid);
 void wfi_kick_all(void);
 
 
+// ----------------------------------------------------------------------------
+// wfi_should_wake — wfi_wait predicate (interpreter + JIT backend 共用)
+//
+// 唤醒条件 (RV spec §3.3.2):
+//   1. SRS 非 0 (system reset 信号) — 退出 hart loop
+//   2. (mie & csr_mip_read(hart)) != 0 — 任何 enabled-by-mie 的中断 pending;
+//      跟 mstatus.MIE 无关 (WFI 唤醒不要求 global IE; spec 明确)
+//
+// closure = cpu_t * (caller 传 hart); 返 true 时 wfi_wait 内 cond_wait 退出.
+//
+// 锁与可见性: predicate 在 wfi_wait 内 mutex hold 下被调; atomic_load(SRS, acquire)
+// 跟 SRS-setter 端 release 配对; csr_mip_read 内部走 atomic_load.
+//
+// 此函数 T4 期间从 interpreter.c file-static 提为 extern 放本模块 (跟 wfi_wait 协议
+// 对偶, 同模块); JIT backend emit `call wfi_wait(hartid, wfi_should_wake, hart)`
+// 跨 TU 拿地址.
+// ----------------------------------------------------------------------------
+bool wfi_should_wake(void *closure);
+
+
 #endif //CORE_WFI_H

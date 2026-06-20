@@ -1,6 +1,6 @@
 //
 // Created by liujilan on 2026/6/19.
-// jit/translator.c —— RV → IR 翻译器实装 (T1+T2+T3 范围: 48 op 真翻译 + 23 op
+// jit/translator.c —— RV → IR 翻译器实装 (T1-T4 范围: 62 op 真翻译 + 9 op
 // 截断 emit DISPATCH_EXIT 走 interpret 兜底).
 //
 // 实装顶段 doc 见 translator.h.
@@ -10,7 +10,7 @@
 //   - 跨页 check 推进后 cur_pc 进新 page 退 (跟 interpreter.c:896 同体例;
 //     page_mask = ~0xFFFu)
 //   - 软边界 BLOCK_INST_LIMIT - 1 (留 1 slot 给 DISPATCH_EXIT 收尾)
-//   - PC_STEP 用 d.pc_step 而非 hardcoded 4 (T6 加 RVC 时自动适应; T1+T2+T3 全部
+//   - PC_STEP 用 d.pc_step 而非 hardcoded 4 (T6 加 RVC 时自动适应; T1-T4 全部
 //     真翻译 op 都是 PC_STEP_RV = 4)
 //
 // T2 唯一"translator 端有运算"的 op 是 AUIPC: cur_pc + d.imm 合并写进 ir.imm
@@ -26,10 +26,22 @@
 // line): ir_imm = d.imm = csr_addr 12-bit; RWI/RSI/RCI 变体 d.rs1 字段直接是
 // 5-bit zimm 数值, ir.rs1 装它即可 (跟 decoded_inst_t 同体例).
 //
-// T3 暂不翻译的 23 op (仍 fallthrough goto out_translate, 走 interpret 兜底):
-//   RV32M 8 (推 T6 真做 emit) / BRANCH 6 + JAL/JALR (推 T4 控制流) / SYSTEM
-//   ECALL/EBREAK/MRET/SRET/SFENCE_VMA/WFI (推 T4 跟控制流 + trap 一起做) /
-//   OP_UNSUPPORTED (兜底, interpret 走 trap_raise cause=2 illegal).
+// T4 范围 (控制流 + 块出口模板全形态): BRANCH 6 + JAL + JALR + SYSTEM 6 = 14 op
+// 全是硬边界. 三个新局部变量配合末段 DISPATCH_EXIT 装填:
+//   - ir_target_pc: BRANCH 装 taken_pc (= pre-incr cur_pc + d.imm); JAL/JALR 装
+//                    rd 写入值 (= pre-incr cur_pc + d.pc_step); 其他 op 默认 0.
+//   - hard_exit_pc: JAL 装 jump target (= pre-incr cur_pc + d.imm) 给末段
+//                    DISPATCH_EXIT.target_pc; 其他 op 默认 0 走 cur_pc 路径.
+//   - use_runtime_exit: JALR 设 1, 末段 IR 用 IR_OP_DISPATCH_EXIT_RUNTIME 哨兵
+//                    (backend 从 r9d 读 runtime target); 其他 op 默认 0 走标准
+//                    IR_OP_DISPATCH_EXIT 路径.
+// BRANCH 末段 DISPATCH_EXIT.target_pc = cur_pc = fall_through_pc (taken_pc 已
+// 装在 BRANCH IR 自身); MRET/SRET/WFI 末段 target_pc 装 cur_pc 但 backend 走
+// COUNT_ONLY 出口不读此值 (helper 已自写 hart->regs[0]).
+//
+// T4 仍截断的 9 op (仍 fallthrough goto out_translate, 走 interpret 兜底):
+//   RV32M 8 (推 T7 真做 emit) / OP_UNSUPPORTED (兜底, interpret 走 trap_raise
+//   cause=2 illegal).
 //
 
 #include "translator.h"
@@ -59,10 +71,20 @@ void translator_translate(uxlen_t pa, regime_t regime,
 
     const uxlen_t entry_page = pa & TRANSLATOR_PAGE_MASK;
 
+    /* T4 末段 DISPATCH_EXIT 装填用 (loop 外 — 需要循环 break 后可见):
+     *   hard_exit_pc       - JAL 装 jump target; 其他 op 不动
+     *   have_hard_exit_pc  - 1 仅当 JAL 设了 hard_exit_pc (防 JAL imm=-cur_pc
+     *                        撞 hard_exit_pc=0 sentinel 的 edge case)
+     *   use_runtime_exit   - JALR 设 1; 末段走 IR_OP_DISPATCH_EXIT_RUNTIME */
+    uxlen_t hard_exit_pc      = 0;
+    int     have_hard_exit_pc = 0;
+    int     use_runtime_exit  = 0;
+
     /* 翻译循环 (块前缀):
      *   - 软边界 i < BLOCK_INST_LIMIT - 1u (留 1 slot 给 DISPATCH_EXIT 收尾)
-     *   - 非 RV32I 算术全集截断 (含 OP_UNSUPPORTED / boundary 指令 / load/store/
-     *     csr/amo/lrsc/fence/branch/jal/jalr 等; 推 T3-T6 真做)
+     *   - 截断条件 (走 interpret 兜底): RV32M 8 + OP_UNSUPPORTED
+     *   - 硬边界 op (CSR 6 / FENCE_I / BRANCH 6 / JAL / JALR / SYSTEM 6) emit
+     *     完 IR 后 break 切块
      *   - 跨页 check (推进后 cur_pc 进新 page → 退)
      */
     while (i < BLOCK_INST_LIMIT - 1u) {
@@ -79,8 +101,12 @@ void translator_translate(uxlen_t pa, regime_t regime,
                                                  * 就是 csr_addr 12-bit
                                                  * (decode.h:158 line), 复用 imm
                                                  * 字段无需特殊处理 */
-        /* 硬边界 op (CSR 6 + FENCE_I); emit 完该 op IR 后强制 break 出循环 →
-         * DISPATCH_EXIT(cur_pc + pc_step) 收尾切块. plan §1.23.1 表 4 + 表 7. */
+        /* T4 ir_target_pc — BRANCH IR.target_pc 装 taken_pc; JAL/JALR IR.target_pc
+         * 装 rd 写入值 (= pre-incr cur_pc + pc_step). 默认 0 (其他 op 不用此字段). */
+        uxlen_t      ir_target_pc = 0;
+        /* 硬边界 op (CSR 6 + FENCE_I + T4 控制流 14); emit 完该 op IR 后强制
+         * break 出循环 → 末段 DISPATCH_EXIT/_RUNTIME 收尾切块.
+         * plan §1.23.1 表 4 + 表 7. */
         int          is_hard_boundary = 0;
 
         switch (d.kind) {
@@ -158,31 +184,105 @@ void translator_translate(uxlen_t pa, regime_t regime,
             case OP_FENCE:    ir_kind = IR_OP_FENCE;                          break;
             case OP_FENCE_I:  ir_kind = IR_OP_FENCE_I; is_hard_boundary = 1; break;
 
-            /* 仍截断 — 推 T4/T6 真做 emit. 显式列全 (而非走 default) 是因为
+            /* ---- B-type BRANCH (6; T4 加; 硬边界; 双出口) ----
+             * BRANCH IR.target_pc 装 taken_pc (= 本指令 PC + d.imm); 末段
+             * DISPATCH_EXIT.target_pc = cur_pc (= 本指令 PC + pc_step =
+             * fall_through_pc). cur_pc 此时尚未推进, 用即可. */
+            case OP_BEQ:
+                ir_kind = IR_OP_BEQ;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+            case OP_BNE:
+                ir_kind = IR_OP_BNE;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+            case OP_BLT:
+                ir_kind = IR_OP_BLT;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+            case OP_BGE:
+                ir_kind = IR_OP_BGE;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+            case OP_BLTU:
+                ir_kind = IR_OP_BLTU;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+            case OP_BGEU:
+                ir_kind = IR_OP_BGEU;
+                ir_target_pc = cur_pc + (uint32_t)d.imm;
+                is_hard_boundary = 1;
+                break;
+
+            /* ---- J-type JAL (1; T4 加; 硬边界; compile-time target) ----
+             * JAL IR.target_pc 装 rd 写入值 (= 本指令 PC + pc_step); 末段
+             * DISPATCH_EXIT.target_pc 由 hard_exit_pc 装 jump target
+             * (= 本指令 PC + d.imm). */
+            case OP_JAL:
+                ir_kind = IR_OP_JAL;
+                ir_target_pc      = cur_pc + d.pc_step;
+                hard_exit_pc      = cur_pc + (uint32_t)d.imm;
+                have_hard_exit_pc = 1;
+                is_hard_boundary  = 1;
+                break;
+
+            /* ---- I-type JALR (1; T4 加; 硬边界; runtime target) ----
+             * JALR IR.target_pc 装 rd 写入值 (= 本指令 PC + pc_step); ir.imm =
+             * imm12 backend 端算 target = (rs1 + imm12) & ~1u 存 r9d; 末段 IR
+             * 走 DISPATCH_EXIT_RUNTIME 从 r9d 读 target. */
+            case OP_JALR:
+                ir_kind = IR_OP_JALR;
+                ir_target_pc = cur_pc + d.pc_step;
+                use_runtime_exit = 1;
+                is_hard_boundary = 1;
+                break;
+
+            /* ---- I-type SYSTEM (6; T4 加; 全硬边界) ----
+             * ECALL/EBREAK: backend emit `call trap_raise_exception` _Noreturn
+             *   longjmp; 末段 DISPATCH_EXIT 是 dead code (backend 选择不 emit).
+             * MRET/SRET: backend emit `call mret_helper/sret_helper`; helper 内
+             *   含 PRIV_CHECK + 写 hart->regs[0] = xepc; 末段走 COUNT_ONLY
+             *   不写 cpu->pc.
+             * SFENCE_VMA: backend emit PRIV_CHECK inline + `call sfence_vma_helper`;
+             *   末段走标准 DISPATCH_EXIT (helper 不写 cpu->pc).
+             * WFI: backend emit TW 检查 inline + `call wfi_wait` (cond_wait 阻塞
+             *   到 SRS / 中断 pending) + `call lrsc_clear_self` + pc += 4 自推
+             *   进; 末段走 COUNT_ONLY 不写 cpu->pc.
+             * raw_inst 由 ir_buf 末段统一装 (line 184), helper 内 PRIV_CHECK/TW
+             * 失败 trap 时用作 mtval. */
+            case OP_ECALL:       ir_kind = IR_OP_ECALL;       is_hard_boundary = 1; break;
+            case OP_EBREAK:      ir_kind = IR_OP_EBREAK;      is_hard_boundary = 1; break;
+            case OP_MRET:        ir_kind = IR_OP_MRET;        is_hard_boundary = 1; break;
+            case OP_SRET:        ir_kind = IR_OP_SRET;        is_hard_boundary = 1; break;
+            case OP_SFENCE_VMA:  ir_kind = IR_OP_SFENCE_VMA;  is_hard_boundary = 1; break;
+            case OP_WFI:         ir_kind = IR_OP_WFI;         is_hard_boundary = 1; break;
+
+            /* 仍截断 — 推 T7 真做 emit. 显式列全 (而非走 default) 是因为
              * -Wswitch-enum -Werror 强制 op_kind_t switch 同步;
              * CLAUDE.md 顶段 "load-bearing mechanism" 段. */
-            /* RV32M (推 T6) */
+            /* RV32M (推 T7) */
             case OP_MUL:    case OP_MULH:   case OP_MULHSU: case OP_MULHU:
             case OP_DIV:    case OP_DIVU:   case OP_REM:    case OP_REMU:
-            /* Branch / JAL / JALR 控制流 (推 T4) */
-            case OP_BEQ:    case OP_BNE:    case OP_BLT:    case OP_BGE:
-            case OP_BLTU:   case OP_BGEU:
-            case OP_JAL:    case OP_JALR:
-            /* SYSTEM (推 T4; 跟控制流 + trap 一起做) */
-            case OP_ECALL:  case OP_EBREAK: case OP_MRET:   case OP_SRET:
-            case OP_SFENCE_VMA: case OP_WFI:
             /* 兜底 (interpret 走 trap_raise cause=2 illegal) */
             case OP_UNSUPPORTED:
                 goto out_translate;
         }
 
-        ir_buf[i].kind     = ir_kind;
-        ir_buf[i].rd       = (uint8_t)d.rd;
-        ir_buf[i].rs1      = (uint8_t)d.rs1;
-        ir_buf[i].rs2      = (uint8_t)d.rs2;
-        ir_buf[i].imm      = ir_imm;
-        ir_buf[i].raw_inst = inst;       /* CSR 6 op illegal trap mtval; 其他 op
-                                          * 不读 — 一律填便宜不分流 */
+        ir_buf[i].kind      = ir_kind;
+        ir_buf[i].target_pc = ir_target_pc;  /* BRANCH taken_pc / JAL/JALR rd 值;
+                                              * 其他 op 默认 0 (backend 不读) */
+        ir_buf[i].rd        = (uint8_t)d.rd;
+        ir_buf[i].rs1       = (uint8_t)d.rs1;
+        ir_buf[i].rs2       = (uint8_t)d.rs2;
+        ir_buf[i].imm       = ir_imm;
+        ir_buf[i].raw_inst  = inst;       /* CSR 6 + SYSTEM (MRET/SRET/SFENCE_VMA/
+                                           * WFI) op illegal trap mtval; 其他 op
+                                           * 不读 — 一律填便宜不分流 */
         i++;
 
         cur_pc += d.pc_step;
@@ -200,9 +300,21 @@ void translator_translate(uxlen_t pa, regime_t regime,
     }
 out_translate:;
 
-    /* 块出口 DISPATCH_EXIT 收尾 (target_pc = cur_pc = 截断指令 PC / 软边界出块
-     * PC / 跨页边界 PC); backend emit 时编 "写 cpu->pc=target_pc + 写 count_out
-     * + epilogue + ret".
+    /* 块出口 IR 收尾 (T4 起按 use_runtime_exit / have_hard_exit_pc 分流三形态):
+     *
+     *   1. JALR 块 (use_runtime_exit == 1):
+     *        kind = IR_OP_DISPATCH_EXIT_RUNTIME; backend 从 r9d 读 runtime target
+     *        写 cpu->pc + 写 count_out + epilogue. target_pc 字段不读.
+     *
+     *   2. JAL 块 (have_hard_exit_pc == 1):
+     *        kind = IR_OP_DISPATCH_EXIT; target_pc = hard_exit_pc = JAL 的 jump
+     *        target (= JAL pc + d.imm); backend 写 cpu->pc=target_pc.
+     *
+     *   3. 其他 (BRANCH / CSR / FENCE / SYSTEM / 截断 / 跨页 / 软边界):
+     *        kind = IR_OP_DISPATCH_EXIT; target_pc = cur_pc (= 截断指令 PC /
+     *        软边界出块 PC / 硬边界 op 后下一 PC). BRANCH 的 fall_through_pc /
+     *        SYSTEM 的下一 PC 都走此路径. MRET/SRET/WFI 块 backend 走 COUNT_ONLY
+     *        出口不读 target_pc.
      *
      * 块前缀空 (i == 0): target_pc = pa (跟块入口同); backend.compile_block 检
      * 测 n_insts == 1 时返 NOT_IMPLEMENTED, jit_entry.cc set_blacklist 让
@@ -210,8 +322,13 @@ out_translate:;
      *
      * rd/rs1/rs2/imm 清 0 是兜底 (backend default case 只读 target_pc, 这些字段
      * 不读; 清 0 防 stale 数据). */
-    ir_buf[i].kind      = IR_OP_DISPATCH_EXIT;
-    ir_buf[i].target_pc = cur_pc;
+    if (use_runtime_exit) {
+        ir_buf[i].kind      = IR_OP_DISPATCH_EXIT_RUNTIME;
+        ir_buf[i].target_pc = 0;        /* RUNTIME 不读; backend 从 r9d 读 */
+    } else {
+        ir_buf[i].kind      = IR_OP_DISPATCH_EXIT;
+        ir_buf[i].target_pc = have_hard_exit_pc ? hard_exit_pc : cur_pc;
+    }
     ir_buf[i].rd        = 0;
     ir_buf[i].rs1       = 0;
     ir_buf[i].rs2       = 0;

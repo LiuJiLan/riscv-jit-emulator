@@ -21,7 +21,10 @@
 #include <time.h>
 
 #include "config.h"               // MAX_HARTS / WFI_TIMEOUT_NS
+#include "cpu.h"                  // cpu_t (wfi_should_wake_default 读 hart->trap._mie)
+#include "csr.h"                  // csr_mip_read (wfi_should_wake_default 合成读 mip)
 #include "debug.h"                // DEBUG_WFI_SLEEP ('w' 进 cond_wait 前打)
+#include "runtime.h"              // system_reset_signal (wfi_should_wake_default predicate 内读)
 
 
 // ----------------------------------------------------------------------------
@@ -206,4 +209,21 @@ void wfi_kick_all(void) {
     for (uint32_t i = 0; i < MAX_HARTS; i++) {
         wfi_kick(i);
     }
+}
+
+
+// ----------------------------------------------------------------------------
+// wfi_should_wake —— wfi_wait predicate (interpreter + JIT backend 共用)
+//
+// 顶段 doc 见 wfi.h. T4 期间从 interpreter.c file-static 提为 extern 放本模块.
+// 跟 wfi_wait 协议对偶 (predicate 跟 wait 同模块, 跨 TU 让 JIT backend 拿地址).
+//
+// 唤醒条件 (RV spec §3.3.2): SRS 非 0 或 (mie & csr_mip_read(hart)) != 0.
+// ----------------------------------------------------------------------------
+bool wfi_should_wake(void *closure) {
+    cpu_t *h = (cpu_t *)closure;
+    if (atomic_load_explicit(&system_reset_signal, memory_order_acquire) != 0u) {
+        return true;
+    }
+    return (csr_mip_read(h) & h->trap._mie) != 0u;
 }

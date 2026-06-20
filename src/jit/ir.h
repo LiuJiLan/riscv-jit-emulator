@@ -22,18 +22,25 @@
 //     否决的选项 A "无 IR / backend 被迫 RV 化"
 //
 // ============================================================================
-// T1+T2+T3 真做范围 (48 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 + AMO 9 +
-//                    LR/SC 2 + FENCE 2)
+// T1-T4 真做范围 (62 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 + AMO 9 +
+//                  LR/SC 2 + FENCE 2 + BRANCH 6 + JAL + JALR + SYSTEM 6)
 // ============================================================================
 //
-// IR_OP_UNSUPPORTED   - enum 完整性哨兵 (永不真出现在 IR buffer; -Wswitch-enum
-//                        + -Werror 强制 backend switch 完整, default case 写
-//                        __builtin_unreachable / abort 兜底). 跟 decode.h
-//                        OP_UNSUPPORTED 同名陷阱: decode 端真撞, IR 端哨兵不撞.
-// IR_OP_DISPATCH_EXIT - 块出口模板 (= interpreter is_block_boundary_inst 后
-//                        goto out 的 JIT 对偶); target_pc 字段填下一块入口 pc.
-//                        backend emit 写 cpu->pc + 写 count_out + epilogue + ret.
-//                        每个 IR 流末尾必有一条 IR_OP_DISPATCH_EXIT.
+// IR_OP_UNSUPPORTED         - enum 完整性哨兵 (永不真出现在 IR buffer; -Wswitch-
+//                              enum + -Werror 强制 backend switch 完整, default
+//                              case 写 __builtin_unreachable / abort 兜底). 跟
+//                              decode.h OP_UNSUPPORTED 同名陷阱: decode 端真撞,
+//                              IR 端哨兵不撞.
+// IR_OP_DISPATCH_EXIT       - 块出口模板 (compile-time imm target); target_pc
+//                              字段填下一块入口 pc. backend emit 写 cpu->pc +
+//                              写 count_out + epilogue + ret. 大多数 IR 流末尾
+//                              都是这条 (BRANCH 6 / JAL / CSR / FENCE / SYSTEM
+//                              ECALL/EBREAK/SFENCE/MRET/SRET/WFI).
+// IR_OP_DISPATCH_EXIT_RUNTIME - 块出口模板 (runtime reg target; T4 加给 JALR
+//                              用). backend emit 从约定 scratch reg r9d 读
+//                              target PC 写 cpu->pc, 其他跟 DISPATCH_EXIT 一致.
+//                              IR 流末尾仅 JALR 块用此 sentinel; 其他 13 op 末
+//                              仍用 DISPATCH_EXIT.
 //
 // RV32I 算术全集 21 op (T1+T2; 按 decode.h op_kind_t 同分段顺序):
 //   U-type 2:
@@ -103,6 +110,53 @@
 // CSR/FENCE/FENCE_I 是硬边界 op (plan §1.23.1 表 4 + 表 7), translator emit
 // 完该 op 后立刻 emit IR_OP_DISPATCH_EXIT 切块.
 //
+// T4 真做范围 (控制流 + 块出口模板全形态):
+//
+//   BRANCH 6 (B-type, opcode 0x63; rs1/rs2 比较, imm = 13-bit signed offset):
+//     IR_OP_BEQ   taken if rs1 == rs2  (signed/unsigned 不区分)
+//     IR_OP_BNE   taken if rs1 != rs2
+//     IR_OP_BLT   taken if (int32_t)rs1 <  (int32_t)rs2
+//     IR_OP_BGE   taken if (int32_t)rs1 >= (int32_t)rs2
+//     IR_OP_BLTU  taken if rs1 < rs2   (unsigned)
+//     IR_OP_BGEU  taken if rs1 >= rs2  (unsigned)
+//     双出口块体: BRANCH IR 自 emit cmp + jcc + Label; taken 边内嵌 emit_dispatch_exit
+//     (target_pc=BRANCH IR.target_pc=taken_pc) + emit_epilogue; fall-through 边
+//     走块末 DISPATCH_EXIT (target_pc=cur_pc=fall_through_pc=pc+4). 一块两份
+//     epilogue, host code 块大小 2x 但 asmjit JitRuntime page-granularity 不撞限.
+//   JAL 1 (J-type, opcode 0x6F; rd = pc + pc_step, pc = pc + imm; compile-time target):
+//     IR_OP_JAL   IR 自身只 emit 写 rd = pc + pc_step (compile-time imm,
+//                  装在 ir.target_pc); 块末 DISPATCH_EXIT 装 target_pc = pc + imm
+//                  = jump target (translator 算好).
+//   JALR 1 (I-type, opcode 0x67; rd = pc + pc_step, pc = (rs1 + imm12) & ~1u; runtime target):
+//     IR_OP_JALR  IR 自身 emit 算 runtime target = (rs1 + imm12) & ~1u 存约定
+//                  scratch reg r9d + 写 rd = pc + pc_step (compile-time imm,
+//                  装在 ir.target_pc); 块末 DISPATCH_EXIT_RUNTIME 从 r9d 读
+//                  target 写 cpu->pc. JALR 跟末 RUNTIME 之间无 helper call,
+//                  r9d caller-saved 安全 (后续若加 instrumentation 需改 scratch).
+//   SYSTEM 6 (I-type, opcode 0x73 funct3=0 imm-encoded; 全硬边界):
+//     IR_OP_ECALL     backend emit `call trap_raise_exception(hart, 8+priv, 0)`
+//                      (_Noreturn longjmp); cause = CAUSE_ECALL_FROM_U + hart->priv
+//                      (runtime 读 priv).
+//     IR_OP_EBREAK    backend emit `call trap_raise_exception(hart, 3, 0)`
+//                      (_Noreturn longjmp); cause = CAUSE_BREAKPOINT compile-time.
+//     IR_OP_MRET      backend emit `call mret_helper(hart, raw_inst)` (helper
+//                      内含 PRIV_CHECK_OR_TRAP(PRIV_M); 状态机翻 mstatus
+//                      MIE/MPIE/MPP + MDT/SDT Smdbltrp 联动; 写 hart->regs[0]
+//                      = xepc[PRIV_M]). 末段 DISPATCH_EXIT_COUNT_ONLY 不写
+//                      cpu->pc (helper 已写).
+//     IR_OP_SRET      backend emit `call sret_helper(hart, raw_inst)` (同 MRET
+//                      但 S-mode 字段段 + sepc). 末段同 MRET.
+//     IR_OP_SFENCE_VMA backend emit PRIV_CHECK_OR_TRAP(PRIV_S) inline + `call
+//                      sfence_vma_helper(hart, vaddr_val, asid_val, rs1, rs2)`;
+//                      末段走标准 DISPATCH_EXIT (helper 不写 cpu->pc).
+//     IR_OP_WFI       backend emit TW 检查 inline + `call wfi_wait(hartid,
+//                      wfi_should_wake_default, hart)` (block 阻塞 cond_wait
+//                      跟 interpreter 同行为) + `call lrsc_clear_self(hart)` +
+//                      `add cpu->regs[0], 4` 自推进. 末段 DISPATCH_EXIT_COUNT_ONLY.
+//
+// BRANCH/JAL/JALR/SYSTEM 6 全是硬边界 op; translator emit 完该 op 后立刻 emit
+// 末段 DISPATCH_EXIT / DISPATCH_EXIT_RUNTIME 切块.
+//
 // aq/rl TODO (AMO + LR/SC memory order 修饰; B2 决议 chat session_004):
 //   当前完全忽略, 跟 Spike (riscv-isa-sim insns/amoadd_w.h case 不读 aq/rl) +
 //   rvemu (d0iasm cpu.rs `let _aq = ...; // TODO`) 同体例. 项目 host x86_64
@@ -112,9 +166,8 @@
 //   端 emit fence (tcg_gen_mb 风格), IR 不存 — 是局部增量, 不破坏现 IR 设计;
 //   weak host (ARM/AArch64) JIT 才有真收益, x86_64 host 永远是 no-op.
 //
-// 后续 T4-T6 扩 enum:
-//   T4 控制流:         BRANCH 6 + JAL + JALR; backend emit 条件跳 / 块出口模板
-//   T6 M+RVC:          MUL/DIV/REM 8 + RVC 压缩指令
+// 后续 T7 扩 enum:
+//   T7 M+RVC:          MUL/DIV/REM 8 + RVC 压缩指令
 //
 // IR 流形态 (T1+T2+T3):
 //   [48 op 之一 前缀 N 条 (0 ≤ N ≤ BLOCK_INST_LIMIT - 1)]
@@ -152,25 +205,31 @@
 
 
 // ----------------------------------------------------------------------------
-// ir_op_kind_t —— IR op 分类 (T1+T2+T3 范围: 2 哨兵/出口 + 48 真翻译 op)
+// ir_op_kind_t —— IR op 分类 (T1-T4 范围: 3 哨兵/出口 + 62 真翻译 op)
 //
-// IR_OP_UNSUPPORTED   - enum 完整性哨兵 (永不真出现在 IR buffer); backend
-//                        default case 写 __builtin_unreachable / abort 兜底
-// IR_OP_DISPATCH_EXIT - 块出口模板; target_pc 字段填下一 pc
+// IR_OP_UNSUPPORTED         - enum 完整性哨兵 (永不真出现在 IR buffer); backend
+//                              default case 写 __builtin_unreachable / abort 兜底
+// IR_OP_DISPATCH_EXIT       - 块出口模板 (compile-time imm target); target_pc 填
+//                              下一 pc
+// IR_OP_DISPATCH_EXIT_RUNTIME - 块出口模板 (runtime reg target; T4 加给 JALR);
+//                              backend emit 从约定 scratch reg r9d 读 target
+//                              写 cpu->pc, 其他跟 DISPATCH_EXIT 一致
 //
-// 48 真翻译 op 按 decode.h op_kind_t 分段顺序排 (RV32I 算术 21 → LOAD 5 →
-// STORE 3 → CSR 6 → AMO 9 → LR/SC 2 → MISC-MEM 2); 每条 op 语义见顶段 doc.
+// 62 真翻译 op 按 decode.h op_kind_t 分段顺序排 (RV32I 算术 21 → LOAD 5 →
+// STORE 3 → CSR 6 → AMO 9 → LR/SC 2 → MISC-MEM 2 → BRANCH 6 → JAL → JALR →
+// SYSTEM 6); 每条 op 语义见顶段 doc.
 //
-// IR_OP_UNSUPPORTED=0 / IR_OP_DISPATCH_EXIT=1 sentinel 显式值保留 (其他位置可
-// 自由调整 enum 顺序而不影响 sentinel 语义); 真翻译 op 不指定显式值, switch
-// 按名字访问.
+// IR_OP_UNSUPPORTED=0 / IR_OP_DISPATCH_EXIT=1 / IR_OP_DISPATCH_EXIT_RUNTIME=2
+// sentinel 显式值保留 (其他位置可自由调整 enum 顺序而不影响 sentinel 语义); 真翻译
+// op 不指定显式值, switch 按名字访问.
 //
-// 后续 T4/T6 扩 enum 按 RV op 分组追加 (BRANCH/JAL/JALR 控制流段; M 扩展;
-// RVC 压缩); 接口承诺 sentinel 值不动, 真翻译 op 按 decode.h 段追加末段.
+// 后续 T7 扩 enum 按 RV op 分组追加 (M 扩展; RVC 压缩); 接口承诺 sentinel 值
+// 不动, 真翻译 op 按 decode.h 段追加末段.
 // ----------------------------------------------------------------------------
 typedef enum {
-    IR_OP_UNSUPPORTED   = 0,
-    IR_OP_DISPATCH_EXIT = 1,
+    IR_OP_UNSUPPORTED           = 0,
+    IR_OP_DISPATCH_EXIT         = 1,
+    IR_OP_DISPATCH_EXIT_RUNTIME = 2,
 
     /* ---- U-type (2) ---- */
     IR_OP_LUI,
@@ -238,6 +297,30 @@ typedef enum {
     /* ---- MISC-MEM (2; 无 reg 字段, 硬边界后续紧跟 DISPATCH_EXIT) ---- */
     IR_OP_FENCE,
     IR_OP_FENCE_I,
+
+    /* ---- B-type BRANCH (6; T4 加; 硬边界; 双出口; target_pc 装 taken_pc) ---- */
+    IR_OP_BEQ,
+    IR_OP_BNE,
+    IR_OP_BLT,
+    IR_OP_BGE,
+    IR_OP_BLTU,
+    IR_OP_BGEU,
+
+    /* ---- J-type JAL (1; T4 加; 硬边界; compile-time target;
+            target_pc 装 rd 写入值 = pc + pc_step) ---- */
+    IR_OP_JAL,
+
+    /* ---- I-type JALR (1; T4 加; 硬边界; runtime target;
+            target_pc 装 rd 写入值; 末 IR 用 DISPATCH_EXIT_RUNTIME) ---- */
+    IR_OP_JALR,
+
+    /* ---- I-type SYSTEM (6; T4 加; 全硬边界) ---- */
+    IR_OP_ECALL,
+    IR_OP_EBREAK,
+    IR_OP_MRET,
+    IR_OP_SRET,
+    IR_OP_SFENCE_VMA,
+    IR_OP_WFI,
 } ir_op_kind_t;
 
 
@@ -258,8 +341,13 @@ typedef enum {
 //
 // 字段使用约定 (按 kind 不同):
 //   kind = IR_OP_DISPATCH_EXIT:
-//     target_pc - 下一块入口 PC (硬边界算 / 软边界出块 PC / 截断指令 PC)
+//     target_pc - 下一块入口 PC (硬边界算 / 软边界出块 PC / 截断指令 PC; JAL 时
+//                  装 jump target = pc + imm; BRANCH 时装 fall_through_pc = pc + 4;
+//                  MRET/SRET/WFI 装 pc + 4 但 backend 走 COUNT_ONLY 不读)
 //     rd/rs1/rs2/imm - 不用
+//   kind = IR_OP_DISPATCH_EXIT_RUNTIME (T4; JALR 用):
+//     target_pc / rd / rs1 / rs2 / imm - 不用 (target 从 scratch reg r9d 读,
+//                                              translator 由前条 JALR IR 装好)
 //   kind ∈ U-type {IR_OP_LUI, IR_OP_AUIPC}:
 //     rd  - 寄存器号 0..31
 //     imm - 32 位常数 (translator 端: LUI = decode.imm 直传; AUIPC = baked_pc +
@@ -305,6 +393,40 @@ typedef enum {
 //     imm / target_pc - 不用
 //   kind ∈ FENCE {IR_OP_FENCE, IR_OP_FENCE_I}:
 //     rd / rs1 / rs2 / imm / target_pc - 不用 (helper 无 reg 参数)
+//   kind ∈ BRANCH 6 {IR_OP_BEQ, IR_OP_BNE, IR_OP_BLT, IR_OP_BGE, IR_OP_BLTU,
+//                     IR_OP_BGEU} (T4):
+//     rs1 / rs2 - 寄存器号 (条件比较两操作数)
+//     target_pc - taken_pc (translator 算 cur_pc + (uint32_t)d.imm; backend
+//                  emit cmp + jcc + taken_label: emit_dispatch_exit(taken_pc)
+//                  + emit_epilogue; fall-through 走块末 DISPATCH_EXIT)
+//     rd / imm / raw_inst - 不用 (imm 装也可调试 trace; backend 不读)
+//   kind = IR_OP_JAL (T4):
+//     rd        - 链接寄存器号 (rd = pc + pc_step)
+//     target_pc - rd 写入值 = pc + pc_step (compile-time imm, translator 算)
+//     rs1 / rs2 / imm / raw_inst - 不用 (jump target = pc + imm 装在末
+//                                          DISPATCH_EXIT.target_pc, 不在 IR 自身)
+//   kind = IR_OP_JALR (T4):
+//     rd        - 链接寄存器号
+//     rs1       - 基址寄存器号
+//     imm       - 12-bit signed imm12 (offset; backend 算 target = (rs1 + imm) & ~1u)
+//     target_pc - rd 写入值 = pc + pc_step (compile-time imm)
+//     rs2 / raw_inst - 不用 (末 IR 是 DISPATCH_EXIT_RUNTIME 从 r9d 读 target)
+//   kind ∈ SYSTEM 6 {IR_OP_ECALL, IR_OP_EBREAK, IR_OP_MRET, IR_OP_SRET,
+//                     IR_OP_SFENCE_VMA, IR_OP_WFI} (T4):
+//     ECALL/EBREAK:
+//       rd / rs1 / rs2 / imm / target_pc - 不用 (cause inline 算, tval=0)
+//       raw_inst - 不用 (ECALL/EBREAK 不需要 mtval)
+//     MRET/SRET:
+//       rd / rs1 / rs2 / imm / target_pc - 不用
+//       raw_inst - 触发指令原码 (helper 内 PRIV_CHECK 失败时填 mtval)
+//     SFENCE_VMA:
+//       rs1 / rs2 - 寄存器号 (rs1=vaddr base 跟 rs2=ASID; backend 读 regs 装入参;
+//                    rs1/rs2=0 触发 RV magic encoding 走全清, 详 isa/sfence.c)
+//       raw_inst  - 触发指令原码 (PRIV_CHECK 失败 mtval)
+//       rd / imm / target_pc - 不用
+//     WFI:
+//       raw_inst - 触发指令原码 (TW 检查失败 mtval)
+//       rd / rs1 / rs2 / imm / target_pc - 不用
 //   kind = IR_OP_UNSUPPORTED:
 //     永不真出现 — 哨兵, 字段不读
 //

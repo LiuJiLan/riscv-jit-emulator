@@ -254,4 +254,37 @@ int trap_check_interrupt(cpu_t *hart);
 // 核共用思想.
 _Noreturn void trap_raise_exception(cpu_t *hart, uint32_t cause, uxlen_t tval);
 
+
+// ----------------------------------------------------------------------------
+// mret_helper / sret_helper —— MRET / SRET 状态机 helper (interpreter + JIT backend 共用)
+//
+// 归属 rationale (放 trap.c 不放 csr.c / interpreter.c / isa/*):
+//   - MRET/SRET 状态机跟 trap entry 同源 — 都改 mstatus xPIE/xIE/xPP/xDT 字段,
+//     方向相反 (trap entry 进 priv, MRET/SRET 退 priv). 内聚在 trap.c.
+//   - 不放 interpreter.c 因 JIT backend 也 emit `call mret_helper`, 跨 TU 调用.
+//   - 不放 csr.c 因 MRET/SRET 是 SYSTEM opcode (funct3=0), 不走 csr_op 入口,
+//     跟 CSRRW 等真 CSR 指令分流不同.
+//   - 不放 isa/ 因不是 ISA-级 inst 实装, 是 trap 状态机的反操作.
+//
+// 入参:
+//   hart     - cpu_t * (priv / mstatus / xepc 都在 hart->trap 字段)
+//   raw_inst - 触发指令 32-bit 原码 (PRIV_CHECK 失败时填 mtval, RV spec §3.1.16)
+//
+// 行为 (正常路径):
+//   1. PRIV_CHECK_OR_TRAP — priv >= M (MRET) 或 priv >= S (SRET); 失败
+//      trap_raise_exception(CAUSE_ILLEGAL_INSTRUCTION, raw_inst) _Noreturn longjmp.
+//   2. 翻 mstatus 字段 (MIE/MPIE/MPP/MDT/SDT 或 SIE/SPIE/SPP/SDT, 见 trap.c 实装).
+//   3. 写 hart->priv = MPP (或 SPP).
+//   4. 写 hart->regs[0] = xepc[PRIV_M] (或 xepc[PRIV_S]).
+//
+// 返回:
+//   正常成功路径 void return; PRIV_CHECK 失败走 trap_raise_exception _Noreturn longjmp.
+//   非 _Noreturn 标记 (因正常路径正常返).
+//
+// 调用方:
+//   - interpreter.c OP_MRET / OP_SRET case (重构后): SYNC_COUNT() + mret_helper(hart, d.raw_inst)
+//   - JIT backend_asmjit.cc emit_ir_system MRET/SRET case: `call mret_helper(hart, raw_inst)`
+void mret_helper(cpu_t *hart, u32_t raw_inst);
+void sret_helper(cpu_t *hart, u32_t raw_inst);
+
 #endif //CORE_TRAP_H

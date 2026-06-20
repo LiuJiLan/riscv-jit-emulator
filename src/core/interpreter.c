@@ -10,7 +10,7 @@
 
 #include "config.h"     // BLOCK_INST_LIMIT, IALIGN_MASK
 #include "cpu.h"
-#include "csr.h"        // csr_op + csr_op_t + csr_mip_read (wfi_should_wake)
+#include "csr.h"        // csr_op + csr_op_t
 #include "debug.h"      // DEBUG_WFI ('w' trace; WFI 进 cond_wait 标记)
 #include "decode.h"
 #include "isa/amo.h"    // amo_xxx_helper (9 inline 顶层; Zaamo)
@@ -18,39 +18,13 @@
 #include "isa/lrsc.h"   // lrsc_clear_self (WFI 醒后清 reservation; Q5 B4)
 #include "isa/lsu.h"    // lsu_load_helper / lsu_store_helper (inline 顶层) + store_helper (extern, HVA-based)
 #include "isa/sfence.h" // sfence_vma_helper (extern)
-#include "riscv.h"      // PRIV_M (MRET 读 hart->trap.xepc[PRIV_M]) / MSTATUS_TW (WFI 检查)
-#include "runtime.h"    // system_reset_signal (wfi_should_wake predicate 内读)
+#include "riscv.h"      // PRIV_M / MSTATUS_TW (WFI 检查)
 #include "tlb.h"
-#include "trap.h"       // trap_raise_exception (_Noreturn longjmp)
-#include "wfi.h"        // wfi_wait / wfi_predicate_fn (WFI 唤醒框架)
+#include "trap.h"       // trap_raise_exception (_Noreturn longjmp) + mret_helper / sret_helper
+#include "wfi.h"        // wfi_wait / wfi_predicate_fn / wfi_should_wake_default
 
-#include <stdatomic.h>  // atomic_load_explicit (wfi_should_wake 读 SRS)
-#include <stdbool.h>    // wfi_predicate_fn 返 bool
 #include <stdint.h>
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing
-
-
-// ----------------------------------------------------------------------------
-// wfi_should_wake — WFI cond_wait predicate (file-static; 传给 wfi_wait 当 callback)
-//
-// closure = cpu_t * (caller 传 hart 进去); 返 true 时 wfi_wait 内 cond_wait 退出。
-//
-// 唤醒条件 (RV spec §3.3.2):
-//   1. SRS 非 0 (system reset 信号; HART 只看 SRS 不看 SDS, dummy.txt 体例) — 退出 hart loop
-//   2. (mie & csr_mip_read(hart)) != 0 — 任何 enabled-by-mie 的中断 pending; 跟 mstatus.MIE
-//      无关 (WFI 唤醒不要求 global IE; spec 明确规定)
-//
-// 锁与可见性: predicate 在 wfi_wait 内 mutex hold 下被调; atomic_load(SRS, acquire)
-// 跟 SRS-setter 端 release 配对; csr_mip_read 内部走 atomic_load (CLINT mtip cache /
-// PLIC ctx_eip cache 都 acquire), 不需要额外锁。
-// ----------------------------------------------------------------------------
-static bool wfi_should_wake(void *closure) {
-    cpu_t *h = (cpu_t *)closure;
-    if (atomic_load_explicit(&system_reset_signal, memory_order_acquire) != 0u) {
-        return true;
-    }
-    return (csr_mip_read(h) & h->trap._mie) != 0u;
-}
 
 void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                          uint8_t *hva_pc, uint64_t *count_out) {
@@ -511,37 +485,20 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                                        CSR_OP_RC, d.raw_inst));
                 break;
 
-            // ---- I-type SYSTEM (ECALL / EBREAK / MRET) ----
+            // ---- I-type SYSTEM (ECALL / EBREAK / MRET / SRET) ----
             //
-            // ECALL: 触发 environment-call trap, cause 按 priv 分流 (RV spec table 3.6):
-            //          priv U → cause 8, priv S → cause 9, priv M → cause 11
-            //          有意写成 (8 + hart->priv) 公式 — RV 编码巧合: PRIV_U=0, PRIV_S=1,
-            //          PRIV_M=3 与 cause 8/9/11 差 8。Spike/QEMU 同做法。
-            //          tval = 0 (RV spec §3.1.17: ECALL/EBREAK 的 mtval write 0)。
-            //
-            // EBREAK: cause 3 (breakpoint, RV spec); 不分 priv。tval 一般 = 0
-            //          (实现 debug 子集时可填触发 PC, 项目当前 = 0)。
-            //
-            // MRET: 从 trap handler 回归; 不调 trap_raise_exception, 是 csr 路径 + trap_set_exception_state
-            //          / trap_set_interrupt_state 的反操作:
-            //          - hart->priv = mstatus.MPP                 (从 MPP 恢复 caller priv)
-            //          - mstatus.MIE  = mstatus.MPIE              (恢复 interrupt-enable)
-            //          - mstatus.MPIE = 1                          (RV spec 要求)
-            //          - mstatus.MPP  = PRIV_U                     (RV spec least-priv reset)
-            //          - hart->regs[0] = hart->trap.xepc[PRIV_M]   (从 mepc 恢复 PC)
-            //          - mstatus.MDT = 0                           (Smdbltrp §3.1.6.2 MRET 清 MDT)
-            //          - 若新 priv ∈ {U, VS, VU}: sstatus.SDT = 0  (§3.1.6.2 末段
-            //                                                       Ssdbltrp 联动; 项目无 H,
-            //                                                       仅 PRIV_U 触发)
+            // ECALL: cause 按 priv 分流 (RV spec table 3.6): priv U/S/M → cause 8/9/11.
+            //          公式 (8 + hart->priv) 利用 RV 编码巧合 (PRIV_U=0/S=1/M=3). tval = 0.
+            // EBREAK: cause 3 (breakpoint, RV spec); tval = 0.
+            // MRET/SRET: T4 起抽 mret_helper / sret_helper 放 trap.c (单一真理; JIT backend
+            //          也调同一 helper). helper 内含 PRIV_CHECK_OR_TRAP + spec 状态机
+            //          (mstatus xPIE/xIE/xPP 翻 + Smdbltrp MDT/Ssdbltrp SDT 联动 + pc =
+            //          xepc[xpriv]). PRIV_CHECK 失败时 helper 内 trap_raise_exception
+            //          _Noreturn longjmp.
             //
             //          case 末 break (不 goto out): fetch loop 末 += PC_STEP_NONE (=0, NOP),
-            //          count++ 计入本指令 (precise: MRET 已成功执行), boundary 检查 (MRET 是
-            //          boundary) → goto out 退出 fetch loop, dispatcher 重派发 from xepc。
-            //
-            //          权限要求: MRET 仅在 priv >= M 时合法 (M-mode CSR 入口); MRET 本身
-            //          不是 csr 指令而是 system 指令, 没走 csr_op 入口判, case 入口
-            //          PRIV_CHECK_OR_TRAP(PRIV_M) 显式判。U/S-mode 触发 MRET → cause=2
-            //          (illegal instruction), tval=raw_inst。
+            //          count++ 计入本指令 (precise: 已成功执行), boundary 检查 (MRET/SRET
+            //          是 boundary) → goto out, dispatcher 重派发 from xepc.
             case OP_ECALL:
                 /* RV 编码巧合: PRIV_U=0/S=1/M=3 ↔ cause 8/9/11 (= CAUSE_ECALL_FROM_U + priv).
                  * Spike / QEMU 同写法; PRIV_H=2 在没 H 扩展下不会触发 (hart->priv ∉ {2}). */
@@ -552,82 +509,14 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
                 SYNC_COUNT();
                 trap_raise_exception(hart, CAUSE_BREAKPOINT, /*tval*/0u);
                 goto out;
-            case OP_MRET: {
+            case OP_MRET:
                 SYNC_COUNT();
-                PRIV_CHECK_OR_TRAP(PRIV_M);
-                uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
-
-                /* hart->priv = MPP (从 mstatus 恢复 caller priv) */
-                hart->priv = (uint8_t)((mstatus_lo >> MSTATUS_MPP_SHIFT) & MSTATUS_MPP_MASK);
-
-                /* mstatus.MIE = mstatus.MPIE */
-                if (mstatus_lo & MSTATUS_MPIE) { mstatus_lo |=  MSTATUS_MIE; }
-                else { mstatus_lo &= ~MSTATUS_MIE; }
-
-                /* mstatus.MPIE = 1 (RV spec) */
-                mstatus_lo |= MSTATUS_MPIE;
-
-                /* mstatus.MPP = PRIV_U = 0 (RV spec least-priv reset) */
-                mstatus_lo &= ~MSTATUS_MPP;
-                /* PRIV_U=0 已是清零默认; 显式 `| (PRIV_U << MSTATUS_MPP_SHIFT)` 是 0, 省略 */
-
-                hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
-                                    | (uint64_t)mstatus_lo;
-
-                /* Smdbltrp §3.1.6.2: MRET 清 mstatus.MDT = 0 (在 _mstatus bit 42).
-                 * Ssdbltrp §4.1.1.5 联动: 若新 priv ∈ {U, VS, VU}, sstatus.SDT
-                 * 也清 0 (项目无 H 扩展, 仅 PRIV_U 触发)。 */
-                hart->trap._mstatus &= ~MSTATUS_MDT_BIT64;
-                if (hart->priv == PRIV_U) {
-                    hart->trap._mstatus &= ~(uint64_t)MSTATUS_SDT;
-                }
-
-                hart->regs[0]      = hart->trap.xepc[PRIV_M];
+                mret_helper(hart, d.raw_inst);   /* 含 PRIV_CHECK_OR_TRAP(PRIV_M) */
                 break;
-            }
-
-            // ---- I-type SYSTEM SRET (跟 OP_MRET 同形态; S-mode 字段段 + sepc) ----
-            //
-            // RV Privileged Spec Vol II §3.3.2:
-            //   priv = SPP (1-bit; 0=U, 1=S)
-            //   SIE  = SPIE
-            //   SPIE = 1
-            //   SPP  = PRIV_U = 0 (least-priv reset)
-            //   pc   = sepc (= trap.xepc[PRIV_S])
-            //   sstatus.SDT = 0 (Ssdbltrp §4.1.1.5 SRET 清 SDT)
-            //
-            // 权限要求 (跟 OP_MRET 同形态):
-            //   SRET 仅在 hart->priv >= S 时合法; U-mode SRET → cause=2 illegal instruction,
-            //   tval=raw_inst。case 入口 PRIV_CHECK_OR_TRAP(PRIV_S) 显式判。
-            //   mstatus.TSR=1 时 S-mode SRET 也 trap to M (cause=2)。TSR 控制位长期 TODO
-            //   (需要 trap_csrs_t.xxxx 字段同步 + helper 内组合判)。
-            case OP_SRET: {
+            case OP_SRET:
                 SYNC_COUNT();
-                PRIV_CHECK_OR_TRAP(PRIV_S);
-                uint32_t mstatus_lo = (uint32_t)(hart->trap._mstatus & 0xFFFFFFFFu);
-
-                /* hart->priv = SPP (1-bit; 0=U, 1=S) */
-                hart->priv = (uint8_t)((mstatus_lo & MSTATUS_SPP) >> MSTATUS_SPP_SHIFT);
-
-                /* mstatus.SIE = mstatus.SPIE */
-                if (mstatus_lo & MSTATUS_SPIE) { mstatus_lo |=  MSTATUS_SIE; }
-                else { mstatus_lo &= ~MSTATUS_SIE; }
-
-                /* mstatus.SPIE = 1 (RV spec) */
-                mstatus_lo |= MSTATUS_SPIE;
-
-                /* mstatus.SPP = PRIV_U = 0 (RV spec least-priv reset; SPP 是 1-bit, 清 0) */
-                mstatus_lo &= ~MSTATUS_SPP;
-
-                /* Ssdbltrp §4.1.1.5: SRET 清 sstatus.SDT = 0 (regardless of new priv) */
-                mstatus_lo &= ~MSTATUS_SDT;
-
-                hart->trap._mstatus = (hart->trap._mstatus & 0xFFFFFFFF00000000ULL)
-                                    | (uint64_t)mstatus_lo;
-
-                hart->regs[0]      = hart->trap.xepc[PRIV_S];   /* sepc */
+                sret_helper(hart, d.raw_inst);   /* 含 PRIV_CHECK_OR_TRAP(PRIV_S) */
                 break;
-            }
 
             // ---- I-type SYSTEM SFENCE.VMA ----
             //

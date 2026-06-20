@@ -124,8 +124,12 @@
 #include <asmjit/x86.h>     // asmjit::JitRuntime / CodeHolder / x86::Assembler / imm()
                             // (asmjit/asmjit.h v1.18 已 deprecated, 用 x86.h)
 
-#include "core/cpu.h"       // cpu_t (offsetof regs)
+#include "core/cpu.h"       // cpu_t (offsetof regs / priv / hartid; T4 backend 端
+                            //   PRIV_CHECK / ECALL priv 公式 / WFI hartid 入参用)
 #include "core/mmu.h"       // regime_t (T3 regime 分流)
+#include "riscv.h"          // T4 backend 端 inline 用: PRIV_S / PRIV_M / CAUSE_* /
+                            //   MSTATUS_TW; ECALL/EBREAK cause / SFENCE_VMA PRIV_CHECK /
+                            //   WFI TW 检查直接 emit 数值用
 #include "ir.h"             // ir_inst_t + IR_OP_*
 #include "api/helpers.h"    // T3 slow path helper 集中声明 (mmu_walker / csr_op /
                             //   store_helper / mmio_*_helper / fence_*_helper /
@@ -218,10 +222,15 @@ constexpr int32_t STACK_SLOT_HART      = -48;  // [rbp - 48] = saved rdi (hart p
 constexpr int32_t STACK_SLOT_COUNT_OUT = -56;  // [rbp - 56] = saved rdx (count_out ptr)
 
 // prologue: push callee-saved (rbp + rbx + r12-r15) + push rdi/rdx (T3 helper call
-// reload 用) + load x1-x5 from cpu->regs[1..5].
+// reload 用) + sub rsp 8-byte dummy 对齐 (T4) + load x1-x5 from cpu->regs[1..5].
 //
-// 8 个 push (rbp + rbx + r12-r15 + rdi + rdx) 后 rsp % 16 == 0, helper call 进
-// 入时 rsp % 16 == 8 (SysV ABI 满足).
+// T4 stack alignment 修正 (a_03_14/03_wfi_irq_wakeup_race SEGV root cause):
+//   函数入口 rsp ≡ 8 mod 16 (CALL pushed ret addr; SysV 标准). 8 个 push (8 * 8
+//   = 64 bytes shift) 后 rsp 仍 ≡ 8 mod 16 (64 mod 16 = 0, 不改对齐). Call
+//   helper 前 rsp 必须 ≡ 0 mod 16 (helper 入口 rsp ≡ 8 mod 16 满足 SysV). T3
+//   helpers (csr_op / store_helper / mmu_walker_*) 不严格要求 16-byte 对齐, 撞
+//   不出来; T4 wfi_wait → pthread_cond_timedwait64 内部 SSE / movaps 需严格
+//   对齐, 不修立爆 SEGV. 加 8-byte dummy slot 让 rsp ≡ 0 mod 16.
 void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::rbp);
     a.mov(asmjit::x86::rbp, asmjit::x86::rsp);
@@ -232,6 +241,7 @@ void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::r15);
     a.push(asmjit::x86::rdi);   // [rbp - 48] = hart pointer (helper call reload)
     a.push(asmjit::x86::rdx);   // [rbp - 56] = count_out ptr (emit_dispatch_exit reload)
+    a.sub(asmjit::x86::rsp, asmjit::imm(8));   // 8-byte dummy 对齐 (T4; SysV 16-byte)
 
     // load x1-x5 from cpu->regs[1..5] (rdi 入口还是 hart, 未被 helper call 破坏)
     a.mov(asmjit::x86::ebx,
@@ -252,10 +262,11 @@ void emit_reload_hart(asmjit::x86::Assembler &a) {
           asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_HART));
 }
 
-// epilogue: store x1-x5 to cpu->regs[1..5] + pop 对称 + ret.
+// epilogue: store x1-x5 to cpu->regs[1..5] + 对称释放 8-byte dummy align slot +
+// pop 对称 + ret.
 //
-// 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). pop 顺序对称
-// prologue (后入先出).
+// 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). 释放
+// stack-alignment dummy slot 后 pop 顺序对称 prologue (后入先出).
 void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(1)),
           asmjit::x86::ebx);
@@ -268,6 +279,7 @@ void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)),
           asmjit::x86::r15d);
 
+    a.add(asmjit::x86::rsp, asmjit::imm(8));   // 释放 8-byte align slot (跟 prologue 末 sub 对偶)
     a.pop(asmjit::x86::rdx);
     a.pop(asmjit::x86::rdi);
     a.pop(asmjit::x86::r15);
@@ -440,10 +452,12 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
             emit_store_rv_reg(a, inst.rd, eax);
             return;
 
-        /* ---- 哨兵 + T3 非算术 op (emit_ir_arith 不该看到; caller 路径已分流到
-                emit_ir_load / store / amo / lr_sc / csr_fence) ---- */
+        /* ---- 哨兵 + T3/T4 非算术 op (emit_ir_arith 不该看到; caller 路径已分流到
+                emit_ir_load / store / amo / lr_sc / csr / fence / branch / jal /
+                jalr / system) ---- */
         case IR_OP_UNSUPPORTED:
         case IR_OP_DISPATCH_EXIT:
+        case IR_OP_DISPATCH_EXIT_RUNTIME:
         case IR_OP_LB: case IR_OP_LH: case IR_OP_LW: case IR_OP_LBU: case IR_OP_LHU:
         case IR_OP_SB: case IR_OP_SH: case IR_OP_SW:
         case IR_OP_CSRRW: case IR_OP_CSRRS: case IR_OP_CSRRC:
@@ -453,6 +467,12 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
         case IR_OP_AMO_MAX_W: case IR_OP_AMO_MINU_W: case IR_OP_AMO_MAXU_W:
         case IR_OP_LR_W: case IR_OP_SC_W:
         case IR_OP_FENCE: case IR_OP_FENCE_I:
+        case IR_OP_BEQ: case IR_OP_BNE: case IR_OP_BLT:
+        case IR_OP_BGE: case IR_OP_BLTU: case IR_OP_BGEU:
+        case IR_OP_JAL: case IR_OP_JALR:
+        case IR_OP_ECALL: case IR_OP_EBREAK:
+        case IR_OP_MRET:  case IR_OP_SRET:
+        case IR_OP_SFENCE_VMA: case IR_OP_WFI:
             __builtin_unreachable();
     }
 }
@@ -738,6 +758,306 @@ void emit_ir_fence(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     }
 }
 
+// emit_dispatch_exit 前向声明 (定义见下方; T4 BRANCH/SYSTEM 自含末段时调本函数,
+// 但函数定义在新 emit_ir_* helper 之后 — 加 forward 声明避开 reorder).
+void emit_dispatch_exit(asmjit::x86::Assembler &a, uxlen_t target_pc,
+                        uint64_t block_inst_count);
+
+// ============================================================================
+// T4 emit helper —— 控制流 BRANCH/JAL/JALR + SYSTEM 6
+// ============================================================================
+//
+// 形态分组 (顶段 doc T1-T4 实状段):
+//   BRANCH 6: 双出口块体 — 内嵌 emit cmp + jcc + 两份 epilogue (taken 边 + fall-
+//             through 边). 自含末段, compile_block 不再 emit DISPATCH_EXIT.
+//   JAL: 仅写 rd = pc + pc_step (compile-time imm); jump target 在末段 DISPATCH_
+//        EXIT.target_pc (translator 装 hard_exit_pc); 走标准末段.
+//   JALR: 写 rd + 算 runtime target = (rs1 + imm12) & ~1u 存约定 scratch r9d;
+//         末段是 DISPATCH_EXIT_RUNTIME 从 r9d 读. r9d 假定 JALR → 末 RUNTIME 之
+//         间无 helper call (translator 保证, 见 emit_ir_jalr 注释).
+//   SYSTEM 6: 自含末段 + epilogue (ECALL/EBREAK 走 _Noreturn longjmp 无末段;
+//             MRET/SRET/WFI 走 COUNT_ONLY; SFENCE_VMA 走标准 DISPATCH_EXIT).
+//             compile_block set block_done=true 跳过外层末段 emit.
+
+// emit_dispatch_exit_runtime (块出口模板 — runtime target):
+//   reload rdi + rdx
+//   写 cpu->regs[0] = r9d (JALR 算的 runtime target)
+//   写 *count_out = block_inst_count
+//   后续 epilogue 紧接 emit (rdi 已 reload).
+//
+// 跟 emit_dispatch_exit 区别: target 不是 compile-time imm, 是 scratch reg r9d.
+// JALR emit 时设了 r9d (在 emit_reload_hart / helper call 之前, 因 JALR 块体内无
+// helper call — translator 保证 JALR 是块倒数第二条, 末 IR 是 RUNTIME 出口).
+void emit_dispatch_exit_runtime(asmjit::x86::Assembler &a,
+                                uint64_t block_inst_count) {
+    emit_reload_hart(a);
+    a.mov(asmjit::x86::rdx,
+          asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_COUNT_OUT));
+    // 写 cpu->regs[0] = r9d (JALR 块体设的 runtime target)
+    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(0)),
+          asmjit::x86::r9d);
+    // 写 *count_out = block_inst_count
+    a.mov(asmjit::x86::rax, asmjit::imm(block_inst_count));
+    a.mov(asmjit::x86::qword_ptr(asmjit::x86::rdx), asmjit::x86::rax);
+}
+
+// emit_dispatch_exit_count_only (块出口模板 — 仅 *count_out, 不写 cpu->regs[0]):
+//   reload rdi (epilogue 入口要求) + rdx
+//   写 *count_out = block_inst_count
+//
+// 用法: MRET/SRET helper 内已写 hart->regs[0] = xepc; WFI 块体 emit add cpu->regs[0],
+// 4 自推进. 末段不能再写 cpu->regs[0]. 但 *count_out 仍需要写 (块前缀 RV 指令数).
+void emit_dispatch_exit_count_only(asmjit::x86::Assembler &a,
+                                   uint64_t block_inst_count) {
+    emit_reload_hart(a);
+    a.mov(asmjit::x86::rdx,
+          asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_COUNT_OUT));
+    a.mov(asmjit::x86::rax, asmjit::imm(block_inst_count));
+    a.mov(asmjit::x86::qword_ptr(asmjit::x86::rdx), asmjit::x86::rax);
+}
+
+// emit_ir_branch (6 op BEQ/BNE/BLT/BGE/BLTU/BGEU; 双出口自含末段):
+//
+// 形态:
+//   load rs1, rs2 → eax, ecx
+//   cmp eax, ecx
+//   jcc taken_label              ; BEQ→je / BNE→jne / BLT→jl / BGE→jge /
+//                                  BLTU→jb / BGEU→jae
+//   ; fall-through path: emit_dispatch_exit(fall_through_pc, count) + epilogue
+//   taken_label:
+//     emit_dispatch_exit(taken_pc, count) + epilogue
+//
+// taken_pc 在 inst.target_pc; fall_through_pc 在 exit_inst.target_pc (translator
+// 装 cur_pc = pc + pc_step). block_inst_count = n_insts - 1 (跟标准末段一致).
+//
+// 一块两份 epilogue (taken + fall-through 各一份); host code 块大小 2x 但 asmjit
+// JitRuntime page-granularity 不撞 size 限.
+void emit_ir_branch(asmjit::x86::Assembler &a, const ir_inst_t &inst,
+                    const ir_inst_t &exit_inst, uint64_t block_inst_count) {
+    using namespace asmjit::x86;
+    asmjit::Label l_taken = a.new_label();
+
+    /* load rs1 → eax, rs2 → ecx; emit_load_rv_reg 内部对 rs/rd > 5 case 会
+     * emit_reload_hart, 但本 emit 不调 helper, eax/ecx 是 caller-saved 都 OK */
+    emit_load_rv_reg(a, eax, inst.rs1);
+    emit_load_rv_reg(a, ecx, inst.rs2);
+    a.cmp(eax, ecx);
+
+    switch (inst.kind) {
+        case IR_OP_BEQ:   a.je (l_taken); break;
+        case IR_OP_BNE:   a.jne(l_taken); break;
+        case IR_OP_BLT:   a.jl (l_taken); break;   /* signed less */
+        case IR_OP_BGE:   a.jge(l_taken); break;
+        case IR_OP_BLTU:  a.jb (l_taken); break;   /* unsigned less (below) */
+        case IR_OP_BGEU:  a.jae(l_taken); break;
+        default: __builtin_unreachable();
+    }
+
+    /* fall-through 边: emit DISPATCH_EXIT(fall_through_pc) + epilogue */
+    emit_dispatch_exit(a, exit_inst.target_pc, block_inst_count);
+    emit_epilogue(a);
+
+    /* taken 边: bind label + DISPATCH_EXIT(taken_pc) + epilogue */
+    a.bind(l_taken);
+    emit_dispatch_exit(a, inst.target_pc, block_inst_count);
+    emit_epilogue(a);
+}
+
+// emit_ir_jal (1 op; compile-time target):
+//
+// 形态: 写 rd = ir.target_pc = pc + pc_step (translator 端 compile-time 算).
+//       不 emit jmp/exit — 让末段标准 DISPATCH_EXIT.target_pc 走 jump target
+//       (= pc + d.imm, translator 装 hard_exit_pc 路径).
+//
+// 跟 LUI emit 同 (a.mov(eax, imm); store rd); compile_block fall through 末段.
+void emit_ir_jal(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
+    using namespace asmjit::x86;
+    a.mov(eax, asmjit::imm(static_cast<int32_t>(inst.target_pc)));
+    emit_store_rv_reg(a, inst.rd, eax);
+}
+
+// emit_ir_jalr (1 op; runtime target):
+//
+// 形态: 算 runtime target = (rs1 + imm12) & ~1u 存 r9d; 写 rd = ir.target_pc =
+//       pc + pc_step (compile-time). 末段 IR 是 DISPATCH_EXIT_RUNTIME 从 r9d
+//       读 target.
+//
+// r9d 选择 rationale: caller-saved 32-bit reg, 不跟 x1-x5 host 映射冲突 (那是
+// callee-saved rbx/r12d-r15d). 假设 JALR → 末 RUNTIME 之间无 helper call —
+// translator 保证 JALR 是块倒数第二条 (is_hard_boundary=1 触发 break), 末 IR
+// 是 DISPATCH_EXIT_RUNTIME 中间无 emit. 后续 milestone (e.g. T5 加 interrupt
+// check inline) 若破坏此假设, 改 r9d 为 callee-saved scratch (e.g. push 一个 8-byte
+// 给 jalr_target 用) 维持假设.
+//
+// rd / rs1 可能相同 (e.g. jalr ra, 0(ra) return 模式) — 必须先算 target 再写 rd:
+//   emit_load_rv_reg(a, eax, rs1) → 算 (rs1 + imm) & ~1u 存 r9d → store rd.
+// 顺序保证 rs1 读到的是写 rd 之前的值.
+void emit_ir_jalr(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
+    using namespace asmjit::x86;
+
+    /* 算 runtime target = (rs1 + imm12) & ~1u 存 r9d */
+    emit_load_rv_reg(a, eax, inst.rs1);
+    a.add(eax, asmjit::imm(inst.imm));
+    a.and_(eax, asmjit::imm(static_cast<int32_t>(~1u)));
+    a.mov(r9d, eax);                     /* runtime target → 约定 scratch */
+
+    /* 写 rd = ir.target_pc (compile-time = pc + pc_step) */
+    a.mov(eax, asmjit::imm(static_cast<int32_t>(inst.target_pc)));
+    emit_store_rv_reg(a, inst.rd, eax);
+}
+
+// emit_ir_system (6 op ECALL/EBREAK/MRET/SRET/SFENCE_VMA/WFI; 自含末段):
+//
+// 形态分组:
+//   ECALL/EBREAK: emit `call trap_raise_exception(hart, cause, 0)` _Noreturn
+//                  longjmp; emit ud2 兜底 (如果 helper 反常返回则立即 trap;
+//                  spec 上 trap_raise_exception 是 _Noreturn, 仅为防御). 无末段
+//                  无 epilogue (dead code).
+//   MRET/SRET: emit `call mret_helper/sret_helper(hart, raw_inst)`; helper 内含
+//              PRIV_CHECK + 写 hart->regs[0] = xepc + 翻 mstatus. 末段走
+//              emit_dispatch_exit_count_only (不再写 cpu->regs[0]; helper 已写) +
+//              epilogue.
+//   SFENCE_VMA: emit PRIV_CHECK_OR_TRAP(PRIV_S) inline (cmp priv,S; jae l_ok;
+//               trap_raise illegal+raw_inst; l_ok:); emit `call sfence_vma_helper(
+//               hart, vaddr_val, asid_val, rs1, rs2)`. 末段走标准 emit_dispatch_exit
+//               (target_pc=exit_inst.target_pc=fall_through_pc) + epilogue.
+//   WFI: emit TW 检查 inline (cmp priv,M; jae l_skip; test mstatus,TW; jz l_no_trap;
+//        trap_raise illegal+raw_inst; l_no_trap: l_skip:); emit `call wfi_wait(
+//        hartid, wfi_should_wake_default, hart)` (cond_wait 阻塞到 SRS / 中断
+//        pending); emit `call lrsc_clear_self(hart)`; emit `add cpu->regs[0], 4`
+//        自推进. 末段走 emit_dispatch_exit_count_only (cpu->regs[0] 已自加) +
+//        epilogue.
+//
+// 入参 exit_inst / block_inst_count 给末段 emit 用.
+void emit_ir_system(asmjit::x86::Assembler &a, const ir_inst_t &inst,
+                    const ir_inst_t &exit_inst, uint64_t block_inst_count) {
+    using namespace asmjit::x86;
+
+    switch (inst.kind) {
+        case IR_OP_ECALL: {
+            /* trap_raise_exception(hart, CAUSE_ECALL_FROM_U + hart->priv, 0)
+             * SysV: rdi=hart, esi=cause, edx=tval */
+            emit_reload_hart(a);
+            /* esi = CAUSE_ECALL_FROM_U + hart->priv (priv runtime 读, uint8_t) */
+            a.movzx(esi,
+                    byte_ptr(rdi, offsetof(cpu_t, priv)));
+            a.add(esi, asmjit::imm(static_cast<int32_t>(CAUSE_ECALL_FROM_U)));
+            a.xor_(edx, edx);             /* tval = 0 */
+            emit_call_helper(a, trap_raise_exception);
+            /* _Noreturn longjmp; ud2 兜底防御 (helper 反常返回则立即 trap) */
+            a.ud2();
+            return;
+        }
+        case IR_OP_EBREAK: {
+            /* trap_raise_exception(hart, CAUSE_BREAKPOINT, 0) */
+            emit_reload_hart(a);
+            a.mov(esi, asmjit::imm(static_cast<int32_t>(CAUSE_BREAKPOINT)));
+            a.xor_(edx, edx);
+            emit_call_helper(a, trap_raise_exception);
+            a.ud2();
+            return;
+        }
+        case IR_OP_MRET: {
+            /* mret_helper(hart, raw_inst); SysV: rdi=hart, esi=raw_inst */
+            emit_reload_hart(a);
+            a.mov(esi, asmjit::imm(static_cast<int32_t>(inst.raw_inst)));
+            emit_call_helper(a, mret_helper);
+            /* helper 已写 hart->regs[0] = xepc; 末段不能再写 — 走 COUNT_ONLY */
+            emit_dispatch_exit_count_only(a, block_inst_count);
+            emit_epilogue(a);
+            return;
+        }
+        case IR_OP_SRET: {
+            emit_reload_hart(a);
+            a.mov(esi, asmjit::imm(static_cast<int32_t>(inst.raw_inst)));
+            emit_call_helper(a, sret_helper);
+            emit_dispatch_exit_count_only(a, block_inst_count);
+            emit_epilogue(a);
+            return;
+        }
+        case IR_OP_SFENCE_VMA: {
+            /* PRIV_CHECK_OR_TRAP(PRIV_S) inline:
+             *   if (hart->priv < PRIV_S) trap_raise(illegal, raw_inst)  _Noreturn */
+            asmjit::Label l_priv_ok = a.new_label();
+            emit_reload_hart(a);
+            a.movzx(eax, byte_ptr(rdi, offsetof(cpu_t, priv)));
+            a.cmp(eax, asmjit::imm(static_cast<int32_t>(PRIV_S)));
+            a.jae(l_priv_ok);             /* priv >= S (unsigned) → OK */
+            /* trap_raise_exception(hart, CAUSE_ILLEGAL_INSTRUCTION, raw_inst) */
+            a.mov(esi, asmjit::imm(static_cast<int32_t>(CAUSE_ILLEGAL_INSTRUCTION)));
+            a.mov(edx, asmjit::imm(static_cast<int32_t>(inst.raw_inst)));
+            emit_call_helper(a, trap_raise_exception);
+            a.ud2();
+
+            a.bind(l_priv_ok);
+            /* sfence_vma_helper(hart, vaddr_val, asid_val, rs1, rs2);
+             * SysV: rdi=hart, rsi=vaddr_val, edx=asid_val, ecx=rs1, r8d=rs2.
+             * 先 load rs1/rs2 values (用 esi/edx 装), 再 reload rdi (避免被破坏),
+             * 再装 rs1/rs2 nums (immediates 给 ecx/r8d). */
+            emit_load_rv_reg(a, esi, inst.rs1);    /* vaddr_val = READ_REG(rs1) */
+            emit_load_rv_reg(a, edx, inst.rs2);    /* asid_val  = READ_REG(rs2) */
+            emit_reload_hart(a);                    /* rdi = hart (rs/rd > 5 case
+                                                     * 内 emit_load_rv_reg 可能
+                                                     * 用 rdi, 重 load 保险) */
+            a.mov(ecx, asmjit::imm(static_cast<int32_t>(inst.rs1)));   /* rs1 编号 */
+            a.mov(r8d, asmjit::imm(static_cast<int32_t>(inst.rs2)));   /* rs2 编号 */
+            emit_call_helper(a, sfence_vma_helper);
+            /* 末段走标准 DISPATCH_EXIT(fall_through_pc) — helper 不写 cpu->regs[0] */
+            emit_dispatch_exit(a, exit_inst.target_pc, block_inst_count);
+            emit_epilogue(a);
+            return;
+        }
+        case IR_OP_WFI: {
+            /* TW 检查: if (hart->priv < PRIV_M && mstatus.TW) trap_raise(illegal, raw_inst).
+             *   priv < M (unsigned) → 进 TW 测试; priv >= M (= M) → skip (无 TW 限制) */
+            asmjit::Label l_skip_tw  = a.new_label();
+            asmjit::Label l_no_trap  = a.new_label();
+            emit_reload_hart(a);
+            a.movzx(eax, byte_ptr(rdi, offsetof(cpu_t, priv)));
+            a.cmp(eax, asmjit::imm(static_cast<int32_t>(PRIV_M)));
+            a.jae(l_skip_tw);             /* priv >= M → skip TW 检查 */
+            /* test mstatus.TW (bit 21 in _mstatus low 32; MSTATUS_TW imm32 32-bit) */
+            a.mov(rcx, qword_ptr(rdi,
+                  offsetof(cpu_t, trap) + offsetof(trap_csrs_t, _mstatus)));
+            a.test(rcx, asmjit::imm(static_cast<int64_t>(MSTATUS_TW)));
+            a.jz(l_no_trap);              /* TW=0 → no trap */
+            /* TW=1 + priv<M → illegal trap */
+            a.mov(esi, asmjit::imm(static_cast<int32_t>(CAUSE_ILLEGAL_INSTRUCTION)));
+            a.mov(edx, asmjit::imm(static_cast<int32_t>(inst.raw_inst)));
+            emit_call_helper(a, trap_raise_exception);
+            a.ud2();
+
+            a.bind(l_no_trap);
+            a.bind(l_skip_tw);
+
+            /* wfi_wait(hartid, wfi_should_wake, hart);
+             * SysV: edi=hartid (uint32_t), rsi=pred, rdx=closure.
+             * 先装 rsi/rdx (用 rdi=hart 还能读), 最后再窄化 edi=hartid. */
+            emit_reload_hart(a);                    /* rdi = hart */
+            a.mov(rdx, rdi);                        /* closure = hart */
+            a.mov(rsi, asmjit::imm(
+                  reinterpret_cast<uintptr_t>(&wfi_should_wake)));
+            a.mov(edi, dword_ptr(rdi, offsetof(cpu_t, hartid)));  /* hartid */
+            emit_call_helper(a, wfi_wait);
+
+            /* lrsc_clear_self(hart) — WFI 醒后清自己 reservation (跟 interpreter 同) */
+            emit_reload_hart(a);
+            emit_call_helper(a, lrsc_clear_self);
+
+            /* hart->regs[0] += 4 (PC_STEP_NONE 自推进 — WFI 块跑完后 cpu->pc 是
+             * 下一条 RV 指令 PC) */
+            emit_reload_hart(a);
+            a.add(dword_ptr(rdi, regs_offset(0)), asmjit::imm(4));
+
+            /* 末段 COUNT_ONLY (cpu->regs[0] 已自加, 不再写) */
+            emit_dispatch_exit_count_only(a, block_inst_count);
+            emit_epilogue(a);
+            return;
+        }
+        default: __builtin_unreachable();
+    }
+}
+
 // emit DISPATCH_EXIT (块出口模板):
 //   reload rdi (hart) + rdx (count_out) — 块体内 helper call 可能破坏 (T3)
 //   写 cpu->regs[0] = target_pc (regs[0] 物理位置存 pc; uxlen_t = uint32_t for RV32)
@@ -821,7 +1141,16 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
 
     emit_prologue(a);
 
-    // 块体: 前 n_insts-1 条 (T1+T2+T3 48 op), 末 1 条 DISPATCH_EXIT 单独处理
+    /* T4: 块末 IR (insts[n_insts-1]) 给 BRANCH/SYSTEM 自含末段路径用 (传 exit_inst
+     * 给 emit_ir_branch / emit_ir_system 让它们 emit 完整 epilogue). 单 IR_OP_DISPATCH_
+     * EXIT_RUNTIME 块 (JALR) 跟标准 DISPATCH_EXIT 块由外层末段分流 emit. */
+    const ir_inst_t &exit_inst = insts[n_insts - 1];
+
+    /* T4: 块体内自含末段的 op (BRANCH 6 + SYSTEM 6) set block_done=true 后跳过外
+     * 层末段 emit. JAL/JALR + 算术/LOAD/STORE/AMO/LR_SC/CSR/FENCE 走外层标准末段. */
+    bool block_done = false;
+
+    // 块体: 前 n_insts-1 条 (T1+T2+T3+T4 62 op), 末 1 条 DISPATCH_EXIT/_RUNTIME 单独处理
     for (size_t i = 0; i < n_insts - 1; i++) {
         const ir_inst_t &inst = insts[i];
         switch (inst.kind) {
@@ -872,8 +1201,39 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 emit_ir_fence(a, inst);
                 break;
 
+            /* T4 BRANCH 6 op → emit_ir_branch (双出口自含末段; block_done=true) */
+            case IR_OP_BEQ: case IR_OP_BNE: case IR_OP_BLT:
+            case IR_OP_BGE: case IR_OP_BLTU: case IR_OP_BGEU:
+                emit_ir_branch(a, inst, exit_inst,
+                               static_cast<uint64_t>(n_insts - 1));
+                block_done = true;
+                break;
+
+            /* T4 JAL → emit_ir_jal (compile-time target; 走外层标准末段) */
+            case IR_OP_JAL:
+                emit_ir_jal(a, inst);
+                break;
+
+            /* T4 JALR → emit_ir_jalr (runtime target 存 r9d; 走外层 DISPATCH_EXIT
+             * _RUNTIME 末段) */
+            case IR_OP_JALR:
+                emit_ir_jalr(a, inst);
+                break;
+
+            /* T4 SYSTEM 6 op → emit_ir_system (自含末段; block_done=true).
+             * ECALL/EBREAK 走 _Noreturn longjmp 无末段; MRET/SRET/WFI 走 COUNT_ONLY;
+             * SFENCE_VMA 走标准 DISPATCH_EXIT — 都由 emit_ir_system 内部 emit. */
+            case IR_OP_ECALL: case IR_OP_EBREAK:
+            case IR_OP_MRET:  case IR_OP_SRET:
+            case IR_OP_SFENCE_VMA: case IR_OP_WFI:
+                emit_ir_system(a, inst, exit_inst,
+                               static_cast<uint64_t>(n_insts - 1));
+                block_done = true;
+                break;
+
             case IR_OP_DISPATCH_EXIT:
-                // 块前缀里出现 DISPATCH_EXIT 是 translator bug
+            case IR_OP_DISPATCH_EXIT_RUNTIME:
+                // 块前缀里出现 DISPATCH_EXIT/_RUNTIME 是 translator bug
                 *host_code_out = nullptr;
                 return JIT_BACKEND_INTERNAL;
             case IR_OP_UNSUPPORTED:
@@ -882,16 +1242,30 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
         }
     }
 
-    // 末段 DISPATCH_EXIT + epilogue
-    const ir_inst_t &exit_inst = insts[n_insts - 1];
-    if (exit_inst.kind != IR_OP_DISPATCH_EXIT) {
-        // translator bug: 末段必须是 DISPATCH_EXIT
-        *host_code_out = nullptr;
-        return JIT_BACKEND_INTERNAL;
+    /* 末段 emit (T4 起按 block_done + exit_inst.kind 分流):
+     *   block_done=true (BRANCH 6 / SYSTEM 6) — 跳过, 末段已内嵌 emit
+     *   exit_inst.kind == DISPATCH_EXIT — 走标准 emit_dispatch_exit (compile-time
+     *                                       target_pc; JAL/CSR/FENCE_I/算术截断等)
+     *   exit_inst.kind == DISPATCH_EXIT_RUNTIME — 走 emit_dispatch_exit_runtime
+     *                                              (JALR; target 从 r9d 读)
+     *   其他 kind — translator bug. */
+    if (!block_done) {
+        switch (exit_inst.kind) {
+            case IR_OP_DISPATCH_EXIT:
+                emit_dispatch_exit(a, exit_inst.target_pc,
+                                   static_cast<uint64_t>(n_insts - 1));
+                break;
+            case IR_OP_DISPATCH_EXIT_RUNTIME:
+                emit_dispatch_exit_runtime(a,
+                                           static_cast<uint64_t>(n_insts - 1));
+                break;
+            default:
+                /* translator bug: 末段必须是 DISPATCH_EXIT 或 DISPATCH_EXIT_RUNTIME */
+                *host_code_out = nullptr;
+                return JIT_BACKEND_INTERNAL;
+        }
+        emit_epilogue(a);
     }
-    emit_dispatch_exit(a, exit_inst.target_pc,
-                       static_cast<uint64_t>(n_insts - 1));
-    emit_epilogue(a);
 
     // finalize + commit to JitRuntime (asmjit 内部 mmap RX + relocate)
     jit_block_func_t fn = nullptr;
