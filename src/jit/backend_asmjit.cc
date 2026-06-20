@@ -13,40 +13,45 @@
 //     具体后端
 //
 // ============================================================================
-// T1+T2+T3 实状
+// T1-T6 实状
 // ============================================================================
 //
 // 5 vtable 全真填:
 //   asmjit_backend_init             alloc file-static asmjit::JitRuntime
-//   asmjit_backend_compile_block    regime 分流: BARE → emit; SV32 → NOT_IMPLEMENTED
-//                                    (set_blacklist BLACK 路径, interpret 兜底).
-//                                    BARE 路径走 CodeHolder + Assembler emit
-//                                    (prologue + 块体 + DISPATCH_EXIT + epilogue)
-//                                    → JitRuntime::add 拿 RX 段地址, 返 jit_block_func_t
+//   asmjit_backend_compile_block    regime 三分流真编 (BARE / SV32_S / SV32_U);
+//                                    走 CodeHolder + Assembler emit (prologue +
+//                                    块体 + DISPATCH_EXIT + epilogue) → JitRuntime::add
+//                                    拿 RX 段地址, 返 jit_block_func_t
 //   asmjit_backend_invalidate_block JitRuntime::release(host_code) (Q8 配合; backend
 //                                    纯 unmap host code; 状态灯扫在 jit_entry.cc)
 //   asmjit_backend_flush_all        JitRuntime::reset() (asmjit v1.18+ 自带 reset)
 //   asmjit_backend_destroy          delete JitRuntime
 //
-// 块体 IR 翻译 (T1+T2+T3 范围): 48 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 +
-// AMO 9 + LR/SC 2 + FENCE/FENCE_I 2; IR_OP_DISPATCH_EXIT 收尾;
-// IR_OP_UNSUPPORTED 哨兵 default case 写 __builtin_unreachable 兜底.
+// 块体 IR 翻译 (T1+T2+T3+T4 范围): 48 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 +
+// AMO 9 + LR/SC 2 + FENCE/FENCE_I 2 + BRANCH 6 + JAL/JALR 2 + SYSTEM 6;
+// IR_OP_DISPATCH_EXIT/_RUNTIME 收尾; IR_OP_UNSUPPORTED 哨兵 default case 写
+// __builtin_unreachable 兜底.
 //
-// T3 emit 形态分组 (BARE regime only; SV32 走 NOT_IMPLEMENTED):
-//   LOAD 5  : inline IS_GPA_RAM 分流 + RAM 直 movsx/movzx eax, [hva] / MMIO
-//             call mmio_read_helper (plan §1.1 fast path; lsu.h:119 line "JIT
-//             自己 inline 等价逻辑")
-//   STORE 3 : inline IS_GPA_RAM 分流 + RAM 走 call store_helper (LR/SC + SMC
-//             副作用强制经 helper, lsu.h §load/store 不对称真机理) / MMIO call
-//             mmio_write_helper
-//   AMO 9   : 直接 call mmu_walker_helper_amo_xxx (BARE walker 内分流; 不在
-//             backend inline IS_GPA_RAM 因 9 × 18 段重复 emit 不如统一 walker)
-//   LR/SC 2 : 直接 call mmu_walker_helper_lr_w / sc_w (同 AMO)
+// emit 形态分组:
+//   LOAD 5  : T3 BARE inline IS_GPA_RAM 分流 + RAM 直 movsx/movzx eax, [hva] /
+//             MMIO call mmio_read_helper. T6 加 SV32_S / SV32_U fast path:
+//             inline TLB vpn/index 查 entry, V + tag + baked PTE_U (S 视角 SUM /
+//             U 视角强制) + R/MXR check, hit 直 movsx/movzx host load; miss
+//             call mmu_walker_helper_load (helper walk + fill TLB 或 trap longjmp).
+//   STORE 3 : T3 BARE 同 LOAD 分流, RAM 走 call store_helper (LR/SC + SMC 副作用
+//             强制经 helper, lsu.h §load/store 不对称真机理). T6 加 SV32_S/_U
+//             fast path: 同 LOAD baked S/U 视角 PTE_U, 加 PTE_W + PTE_D check
+//             (D=0 fall back walker 让 walker set D=1); hit 走 call store_helper;
+//             miss call mmu_walker_helper_store.
+//   AMO 9   : 直接 call mmu_walker_helper_amo_xxx; walker 内按 tlb==NULL 分流
+//             BARE/SV32 (T6 起 backend 端 emit_reload_current_tlb 不分 regime).
+//   LR/SC 2 : 直接 call mmu_walker_helper_lr_w / sc_w (同 AMO).
 //   CSR 6   : call csr_op(hart, csr_addr, new_val, op, raw_inst); 6 变体在
 //             ir_inst.kind 区分 + new_val/op 静态选择; 硬边界, 后续紧跟
 //             DISPATCH_EXIT
 //   FENCE 2 : FENCE call fence_helper / FENCE_I call fence_i_helper (硬边界,
 //             后续紧跟 DISPATCH_EXIT)
+//   BRANCH 6 / JAL / JALR / SYSTEM 6: T4 自含末段 / 标准末段 / runtime target 三类.
 //
 // 静态固定映射 (Q2=b): RV x1-x5 (ra/sp/gp/tp/t0) → host callee-saved 32-bit reg
 //   x1 → ebx
@@ -80,15 +85,18 @@
 // caller-saved: rax, rcx, rdx, rsi, rdi, r8-r11 (helper call 内可能改; 块体内
 //   reload 协议 — 见下)
 //
-// T3 helper call 协议 (prologue 加 push rdi+rdx, 块体内 reload):
-//   prologue push rbp / rbx / r12-r15 / rdi / rdx 共 8 个 8-byte → rsp % 16 == 0
-//     (call 之前满足 SysV 16-byte 对齐, 进 helper 后 rsp % 16 == 8)
+// helper call 协议 (prologue 加 push rdi/rdx/rsi, 块体内 reload):
+//   T3 起步: prologue push rbp / rbx / r12-r15 / rdi / rdx 共 8 个 → 加 sub rsp 8
+//          dummy 凑 16-byte 对齐 (call helper SysV 要求 rsp % 16 == 0).
+//   T6 升级: prologue 多 push rsi (current_tlb), 9 个 push × 8 = 72 bytes; 入口
+//          rsp ≡ 8 mod 16, push 后 ≡ 80 ≡ 0 mod 16 天然对齐, 不再需要 dummy slot.
 //   每次 helper call 之前 emit:
-//     mov rdi, [rbp - 48]        ; reload hart 指针
-//     (设其他参数: rsi/rdx/rcx 等按 helper signature)
+//     emit_reload_hart            ; mov rdi, [rbp - 48]
+//     emit_reload_current_tlb     ; mov rsi, [rbp - 64]  (若 helper 第 2 参是 tlb)
+//     (设其他参数: rdx/rcx/r8 等按 helper signature)
 //     call <helper_static_addr>
 //   helper return 后 rax 装返回值, rdi/rsi/rdx/rcx 可能被 helper 改 (caller-saved)
-//   下次 helper call 前再 reload rdi
+//   下次 helper call 前再 reload rdi/rsi
 //   映射 host reg (rbx/r12-r15 = x1-x5) callee-saved, helper 不破坏, 不 save/restore
 //   emit_dispatch_exit 前置 reload rdi + rdx (写 cpu->regs[0] + *count_out)
 //   epilogue 入口前 rdi 已 reload (emit_dispatch_exit 末), 直接 store x1-x5
@@ -102,6 +110,9 @@
 //   [rbp - 40]  = r15
 //   [rbp - 48]  = rdi (hart pointer, save 用于 helper call reload)
 //   [rbp - 56]  = rdx (count_out pointer, save 用于 emit_dispatch_exit reload)
+//   [rbp - 64]  = rsi (current_tlb pointer, T6 SV32 fast path / AMO/LR-SC walker
+//                       reload 用; BARE 时 dispatcher 传 NULL, 槽里就是 NULL,
+//                       regime-agnostic — walker 内部按 tlb==NULL 分流 BARE/SV32)
 //
 // ============================================================================
 // 命名 (项目体例)
@@ -124,9 +135,12 @@
 #include <asmjit/x86.h>     // asmjit::JitRuntime / CodeHolder / x86::Assembler / imm()
                             // (asmjit/asmjit.h v1.18 已 deprecated, 用 x86.h)
 
-#include "core/cpu.h"       // cpu_t (offsetof regs / priv / hartid; T4 backend 端
-                            //   PRIV_CHECK / ECALL priv 公式 / WFI hartid 入参用)
+#include "core/cpu.h"       // cpu_t (offsetof regs / priv / hartid / trap._mstatus;
+                            //   T4 backend 端 PRIV_CHECK / ECALL priv 公式 / WFI hartid
+                            //   入参用; T6 SV32 fast path SUM/MXR runtime 读)
 #include "core/mmu.h"       // regime_t (T3 regime 分流)
+#include "core/tlb.h"       // tlb_e_t / tlb_t / TLB_NUM_ENTRIES (T6 SV32 fast path
+                            //   inline TLB lookup 需要 offsetof / sizeof)
 #include "riscv.h"          // T4 backend 端 inline 用: PRIV_S / PRIV_M / CAUSE_* /
                             //   MSTATUS_TW; ECALL/EBREAK cause / SFENCE_VMA PRIV_CHECK /
                             //   WFI TW 检查直接 emit 数值用
@@ -217,20 +231,25 @@ void emit_store_rv_reg(asmjit::x86::Assembler &a, uint8_t rv_reg,
     }
 }
 
-// 栈 slot 偏移常量 (顶段 doc "栈布局" 段; T3 helper call 协议).
-constexpr int32_t STACK_SLOT_HART      = -48;  // [rbp - 48] = saved rdi (hart pointer)
-constexpr int32_t STACK_SLOT_COUNT_OUT = -56;  // [rbp - 56] = saved rdx (count_out ptr)
+// 栈 slot 偏移常量 (顶段 doc "栈布局" 段; T3 + T6 helper call 协议).
+constexpr int32_t STACK_SLOT_HART        = -48;  // [rbp - 48] = saved rdi (hart pointer)
+constexpr int32_t STACK_SLOT_COUNT_OUT   = -56;  // [rbp - 56] = saved rdx (count_out ptr)
+constexpr int32_t STACK_SLOT_CURRENT_TLB = -64;  // [rbp - 64] = saved rsi (current_tlb ptr; T6)
 
-// prologue: push callee-saved (rbp + rbx + r12-r15) + push rdi/rdx (T3 helper call
-// reload 用) + sub rsp 8-byte dummy 对齐 (T4) + load x1-x5 from cpu->regs[1..5].
+// prologue: push callee-saved (rbp + rbx + r12-r15) + push rdi/rdx/rsi (helper call
+// reload 用) + load x1-x5 from cpu->regs[1..5].
 //
-// T4 stack alignment 修正 (a_03_14/03_wfi_irq_wakeup_race SEGV root cause):
-//   函数入口 rsp ≡ 8 mod 16 (CALL pushed ret addr; SysV 标准). 8 个 push (8 * 8
-//   = 64 bytes shift) 后 rsp 仍 ≡ 8 mod 16 (64 mod 16 = 0, 不改对齐). Call
-//   helper 前 rsp 必须 ≡ 0 mod 16 (helper 入口 rsp ≡ 8 mod 16 满足 SysV). T3
-//   helpers (csr_op / store_helper / mmu_walker_*) 不严格要求 16-byte 对齐, 撞
-//   不出来; T4 wfi_wait → pthread_cond_timedwait64 内部 SSE / movaps 需严格
-//   对齐, 不修立爆 SEGV. 加 8-byte dummy slot 让 rsp ≡ 0 mod 16.
+// 栈对齐:
+//   T3 起步: 8 push (rbp/rbx/r12-r15/rdi/rdx) + sub rsp 8 dummy. 入口 rsp ≡ 8 mod 16
+//          (CALL 压 ret addr), 8 push 后 ≡ 8 mod 16 (64 mod 16 = 0 不改), 减 8 让
+//          rsp ≡ 0 mod 16, helper call SysV 16-byte 对齐.
+//   T6 升级: 多 push rsi (current_tlb) → 9 push × 8 = 72 bytes, rsp ≡ 8 + 72 = 80
+//          ≡ 0 mod 16 天然对齐, 不再需要 dummy slot.
+//
+// T4 stack alignment 起源 (a_03_14/03_wfi_irq_wakeup_race SEGV root cause; 留 trail):
+//   T4 wfi_wait → pthread_cond_timedwait64 内部 SSE / movaps 需严格 16-byte 对齐,
+//   不对齐立爆 SEGV. T6 改 9 push 后天然对齐, 起源 issue 不再存在 (但 SysV 16-byte
+//   要求本身没变, 任何后续改 push 数都需复算).
 void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::rbp);
     a.mov(asmjit::x86::rbp, asmjit::x86::rsp);
@@ -241,7 +260,8 @@ void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::r15);
     a.push(asmjit::x86::rdi);   // [rbp - 48] = hart pointer (helper call reload)
     a.push(asmjit::x86::rdx);   // [rbp - 56] = count_out ptr (emit_dispatch_exit reload)
-    a.sub(asmjit::x86::rsp, asmjit::imm(8));   // 8-byte dummy 对齐 (T4; SysV 16-byte)
+    a.push(asmjit::x86::rsi);   // [rbp - 64] = current_tlb ptr (T6 SV32 fast path /
+                                //               AMO/LR-SC walker reload; BARE 时入口 = NULL)
 
     // load x1-x5 from cpu->regs[1..5] (rdi 入口还是 hart, 未被 helper call 破坏)
     a.mov(asmjit::x86::ebx,
@@ -262,11 +282,20 @@ void emit_reload_hart(asmjit::x86::Assembler &a) {
           asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_HART));
 }
 
-// epilogue: store x1-x5 to cpu->regs[1..5] + 对称释放 8-byte dummy align slot +
-// pop 对称 + ret.
+// helper: reload current_tlb 指针 (rsi) 从栈 saved slot. T6 起步:
+//   - SV32 fast path 内算 TLB entry 地址 (rsi + index * 16) + miss 调
+//     mmu_walker_helper_load/store 时 (helper 第 2 参) 用
+//   - AMO / LR-SC 调 mmu_walker_helper_xxx 时用 (helper 第 2 参; BARE 时栈槽 = NULL
+//     自动对偶, walker 内部按 tlb==NULL 分流 BARE/SV32, backend 不需要 regime 分流)
+void emit_reload_current_tlb(asmjit::x86::Assembler &a) {
+    a.mov(asmjit::x86::rsi,
+          asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_CURRENT_TLB));
+}
+
+// epilogue: store x1-x5 to cpu->regs[1..5] + pop 对称 prologue + ret.
 //
-// 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). 释放
-// stack-alignment dummy slot 后 pop 顺序对称 prologue (后入先出).
+// 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). pop 顺序对称
+// prologue (后入先出). T6 起 9 push 天然 16-byte 对齐, 不再需要释放 dummy slot.
 void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(1)),
           asmjit::x86::ebx);
@@ -279,7 +308,7 @@ void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)),
           asmjit::x86::r15d);
 
-    a.add(asmjit::x86::rsp, asmjit::imm(8));   // 释放 8-byte align slot (跟 prologue 末 sub 对偶)
+    a.pop(asmjit::x86::rsi);    // T6: 对称 prologue 末 push rsi (current_tlb)
     a.pop(asmjit::x86::rdx);
     a.pop(asmjit::x86::rdi);
     a.pop(asmjit::x86::r15);
@@ -502,26 +531,165 @@ inline void emit_call_helper(asmjit::x86::Assembler &a, Fn *fn) {
     a.call(asmjit::imm(reinterpret_cast<uintptr_t>(fn)));
 }
 
-// emit_ir_load (5 op LB/LH/LW/LBU/LHU; BARE inline IS_GPA_RAM):
+// emit_ir_load (5 op LB/LH/LW/LBU/LHU; regime 三分流: BARE / SV32_S / SV32_U):
 //
-// 形态 (跟 lsu.h:144-160 line interpreter BARE 路径同结构):
-//   eax = rs1 + imm (gva)
-//   IS_GPA_RAM(gva) ? RAM (load *hva sext/zext) : MMIO (call mmio_read_helper)
-//   .Ldone: emit_store_rv_reg rd, eax
+// BARE 形态 (跟 lsu.h:144-160 interpreter BARE 路径同结构):
+//   eax = rs1 + imm (gva); IS_GPA_RAM(gva) ? RAM 直读 *hva sext/zext :
+//   MMIO call mmio_read_helper; .Ldone: store rd.
 //
-// rd = x0 时 emit_store_rv_reg 走 skip 分支 — load 仍 emit (副作用 mmio_read_helper
-// 仍触发, 跟 interpreter case 同), 只是值丢.
-void emit_ir_load(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
+// SV32_S / SV32_U fast path (T6; 镜像 lsu.h:139-187 interpreter SV32 路径):
+//   eax = gva; vpn = gva>>12; index = vpn & (TLB_NUM_ENTRIES-1);
+//   reload rsi=current_tlb; r9 = &tlb->e[index];
+//   V bit check + tag compare;
+//   PTE_U baked check (S 视角: PTE_U=1 时需 SUM=1; U 视角: PTE_U=1 强制);
+//   R / MXR check (PTE_R=0 时 fallback MXR=1 + PTE_X=1);
+//   hva = host_ptr + (gva & 0xFFF); 按 size load + sext/zext.
+//   miss / V=0 / tag mismatch / perm fail → call mmu_walker_helper_load
+//   (helper 内部 walk + fill TLB + sext/zext 由 backend 末段做, 或 trap longjmp).
+//
+// regime 拆分长期 (plan/start_plan_b_02 §[4.4]): jit_cache key=(PA, regime),
+// S/U 各编一份块体, 编译时 baked PTE_U 视角差异, 消除 runtime priv 分支.
+// SUM/MXR 仍 runtime 读 mstatus (guest 可动态改 csrw mstatus, 不可 baked).
+//
+// rd = x0 时 emit_store_rv_reg 走 skip 分支 — load 仍 emit (mmio_read_helper /
+// walker fault 副作用仍触发), 只是值丢.
+void emit_ir_load(asmjit::x86::Assembler &a, const ir_inst_t &inst,
+                  regime_t regime) {
     using namespace asmjit::x86;
 
-    asmjit::Label l_mmio = a.new_label();
-    asmjit::Label l_done = a.new_label();
-
-    // eax = gva = rs1 + imm
+    /* eax = gva = rs1 + imm (BARE / SV32 两路共用) */
     emit_load_rv_reg(a, eax, inst.rs1);
     a.add(eax, asmjit::imm(inst.imm));
 
-    // IS_GPA_RAM(gva): (uint32_t)(gva - GUEST_RAM_START) < GUEST_RAM_SIZE
+    /* size 按 op_kind (helper call + sext/zext 用; 两路共用) */
+    uint32_t size = 0;
+    switch (inst.kind) {
+        case IR_OP_LB: case IR_OP_LBU: size = 1; break;
+        case IR_OP_LH: case IR_OP_LHU: size = 2; break;
+        case IR_OP_LW:                 size = 4; break;
+        default: __builtin_unreachable();
+    }
+
+    if (regime != REGIME_BARE) {
+        /* ============================================================
+         * SV32_S / SV32_U fast path
+         * ============================================================ */
+        asmjit::Label l_perm_ok = a.new_label();
+        asmjit::Label l_r_ok    = a.new_label();
+        asmjit::Label l_miss    = a.new_label();
+        asmjit::Label l_done    = a.new_label();
+
+        /* ecx = vpn = gva >> 12; edx = vpn (tag compare 保留) */
+        a.mov(ecx, eax);
+        a.shr(ecx, asmjit::imm(12));
+        a.mov(edx, ecx);
+
+        /* ecx = index = vpn & (TLB_NUM_ENTRIES - 1) */
+        a.and_(ecx, asmjit::imm(TLB_NUM_ENTRIES - 1));
+
+        /* rcx = index * sizeof(tlb_e_t) = index * 16; x86 32-bit op 自动 zero-ext
+         * 高 32, 然后 shl rcx 4 得 64-bit (index << 4). 用于 lea entry 地址.
+         * x86 lea scale ≤ 8, 不能直接 [rsi + rcx*16], shl 单独做 */
+        a.shl(rcx, asmjit::imm(4));
+
+        /* rsi = current_tlb (从栈槽 reload; offsetof(tlb_t, e) = 0) */
+        emit_reload_current_tlb(a);
+
+        /* r9 = &tlb->e[index] */
+        a.lea(r9, asmjit::x86::ptr(rsi, rcx));
+
+        /* r10d = pte_flags (16-bit zero-ext) */
+        a.movzx(r10d, asmjit::x86::word_ptr(r9,
+                static_cast<int32_t>(offsetof(tlb_e_t, pte_flags))));
+
+        /* V bit check */
+        a.test(r10d, asmjit::imm(PTE_V));
+        a.jz(l_miss);
+
+        /* tag compare */
+        a.cmp(asmjit::x86::dword_ptr(r9,
+              static_cast<int32_t>(offsetof(tlb_e_t, gva_tag))), edx);
+        a.jne(l_miss);
+
+        /* mstatus 字段偏移 (trap._mstatus, RV32 低 32-bit 含 SUM/MXR bits) */
+        const int32_t mstatus_off =
+            static_cast<int32_t>(offsetof(cpu_t, trap)) +
+            static_cast<int32_t>(offsetof(trap_csrs_t, _mstatus));
+
+        /* PTE_U baked check (S 视角 vs U 视角) */
+        if (regime == REGIME_SV32_S) {
+            /* S 视角: PTE_U=0 默认通; PTE_U=1 需 SUM=1 (load 路径不检 X) */
+            a.test(r10d, asmjit::imm(PTE_U));
+            a.jz(l_perm_ok);
+            emit_reload_hart(a);
+            a.test(asmjit::x86::dword_ptr(rdi, mstatus_off),
+                   asmjit::imm(MSTATUS_SUM));
+            a.jz(l_miss);
+            a.bind(l_perm_ok);
+        } else {
+            /* SV32_U: PTE_U=1 强制 */
+            a.test(r10d, asmjit::imm(PTE_U));
+            a.jz(l_miss);
+        }
+
+        /* R / MXR check (S/U 通用; PTE_R=0 时 fallback MXR=1 + PTE_X=1) */
+        a.test(r10d, asmjit::imm(PTE_R));
+        a.jnz(l_r_ok);
+        emit_reload_hart(a);
+        a.test(asmjit::x86::dword_ptr(rdi, mstatus_off),
+               asmjit::imm(MSTATUS_MXR));
+        a.jz(l_miss);
+        a.test(r10d, asmjit::imm(PTE_X));
+        a.jz(l_miss);
+        a.bind(l_r_ok);
+
+        /* hva = host_ptr + (gva & 0xFFF); r11 = host_ptr, r10d = page offset */
+        a.mov(r11, asmjit::x86::qword_ptr(r9,
+              static_cast<int32_t>(offsetof(tlb_e_t, host_ptr))));
+        a.mov(r10d, eax);
+        a.and_(r10d, asmjit::imm(0xFFF));
+
+        /* host load 按 size + sext/zext */
+        switch (inst.kind) {
+            case IR_OP_LB:  a.movsx(eax, asmjit::x86::byte_ptr (r11, r10)); break;
+            case IR_OP_LH:  a.movsx(eax, asmjit::x86::word_ptr (r11, r10)); break;
+            case IR_OP_LW:  a.mov  (eax, asmjit::x86::dword_ptr(r11, r10)); break;
+            case IR_OP_LBU: a.movzx(eax, asmjit::x86::byte_ptr (r11, r10)); break;
+            case IR_OP_LHU: a.movzx(eax, asmjit::x86::word_ptr (r11, r10)); break;
+            default: __builtin_unreachable();
+        }
+        a.jmp(l_done);
+
+        /* ---- miss path: call mmu_walker_helper_load(hart, current_tlb, gva, size) ---- */
+        a.bind(l_miss);
+        /* eax 仍是 gva (fast path 没改 eax) */
+        emit_reload_hart(a);              /* rdi = hart */
+        emit_reload_current_tlb(a);       /* rsi = current_tlb */
+        a.mov(edx, eax);                  /* gva (3rd arg) */
+        a.mov(ecx, asmjit::imm(size));    /* size (4th arg) */
+        emit_call_helper(a, mmu_walker_helper_load);
+        /* helper 返 raw uxlen_t in eax (低 size 字节有效, 高位 0); sext/zext 按 op_kind */
+        switch (inst.kind) {
+            case IR_OP_LB:  a.movsx(eax, al); break;
+            case IR_OP_LH:  a.movsx(eax, ax); break;
+            case IR_OP_LW:  /* 32-bit 已满, noop */ break;
+            case IR_OP_LBU: a.movzx(eax, al); break;
+            case IR_OP_LHU: a.movzx(eax, ax); break;
+            default: __builtin_unreachable();
+        }
+
+        a.bind(l_done);
+        emit_store_rv_reg(a, inst.rd, eax);
+        return;
+    }
+
+    /* ============================================================
+     * BARE inline IS_GPA_RAM
+     * ============================================================ */
+    asmjit::Label l_mmio = a.new_label();
+    asmjit::Label l_done = a.new_label();
+
+    /* IS_GPA_RAM(gva): (uint32_t)(gva - GUEST_RAM_START) < GUEST_RAM_SIZE */
     a.mov(ecx, eax);
     a.sub(ecx, asmjit::imm(static_cast<int32_t>(GUEST_RAM_START)));
     a.cmp(ecx, asmjit::imm(static_cast<int32_t>(GUEST_RAM_SIZE)));
@@ -548,17 +716,9 @@ void emit_ir_load(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     emit_reload_hart(a);              /* rdi = hart */
     a.mov(esi, eax);                  /* pa = gva (BARE identity) */
     a.mov(edx, eax);                  /* gva */
-    /* size 按 op_kind */
-    uint32_t size = 0;
-    switch (inst.kind) {
-        case IR_OP_LB: case IR_OP_LBU:  size = 1; break;
-        case IR_OP_LH: case IR_OP_LHU:  size = 2; break;
-        case IR_OP_LW:                  size = 4; break;
-        default: __builtin_unreachable();
-    }
-    a.mov(ecx, asmjit::imm(size));
+    a.mov(ecx, asmjit::imm(size));    /* size */
     emit_call_helper(a, mmio_read_helper);
-    /* helper 返 raw uxlen_t in eax; sext/zext 按 op_kind (RAM 路径已做, MMIO 也做) */
+    /* helper 返 raw uxlen_t in eax; sext/zext 按 op_kind */
     switch (inst.kind) {
         case IR_OP_LB:   a.movsx(eax, al); break;
         case IR_OP_LH:   a.movsx(eax, ax); break;
@@ -572,29 +732,149 @@ void emit_ir_load(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     emit_store_rv_reg(a, inst.rd, eax);
 }
 
-// emit_ir_store (3 op SB/SH/SW; BARE inline IS_GPA_RAM):
+// emit_ir_store (3 op SB/SH/SW; regime 三分流: BARE / SV32_S / SV32_U):
 //
-// 形态:
-//   eax = gva = rs1 + imm
-//   r8d = value = rs2 (save before IS_GPA_RAM check, jump 两路都用)
+// BARE 形态:
+//   eax = gva = rs1 + imm; r8d = value = rs2;
 //   IS_GPA_RAM(gva) ?
-//     RAM: call store_helper(hart, hva=gpa_to_hva_offset+gva, gva, value, size) -- LR/SC + SMC 副作用强制经 helper
+//     RAM: call store_helper(hart, hva=gpa_to_hva_offset+gva, gva, value, size)
+//          (LR/SC + SMC 副作用强制经 helper)
 //     MMIO: call mmio_write_helper(hart, pa=gva, gva, value, size)
 //
+// SV32_S / SV32_U fast path (T6; 镜像 lsu.h:212-260 interpreter SV32 路径):
+//   eax = gva; r8d = value; vpn / index → reload rsi=current_tlb → entry;
+//   V + tag + PTE_U baked (S 视角 SUM / U 视角强制) + W bit + D bit check;
+//   hit: call store_helper(hart, hva=host_ptr+(gva&0xFFF), gva, value, size).
+//   miss / 任一 check fail: call mmu_walker_helper_store(hart, current_tlb,
+//   gva, value, size); helper 自己 walk + set D + fill TLB 或 trap longjmp.
+//
+// D bit check 不冗余 (lsu.h §load/store 不对称): D=0 → walker 重 set D=1 +
+// fill TLB; 若 backend 不检 D 直接走 hit, walker 永远没机会 set D, D bit 永
+// 留 0, 每次都走 hit 不 set, guest OS 看到的 PT 字段错.
+//
 // STORE 无 rd, .Ldone 不写 rv reg.
-void emit_ir_store(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
+void emit_ir_store(asmjit::x86::Assembler &a, const ir_inst_t &inst,
+                   regime_t regime) {
     using namespace asmjit::x86;
 
-    asmjit::Label l_mmio = a.new_label();
-    asmjit::Label l_done = a.new_label();
-
-    /* eax = gva = rs1 + imm */
+    /* eax = gva = rs1 + imm (BARE / SV32 两路共用) */
     emit_load_rv_reg(a, eax, inst.rs1);
     a.add(eax, asmjit::imm(inst.imm));
 
-    /* r8d = value = rs2 (跳两路前 save; r8 caller-saved 但 IS_GPA_RAM check 不
-       会破坏 r8, helper call 路径会重设 r8 = size) */
+    /* r8d = value = rs2 (两路共用; r8 caller-saved 但 IS_GPA_RAM check / SV32
+     * fast path TLB lookup 都不破坏 r8, helper call 路径会重设 r8 = size) */
     emit_load_rv_reg(a, r8d, inst.rs2);
+
+    /* size 按 op_kind (两路共用) */
+    uint32_t size = 0;
+    switch (inst.kind) {
+        case IR_OP_SB: size = 1; break;
+        case IR_OP_SH: size = 2; break;
+        case IR_OP_SW: size = 4; break;
+        default: __builtin_unreachable();
+    }
+
+    if (regime != REGIME_BARE) {
+        /* ============================================================
+         * SV32_S / SV32_U fast path
+         * ============================================================ */
+        asmjit::Label l_perm_ok = a.new_label();
+        asmjit::Label l_miss    = a.new_label();
+        asmjit::Label l_done    = a.new_label();
+
+        /* ecx = vpn = gva >> 12; edx = vpn (tag compare 保留) */
+        a.mov(ecx, eax);
+        a.shr(ecx, asmjit::imm(12));
+        a.mov(edx, ecx);
+
+        /* ecx = index = vpn & (TLB_NUM_ENTRIES - 1); rcx = index * 16 */
+        a.and_(ecx, asmjit::imm(TLB_NUM_ENTRIES - 1));
+        a.shl(rcx, asmjit::imm(4));
+
+        /* rsi = current_tlb (从栈槽 reload) */
+        emit_reload_current_tlb(a);
+
+        /* r9 = &tlb->e[index] */
+        a.lea(r9, asmjit::x86::ptr(rsi, rcx));
+
+        /* r10d = pte_flags */
+        a.movzx(r10d, asmjit::x86::word_ptr(r9,
+                static_cast<int32_t>(offsetof(tlb_e_t, pte_flags))));
+
+        /* V bit check */
+        a.test(r10d, asmjit::imm(PTE_V));
+        a.jz(l_miss);
+
+        /* tag compare */
+        a.cmp(asmjit::x86::dword_ptr(r9,
+              static_cast<int32_t>(offsetof(tlb_e_t, gva_tag))), edx);
+        a.jne(l_miss);
+
+        const int32_t mstatus_off =
+            static_cast<int32_t>(offsetof(cpu_t, trap)) +
+            static_cast<int32_t>(offsetof(trap_csrs_t, _mstatus));
+
+        /* PTE_U baked check (S 视角 vs U 视角) */
+        if (regime == REGIME_SV32_S) {
+            /* S 视角: PTE_U=0 默认通; PTE_U=1 需 SUM=1 */
+            a.test(r10d, asmjit::imm(PTE_U));
+            a.jz(l_perm_ok);
+            emit_reload_hart(a);
+            a.test(asmjit::x86::dword_ptr(rdi, mstatus_off),
+                   asmjit::imm(MSTATUS_SUM));
+            a.jz(l_miss);
+            a.bind(l_perm_ok);
+        } else {
+            /* SV32_U: PTE_U=1 强制 */
+            a.test(r10d, asmjit::imm(PTE_U));
+            a.jz(l_miss);
+        }
+
+        /* W bit check (store 路径; 不享 MXR fallback) */
+        a.test(r10d, asmjit::imm(PTE_W));
+        a.jz(l_miss);
+
+        /* D bit check (D=0 → walker 重 set D=1; 不检 D 会导致 D 永留 0) */
+        a.test(r10d, asmjit::imm(PTE_D));
+        a.jz(l_miss);
+
+        /* ---- hit path: call store_helper(hart, hva, gva, value, size) ----
+         * SysV ABI: hart=rdi, hva=rsi, gva=rdx, value=rcx, size=r8
+         * hva = host_ptr + (gva & 0xFFF) */
+        a.mov(r11, asmjit::x86::qword_ptr(r9,
+              static_cast<int32_t>(offsetof(tlb_e_t, host_ptr))));
+        a.mov(ecx, eax);                  /* ecx = gva (临时, 算 page offset) */
+        a.and_(ecx, asmjit::imm(0xFFF));  /* ecx = gva & 0xFFF (高 32 自动 zero-ext) */
+
+        emit_reload_hart(a);              /* rdi = hart */
+        a.mov(rsi, r11);                  /* rsi = host_ptr base */
+        a.add(rsi, rcx);                  /* rsi = hva = base + page offset */
+        a.mov(edx, eax);                  /* rdx = gva (tval) */
+        a.mov(ecx, r8d);                  /* rcx = value */
+        a.mov(r8d, asmjit::imm(size));    /* r8 = size */
+        emit_call_helper(a, store_helper);
+        a.jmp(l_done);
+
+        /* ---- miss path: call mmu_walker_helper_store(hart, current_tlb,
+         *                                              gva, value, size) ---- */
+        a.bind(l_miss);
+        /* eax 仍是 gva, r8d 仍是 value (fast path 没改) */
+        emit_reload_hart(a);              /* rdi = hart */
+        emit_reload_current_tlb(a);       /* rsi = current_tlb */
+        a.mov(edx, eax);                  /* rdx = gva */
+        a.mov(ecx, r8d);                  /* rcx = value */
+        a.mov(r8d, asmjit::imm(size));    /* r8 = size */
+        emit_call_helper(a, mmu_walker_helper_store);
+
+        a.bind(l_done);
+        return;
+    }
+
+    /* ============================================================
+     * BARE inline IS_GPA_RAM
+     * ============================================================ */
+    asmjit::Label l_mmio = a.new_label();
+    asmjit::Label l_done = a.new_label();
 
     /* IS_GPA_RAM check */
     a.mov(ecx, eax);
@@ -610,14 +890,7 @@ void emit_ir_store(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     a.add(rsi, rax);                                          /* rsi = hva = offset + gva (rax 高 32 已 0) */
     a.mov(edx, eax);                                          /* gva (传给 store_helper 当 tval 备用) */
     a.mov(ecx, r8d);                                          /* value (低 32-bit) */
-    uint32_t size_ram = 0;
-    switch (inst.kind) {
-        case IR_OP_SB: size_ram = 1; break;
-        case IR_OP_SH: size_ram = 2; break;
-        case IR_OP_SW: size_ram = 4; break;
-        default: __builtin_unreachable();
-    }
-    a.mov(r8d, asmjit::imm(size_ram));                        /* size */
+    a.mov(r8d, asmjit::imm(size));                            /* size */
     emit_call_helper(a, store_helper);
     a.jmp(l_done);
 
@@ -628,17 +901,20 @@ void emit_ir_store(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     a.mov(esi, eax);                                          /* pa = gva */
     a.mov(edx, eax);                                          /* gva */
     a.mov(ecx, r8d);                                          /* value */
-    uint32_t size_mmio = size_ram;   /* 跟 RAM 路径同 size 计算 */
-    a.mov(r8d, asmjit::imm(size_mmio));
+    a.mov(r8d, asmjit::imm(size));                            /* size */
     emit_call_helper(a, mmio_write_helper);
 
     a.bind(l_done);
 }
 
-// emit_ir_amo (9 op AMO_*_W; BARE call walker_helper):
+// emit_ir_amo (9 op AMO_*_W; call walker_helper, regime-agnostic):
 //
-// 形态: call mmu_walker_helper_amo_xxx(hart, current_tlb=NULL, gva=rs1, value=rs2)
+// 形态: call mmu_walker_helper_amo_xxx(hart, current_tlb, gva=rs1, value=rs2)
 // 返 旧值 (RMW result before update) in eax → store rd.
+//
+// T6: current_tlb 从栈槽 reload (emit_reload_current_tlb), BARE 时槽里是 NULL
+// 自动对偶, SV32 时槽里是真 tlb_t*, walker 内部按 tlb==NULL 分流 BARE/SV32
+// (a_04 拍 AMO/LR-SC 长期不加 inline TLB fast path, 永远走 walker).
 //
 // BARE walker 内: IS_GPA_RAM(pa) ? amo_xxx_apply(hva) : trap cause 7 (MMIO AMO 不
 // 支持; access_helper_call_graph §3 注). backend 不在 inline IS_GPA_RAM 因 9 op
@@ -650,7 +926,7 @@ void emit_ir_amo(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     emit_load_rv_reg(a, edx, inst.rs1);   /* gva */
     emit_load_rv_reg(a, ecx, inst.rs2);   /* value */
     emit_reload_hart(a);                  /* rdi = hart */
-    a.xor_(esi, esi);                     /* current_tlb = NULL (BARE) */
+    emit_reload_current_tlb(a);           /* rsi = current_tlb (regime-agnostic; BARE→NULL) */
 
     switch (inst.kind) {
         case IR_OP_AMO_ADD_W:   emit_call_helper(a, mmu_walker_helper_amo_add_w);  break;
@@ -668,10 +944,13 @@ void emit_ir_amo(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     emit_store_rv_reg(a, inst.rd, eax);
 }
 
-// emit_ir_lr_sc (2 op LR_W/SC_W; BARE call walker_helper):
+// emit_ir_lr_sc (2 op LR_W/SC_W; call walker_helper, regime-agnostic):
 //
-// LR_W: call mmu_walker_helper_lr_w(hart, NULL, gva); 返 *hva in eax → store rd
-// SC_W: call mmu_walker_helper_sc_w(hart, NULL, gva, value); 返 0=success/1=fail in eax → store rd
+// LR_W: call mmu_walker_helper_lr_w(hart, current_tlb, gva); 返 *hva in eax → store rd
+// SC_W: call mmu_walker_helper_sc_w(hart, current_tlb, gva, value); 返 0=success/1=fail in eax → store rd
+//
+// T6: current_tlb 从栈槽 reload (跟 emit_ir_amo 同体例; BARE 时槽里 NULL 自动对偶,
+// SV32 时槽里真 tlb_t*, walker 内部按 tlb==NULL 分流).
 //
 // BARE walker 内: walker → lrsc_lr_w/sc_w (apply 层, PA-based; access_helper_call_graph
 // §4-§5). LR/SC 落 MMIO walker 内 trap cause 5/7.
@@ -680,19 +959,19 @@ void emit_ir_lr_sc(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
 
     switch (inst.kind) {
         case IR_OP_LR_W:
-            /* call mmu_walker_helper_lr_w(hart=rdi, tlb=rsi=NULL, gva=rdx) */
+            /* call mmu_walker_helper_lr_w(hart=rdi, tlb=rsi, gva=rdx) */
             emit_load_rv_reg(a, edx, inst.rs1);
             emit_reload_hart(a);
-            a.xor_(esi, esi);
+            emit_reload_current_tlb(a);
             emit_call_helper(a, mmu_walker_helper_lr_w);
             emit_store_rv_reg(a, inst.rd, eax);
             return;
         case IR_OP_SC_W:
-            /* call mmu_walker_helper_sc_w(hart=rdi, tlb=rsi=NULL, gva=rdx, value=rcx) */
+            /* call mmu_walker_helper_sc_w(hart=rdi, tlb=rsi, gva=rdx, value=rcx) */
             emit_load_rv_reg(a, edx, inst.rs1);
             emit_load_rv_reg(a, ecx, inst.rs2);
             emit_reload_hart(a);
-            a.xor_(esi, esi);
+            emit_reload_current_tlb(a);
             emit_call_helper(a, mmu_walker_helper_sc_w);
             emit_store_rv_reg(a, inst.rd, eax);
             return;
@@ -1109,15 +1388,15 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                                                  void **host_code_out) {
     (void)pa;
 
-    // T3 regime 分流: BARE 真编译; SV32_S/_U 返 NOT_IMPLEMENTED → jit_entry.cc
-    // set_blacklist (BLACK) 路径 → dispatcher 下次 lookup interpret 兜底. SV32
-    // fast path (TLB tag compare + baked PTE_U + SUM/MXR 运行时读 mstatus) 推到
-    // 后续 milestone (b_03+ 上 SMC + 真 SV32 OS guest 时一起做), 跟 plan §1.1 /
-    // mmu.h:79 line "消除运行时 priv 分支" 一致.
-    if (regime != REGIME_BARE) {
-        *host_code_out = nullptr;
-        return JIT_ERR_NOT_IMPLEMENTED;
-    }
+    // T6 regime 分流: BARE / SV32_S / SV32_U 三 regime 都真编译.
+    //   - BARE  : LOAD/STORE inline IS_GPA_RAM; AMO/LR-SC call walker (BARE→NULL tlb)
+    //   - SV32_*: LOAD/STORE inline TLB fast path (baked S/U 视角 PTE_U + 运行时
+    //             SUM/MXR), miss 走 mmu_walker_helper_load/store; AMO/LR-SC call
+    //             walker (SV32 路径)
+    // regime baked 到 emit_ir_load/store 函数内 (作为函数参), 跟 jit_cache key
+    // (PA, regime) 拆分一致 — 同一 PA 在 S/U 视角下编两份块体.
+    // (T3 起步阶段 SV32 早 return NOT_IMPLEMENTED → set_blacklist BLACK 的体例
+    // T6 拆除, 但 plan §1.1 / mmu.h:79 line "消除运行时 priv 分支" 设计仍有效.)
 
     // 块前缀空 (仅 DISPATCH_EXIT 收尾, n_insts == 1) → 不真编译, NOT_IMPLEMENTED
     // 让 jit_entry.cc step 3 set_blacklist + interpret 兜底真执行那条 RV
@@ -1166,15 +1445,17 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 emit_ir_arith(a, inst);
                 break;
 
-            /* T3 LOAD 5 op → emit_ir_load (BARE inline IS_GPA_RAM) */
+            /* T3 LOAD 5 op → emit_ir_load (T6: regime 三分流, BARE 沿用 inline
+             * IS_GPA_RAM; SV32_S/_U 走 TLB fast path + miss walker) */
             case IR_OP_LB:  case IR_OP_LH:  case IR_OP_LW:
             case IR_OP_LBU: case IR_OP_LHU:
-                emit_ir_load(a, inst);
+                emit_ir_load(a, inst, regime);
                 break;
 
-            /* T3 STORE 3 op → emit_ir_store (BARE inline IS_GPA_RAM) */
+            /* T3 STORE 3 op → emit_ir_store (T6: regime 三分流, BARE 沿用 inline
+             * IS_GPA_RAM; SV32_S/_U 走 TLB fast path + W/D check + miss walker) */
             case IR_OP_SB:  case IR_OP_SH:  case IR_OP_SW:
-                emit_ir_store(a, inst);
+                emit_ir_store(a, inst, regime);
                 break;
 
             /* T3 CSR 6 op → emit_ir_csr (call csr_op; 硬边界, 下一条必是 DISPATCH_EXIT) */
