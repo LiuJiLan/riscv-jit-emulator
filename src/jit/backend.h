@@ -58,14 +58,18 @@
 
 #include <stddef.h>      // size_t (ir 流长度)
 
-#include "api/jit_api.h" // jit_status_t (compile_block 返值)
-#include "core/mmu.h"    // regime_t (compile_block 参数)
-#include "ir.h"          // ir_inst_t (compile_block 输入)
-#include "riscv.h"       // uxlen_t (pa 参数; dummy.txt §13 typedef family)
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* 转发 C 头放进 extern "C" 块 — 让 backend_asmjit.cc (C++) include backend.h
+ * 时拿到 extern "C" linkage 的 declarations, 不被 C++ name mangling. helpers.h
+ * 同体例. */
+#include "api/jit_api.h" // jit_status_t (compile_block 返值)
+#include "core/mmu.h"    // regime_t (compile_block 参数) + mmu_walker_helper_*
+                         // declarations (T3 backend emit call 用)
+#include "ir.h"          // ir_inst_t (compile_block 输入)
+#include "riscv.h"       // uxlen_t (pa 参数; dummy.txt §13 typedef family)
 
 // ----------------------------------------------------------------------------
 // jit_block_func_t —— JIT 编译产物 (host_code_ptr) 的函数签名 (Q1 a, 统一签名)

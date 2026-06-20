@@ -1,7 +1,7 @@
 //
 // Created by liujilan on 2026/6/19.
-// jit/translator.c —— RV → IR 翻译器实装 (T1+T2 范围: RV32I 算术全集 21 op
-// 真翻译 + 其他截断 emit DISPATCH_EXIT 走 interpret 兜底).
+// jit/translator.c —— RV → IR 翻译器实装 (T1+T2+T3 范围: 48 op 真翻译 + 23 op
+// 截断 emit DISPATCH_EXIT 走 interpret 兜底).
 //
 // 实装顶段 doc 见 translator.h.
 //
@@ -10,13 +10,26 @@
 //   - 跨页 check 推进后 cur_pc 进新 page 退 (跟 interpreter.c:896 同体例;
 //     page_mask = ~0xFFFu)
 //   - 软边界 BLOCK_INST_LIMIT - 1 (留 1 slot 给 DISPATCH_EXIT 收尾)
-//   - PC_STEP 用 d.pc_step 而非 hardcoded 4 (T6 加 RVC 时自动适应; T1+T2 RV32I
-//     算术全集都是 PC_STEP_RV = 4)
+//   - PC_STEP 用 d.pc_step 而非 hardcoded 4 (T6 加 RVC 时自动适应; T1+T2+T3 全部
+//     真翻译 op 都是 PC_STEP_RV = 4)
 //
 // T2 唯一"translator 端有运算"的 op 是 AUIPC: cur_pc + d.imm 合并写进 ir.imm
 // (选 a 常量折叠, 跟 QEMU 默认 + rv8 一致; baked_pc 不进 ir_inst_t 字段).
 // PA != VA trail: V1 BARE only, cur_pc = pa = VA; SV32 上线 (b_03+) 时
 // AUIPC baked_pc 来源 (用 pa 还是 cpu->pc VA) 单独议.
+//
+// T3 范围 (helper call): LOAD 5 + STORE 3 + CSR 6 + AMO 9 + LR/SC 2 + MISC-MEM 2
+// = 27 op. CSR 6 + FENCE_I 是硬边界 op_kind (plan §1.23.1 表 4 + 表 7;
+// is_block_boundary_inst 返 1), translator emit 完该 op 的 IR 后立刻 break 出
+// 翻译循环 — DISPATCH_EXIT 收尾段 target_pc = cur_pc (= 该 op 后下一条 PC) 让
+// dispatcher 重派发. CSR 字段约定 (ir.h 顶段 + ir_inst_t 段对偶 decode.h:158
+// line): ir_imm = d.imm = csr_addr 12-bit; RWI/RSI/RCI 变体 d.rs1 字段直接是
+// 5-bit zimm 数值, ir.rs1 装它即可 (跟 decoded_inst_t 同体例).
+//
+// T3 暂不翻译的 23 op (仍 fallthrough goto out_translate, 走 interpret 兜底):
+//   RV32M 8 (推 T6 真做 emit) / BRANCH 6 + JAL/JALR (推 T4 控制流) / SYSTEM
+//   ECALL/EBREAK/MRET/SRET/SFENCE_VMA/WFI (推 T4 跟控制流 + trap 一起做) /
+//   OP_UNSUPPORTED (兜底, interpret 走 trap_raise cause=2 illegal).
 //
 
 #include "translator.h"
@@ -62,7 +75,13 @@ void translator_translate(uxlen_t pa, regime_t regime,
          * 假警 (debug -O0 不撞; switch 全覆盖时实际不会读默认值, 但 GCC -O2
          * 静态分析推不出来). */
         ir_op_kind_t ir_kind = IR_OP_UNSUPPORTED;
-        int32_t      ir_imm  = d.imm;           /* 默认沿用 d.imm */
+        int32_t      ir_imm  = d.imm;           /* 默认沿用 d.imm; CSR 时 d.imm
+                                                 * 就是 csr_addr 12-bit
+                                                 * (decode.h:158 line), 复用 imm
+                                                 * 字段无需特殊处理 */
+        /* 硬边界 op (CSR 6 + FENCE_I); emit 完该 op IR 后强制 break 出循环 →
+         * DISPATCH_EXIT(cur_pc + pc_step) 收尾切块. plan §1.23.1 表 4 + 表 7. */
+        int          is_hard_boundary = 0;
 
         switch (d.kind) {
             /* ---- U-type ---- */
@@ -96,49 +115,85 @@ void translator_translate(uxlen_t pa, regime_t regime,
             case OP_OR:     ir_kind = IR_OP_OR;    break;
             case OP_AND:    ir_kind = IR_OP_AND;   break;
 
-            /* 非 RV32I 算术 — 块前缀截断, 走 DISPATCH_EXIT(cur_pc) 收尾让
-             * dispatcher 下一轮重派发 (BLACK 时由 interpret 兜底). 显式列全
-             * (而非走 default) 是因为 -Wswitch-enum -Werror 强制 op_kind_t
-             * switch 同步; CLAUDE.md 顶段 "load-bearing mechanism" 段. */
-            /* RV32M (推 T6 真做 emit) */
+            /* ---- I-type LOAD (5; T3 加; rs1+imm = gva) ---- */
+            case OP_LB:     ir_kind = IR_OP_LB;    break;
+            case OP_LH:     ir_kind = IR_OP_LH;    break;
+            case OP_LW:     ir_kind = IR_OP_LW;    break;
+            case OP_LBU:    ir_kind = IR_OP_LBU;   break;
+            case OP_LHU:    ir_kind = IR_OP_LHU;   break;
+
+            /* ---- S-type STORE (3; T3 加; rs1+imm = gva, rs2 = value) ---- */
+            case OP_SB:     ir_kind = IR_OP_SB;    break;
+            case OP_SH:     ir_kind = IR_OP_SH;    break;
+            case OP_SW:     ir_kind = IR_OP_SW;    break;
+
+            /* ---- I-type SYSTEM CSR (6; T3 加; 硬边界 — emit 后切块) ----
+             * ir_imm = d.imm (= csr_addr 12-bit, decode.h:158 line 字段约定);
+             * ir.rs1 = d.rs1 直传 (RW/RS/RC 是寄存器号, RWI/RSI/RCI 是 5-bit
+             * zimm 数值, 字段位置共用 — decode.h:159-162 line + ir.h 字段约定
+             * I 变体段). */
+            case OP_CSRRW:  ir_kind = IR_OP_CSRRW;  is_hard_boundary = 1; break;
+            case OP_CSRRS:  ir_kind = IR_OP_CSRRS;  is_hard_boundary = 1; break;
+            case OP_CSRRC:  ir_kind = IR_OP_CSRRC;  is_hard_boundary = 1; break;
+            case OP_CSRRWI: ir_kind = IR_OP_CSRRWI; is_hard_boundary = 1; break;
+            case OP_CSRRSI: ir_kind = IR_OP_CSRRSI; is_hard_boundary = 1; break;
+            case OP_CSRRCI: ir_kind = IR_OP_CSRRCI; is_hard_boundary = 1; break;
+
+            /* ---- R-type A 扩展 Zaamo (9; T3 加; rs1=gva, rs2=value) ---- */
+            case OP_AMO_ADD_W:  ir_kind = IR_OP_AMO_ADD_W;  break;
+            case OP_AMO_SWAP_W: ir_kind = IR_OP_AMO_SWAP_W; break;
+            case OP_AMO_XOR_W:  ir_kind = IR_OP_AMO_XOR_W;  break;
+            case OP_AMO_OR_W:   ir_kind = IR_OP_AMO_OR_W;   break;
+            case OP_AMO_AND_W:  ir_kind = IR_OP_AMO_AND_W;  break;
+            case OP_AMO_MIN_W:  ir_kind = IR_OP_AMO_MIN_W;  break;
+            case OP_AMO_MAX_W:  ir_kind = IR_OP_AMO_MAX_W;  break;
+            case OP_AMO_MINU_W: ir_kind = IR_OP_AMO_MINU_W; break;
+            case OP_AMO_MAXU_W: ir_kind = IR_OP_AMO_MAXU_W; break;
+
+            /* ---- R-type A 扩展 Zalrsc (2; T3 加) ---- */
+            case OP_LR_W:   ir_kind = IR_OP_LR_W;  break;
+            case OP_SC_W:   ir_kind = IR_OP_SC_W;  break;
+
+            /* ---- MISC-MEM (2; T3 加; FENCE_I 硬边界, FENCE 不是) ---- */
+            case OP_FENCE:    ir_kind = IR_OP_FENCE;                          break;
+            case OP_FENCE_I:  ir_kind = IR_OP_FENCE_I; is_hard_boundary = 1; break;
+
+            /* 仍截断 — 推 T4/T6 真做 emit. 显式列全 (而非走 default) 是因为
+             * -Wswitch-enum -Werror 强制 op_kind_t switch 同步;
+             * CLAUDE.md 顶段 "load-bearing mechanism" 段. */
+            /* RV32M (推 T6) */
             case OP_MUL:    case OP_MULH:   case OP_MULHSU: case OP_MULHU:
             case OP_DIV:    case OP_DIVU:   case OP_REM:    case OP_REMU:
             /* Branch / JAL / JALR 控制流 (推 T4) */
             case OP_BEQ:    case OP_BNE:    case OP_BLT:    case OP_BGE:
             case OP_BLTU:   case OP_BGEU:
             case OP_JAL:    case OP_JALR:
-            /* CSR (推 T3; 硬边界 — interpreter 同) */
-            case OP_CSRRW:  case OP_CSRRS:  case OP_CSRRC:
-            case OP_CSRRWI: case OP_CSRRSI: case OP_CSRRCI:
-            /* SYSTEM (推 T3; 硬边界) */
+            /* SYSTEM (推 T4; 跟控制流 + trap 一起做) */
             case OP_ECALL:  case OP_EBREAK: case OP_MRET:   case OP_SRET:
             case OP_SFENCE_VMA: case OP_WFI:
-            /* LOAD / STORE (推 T3) */
-            case OP_LB:     case OP_LH:     case OP_LW:
-            case OP_LBU:    case OP_LHU:
-            case OP_SB:     case OP_SH:     case OP_SW:
-            /* MISC-MEM (推 T3; FENCE.I 硬边界) */
-            case OP_FENCE:  case OP_FENCE_I:
-            /* Zaamo 9 op (推 T3) */
-            case OP_AMO_ADD_W:  case OP_AMO_SWAP_W: case OP_AMO_XOR_W:
-            case OP_AMO_OR_W:   case OP_AMO_AND_W:
-            case OP_AMO_MIN_W:  case OP_AMO_MAX_W:
-            case OP_AMO_MINU_W: case OP_AMO_MAXU_W:
-            /* Zalrsc (推 T3) */
-            case OP_LR_W:   case OP_SC_W:
-            /* 兜底 (后续 interpret 走 trap_raise cause=2) */
+            /* 兜底 (interpret 走 trap_raise cause=2 illegal) */
             case OP_UNSUPPORTED:
                 goto out_translate;
         }
 
-        ir_buf[i].kind = ir_kind;
-        ir_buf[i].rd   = (uint8_t)d.rd;
-        ir_buf[i].rs1  = (uint8_t)d.rs1;
-        ir_buf[i].rs2  = (uint8_t)d.rs2;
-        ir_buf[i].imm  = ir_imm;
+        ir_buf[i].kind     = ir_kind;
+        ir_buf[i].rd       = (uint8_t)d.rd;
+        ir_buf[i].rs1      = (uint8_t)d.rs1;
+        ir_buf[i].rs2      = (uint8_t)d.rs2;
+        ir_buf[i].imm      = ir_imm;
+        ir_buf[i].raw_inst = inst;       /* CSR 6 op illegal trap mtval; 其他 op
+                                          * 不读 — 一律填便宜不分流 */
         i++;
 
         cur_pc += d.pc_step;
+
+        /* 硬边界 op (CSR 6 + FENCE_I): emit 完后强制 break 出循环, 走
+         * DISPATCH_EXIT 收尾 — dispatcher 重派发以重新算 (regime, current_tlb)
+         * 跟 trap 状态. plan §1.23.1 + ir.h 顶段 T3 范围段. */
+        if (is_hard_boundary) {
+            break;
+        }
+
         if ((cur_pc & TRANSLATOR_PAGE_MASK) != entry_page) {
             break;
         }
@@ -161,6 +216,7 @@ out_translate:;
     ir_buf[i].rs1       = 0;
     ir_buf[i].rs2       = 0;
     ir_buf[i].imm       = 0;
+    ir_buf[i].raw_inst  = 0;
     i++;
 
     *n_insts = i;
