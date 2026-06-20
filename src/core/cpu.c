@@ -30,6 +30,15 @@
 // 非 _Atomic: main 在线程 spawn 之前写一次, 之后只读 (spawn 屏障保证多 hart 并发读安全)。
 uint32_t n_harts = 1u;
 
+// harts_table — 进程级 hart_t * 注册表 (cap [MAX_HARTS]; cap-vs-n_harts §15 lifecycle
+// 配对体例). cpu_create 末段写 harts_table[hartid] = hart, cpu_destroy 头段清 NULL.
+// 用途: cpu_wait_all_harts_exit_host_code (b_02 T5 jit_invalidate_block 协议) 扫所有
+// hart 等退出某 host_code; 跟 wfi_slots[MAX_HARTS] 同形态 (file-static 数据 + 公开
+// fn 接口, 不 extern 暴露 array). phantom slot (idx ∈ [n_harts, cap)) 永远 NULL,
+// 扫描循环跳过. main.c local harts[] 本来已存类似含义, 此表是为了让 jit/cpu helper
+// 不需要 main.c 注入指针 (跟 wfi_kick_all 体例对偶).
+static cpu_t *harts_table[MAX_HARTS] = { NULL };
+
 // cpu_info_shared_default — 多 hart 共享出场信息 RO CSR (cpu_t::shared_info 指向)
 //
 // 制造商信息 (mvendorid/marchid/mimpid) 是机器整体属性, 不区分 hart; 当前 open-source
@@ -138,6 +147,12 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
     hart->tlb_table[PRIV_U] = hart->tlb_table[PRIV_S];
 
     // [PRIV_M] / [PRIV_H]: 不分配, memset 0 保证 NULL。
+
+    // 注册进 harts_table (b_02 T5; cpu_wait_all_harts_exit_host_code 扫表用).
+    // hartid < MAX_HARTS 是 cpu_create 入参约束 (main 0..n_harts-1); cap 边界防御.
+    if (hart->hartid < MAX_HARTS) {
+        harts_table[hart->hartid] = hart;
+    }
 
     return hart;
 }
@@ -273,6 +288,11 @@ static void cpu_dump(const cpu_t *hart) {
 void cpu_destroy(cpu_t *hart) {
     if (hart == NULL) { return; }
 
+    // 注销 harts_table (b_02 T5; 防 cpu_wait_all_harts_exit_host_code 后续撞悬空指针).
+    if (hart->hartid < MAX_HARTS && harts_table[hart->hartid] == hart) {
+        harts_table[hart->hartid] = NULL;
+    }
+
     // 销毁前 dump 终态 (DEBUG_CPU_DUMP_ON gate; Release 不打)。放 free 之前 hart 字段
     // 仍完整可读。注: cpu_create 失败回滚路径也走 cpu_destroy, 那时 hart 只半初始化,
     // dump 出来多是 0 值 —— 属错误路径, 无害 (失败原因前面已 fprintf 过)。
@@ -298,4 +318,35 @@ void cpu_destroy(cpu_t *hart) {
     // [PRIV_M] M: 不分配 (Trust regime 不走 TLB), 不再 free。
 
     free(hart);
+}
+
+
+// ----------------------------------------------------------------------------
+// cpu_wait_all_harts_exit_host_code — 扫所有 hart 等退出某 host_code (b_02 T5)
+//
+// caller: jit_entry.cc 的 jit_invalidate_block — backend 真 unmap host_code mmap
+// 区前调用本 fn, 确保没有 hart 正在执行该 host code (跑过该 host_code 的指令
+// 在 host pc 内, unmap 会让 host CPU prefetch / 已派发 uop 走悬空 mmap 段).
+//
+// 协议跟 jit_executing_host_code 状态灯 (cpu.h cpu_t 字段顶段 doc) 对偶:
+//   dispatcher fork 点 hit COMPILED 时点亮状态灯 (release), 跑完清状态灯;
+//   本 fn 扫 cap [MAX_HARTS] 所有 hart 字段 acquire 读, 等所有 hart 不再
+//   == host_code 才返回 (busy-wait + __builtin_ia32_pause hint x86 spin-loop).
+//
+// cap-vs-n_harts (§15): 扫 cap 是因 phantom slot 永远 NULL ≠ host_code 不卡;
+// 防御边界跟 lifecycle 配对走 cap 同体例 (跟 wfi_kick_all 一致).
+//
+// 起步 PAUSE busy-wait, 真撞 perf 推 b_03+ 换 cond_wait (start_plan_b_02 §0.8 R8
+// "起步 busy-wait + short pause; 真撞 perf 时换 cond_wait / pthread_yield 推 b_03+").
+// ----------------------------------------------------------------------------
+void cpu_wait_all_harts_exit_host_code(void *host_code) {
+    if (host_code == NULL) { return; }
+    for (uint32_t i = 0; i < MAX_HARTS; i++) {
+        cpu_t *h = harts_table[i];
+        if (h == NULL) { continue; }   /* phantom slot / 已 destroy hart */
+        while (atomic_load_explicit(&h->jit_executing_host_code,
+                                    memory_order_acquire) == host_code) {
+            __builtin_ia32_pause();
+        }
+    }
 }

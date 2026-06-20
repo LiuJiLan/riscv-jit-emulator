@@ -41,6 +41,13 @@
 //   - 未来 SMC chain hook: 块边界 JIT cache page invalidate / page_dirty bitmap
 //     从这里加 (a_05+); 当前不实
 //
+// SMC trigger 端就是 fence.i, 不在 sfence.vma — fence.i 是 i-cache flush (guest
+// 自改代码段后的可见性边界, 直接 SMC 相关), sfence.vma 只是 TLB shootdown (地址翻译
+// cache 失效, 不动 i-cache / 不动 PA 字节). 上方"三者无共享 helper"的真实含义就是
+// 语义边界完全独立, 别把 JIT invalidate 错挂 sfence.vma. 详 sfence.h 顶段"sfence_vma
+// _helper 不调 jit_invalidate_block — 为什么"段 (b_02 T5 重审推翻 start_plan_b_02
+// §[2] T5 第 5 点; memory `feedback_overturn_plan_leave_trail`).
+//
 // fence.i 是块边界, plain fence 不是 (Q14 拍): fence.i 改 i-cache 视图, 块内后续指令
 // 译码假设失效; plain fence 是 memory ordering, 不动指令流, 可以同 block 继续译.
 // is_block_boundary_inst (decode.h) 体现该分类.

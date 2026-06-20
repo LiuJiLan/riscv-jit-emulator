@@ -90,6 +90,20 @@
 #define BLOCK_INST_LIMIT  64U
 
 // ----------------------------------------------------------------------------
+// JIT 热度阈值 (b_02 T5; plan §1.23.10 起 100 静态)
+// ----------------------------------------------------------------------------
+//
+// dispatcher fork 点 lookup_or_init 返 COUNTING entry 时 atomic_fetch_add counter,
+// 达 COMPILE_THRESHOLD 触发 jit_compile_block; 未达走 interpreter 兜底.
+//
+// 起步 100 (plan §1.23.10 起步值; 合理范围 [50, 500]). config.h 可调, 改完
+// 重建即生效. 自适应阈值跟热衰减 / LRU 是远期 (plan §2 改进项 #24).
+//
+// 编译失败的 PA 在 jit_cache 标 BLACK, dispatcher fork 点见 BLACK 走 interpret
+// 不增 counter (plan §1.23.8 末段编译失败黑名单).
+#define COMPILE_THRESHOLD  100U
+
+// ----------------------------------------------------------------------------
 // hart 数量 (编译期 cap; 运行期实际数 = n_harts, 见 src/core/cpu.h)
 // ----------------------------------------------------------------------------
 //

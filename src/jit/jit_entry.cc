@@ -28,9 +28,22 @@
 //   jit_cache_flush_all → backend.flush_all (固定顺序; jit_cache 内 RCU sync 等
 //                                            grace period 后才能 backend 真 unmap)
 //
-// jit_invalidate_block — stub nop (跟 jit_api.h 顶段 doc 一致):
-//   SMC 真路径走 jit_cache_invalidate_page (按 page 颗粒度) 不是按 (pa, regime)
-//   单块. 按块颗粒度的 caller 语义留 b_03 真做 SMC + fence.i 双保险时拍.
+// jit_invalidate_block (b_02 T5 真填; 协议骨架接通):
+//   take 路径: jit_cache_take_compiled_host_code(pa, regime) 拿 host_code +
+//              CAS COMPILED→EMPTY (后续 lookup 见 EMPTY 视 miss);
+//   RCU sync : jit_rcu_synchronize 等所有 in-flight dispatcher read critical
+//              出, 确保已经 hit COMPILED 的 dispatcher 都已经写完状态灯;
+//   状态灯扫 : cpu_wait_all_harts_exit_host_code 扫所有 hart 等退出该 host_code
+//              (起步 busy-wait + PAUSE, §0.8 R8);
+//   unmap   : backend.invalidate_block(host_code) 真 unmap host code mmap 区.
+//
+//   caller (b_03 真做 SMC chain): fence.i / SIGSEGV handler 触发 page_dirty
+//   bitmap → dispatcher 主循环顶扫 bitmap → 按 page 颗粒度调
+//   jit_cache_invalidate_page (顺链表清 status + sync grace) 而非本接口.
+//   本接口提供按 (pa, regime) 单块失效语义, future block chaining / 单点
+//   invalidate 真撞场景留用.
+//   注意 sfence.vma 不调本接口 — sfence 只清 TLB, JIT 块 key=(PA, regime) 在
+//   sfence 后不过期 (PA 不变 + perm runtime 读 TLB; 详 sfence.h 顶段).
 //
 // jit_compile_block — Q11 a 组合层 (dispatcher fork 点 miss 路径调):
 //   step 1: backend.compile_block → JIT_OK 时 jit_cache_install + 返 JIT_OK
@@ -64,6 +77,7 @@
 
 #include "api/jit_api.h"
 #include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小)
+#include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (T5 invalidate 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
 #include "jit/translator.h"  // translator_translate (RV → IR; T1 c+ 真做)
@@ -109,14 +123,42 @@ void jit_flush_all(void) {
 
 
 // ----------------------------------------------------------------------------
-// jit_invalidate_block — T3 stub nop (跟 jit_api.h 顶段 doc 一致)
+// jit_invalidate_block — b_02 T5 真填 (协议骨架接通; 调用者 = b_03 SMC chain)
 //
-// SMC 真路径 (b_03+) 走 jit_cache_invalidate_page (按 page 颗粒度); 按 (pa,
-// regime) 单块失效语义留 b_03 真做 SMC + fence.i 双保险时拍 (start_plan_b_01
-// [4'.6] B1 user 倾向方案 B 双保险时议).
+// 协议 4 步 (详本文件顶段 §"5 个 extern C 入口" jit_invalidate_block 段):
+//   1. take: jit_cache_take_compiled_host_code 拿 host_code + CAS COMPILED→EMPTY
+//   2. RCU sync: 等 in-flight dispatcher read critical 出 (确保状态灯写完 visible)
+//   3. 状态灯扫: cpu_wait_all_harts_exit_host_code (busy-wait + PAUSE)
+//   4. unmap: backend.invalidate_block 真 unmap host code mmap 区
+//
+// race-safe: take CAS 拿失败 → host_code = NULL → 后续 step skip (别 hart 已
+// invalidate / 还没 promote / BLACK).
+//
+// 调用者:
+//   - 当前: jit_api 测试 fixture 直调 (T5 验收 fixture; 协议路径 verify)
+//   - 未来 b_03: SMC handler 触发 page_dirty bitmap, dispatcher 主循环顶按 page
+//     调 jit_cache_invalidate_page (顺链表; 不是本接口). 本接口给 future
+//     block chaining 等按 (pa, regime) 单块失效场景预留.
+//
+// 不接 sfence_vma_helper — sfence 只清 TLB, JIT 块 key=(PA, regime) 不过期.
 // ----------------------------------------------------------------------------
 void jit_invalidate_block(uxlen_t pa, regime_t regime) {
-    (void)pa; (void)regime;
+    /* step 1: take + CAS COMPILED→EMPTY */
+    void *host_code = jit_cache_take_compiled_host_code(pa, regime);
+    if (host_code == nullptr) {
+        return;   /* 无 entry / 非 COMPILED / 已被别 hart take 走 — 不需 invalidate */
+    }
+
+    /* step 2: RCU sync (等所有 in-flight read critical 出; 此时所有"已 lookup hit
+     * 的"dispatcher 都已经写完状态灯 release, step 3 扫描能看到 visible 值) */
+    jit_rcu_synchronize();
+
+    /* step 3: 状态灯扫所有 hart 等退出 host_code (busy-wait + PAUSE) */
+    cpu_wait_all_harts_exit_host_code(host_code);
+
+    /* step 4: backend 真 unmap host code mmap RX 段 */
+    const backend_t *be = backend_get_default();
+    be->backend_invalidate_block(host_code);
 }
 
 

@@ -89,6 +89,21 @@ static inline size_t jit_cache_hash(uxlen_t pa, regime_t regime) {
 
 
 /* ============================================================================
+ * 内部 helper: entry_key_matches — atomic load key 比较 (b_02 T5 race-free)
+ *
+ * key_pa / key_regime 升 _Atomic (jit_cache.h struct 字段段 doc). 比较读用
+ * atomic_load_explicit relaxed (status 的 acquire/release 已建立 happens-before,
+ * key 只需要不撕裂值).
+ * ============================================================================ */
+static inline int entry_key_matches(jit_cache_entry_t *e,
+                                    uxlen_t pa, regime_t regime) {
+    return atomic_load_explicit(&e->key_pa, memory_order_relaxed) == pa
+        && atomic_load_explicit(&e->key_regime, memory_order_relaxed) ==
+               (uint32_t)regime;
+}
+
+
+/* ============================================================================
  * lifecycle (对偶 wfi_init/destroy + lrsc_init/destroy)
  *
  * 配对按 cap (dummy.txt §15 lifecycle 必用 cap): hash_table / page_block_head
@@ -99,9 +114,12 @@ int jit_cache_init(void) {
     /* hash_table: 全 EMPTY + next_in_page 哨兵; key 字段清 0 (release store
      * status 给 future race 看到 EMPTY 时其他字段亦清). */
     for (uint32_t i = 0; i < JIT_CACHE_SIZE; i++) {
-        hash_table[i].key_pa        = 0;
-        hash_table[i].key_regime    = REGIME_BARE;
-        hash_table[i].counter       = 0;
+        atomic_store_explicit(&hash_table[i].key_pa,     0u,
+                              memory_order_relaxed);
+        atomic_store_explicit(&hash_table[i].key_regime, (uint32_t)REGIME_BARE,
+                              memory_order_relaxed);
+        atomic_store_explicit(&hash_table[i].counter,    0u,
+                              memory_order_relaxed);
         hash_table[i].host_code_ptr = NULL;
         hash_table[i].next_in_page  = JIT_PAGE_HEAD_END;
         atomic_store_explicit(&hash_table[i].status,
@@ -199,7 +217,7 @@ jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime) {
         uint32_t s = atomic_load_explicit(&e->status, memory_order_acquire);
 
         if (s == (uint32_t)JIT_CACHE_COMPILED
-            && e->key_pa == pa && e->key_regime == regime) {
+            && entry_key_matches(e, pa, regime)) {
             return e;
         }
         if (s == (uint32_t)JIT_CACHE_EMPTY) {
@@ -213,10 +231,40 @@ jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime) {
 
 
 /* ============================================================================
+ * 内部 helper: page_block_head 挂链表头 (退栈式 CAS)
+ *
+ * jit_cache_install / jit_cache_set_blacklist / jit_cache_lookup_or_init 共享.
+ * page_idx 越界 (pa 不在 RAM, caller bug) 兜底设 next_in_page = JIT_PAGE_HEAD_END.
+ * ============================================================================ */
+static void link_into_page_list(jit_cache_entry_t *e, uxlen_t pa,
+                                uint32_t slot_idx_u32) {
+    uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+    if (page_idx < GUEST_RAM_NPAGES) {
+        uint16_t old_head = atomic_load_explicit(&page_block_head[page_idx],
+                                                 memory_order_acquire);
+        do {
+            e->next_in_page = old_head;
+        } while (!atomic_compare_exchange_weak_explicit(
+                     &page_block_head[page_idx], &old_head,
+                     (uint16_t)slot_idx_u32,
+                     memory_order_acq_rel, memory_order_acquire));
+    } else {
+        e->next_in_page = JIT_PAGE_HEAD_END;
+    }
+}
+
+
+/* ============================================================================
  * jit_cache_install — RCU modify-side, atomic CAS 路径无锁
  *
- * 找 EMPTY slot → CAS EMPTY→COUNTING → 填字段 → CAS 挂 page_block_head →
- * store COMPILED (release).
+ * 两个 entry 路径 (b_02 T5):
+ *   (a) install 路径: 撞 EMPTY slot → CAS EMPTY→COUNTING → 填字段 + 挂链表 →
+ *       store COMPILED. 走 jit_compile_block 二次 Flush 后 (entry 全清回 EMPTY)
+ *       的重试场景.
+ *   (b) promote 路径: 撞 key 匹配 + status=COUNTING (dispatcher fork 点
+ *       lookup_or_init 已建好 entry) → 写 host_code_ptr → store COMPILED
+ *       release (key/next_in_page 已 visible 不重填). 走 dispatcher counter 达
+ *       THRESHOLD 触发 compile 的主路径.
  *
  * page_idx = (pa - GUEST_RAM_START) >> 12; 不在 RAM 区 (caller bug) 兜底不挂链表.
  * ============================================================================ */
@@ -235,52 +283,158 @@ int jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr) {
                 (uint32_t)JIT_CACHE_COUNTING,
                 memory_order_acq_rel, memory_order_acquire)) {
             slot_idx_u32 = slot;
-            goto got_slot;
+            goto got_slot_install;
         }
-        /* CAS 失败: expected 已被 CAS 更新成当前 status. idempotent check 只能在
-         *   COMPILED/BLACK 状态读 key 字段 — 那两状态的 release store 已发布
-         *   (install/blacklist 末段 store COMPILED/BLACK release), key 字段 visible.
-         * COUNTING 状态下 key 字段 in-flight (别 hart CAS 进 COUNTING 之后填字段
-         *   中), 读 key 是 race (TSan 验证). 继续探测下一槽即可. */
-        if ((expected == (uint32_t)JIT_CACHE_COMPILED
-             || expected == (uint32_t)JIT_CACHE_BLACK)
-            && e->key_pa == pa && e->key_regime == regime) {
-            return 0;
+        /* CAS 失败: expected 已被 CAS 更新成当前 status.
+         * 撞 key 匹配的两种 idempotent / promote 路径:
+         *   - status=COMPILED/BLACK + key 匹配 → idempotent return 0
+         *   - status=COUNTING + key 匹配 → promote (b_02 T5 主路径)
+         *
+         * COUNTING 撞 key 匹配的 race 安全: dispatcher lookup_or_init 在 CAS
+         * EMPTY→COUNTING 成功之后填了 key / next_in_page (release 之前所有 store
+         * 对后续读者天然 visible — CAS 是 acq_rel RMW; 其他 hart 后续读 status
+         * COUNTING 时 acquire load 跟 CAS release 配对, key 已 visible).
+         * 不同 hart 间 dispatcher.lookup_or_init 跟 install 撞同 slot:
+         *   - dispatcher A lookup_or_init 抢到 COUNTING + 填 key A
+         *   - dispatcher B 进 jit_compile_block 调本 install, 撞 status=COUNTING +
+         *     key A == 我要 install 的 key → promote 路径 → 写 host_code_ptr +
+         *     store COMPILED (race-safe; CAS race 已经分流 promote vs install). */
+        if (expected == (uint32_t)JIT_CACHE_COMPILED
+            || expected == (uint32_t)JIT_CACHE_BLACK) {
+            if (entry_key_matches(e, pa, regime)) {
+                return 0;
+            }
+        } else if (expected == (uint32_t)JIT_CACHE_COUNTING) {
+            if (entry_key_matches(e, pa, regime)) {
+                slot_idx_u32 = slot;
+                goto got_slot_promote;
+            }
         }
+        /* 别 key 撞同 slot (hash 冲突) — 继续探测 */
     }
-    return -1;   /* FULL: 探测 N 步都没 EMPTY → caller Flush */
+    return -1;   /* FULL: 探测 N 步都没合适 slot → caller Flush */
 
-got_slot:
+got_slot_install:
     /* CAS 成功, owner 独占该 slot. 填字段 (非 atomic; release 给 status 时 visible). */
-    e->key_pa        = pa;
-    e->key_regime    = regime;
-    e->counter       = 0;
+    atomic_store_explicit(&e->key_pa, pa, memory_order_relaxed);
+    atomic_store_explicit(&e->key_regime, (uint32_t)regime, memory_order_relaxed);
+    atomic_store_explicit(&e->counter, 0u, memory_order_relaxed);
     e->host_code_ptr = host_code_ptr;
-
-    /* 挂 page_block_head 链表头 (退栈式; page_idx 用 RAM 起点偏移).
-     * caller 应已 IS_GPA_RAM 检查 pa 在 RAM 区; 兜底防越界用 page_idx <
-     * GUEST_RAM_NPAGES. */
-    uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
-    if (page_idx < GUEST_RAM_NPAGES) {
-        uint16_t old_head = atomic_load_explicit(&page_block_head[page_idx],
-                                                 memory_order_acquire);
-        do {
-            e->next_in_page = old_head;
-        } while (!atomic_compare_exchange_weak_explicit(
-                     &page_block_head[page_idx], &old_head,
-                     (uint16_t)slot_idx_u32,
-                     memory_order_acq_rel, memory_order_acquire));
-    } else {
-        /* pa 不在 RAM (兜底; caller 应保证). slot 仍进 COMPILED 状态, 但
-         * invalidate_page 找不到此 slot (链表外); flush_all 仍能清. 当前实装
-         * 当前阶段没真路径触发, 仅防御. */
-        e->next_in_page = JIT_PAGE_HEAD_END;
-    }
+    link_into_page_list(e, pa, slot_idx_u32);
 
     /* status COMPILED (release; lookup acquire 后 host_code_ptr 等字段 visible) */
     atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_COMPILED,
                           memory_order_release);
     return 0;
+
+got_slot_promote:
+    /* 撞 COUNTING entry + key 匹配 (dispatcher fork 点已建); 写 host_code_ptr +
+     * store COMPILED release. key/next_in_page 已 visible 不重填; counter 留原值
+     * (dispatcher fetch_add 累计的; COMPILED 后 counter 不再读). */
+    e->host_code_ptr = host_code_ptr;
+    atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_COMPILED,
+                          memory_order_release);
+    return 0;
+}
+
+
+/* ============================================================================
+ * jit_cache_lookup_or_init — RCU read-side + lazy install COUNTING entry
+ *
+ * b_02 T5 dispatcher fork 点专用. 跟 lookup 体例:
+ *   - 撞 key 匹配 + 任意非 EMPTY status (COMPILED/COUNTING/BLACK) → return entry
+ *     (caller dispatcher 自己据 status 分流)
+ *   - 撞 EMPTY → CAS EMPTY→COUNTING; 成功填 key + 挂链表 + counter=0; 返本 entry
+ *     (status 留 COUNTING, 不切 COMPILED)
+ *
+ * 前置: caller 已调 jit_rcu_read_lock(hart_id) 进入 read critical section.
+ * 探测 N 步耗尽 → return NULL (caller 退 interpret).
+ * ============================================================================ */
+jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime) {
+    size_t idx = jit_cache_hash(pa, regime);
+
+    for (uint32_t step = 0; step < JIT_LOOKUP_MAX_PROBES; step++) {
+        uint32_t slot = ((uint32_t)idx + step) & JIT_CACHE_MASK;
+        jit_cache_entry_t *e = &hash_table[slot];
+        uint32_t s = atomic_load_explicit(&e->status, memory_order_acquire);
+
+        if (s == (uint32_t)JIT_CACHE_EMPTY) {
+            /* CAS EMPTY → COUNTING; race 输了重判 status */
+            uint32_t expected = (uint32_t)JIT_CACHE_EMPTY;
+            if (atomic_compare_exchange_strong_explicit(
+                    &e->status, &expected,
+                    (uint32_t)JIT_CACHE_COUNTING,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                /* owner; 填 key + 挂链表 + counter=0 */
+                atomic_store_explicit(&e->key_pa, pa, memory_order_relaxed);
+                atomic_store_explicit(&e->key_regime, (uint32_t)regime,
+                                      memory_order_relaxed);
+                atomic_store_explicit(&e->counter, 0u, memory_order_relaxed);
+                e->host_code_ptr = NULL;
+                link_into_page_list(e, pa, slot);
+                /* status 留 COUNTING (不切 COMPILED — 等 jit_compile_block 完成
+                 * promote 才切). dispatcher 拿到此 entry status=COUNTING, 自增
+                 * counter 走 interpret. */
+                return e;
+            }
+            /* CAS 失败: expected 已被更新; race 输了, 落到下方"非 EMPTY"分流 */
+            s = expected;
+        }
+
+        /* 非 EMPTY: 检查 key 匹配 */
+        if (s == (uint32_t)JIT_CACHE_COMPILED
+            || s == (uint32_t)JIT_CACHE_COUNTING
+            || s == (uint32_t)JIT_CACHE_BLACK) {
+            if (entry_key_matches(e, pa, regime)) {
+                return e;
+            }
+            /* hash 冲突: 别 key 占此槽, 继续探测 */
+        }
+    }
+    return NULL;   /* 探测耗尽; caller 退 interpret */
+}
+
+
+/* ============================================================================
+ * jit_cache_take_compiled_host_code — CAS COMPILED→EMPTY 取 host_code (b_02 T5)
+ *
+ * caller: jit_entry.cc 的 jit_invalidate_block. 找到 status=COMPILED + key 匹配
+ * 的 entry → CAS COMPILED→EMPTY (release; 后续 lookup 见 EMPTY 视 miss) →
+ * load host_code_ptr → return.
+ *
+ * 返 NULL: entry 不存在 / status 非 COMPILED (已被 invalidate / 还没 promote /
+ * BLACK). caller 直接 skip backend.invalidate_block.
+ *
+ * race-safe: 多 hart 并发调本接口同 (pa, regime), 只有一个 hart 的 CAS 成功
+ * 拿到 host_code, 其他返 NULL (status 已 EMPTY).
+ * ============================================================================ */
+void *jit_cache_take_compiled_host_code(uxlen_t pa, regime_t regime) {
+    size_t idx = jit_cache_hash(pa, regime);
+
+    for (uint32_t step = 0; step < JIT_LOOKUP_MAX_PROBES; step++) {
+        jit_cache_entry_t *e = &hash_table[((uint32_t)idx + step) & JIT_CACHE_MASK];
+        uint32_t s = atomic_load_explicit(&e->status, memory_order_acquire);
+
+        if (s == (uint32_t)JIT_CACHE_EMPTY) {
+            return NULL;   /* 开放寻址 sentinel; 探测停 */
+        }
+        if (s == (uint32_t)JIT_CACHE_COMPILED
+            && entry_key_matches(e, pa, regime)) {
+            /* CAS COMPILED→EMPTY; 成功拿 host_code_ptr (release 让后续 lookup
+             * 看 EMPTY 时之前的 host_code_ptr load 配对 acquire 已完成) */
+            uint32_t expected = (uint32_t)JIT_CACHE_COMPILED;
+            if (atomic_compare_exchange_strong_explicit(
+                    &e->status, &expected,
+                    (uint32_t)JIT_CACHE_EMPTY,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                return e->host_code_ptr;
+            }
+            /* CAS 输了: 别 hart 先 take 走了 → return NULL */
+            return NULL;
+        }
+        /* COUNTING/BLACK/别 key 撞 → 继续探测 */
+    }
+    return NULL;
 }
 
 
@@ -313,31 +467,18 @@ int jit_cache_set_blacklist(uxlen_t pa, regime_t regime) {
         }
         if ((expected == (uint32_t)JIT_CACHE_COMPILED
              || expected == (uint32_t)JIT_CACHE_BLACK)
-            && e->key_pa == pa && e->key_regime == regime) {
+            && entry_key_matches(e, pa, regime)) {
             return 0;
         }
     }
     return -1;   /* 探测耗尽; caller 通常忽略 (退 interpreter). */
 
 got_slot:
-    e->key_pa        = pa;
-    e->key_regime    = regime;
-    e->counter       = 0;
+    atomic_store_explicit(&e->key_pa, pa, memory_order_relaxed);
+    atomic_store_explicit(&e->key_regime, (uint32_t)regime, memory_order_relaxed);
+    atomic_store_explicit(&e->counter, 0u, memory_order_relaxed);
     e->host_code_ptr = NULL;          /* BLACK 无编译产物 */
-
-    uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
-    if (page_idx < GUEST_RAM_NPAGES) {
-        uint16_t old_head = atomic_load_explicit(&page_block_head[page_idx],
-                                                 memory_order_acquire);
-        do {
-            e->next_in_page = old_head;
-        } while (!atomic_compare_exchange_weak_explicit(
-                     &page_block_head[page_idx], &old_head,
-                     (uint16_t)slot_idx_u32,
-                     memory_order_acq_rel, memory_order_acquire));
-    } else {
-        e->next_in_page = JIT_PAGE_HEAD_END;
-    }
+    link_into_page_list(e, pa, slot_idx_u32);
 
     atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_BLACK,
                           memory_order_release);

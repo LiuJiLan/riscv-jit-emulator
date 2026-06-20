@@ -122,13 +122,10 @@ typedef enum {
 //   key_pa         — 块入口 PA (uxlen_t; dummy.txt §13)
 //   key_regime     — baked priv 视角 (BARE / SV32_S / SV32_U; core/mmu.h)
 //   status         — 状态机 (atomic; load acquire / store release)
-//   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; 非 atomic, CAS
-//                     status COUNTING 后 owner 独占写).
-//                     TODO_T5: T1 阶段未真消费 (Q3=b 拍法; dispatcher fork 点 miss
-//                     直接 jit_compile_block, 不累计 counter). T5 真做时加
-//                     jit_cache_count_or_promote 接口 + 接 config.h
-//                     COMPILE_THRESHOLD 宏 + 跟 invalidate_block 状态灯端到端验证
-//                     一起做 (memory `feedback_one_phase_one_thing` 一阶段一件事).
+//   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; b_02 T5 升 _Atomic,
+//                     dispatcher fork 点多 hart 并发 atomic_fetch_add, 不再走
+//                     "owner 独占写"假设). 达 config.h COMPILE_THRESHOLD 触发
+//                     jit_compile_block + promote COUNTING → COMPILED.
 //   host_code_ptr  — backend 编译产物入口 (类型 jit_block_func_t = void (*)
 //                     (cpu_t*, tlb_t*, uint64_t*); Q1 a; 当前 stub backend
 //                     永返 NOT_IMPLEMENTED 不进 install 路径, b_02 backend
@@ -136,16 +133,28 @@ typedef enum {
 //   next_in_page   — per-page block list 链表 next 索引 (uint16_t; JIT_CACHE_SIZE
 //                     = 65536 索引正好用满 uint16_t; 0xFFFF = 链尾哨兵 = JIT_PAGE_HEAD_END)
 //
-// 字段非 atomic (key_pa / key_regime / counter / host_code_ptr / next_in_page):
+// 字段非 atomic (host_code_ptr / next_in_page):
 //   install CAS status EMPTY→COUNTING 后 owner 独占写这些字段; release store
 //   status = COMPILED 配 lookup acquire load 形成 happens-before, lookup 看到
 //   COMPILED 时其他字段已 visible.
+//
+// key_pa / key_regime / counter 是 _Atomic (b_02 T5):
+//   - counter: dispatcher fork 点 multi-hart 并发 atomic_fetch_add
+//   - key_pa / key_regime: lookup_or_init 在 status=COUNTING 状态也读 key 比较
+//     (跟 install owner CAS 后填 key 期间是 in-flight 窗口, 旧体例"COUNTING 不读
+//     key"会导致 lookup_or_init 误退 → 同 PA 多 entry 蔓延). 升 _Atomic 让读写都
+//     atomic_relaxed (relaxed 即可 — status 的 acquire/release 已建立 happens-
+//     before, key 只需要不撕裂值; TSan 验证 race 无).
+//
+// key_regime 类型 _Atomic uint32_t (跟 status 同体例; atomic 加 enum C11 OK 但部
+// 分编译器 warning, 项目既有体例 cpu->priv 等 enum 用 uint32_t/uint8_t. 比较时
+// caller 调 entry_key_matches helper cast regime_t → uint32_t).
 // ----------------------------------------------------------------------------
 typedef struct jit_cache_entry_s {
-    uxlen_t           key_pa;
-    regime_t          key_regime;
+    _Atomic uxlen_t   key_pa;
+    _Atomic uint32_t  key_regime;      // 实际 regime_t 值, atomic 字段用 uint32_t 体例
     _Atomic uint32_t  status;          // jit_cache_status_t
-    uint32_t          counter;
+    _Atomic uint32_t  counter;         // heat counter (b_02 T5)
     void             *host_code_ptr;
     uint16_t          next_in_page;
 } jit_cache_entry_t;
@@ -203,29 +212,93 @@ jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime);
 
 
 // ----------------------------------------------------------------------------
+// jit_cache_lookup_or_init —— RCU read-side + lazy install COUNTING (b_02 T5)
+//
+// caller: dispatcher fork 点 (C-only, dispatcher.c). C++ 端 (jit_entry.cc) 不
+// 调用此接口 — 它访问 entry 字段 (status/counter/host_code_ptr) 而 C++ 端
+// entry struct 是 opaque (GCC 11 _Atomic 兼容性).
+//
+// 前置: caller 已调 jit_rcu_read_lock(hart_id) 进入 read critical section.
+//
+// 流程 (跟 lookup 同 hash + 线性探测, miss EMPTY 时多一步 install COUNTING):
+//   1. idx = jit_cache_hash(pa, regime)
+//   2. 线性探测 ≤ JIT_LOOKUP_MAX_PROBES 步:
+//      - key 匹配 + status ∈ {COMPILED, COUNTING, BLACK} → return &entry
+//        (跟 lookup 不同: lookup 只返 COMPILED, lookup_or_init 返任意非 EMPTY)
+//      - status = EMPTY → CAS EMPTY → COUNTING:
+//          - 成功 → 填 key + 挂 page_block_head + counter=0; status 留 COUNTING
+//                  (不切 COMPILED); return &entry
+//          - 失败 → race, 另一 hart 抢先 install, 继续探测重判
+//   3. 探测 N 步耗尽 → return NULL (hash table 满, dispatcher 退 interpret)
+//
+// caller 拿到 entry 后据 status 分流:
+//   - COMPILED → host_code 跑 (写 cpu->jit_executing_host_code 状态灯; 跑完清)
+//   - COUNTING → atomic_fetch_add(&entry->counter, 1); 达 COMPILE_THRESHOLD
+//                调 jit_compile_block (本次仍走 interpret, 编译后下次 lookup hit)
+//   - BLACK    → interpret 兜底, 不增 counter (永不编)
+//
+// 跟 lookup 关系: lookup 体例不变 (其他 caller 兼容), lookup_or_init 是
+// dispatcher T5 后专用. 共享 hash + 探测核心 (jit_cache.c 内 file-static helper).
+// ----------------------------------------------------------------------------
+#ifndef __cplusplus
+jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime);
+#endif
+
+
+// ----------------------------------------------------------------------------
 // jit_cache_install —— RCU modify-side, atomic CAS 路径无锁
 //
 // 流程:
 //   1. idx = jit_cache_hash(pa, regime)
-//   2. 线性探测 ≤ JIT_INSTALL_MAX_PROBES 步找 EMPTY slot:
-//      - status atomic CAS EMPTY → COUNTING
-//        - 失败 = 别 hart 抢先 / status 非 EMPTY → 继续探测下一槽
-//        - 成功 = owner 独占该 slot, 进 step 3
-//   3. 填 key_pa / key_regime / host_code_ptr / counter / next_in_page (非 atomic)
-//   4. atomic CAS 挂 page_block_head 链表头 (退栈式, do-while):
-//        do { old_head = load(head); entry.next_in_page = old_head; }
-//        while (!CAS(head, &old_head, idx));
-//   5. atomic store status = COMPILED (release; 让 lookup 看到 COMPILED 时
+//   2. 线性探测 ≤ JIT_INSTALL_MAX_PROBES 步:
+//      - 撞 EMPTY slot: status atomic CAS EMPTY → COUNTING; 成功后填 key /
+//        host_code_ptr / counter=0 / 挂 page_block_head; 走 step 3 store COMPILED
+//      - 撞 key 匹配 + status = COUNTING (b_02 T5 dispatcher 已 lookup_or_init
+//        建好 COUNTING entry): 写 host_code_ptr; 走 step 3 store COMPILED
+//        (promote 路径; 此时 key / next_in_page 已 visible, 不重填)
+//      - 撞 key 匹配 + status = COMPILED / BLACK: idempotent return 0 (race 时
+//        另一 hart 已完成)
+//      - 撞别的 key + status ∈ {COUNTING/COMPILED/BLACK} → 继续探测下一槽
+//   3. atomic store status = COMPILED (release; 让 lookup 看到 COMPILED 时
 //      其他字段已 visible)
 //
 // 返:
-//   0  — install 成功 (status = COMPILED)
-//   -1 — install FULL (探测 N 步都没 EMPTY slot → hash table 满 → caller Flush)
+//   0  — install 成功 (status = COMPILED) 或 idempotent
+//   -1 — install FULL (探测 N 步都没合适 slot → hash table 满 → caller Flush)
 //
 // caller (jit_api 层) 处理 -1 (Q11 a): 调 jit_flush_all + 再调 install 重试 1 次;
 // 二次 -1 调 jit_cache_set_blacklist (本头下方接口) 让 (PA, regime) 进 BLACK.
+//
+// b_02 T5 后兼容两路径: dispatcher fork 点 lookup_or_init 已建 COUNTING entry,
+// 走 promote; jit_compile_block 二次 Flush 后 entry 被全清回 EMPTY, 走旧
+// EMPTY→COMPILED 直通路径.
 // ----------------------------------------------------------------------------
 int  jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr);
+
+
+// ----------------------------------------------------------------------------
+// jit_cache_take_compiled_host_code —— take + CAS COMPILED→EMPTY (b_02 T5)
+//
+// caller: jit_entry.cc 的 jit_invalidate_block (C/C++ 共用接口, 返 void* 不返
+// entry struct, C++ 端友好).
+//
+// 流程:
+//   1. lookup_for_key (hash + 线性探测, 跟 lookup 共享 helper)
+//   2. 找到 status = COMPILED + key 匹配 → atomic CAS COMPILED → EMPTY (release);
+//      成功 → load host_code_ptr → return
+//   3. 找不到 / 非 COMPILED → return NULL (caller 不需 invalidate)
+//
+// CAS COMPILED→EMPTY 后, 后续 lookup 见 EMPTY 终止探测视 miss; dispatcher 不会
+// 再拿到此 host_code. 但已经 hit COMPILED 的 in-flight dispatcher 还在写状态灯
+// 跑 host_code — caller 必须:
+//   1. jit_rcu_synchronize (等所有 in-flight read critical 出 / 状态灯 visible)
+//   2. 扫所有 hart cpu->jit_executing_host_code == host_code, PAUSE 等退出
+//   3. backend.invalidate_block(host_code) 真 unmap
+//
+// idempotent: 撞到 EMPTY/COUNTING/BLACK 返 NULL (entry 已被 invalidate 过 / 还没
+// promote / 已黑名单), caller 直接 skip 后续 step 2/3.
+// ----------------------------------------------------------------------------
+void *jit_cache_take_compiled_host_code(uxlen_t pa, regime_t regime);
 
 
 // ----------------------------------------------------------------------------

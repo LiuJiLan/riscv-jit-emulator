@@ -45,6 +45,10 @@
 
 #include "riscv.h" // uxlen_t / u32_t (typedef family; dummy.txt §13)
 #include "tlb.h"   // tlb_t * 类型 (tlb_table 元素是 tlb_t **)
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include "trap.h"  // trap_csrs_t 内嵌字段类型 (trap.h forward decl cpu_t,
                    // 单向链 trap.h ← cpu.h, 不循环)
 
@@ -223,5 +227,22 @@ void cpu_reset(cpu_t *hart);
 // 释放 cpu_create 分配的 cpu_t 及其下所有子结构 (tlb 容器 + 共享 leaf + 已懒分配的 entries)。
 // NULL 入参 do nothing。
 void cpu_destroy(cpu_t *hart);
+
+
+// ----------------------------------------------------------------------------
+// cpu_wait_all_harts_exit_host_code (b_02 T5; jit_invalidate_block 协议)
+//
+// 扫 harts_table (cap MAX_HARTS) 等所有 hart 的 jit_executing_host_code 字段
+// 不再 == host_code; 起步 busy-wait + PAUSE (start_plan_b_02 §0.8 R8). caller =
+// jit_entry.cc 的 jit_invalidate_block, backend 真 unmap 前必调.
+//
+// 不强求 caller 持锁; cpu_create/cpu_destroy 维护 harts_table 注册表, phantom
+// slot 跳过. 协议跟 cpu_t.jit_executing_host_code 字段顶段 doc 对偶 (cpu.h 上方).
+// ----------------------------------------------------------------------------
+void cpu_wait_all_harts_exit_host_code(void *host_code);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif //CORE_CPU_H

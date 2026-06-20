@@ -13,6 +13,27 @@
 //   在本 helper 入口 (或 csr_op / interpreter case 入口) 加检查, 直接调 trap_raise_exception
 //   长跳 — 不改 helper 签名。当前不实现该检查。
 //
+// sfence_vma_helper 不调 jit_invalidate_block — 为什么 (b_02 T5 重审, 推翻
+// start_plan_b_02 §[2] T5 第 5 点):
+//
+//   start_plan_b_02 原拍 "sfence_vma_helper 调 jit_invalidate_block" 是过时拍法,
+//   基于"JIT 块 baked GVA → PA 映射 / PTE 数值"假设. 实际项目设计:
+//
+//   1. jit_cache key=(PA, regime) — VMA 改了 PA 不变, JIT 块本身不动
+//   2. JIT 块内 perm 检查走 inline TLB compare + walker_helper, PTE perm 从 TLB
+//      entry runtime 拿, **不 baked 数值** (T6 SV32 baked 的是"S/U regime 检查逻辑
+//      序列", 不是某个 PA 的 PTE_U 值; SUM/MXR 也是 runtime 读 mstatus)
+//   3. sfence.vma 清 TLB 后, JIT 块下次 load/store 走 walker_helper 自然适配新页表
+//
+//   JIT cache invalidate 的真正语义边界是 fence.i (i-cache flush = guest 自改代码段
+//   后的可见性边界) + SMC handler (page_dirty bitmap), 不是 sfence.vma. fence.h 顶段
+//   注释明确"fence.i 跟 sfence.vma 语义不同族, 三者无共享 helper". SMC 真挂点推 b_03
+//   / a_05+ (SIGSEGV + page_dirty bitmap; 详 plan §1.17).
+//
+//   推翻 trail: b_02_session_006 chat 重审 + memory `feedback_overturn_plan_leave_trail`
+//   (推翻 plan 留代码注释 trail). 未来开发若再质疑"sfence.vma 是否该调 jit invalidate",
+//   先读本段.
+//
 
 #ifndef ISA_SFENCE_H
 #define ISA_SFENCE_H

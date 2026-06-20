@@ -287,30 +287,27 @@ void dispatcher(cpu_t *hart) {
     if (rc != 0) { continue; }
 
     // ========================================================================
-    // block 3: 派发到 jit / interpreter (fork 点)
+    // block 3: 派发到 jit / interpreter (fork 点; b_02 T5 接 counter + invalidate)
     //
-    // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案):
+    // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案;
+    //       b_02 T5 加 heat counter 真消费):
     //   1. jit_rcu_read_lock(hartid) — 进 RCU read critical section
-    //   2. jit_cache_lookup(pa, regime) → entry 或 NULL
-    //   3. hit: 取 host_code 指针 + atomic 点亮 cpu->jit_executing_host_code 状态灯
-    //           (RCU 内点亮; 防 backend 在 RCU grace 后立即 unmap)
+    //   2. jit_cache_lookup_or_init(pa, regime) → entry 或 NULL
+    //      - miss EMPTY 时内部 CAS install COUNTING entry counter=0
+    //      - 命中 任意非 EMPTY status (COMPILED/COUNTING/BLACK) 返 entry
+    //      - 探测耗尽 (hash table 满) 返 NULL
+    //   3. entry 4 状态分流:
+    //      - COMPILED → 取 host_code + 点亮 cpu->jit_executing_host_code 状态灯,
+    //                   出 RCU 后调 host_code; 跑完清状态灯 (longjmp 路径迭代头兜底清)
+    //      - COUNTING → atomic_fetch_add(&counter, 1); old+1 == COMPILE_THRESHOLD
+    //                   时 needs_compile=1, 出 RCU 后调 jit_compile_block; 本次仍走
+    //                   interpret 兜底 (编译后下次 lookup_or_init hit COMPILED)
+    //      - BLACK   → interpret 不增 counter (永不编)
+    //      - NULL (cache 满) → interpret 兜底 (后续 jit_flush_all 路径自然走通)
     //   4. jit_rcu_read_unlock(hartid) — 立即退 RCU (避免延伸到 host_code 执行期撞
-    //           longjmp 不安全)
-    //   5. hit: jit_block_func_t cast host_code + 调 + 正常路径跑完清状态灯;
-    //           longjmp 路径 sigsetjmp 落点迭代头扫尾兜底清 (见上方迭代头段)
-    //   6. miss: jit_compile_block(pa, regime) — 当前 stub backend 永返
-    //           NOT_IMPLEMENTED, jit_entry.cc Q11 a 组合层 set_blacklist + 返错码;
-    //           之后该 (PA, regime) lookup 永远 BLACK miss → 永走 interpreter
-    //           (当前 JIT 路径仍 dead code; b_02 backend.compile_block 真编译时才有
-    //           真 JIT 路径).
-    //   7. miss: interpret_one_block 兜底 — 块边界由解释器末尾 is_block_boundary_inst
-    //           自然产生.
-    //
-    // TODO_T5: 当前无 heat counter (D2 a 拍法; T1 backend 真填后回头 T5 加 + 真
-    // 接 config.h COMPILE_THRESHOLD 宏 + jit_cache_count_or_promote 接口).
-    // jit_cache_entry_t.counter 字段保留 (jit_cache.h doc 同标 TODO_T5),
-    // T5 跟 invalidate_block 状态灯端到端验证一起做更聚焦 (memory
-    // `feedback_one_phase_one_thing` 一阶段一件事).
+    //                   longjmp 不安全)
+    //   5. needs_compile 时 jit_compile_block — promote COUNTING → COMPILED 或失败
+    //                   set_blacklist (Q11 a 组合层处理 Flush+retry)
     //
     // local_count 跨 longjmp 持久 (volatile + sigsetjmp 之前声明), 累加 + reset 在
     // 迭代头处理 (block 1 之前); 这里只做 block 执行调用. (uint64_t *) cast 因
@@ -318,26 +315,43 @@ void dispatcher(cpu_t *hart) {
     // 语义不影响 (helper 内部本地操作), 调用前后 dispatcher 端 volatile 读写仍生效.
     // ========================================================================
     jit_rcu_read_lock(hart->hartid);
-    jit_cache_entry_t *e = jit_cache_lookup(pa, regime);
-    void *host_code = (e != NULL) ? e->host_code_ptr : NULL;
-    if (host_code != NULL) {
-        atomic_store_explicit(&hart->jit_executing_host_code, host_code,
-                              memory_order_release);
+    jit_cache_entry_t *e = jit_cache_lookup_or_init(pa, regime);
+    void *host_code = NULL;
+    uint32_t needs_compile = 0u;
+    if (e != NULL) {
+        uint32_t s = atomic_load_explicit(&e->status, memory_order_acquire);
+        if (s == (uint32_t)JIT_CACHE_COMPILED) {
+            host_code = e->host_code_ptr;
+            atomic_store_explicit(&hart->jit_executing_host_code, host_code,
+                                  memory_order_release);
+        } else if (s == (uint32_t)JIT_CACHE_COUNTING) {
+            uint32_t old = atomic_fetch_add_explicit(&e->counter, 1u,
+                                                    memory_order_relaxed);
+            /* old+1 == THRESHOLD: 恰好一个 hart 触发 compile (atomic fetch_add
+             * 保证 RMW 顺序唯一性, 后续 hart fetch_add 拿 old >= THRESHOLD 不再
+             * 重触发). 用 == 而非 >= 节省 — compile 完成 entry 切 COMPILED,
+             * 下次 lookup_or_init 直接 hit COMPILED 走 host_code. */
+            if (old + 1u == COMPILE_THRESHOLD) {
+                needs_compile = 1u;
+            }
+        }
+        /* BLACK 不处理 — 走 interpret 兜底 (host_code 留 NULL) */
     }
     jit_rcu_read_unlock(hart->hartid);
 
     if (host_code != NULL) {
-        DEBUG_JIT_HIT();   /* 'J' trace — backend pipeline 真跑通的功能信号 (Q5=a) */
+        DEBUG_JIT_HIT();   /* 'J' trace — JIT 路径走通的功能信号 (Q5=a) */
         jit_block_func_t fn = (jit_block_func_t)host_code;
         fn(hart, current_tlb, (uint64_t *)&local_count);
         atomic_store_explicit(&hart->jit_executing_host_code, NULL,
                               memory_order_release);
     } else {
-        // jit_compile_block 返码本身 dispatcher 不消费 (走 interpreter 兜底逻辑相同),
-        // void cast 即可. 失败 (NOT_IMPLEMENTED / IR_ERROR / BACKEND_INTERNAL) 走
-        // BLACK 黑名单, 之后 lookup miss 永不触发本路径; 成功 (b_02 后) install 进
-        // cache, 下次 fork 点 lookup hit 走 host_code 路径.
-        (void)jit_compile_block(pa, regime);
+        if (needs_compile) {
+            /* jit_compile_block 内部 Q11 a 组合层: 成功 install promote COUNTING →
+             * COMPILED; 失败 (NOT_IMPLEMENTED / 二次 FULL) set_blacklist → BLACK.
+             * 返码本身 dispatcher 不消费 (interpret 兜底逻辑相同), void cast. */
+            (void)jit_compile_block(pa, regime);
+        }
         interpret_one_block(hart, current_tlb, hva, (uint64_t *)&local_count);
     }
     // perf_advance(hart, local_count);  // 占位, dispatcher 不消费; 真做时也搬迭代头
