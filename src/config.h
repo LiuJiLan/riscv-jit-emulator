@@ -103,6 +103,17 @@
 #define COMPILE_THRESHOLD  100U
 
 // ----------------------------------------------------------------------------
+// JIT per-page block 链表上限 (SMC chain jit_invalidate_page 组合层 collect 用)
+// ----------------------------------------------------------------------------
+//
+// jit_entry.cc jit_invalidate_page 调 jit_cache_collect_page_host_codes 用栈数组
+// void *codes[MAX_BLOCKS_PER_PAGE] 收当前 page 所有 host_code 给后续 backend
+// release. 起步 16, JIT_CACHE_SIZE 65536 / GUEST_RAM_NPAGES 32768 ≈ 2 块/page
+// 平均, 上限 16 safe; 真撞 (实际链长 > cap) 是 bug 或工作负载特殊 — fixture
+// 不通过再升。
+#define MAX_BLOCKS_PER_PAGE  16U
+
+// ----------------------------------------------------------------------------
 // hart 数量 (编译期 cap; 运行期实际数 = n_harts, 见 src/core/cpu.h)
 // ----------------------------------------------------------------------------
 //

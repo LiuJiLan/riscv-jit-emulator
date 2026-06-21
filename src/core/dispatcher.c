@@ -12,6 +12,7 @@
 #include "interpreter.h"
 #include "jit/backend.h"   // jit_block_func_t cast (fork 点 hit 路径调 host_code)
 #include "jit/jit_cache.h" // jit_cache_lookup / jit_rcu_read_lock/unlock + entry struct
+#include "jit/smc.h"       // smc_consume_dirty (主循环顶扫 page_dirty bitmap; b_03 T1.a)
 #include "mmu.h"
 #include "tlb.h"
 #include "trap.h"       // trap_set_exception_state (IALIGN 兜底); trap_check_interrupt (loop 顶 polling)
@@ -157,6 +158,31 @@ void dispatcher(cpu_t *hart) {
     //   也是清 NULL → NULL, 单次 atomic store release ~ns 量级开销, 不显著。
     atomic_store_explicit(&hart->jit_executing_host_code, NULL,
                           memory_order_release);
+
+    // ========================================================================
+    // SMC chain 顶扫 (b_03 T1.a; SIGSEGV handler 标 page_dirty bitmap 后, 本处
+    // consume + 调 jit_invalidate_page 真清 JIT 块 + release RX 段).
+    //
+    // 位置:
+    //   - 状态灯清 (上方) 之后: jit_invalidate_page 内部 cpu_wait_all_harts_
+    //     exit_host_code 扫所有 hart 含本 hart; 本 hart 状态灯已 NULL 不自等
+    //   - 中断检查 (下方) 之前: invalidate 可能涉及 RCU sync + 状态灯扫别 hart
+    //     退出 + backend release, 时间不确定; 完成后再做中断检查 (新中断可能
+    //     进 trap handler 再触发新 lookup, 此时 cache 状态已干净)
+    //
+    // 顶扫无 dirty bit 时 (99%+ iter), smc_consume_dirty 一次 linear scan
+    // (32768/64 = 512 word) 全 0 直接 return false, while 不进 — 开销 ~us 量级
+    // (acquire load 512 次), 跟原 hot path 比可忽略.
+    //
+    // while 循环 consume 多 bit: 防 race 中别 hart 也在 consume 拿走 bit 跑掉
+    // (smc_consume_dirty CAS 保证 only-one-winner), 本 hart while 直到看到空.
+    // ========================================================================
+    {
+        uint32_t dirty_page_idx;
+        while (smc_consume_dirty(&dirty_page_idx)) {
+            jit_invalidate_page(dirty_page_idx);
+        }
+    }
 
     // ========================================================================
     // 中断检查 (trap_check_interrupt; 详 dummy.txt §1 路径 2b' / trap.h doc 段)

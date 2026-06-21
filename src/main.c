@@ -54,6 +54,7 @@
 #include "core/wfi.h"          // wfi_init / wfi_destroy (WFI 唤醒框架; wfi_kick_all 不调用, 见 wfi.h doc)
 #include "api/jit_api.h"       // jit_init / jit_shutdown (JIT 子系统 lifecycle; 跟 lrsc_init/destroy 对偶位置)
 #include "isa/lrsc.h"          // lrsc_init / lrsc_destroy (A 扩展 reservation 数据结构; bucket 锁数组 cap 配对)
+#include "jit/smc.h"           // smc_init / smc_destroy (SMC chain SIGSEGV handler 注册; 跟 runtime_install/restore 对偶位置)
 #include "loader.h"
 #include "platform/clint.h"
 #include "platform/plic.h"
@@ -650,6 +651,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // SMC chain SIGSEGV handler 注册 (b_03 T1.a; smc.h 顶段 doc 协议).
+    // 紧跟 runtime_install_signal_handlers 之后 — 都是 signal 注册段; smc_init
+    // 装 SIGSEGV 不跟 runtime 的 SIGINT/SIGTERM/SIGHUP 冲突. 必须在 jit_init
+    // 之后 (smc handler 需要 host_ram_base 已 init; jit_init 自己不依赖 smc,
+    // 但 jit_cache_install 内 smc_protect_page 调用要求 smc 已就位 — 而本处之
+    // 后才 spawn hart 线程 → hart 不会调 jit_compile_block → install 路径不
+    // 触发, 顺序 OK).
+    if (smc_init() != 0) {
+        return 1;
+    }
+
     // main 起 timer 辅助线程 (受 SDS 控制, 跨 system reset 一直跑; 见 dummy.txt
     // §12 谁 spawn 谁 join + clint.h 顶段 doc)。
     //
@@ -836,6 +848,12 @@ int main(int argc, char **argv) {
         if (harts[i] != NULL) { cpu_destroy(harts[i]); }
     }
     ram_destroy();
+
+    // SMC chain SIGSEGV handler 还原 (b_03 T1.a; 跟 smc_init 配对; 紧邻
+    // runtime_restore_signal_handlers — 都是 signal restore 段). 必须在
+    // ram_destroy 之后 — ram_destroy munmap 客户机 RAM, 之后即使有 stray
+    // SIGSEGV 也不该走我们 handler (host_ram_base 已 NULL).
+    smc_destroy();
 
     // 还原 SIG_DFL — main 退出后子进程 / 后续 process state 干净。
     runtime_restore_signal_handlers();

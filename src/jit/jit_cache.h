@@ -58,6 +58,47 @@
 //   jit_rcu_synchronize                — modify-side 等所有 hart 出 critical
 //
 // ============================================================================
+// 失效机制 — 两个独立维度 (容易混; 设计上严格解耦)
+// ============================================================================
+//
+// 机制 A: entry.status (jit_cache_entry_t._Atomic uint32_t status)
+//   - 4 状态: EMPTY / COUNTING / COMPILED / BLACK
+//   - **给 lookup 用** — dispatcher fork 点调 jit_cache_lookup_or_init, 看
+//     entry.status acquire 决定走 JIT (COMPILED) / heat counter (COUNTING) /
+//     interpret 兜底 (EMPTY 时建 new COUNTING / BLACK)
+//   - invalidate_page 改 status (顺 per-page block list 清 status = EMPTY,
+//     release order); 后续 lookup acquire 看到 EMPTY → 走 interpret / 重建
+//   - **hart 自己的失效感知机制** — 不依赖外部告知
+//
+// 机制 B: cpu_t.jit_executing_host_code 状态灯 (per-hart _Atomic(void *))
+//   - 持当前正在跑的 host_code; 没跑 JIT 块时 = NULL
+//   - **给 invalidate caller 用** — 保证"不要在 hart 跑 host_code 的时候 munmap
+//     / release RX 段". caller (jit_entry.cc jit_invalidate_block / 未来 SMC
+//     chain) 调 cpu_wait_all_harts_exit_host_code(host_code) busy-wait 等所有
+//     hart 退出, 才调 backend.invalidate_block release.
+//   - **hart 自己的 lookup 完全不看这个状态灯** — 状态灯不参与 lookup 决策
+//
+// 两机制解耦的关键 invariant:
+//   - entry.status 改 EMPTY 跟 host_code RX 段 release **时机不绑**:
+//     status 改 EMPTY 后立刻生效 (lookup 见 EMPTY), 但 host_code 仍存活直到
+//     caller 等所有 hart 退出
+//   - 旧 host_code 内的 hart 继续跑 OK (RX 段未 release); 新 lookup 走 interpret
+//     兜底 (status = EMPTY 不 hit 旧)
+//   - release/acquire order: invalidate_page step 2 atomic_store EMPTY (release)
+//     → lookup atomic_load status (acquire) 配对, 不撞 stale COMPILED
+//
+// Walk through (典型 race; b_03_session_001 讨论 trail):
+//   1. hartA + hartB 都跑 host_code_a (状态灯亮; entry.status = COMPILED)
+//   2. RAM 改 → SMC handler 写 page_dirty bitmap
+//   3. dispatcher 顶扫 bitmap → invalidate_page: 顺链清 status = EMPTY +
+//      RCU sync; 但 host_code_a 仍在 (caller 待 release)
+//   4. hartA 退出 host_code_a (状态灯清 NULL), hartB 仍跑
+//   5. hartA 重 lookup → entry.status = EMPTY → 新建 COUNTING → 走 interpret
+//      兜底 (**不需要"状态灯告诉 hartA"**, 走机制 A 自然兜)
+//   6. caller cpu_wait_all_harts_exit_host_code(host_code_a) 等 hartB 退出 →
+//      backend.invalidate_block(host_code_a) release RX 段
+//
+// ============================================================================
 // 命名
 // ============================================================================
 //
@@ -69,6 +110,7 @@
 #ifndef JIT_JIT_CACHE_H
 #define JIT_JIT_CACHE_H
 
+#include <stddef.h>        // size_t (jit_cache_collect_page_host_codes 接口)
 #include <stdint.h>
 #ifndef __cplusplus
 #include <stdatomic.h>     // C++ 端 GCC 11 g++ 不接受 _Atomic extension, 整 stdatomic.h
@@ -327,21 +369,43 @@ int  jit_cache_set_blacklist(uxlen_t pa, regime_t regime);
 
 
 // ----------------------------------------------------------------------------
-// jit_cache_invalidate_page —— RCU modify-side, sync grace period
+// jit_cache_invalidate_page —— RCU modify-side, collect + sync grace period
 //
-// 流程:
+// 流程 (collect 跟 invalidate 原子打包; race-free 关键见下方设计段):
 //   1. atomic_exchange page_block_head[page_idx] = JIT_PAGE_HEAD_END (acq_rel)
-//      拿 old_head
-//   2. 顺 old_head 链表清: 每 slot atomic store status = EMPTY (release;
-//      包括 BLACK → EMPTY, Q12 c)
-//   3. jit_rcu_synchronize() — 等所有 hart 出 read critical section
-//   4. backend.invalidate_block release host_code RX 段 (asmjit
-//      JitRuntime::release)
+//      拿 old_head; 此后别 hart install 挂的是 JIT_PAGE_HEAD_END, 不进当前链
+//   2. 顺 old_head 链表遍历:
+//      - out_host_codes[n++] = entry->host_code_ptr (本函数 collect 跟清 status
+//        在同一遍历内, 不可拆)
+//      - atomic store status = EMPTY (release; 包括 BLACK → EMPTY, Q12 c)
+//   3. *out_n = n; jit_rcu_synchronize() — 等所有 hart 出 read critical section
+//   4. backend.invalidate_block release host_code RX 段 — **本函数不做**, 由
+//      caller (jit_entry.cc jit_invalidate_page 组合层) 顺 out_host_codes 调
 //
-// caller: a_05+ SMC handler 触发 page_dirty bitmap → dispatcher 主循环顶扫
-// bitmap → 调 jit_cache_invalidate_page(page_idx); 真端到端 verify 推 a_05+.
+// caller: SMC chain 路径 — SIGSEGV handler 标 page_dirty bitmap → dispatcher
+// 主循环顶扫 bitmap → 调 jit_invalidate_page (jit_entry.cc 组合层) → 本函数 +
+// 状态灯扫 + backend release. b_03 T1.a 接通.
+//
+// 为什么 collect 必须嵌入本函数 (b_03_session_002 race 分析):
+//   若 collect 是独立函数 (在本函数之前调), 中间窗口里别 hart 可能 install 新
+//   块挂 page_block_head; collect 看不到新块, 本函数 atomic_exchange 时拿到的
+//   新链表把新块也清成 EMPTY, 但新块的 host_code_ptr 没进 out 数组 → caller
+//   不会 backend.invalidate_block 它 → RX 段内存泄漏. 整链 race-free 唯一方
+//   案是 collect + invalidate 共享 atomic_exchange 拿到的 old_head.
+//
+// out 参数语义:
+//   - out_host_codes: caller 预分配的数组 (栈 / 堆; 通常 MAX_BLOCKS_PER_PAGE)
+//   - out_capacity: 数组容量上限; 实际链长 > capacity 时静默截断 (T1.a 起步;
+//     真撞需要 runtime_fatal)
+//   - out_n: 实际收到的 host_code 数 (∈ [0, min(链长, capacity)])
+//   - 收到的 host_code_ptr 可能为 NULL (BLACK / COUNTING entry); caller 应 skip
+//
+// page_idx 越界: *out_n = 0 直接 return (跟原版防御一致).
 // ----------------------------------------------------------------------------
-void jit_cache_invalidate_page(uint32_t page_idx);
+void jit_cache_invalidate_page(uint32_t page_idx,
+                               void **out_host_codes,
+                               size_t out_capacity,
+                               size_t *out_n);
 
 
 // ----------------------------------------------------------------------------

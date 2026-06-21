@@ -88,10 +88,21 @@ void jit_shutdown(void);
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime);
 
 // jit_invalidate_block: 失效 jit_cache 内 (pa, regime) 对应的块, release host
-//   code RX 段. 当前 caller 只有测试 fixture (协议路径 verify); a_05+ SMC handler
-//   触发后改走 jit_cache_invalidate_page (按 page 颗粒度更高效), 本接口给 future
-//   block chaining 等单块失效场景留用. 协议 4 步详 jit_entry.cc 实装.
+//   code RX 段. 当前 caller 只有测试 fixture (协议路径 verify); SMC chain 实际
+//   走 jit_invalidate_page (按 page 颗粒度更高效), 本接口给 future block
+//   chaining 等单块失效场景留用. 协议 4 步详 jit_entry.cc 实装.
 void jit_invalidate_block(uxlen_t pa, regime_t regime);
+
+// jit_invalidate_page: 失效 jit_cache 内 page_idx 对应 page 的所有块, release
+//   各 host code RX 段. caller = dispatcher 顶扫 page_dirty bitmap (SMC chain
+//   隐式触发路径; b_03 T1.a 接通) + 未来 T2 fence.i (显式触发, audit Q4.2.1+
+//   拍走 SMC 同路径). 协议 4 步内部对偶 jit_invalidate_block:
+//     1. collect: jit_cache_collect_page_host_codes 收 host_code 链
+//     2. invalidate: jit_cache_invalidate_page (清 status + RCU sync 内含)
+//     3. wait: 循环 cpu_wait_all_harts_exit_host_code (per host_code)
+//     4. release: 循环 backend.invalidate_block (per host_code)
+//   详 jit_entry.cc 实装.
+void jit_invalidate_page(uint32_t page_idx);
 
 // jit_flush_all: 整体 Flush jit_cache + code_cache (CODE_CACHE_FULL 时调).
 //   实装: jit_cache_flush_all → backend.flush_all (顺序固定; backend.flush_all

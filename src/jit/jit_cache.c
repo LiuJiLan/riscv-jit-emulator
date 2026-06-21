@@ -27,6 +27,7 @@
 
 #include "config.h"          // MAX_HARTS / GUEST_RAM_NPAGES / GUEST_RAM_START
 #include "core/cpu.h"        // n_harts (extern; cap-vs-n_harts §15 存在性遍历)
+#include "jit/smc.h"         // smc_protect_page (install 路径接, b_03 T1.a)
 
 
 /* ============================================================================
@@ -321,6 +322,19 @@ got_slot_install:
     e->host_code_ptr = host_code_ptr;
     link_into_page_list(e, pa, slot_idx_u32);
 
+    /* SMC chain (b_03 T1.a): mprotect page R-only **必须 store COMPILED release
+     * 之前** 调. race 时序解释: 若 store COMPILED 后再 mprotect, 中间窗口里
+     * lookup hit COMPILED → 跑 host_code → 客户机 store 同 page → 因为还没
+     * mprotect, 不触发 SIGSEGV → page_dirty bitmap 不标 → dispatcher 顶扫无
+     * 事可做 → 下次 lookup 仍 hit COMPILED 跑旧 host_code 跟改后代码不一致 BUG.
+     * 详 b_03_session_002 + plan §1.17.3 SMP 发布顺序 + smc.h 顶段 doc. */
+    {
+        uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+        if (page_idx < GUEST_RAM_NPAGES) {
+            smc_protect_page(page_idx);
+        }
+    }
+
     /* status COMPILED (release; lookup acquire 后 host_code_ptr 等字段 visible) */
     atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_COMPILED,
                           memory_order_release);
@@ -331,6 +345,18 @@ got_slot_promote:
      * store COMPILED release. key/next_in_page 已 visible 不重填; counter 留原值
      * (dispatcher fetch_add 累计的; COMPILED 后 counter 不再读). */
     e->host_code_ptr = host_code_ptr;
+
+    /* SMC chain: mprotect page R-only 同 install 路径 (store COMPILED release
+     * 之前; 同 race 时序解释). COUNTING 时该 entry 还没 visible 给 lookup hit
+     * (lookup 见 COUNTING 走 heat counter 路径, 不 hit COMPILED 路径), 现在
+     * COMPILED 是 host_code 第一次对 lookup hit visible, mprotect 必须先做. */
+    {
+        uint32_t page_idx = (uint32_t)((pa - GUEST_RAM_START) >> 12);
+        if (page_idx < GUEST_RAM_NPAGES) {
+            smc_protect_page(page_idx);
+        }
+    }
+
     atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_COMPILED,
                           memory_order_release);
     return 0;
@@ -486,18 +512,22 @@ got_slot:
 
 
 /* ============================================================================
- * jit_cache_invalidate_page — RCU modify-side, sync grace period
+ * jit_cache_invalidate_page — RCU modify-side, collect + sync grace period
  *
- * 顺 old_head 链表清 status → synchronize → backend.invalidate_block.
+ * b_03 T1.a 改: collect 嵌入本函数, 同一 atomic_exchange 拿 old_head 后, 遍历
+ * 内同时收 host_code_ptr 进 out 数组 + 清 status. 防 race (若 collect 独立调,
+ * 中间窗口别 hart install 新块, 新块 host_code 不进 out → caller 不 release →
+ * 内存泄漏; 详 jit_cache.h 顶段 "为什么 collect 必须嵌入本函数" doc).
  *
- * 注: 本函数 caller (b_03 SMC chain) 当前没接通 — page_dirty bitmap 是 a_05+
- * 真做项, 本函数预先填好走通协议. backend_invalidate_block 真 release host
- * code RX 段 (asmjit JitRuntime::release), 顺链清的每个 host_code_ptr 都要调,
- * 但本函数遍历链表时只清 status 不读 host_code_ptr (entry 字段 invalidate 后
- * lookup 见 EMPTY 即可); SMC chain 真做时需 collect host_code_ptr 列表后逐个
- * backend.invalidate_block 调.
+ * caller (jit_entry.cc jit_invalidate_page 组合层) 拿到 out 后:
+ *   - 顺 out_host_codes[0..*out_n) 逐个调 cpu_wait_all_harts_exit_host_code
+ *     + backend.invalidate_block. NULL 元素 skip (BLACK / COUNTING entry).
  * ============================================================================ */
-void jit_cache_invalidate_page(uint32_t page_idx) {
+void jit_cache_invalidate_page(uint32_t page_idx,
+                               void **out_host_codes,
+                               size_t out_capacity,
+                               size_t *out_n) {
+    *out_n = 0;
     if (page_idx >= GUEST_RAM_NPAGES) { return; }   /* 防御 */
 
     /* atomic_exchange 拿 old_head + 清头 (acq_rel; 其他 hart install 看到新链头
@@ -506,22 +536,34 @@ void jit_cache_invalidate_page(uint32_t page_idx) {
                                                  JIT_PAGE_HEAD_END,
                                                  memory_order_acq_rel);
 
-    /* 顺链表清 status (release; lookup acquire 之后看 EMPTY 即 miss).
-     * 包括 BLACK → EMPTY (Q12 c; SMC / Flush 路径都清). */
+    /* 顺链表 collect host_code + 清 status (同遍历内, race-free).
+     *
+     * 顺序: 先 collect 再清 status — 因为清 status 后别 hart lookup 可能撞此 slot
+     * 走 install 重用, 写新 host_code_ptr; 必须在那之前把旧 host_code_ptr 收
+     * 走. (实际本函数遍历期 RCU sync 还没调, 别 hart 的 read critical 都还
+     * 没结束, 不会重用 slot; 但顺序仍按 collect-then-clear 防御 future
+     * grace period 缩短优化.)
+     *
+     * 包括 BLACK → EMPTY (Q12 c; SMC / Flush 路径都清). BLACK entry
+     * host_code_ptr = NULL, 进 out 数组也是 NULL, caller skip. */
+    size_t n = 0;
     while (old_head != JIT_PAGE_HEAD_END) {
         jit_cache_entry_t *e = &hash_table[old_head];
         uint16_t next = e->next_in_page;
+        if (n < out_capacity) {
+            out_host_codes[n++] = e->host_code_ptr;   /* BLACK/COUNTING 时 NULL */
+        }
+        /* 实际链长 > capacity 时静默截断 — T1.a 起步; 真撞 fixture 不通过再
+         * 升 runtime_fatal. */
         atomic_store_explicit(&e->status, (uint32_t)JIT_CACHE_EMPTY,
                               memory_order_release);
         old_head = next;
     }
+    *out_n = n;
 
     /* 等所有 hart 出 read critical section, 旧引用 host_code_ptr 不再被任何
-     * hart 持有, backend 可安全 release host_code RX 段. */
+     * hart 持有, backend 可安全 release host_code RX 段 (caller 在 sync 后做). */
     jit_rcu_synchronize();
-
-    /* 顺链 backend.invalidate_block 真 release 由 caller (SMC chain) 协议补完,
-     * 见函数顶段 doc; jit_cache 本身只清 status. */
 }
 
 

@@ -70,7 +70,7 @@
 //
 
 #include "api/jit_api.h"
-#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小)
+#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小) / MAX_BLOCKS_PER_PAGE
 #include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (invalidate 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
@@ -153,6 +153,46 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
     /* step 4: backend release host code RX 段 (asmjit JitRuntime::release) */
     const backend_t *be = backend_get_default();
     be->backend_invalidate_block(host_code);
+}
+
+
+// ----------------------------------------------------------------------------
+// jit_invalidate_page — 按 page_idx 整 page 失效 (SMC chain caller 用)
+//
+// 协议 4 步内部对偶 jit_invalidate_block (单块版), 差异在 step 1+2 合并 (collect
+// 跟 invalidate 必须原子打包; 详 jit_cache.h jit_cache_invalidate_page 顶段
+// "为什么 collect 必须嵌入本函数" race 分析):
+//   1+2. jit_cache_invalidate_page (内部 atomic_exchange head + 遍历 collect
+//        host_code 进 out 数组 + 清 status + RCU sync); 替代了 block 版的
+//        take CAS COMPILED→EMPTY + RCU sync 两步
+//   3. 状态灯扫: 循环每 host_code 调 cpu_wait_all_harts_exit_host_code
+//   4. release: 循环每 host_code 调 backend.invalidate_block
+//
+// caller (b_03 T1.a 接通):
+//   - dispatcher 主循环顶扫 page_dirty bitmap 拿到 dirty page_idx 调本函数
+//   - T2 fence.i 不直接调本函数 (audit Q4.2.1+ 拍 fence_i_helper 不主动
+//     invalidate, 走块边界 + 已 SMC chain 路径自动)
+//
+// out 数组用栈 (MAX_BLOCKS_PER_PAGE, 起步 16; jit_cache.h 顶段说明上限算法).
+// NULL 元素 (BLACK / COUNTING entry) skip.
+// ----------------------------------------------------------------------------
+void jit_invalidate_page(uint32_t page_idx) {
+    /* step 1+2: collect + invalidate + RCU sync (jit_cache 内原子打包) */
+    void *host_codes[MAX_BLOCKS_PER_PAGE];
+    size_t n_codes = 0;
+    jit_cache_invalidate_page(page_idx, host_codes,
+                              (size_t)MAX_BLOCKS_PER_PAGE, &n_codes);
+    if (n_codes == 0u) {
+        return;   /* page 空 (无 JIT 块) / page_idx 越界 — 不需 release */
+    }
+
+    /* step 3 + 4: 循环每 host_code 等 hart 退出 + backend release */
+    const backend_t *be = backend_get_default();
+    for (size_t i = 0; i < n_codes; i++) {
+        if (host_codes[i] == nullptr) { continue; }   /* BLACK / COUNTING 无 host_code */
+        cpu_wait_all_harts_exit_host_code(host_codes[i]);
+        be->backend_invalidate_block(host_codes[i]);
+    }
 }
 
 
