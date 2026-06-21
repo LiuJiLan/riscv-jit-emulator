@@ -46,12 +46,15 @@ void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
     lrsc_on_store(hart, pa);
 
     // ----------------------------------------------------------------------
-    // SMC 检测 (page_dirty bitmap) —— 占位
+    // SMC 副作用 (page_dirty bitmap) —— 不走本 helper
     //
-    // a_05+ SMC chain: store 写到含 JIT 翻译过的 page 时, 配合 jit/smc.c 的
-    // page_dirty bitmap 检测, 让 dispatcher 在下次进 block 前 invalidate 该 page
-    // 上所有 jit_cache 条目 (整页失效 — 不是精细; plan §1.17 + §3 #13 决策)。
-    // 当前 store_helper 不动 page_dirty, 等 a_05+ SIGSEGV mprotect path 真做。
+    // SMC chain 路径走 SIGSEGV handler + mprotect (jit/smc.c): JIT install 时
+    // mprotect 含 JIT 块的 page R-only, 客户机 sw 改 → SIGSEGV → handler atomic
+    // 标 page_dirty bitmap + 加 mprotect R/W; dispatcher 顶扫 bitmap → 调
+    // jit_invalidate_page 整页失效 (plan §1.17 + §3 #13 决策).
+    //
+    // store_helper 本身不动 page_dirty — 副作用源是 host kernel SIGSEGV, 不在
+    // 这条 RAM 写路径上 (memcpy 已写入 RAM 后, kernel 才回调 handler).
     //
     // 注: MMIO 非可执行 page, 不参与 SMC (跟 reservation 同理由), 所以本 helper
     // 不服务 MMIO 路径。

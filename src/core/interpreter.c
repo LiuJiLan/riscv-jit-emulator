@@ -686,9 +686,11 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // FENCE   = memory ordering NOP (host x86 TSO + helper atomic 双重 cover; 详见
             //           isa/fence.h 顶段). 非块边界, 同 block 继续译; 走 fetch loop 末段
             //           PC_STEP_RV 自推进.
-            // FENCE.I = i-cache flush, 副作用 lrsc_clear_self (RV spec 七类清除 #4; 未来
-            //           a_05+ 加 JIT cache invalidate). 是块边界 (is_block_boundary_inst → 1),
-            //           走 fetch loop 末 += PC_STEP_RV → goto out 退块, dispatcher 重派发.
+            // FENCE.I = i-cache flush, 副作用 lrsc_clear_self (RV spec 七类清除 #4);
+            //           是块边界 (is_block_boundary_inst → 1), 走 fetch loop 末 +=
+            //           PC_STEP_RV → goto out 退块, dispatcher 重派发. fence_i_helper
+            //           不主动调 jit_invalidate_page — JIT 块失效由 SMC chain SIGSEGV
+            //           bitmap 路径承担 (详 isa/fence.h 顶段 "为什么不调" doc 段).
             // 两个 helper 都 pure (无 longjmp 路径), 不需 SYNC_COUNT.
             case OP_FENCE:
                 fence_helper(hart);

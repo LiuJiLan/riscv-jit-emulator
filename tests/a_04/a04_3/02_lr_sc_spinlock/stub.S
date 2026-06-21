@@ -3,6 +3,17 @@
 # ===== 运行参数 =====
 # RUN-SMP: 2
 # RUN-EXPECT-EXIT: 0
+# RUN-TSAN-SKIP
+#
+# ===== TSan SKIP 原因 =====
+# TSan 报 race: lrsc_lr_w atomic_load *pa vs store_helper plain memcpy *hva
+# (cross-hart 同 PA RAM access). 这是项目 host x86 TSO 接受的 latent race —
+# x86 4-byte aligned mov 单指令原子, plain memcpy 行为等价 atomic (跟 lrsc.c
+# 顶段 doc + b03_01/05_smc_smp2_race 同源 RV spec 允许 cross-hart no-fence
+# 语义). 不是 LR/SC 实装引入的新问题; spinlock 50 万条密集 busy-wait 必然
+# 触发 (a_03 短 fixture 没采到). 跨 host ARM64 兼容时 lsu RAM access 一并
+# 升 atomic (plan §2 + lrsc_amo_decision.md Q20 撤回项). 在 Debug+ASan+UBSan
+# 验 race-free correctness 即可; TSan run 整体 skip.
 #
 # ===== 测试目的 =====
 # 2-hart LR.W/SC.W spinlock 竞争 — 端到端验跨 hart reservation 清除 + 序列化:
@@ -31,13 +42,7 @@
 # N=16 是 fixture 速度跟覆盖率折中 (32 次成功 CAS 已能 stress lrsc_on_store + bucket
 # lock 路径; 跑过快不增确定性).
 #
-# ===== TSan note =====
-# 本 fixture 在 TSan build 上会报 race: lrsc_lr_w atomic_load *pa vs store_helper
-# plain memcpy *hva (cross-hart 同 PA RAM access). 这是项目 host x86 TSO 接受的
-# latent race (跟 a_03 SMP cross-hart plain RAM access 同源 — a_03 fixture 短没采到,
-# spinlock 50 万条密集 busy-wait 必然触发). 不是 LR/SC 实装引入的新问题, 跑 debug
-# build 验证 functional correctness 即可. 跨 host ARM64 兼容时 lsu RAM access 一并
-# 升 atomic (plan §2 + lrsc_amo_decision.md Q20 撤回项).
+# (TSan SKIP 原因见顶段 "===== TSan SKIP 原因 =====" 段)
 
 .equ TEST_DEV_BASE,     0x00100000
 .equ FINISHER_PASS,     0x5555

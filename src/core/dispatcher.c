@@ -160,8 +160,9 @@ void dispatcher(cpu_t *hart) {
                           memory_order_release);
 
     // ========================================================================
-    // SMC chain 顶扫 (b_03 T1.a; SIGSEGV handler 标 page_dirty bitmap 后, 本处
-    // consume + 调 jit_invalidate_page 真清 JIT 块 + release RX 段).
+    // SMC chain 顶扫 (SIGSEGV handler 标 page_dirty bitmap 后, 本处 consume +
+    // 调 jit_invalidate_page 真清 JIT 块 + release RX 段; 协议详 jit/smc.h 顶段
+    // + dummy.txt §17).
     //
     // 位置:
     //   - 状态灯清 (上方) 之后: jit_invalidate_page 内部 cpu_wait_all_harts_

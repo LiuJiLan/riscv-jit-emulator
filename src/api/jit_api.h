@@ -22,7 +22,9 @@
 // backend_get_default() 拿 backend_t* 调 vtable). dispatcher fork 点 miss 路径
 // 调 jit_compile_block; lifecycle (jit_init / jit_shutdown) main POR / teardown
 // 配对一次; jit_flush_all 作 jit_compile_block 内部 Q11 a 组合用;
-// jit_invalidate_block 当前 caller 只有测试 fixture (SMC 真触发在 a_05+).
+// jit_invalidate_page caller = dispatcher 顶扫 page_dirty bitmap (SMC chain
+// 隐式触发); jit_invalidate_block 主要 caller 是测试 fixture, 给 future block
+// chaining 等按 (pa, regime) 单块失效场景留用.
 //
 // 错误码 jit_status_t:
 //   JIT_OK                  — 编译成功 / 接口调用成功
@@ -88,17 +90,19 @@ void jit_shutdown(void);
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime);
 
 // jit_invalidate_block: 失效 jit_cache 内 (pa, regime) 对应的块, release host
-//   code RX 段. 当前 caller 只有测试 fixture (协议路径 verify); SMC chain 实际
-//   走 jit_invalidate_page (按 page 颗粒度更高效), 本接口给 future block
-//   chaining 等单块失效场景留用. 协议 4 步详 jit_entry.cc 实装.
+//   code RX 段. 主要 caller 是测试 fixture (协议路径 verify); SMC chain 走
+//   jit_invalidate_page (按 page 颗粒度更高效), 本接口给 future block chaining
+//   等单块失效场景留用. 协议 4 步详 jit_entry.cc 实装.
 void jit_invalidate_block(uxlen_t pa, regime_t regime);
 
 // jit_invalidate_page: 失效 jit_cache 内 page_idx 对应 page 的所有块, release
 //   各 host code RX 段. caller = dispatcher 顶扫 page_dirty bitmap (SMC chain
-//   隐式触发路径; b_03 T1.a 接通) + 未来 T2 fence.i (显式触发, audit Q4.2.1+
-//   拍走 SMC 同路径). 协议 4 步内部对偶 jit_invalidate_block:
-//     1. collect: jit_cache_collect_page_host_codes 收 host_code 链
-//     2. invalidate: jit_cache_invalidate_page (清 status + RCU sync 内含)
+//   隐式触发路径). fence.i 不直接调 — audit Q4.2.1+ 拍 fence_i_helper 不主动
+//   invalidate, 走块边界 + SMC chain bitmap 间接触发 (详 isa/fence.h 顶段 doc).
+//   协议 4 步内部对偶 jit_invalidate_block, step 1+2 合并 (collect 跟 invalidate
+//   原子打包, 详 jit_cache.h jit_cache_invalidate_page 顶段 race 分析):
+//     1+2. jit_cache_invalidate_page (atomic_exchange head + 遍历 collect +
+//          清 status + RCU sync; 单 atomic 边界保 race-free)
 //     3. wait: 循环 cpu_wait_all_harts_exit_host_code (per host_code)
 //     4. release: 循环 backend.invalidate_block (per host_code)
 //   详 jit_entry.cc 实装.

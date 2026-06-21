@@ -13,8 +13,9 @@
 //
 // AUIPC: cur_pc + d.imm 合并写进 ir.imm (选 a 常量折叠, 跟 QEMU 默认 + rv8 一致;
 //   baked_pc 不进 ir_inst_t 字段).
-// PA != VA trail: V1 BARE only, cur_pc = pa = VA; SV32 上线 (a_05+) 时
-// AUIPC baked_pc 来源 (用 pa 还是 cpu->pc VA) 单独议.
+// PA != VA trail: 当前 cur_pc = pa, fixture 走 BARE 或者 SV32 直接映射时 pa = VA
+// 等价; OS guest 真撞 pa != VA 时 (mapping 跨 page 不同 VA), AUIPC baked_pc 来源
+// (用 pa 还是 cpu->pc VA) 单独议. 当前测试范围内未撞.
 //
 // 硬边界 op: CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6 = 19 op
 // (plan §1.23.1 表 4 + 表 7; is_block_boundary_inst 返 1), translator emit

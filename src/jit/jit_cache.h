@@ -18,8 +18,8 @@
 //                jit_flush_all + 再 install 重试 1 次 (retry 完整路径见
 //                jit/jit_entry.cc)
 //   Q12 c    — invalidate_reason_t 入参不带; 现役两条路径 (SMC invalidate /
-//                Flush_all) 都清 BLACK; 未来加 block chaining / SMC 立即重编时
-//                ABI append-only 扩 reason 入参
+//                Flush_all) 都清 BLACK; 未来加 block chaining 时若真需要按 reason
+//                差别处理, ABI append-only 扩 reason 入参
 //
 // SMP 一次性到位原则 (plan §1.9 末段 + dummy.txt §15 末段):
 //   jit_cache 出生即 lock-free + RCU, 不走"先单 hart 后补 SMP".
@@ -73,9 +73,9 @@
 // 机制 B: cpu_t.jit_executing_host_code 状态灯 (per-hart _Atomic(void *))
 //   - 持当前正在跑的 host_code; 没跑 JIT 块时 = NULL
 //   - **给 invalidate caller 用** — 保证"不要在 hart 跑 host_code 的时候 munmap
-//     / release RX 段". caller (jit_entry.cc jit_invalidate_block / 未来 SMC
-//     chain) 调 cpu_wait_all_harts_exit_host_code(host_code) busy-wait 等所有
-//     hart 退出, 才调 backend.invalidate_block release.
+//     / release RX 段". caller (jit_entry.cc jit_invalidate_block /
+//     jit_invalidate_page) 调 cpu_wait_all_harts_exit_host_code(host_code)
+//     busy-wait 等所有 hart 退出, 才调 backend.invalidate_block release.
 //   - **hart 自己的 lookup 完全不看这个状态灯** — 状态灯不参与 lookup 决策
 //
 // 两机制解耦的关键 invariant:

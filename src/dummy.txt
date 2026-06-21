@@ -2294,8 +2294,207 @@ emit 完即硬边界切块.
 
 ### 推翻 trail (重要 — start_plan_b_02 §[2] T5 第 5 点)
 
-sfence_vma_helper 跟 fence_helper / fence_i_helper **不调 jit_invalidate_block**:
-JIT 块 key=(PA, regime), perm 是 TLB entry runtime 拿不 baked 数值; sfence 只
-清 TLB, JIT 块在 sfence 后不过期. fence.i 真触发 invalidate 是 a_05+ SMC chain
-双保险接口形态的事, 不是 sfence 范围. 详 trade_off_log §T.20 + src/isa/
-sfence.h:15-33 + fence.h:47-49 + jit_entry.cc 顶段 doc.
+sfence_vma_helper 跟 fence_helper / fence_i_helper **不调 jit_invalidate_block /
+jit_invalidate_page**: JIT 块 key=(PA, regime), perm 是 TLB entry runtime 拿不
+baked 数值; sfence 只清 TLB, JIT 块在 sfence 后不过期. fence.i (b_03 audit
+Q4.2.1+) 也不主动调 — 块边界 + SMC chain bitmap 路径自动触发整页失效, fence.i
+自身只清 reservation. 详 trade_off_log §T.20 + src/isa/sfence.h:15-33 +
+fence.h:47-49 + jit_entry.cc 顶段 doc.
+
+
+
+
+## §18. SMC chain caller 协议 (b_03 落地; SIGSEGV + mprotect + page_dirty bitmap + dispatcher 顶扫 + jit_invalidate_page 4 步)
+
+涉及文件:
+  - src/jit/smc.{c,h}            (SIGSEGV handler + page_dirty bitmap +
+                                  dirty_pending counter + mprotect API)
+  - src/jit/jit_cache.{c,h}      (jit_cache_invalidate_page 嵌入 collect + install
+                                  路径接 smc_protect_page race-free 时序)
+  - src/jit/jit_entry.cc         (jit_invalidate_page 组合层 4 步)
+  - src/api/jit_api.h            (jit_invalidate_page extern C 声明)
+  - src/core/dispatcher.c        (主循环顶 smc_consume_dirty + 调 jit_invalidate_page)
+  - src/main.c                   (POR 段 smc_init + teardown 段 smc_destroy)
+  - src/isa/lsu.c                (store_helper 不动 page_dirty — 副作用源是 host
+                                  kernel SIGSEGV, 不在 RAM 写路径上)
+  - src/isa/fence.h / fence.c    (fence.i 块边界 + 不主动 invalidate; 走块边界
+                                  + SMC chain bitmap 间接, audit Q4.2.1+)
+
+
+--------------------------------------------------------------------------------
+背景与目的
+--------------------------------------------------------------------------------
+
+JIT 块 install 后, 客户机改这个 page 上的指令 (self-modifying code, SMC) 必须
+让旧 JIT 块失效, 否则跑 stale 指令 = BUG. 选择 mprotect + SIGSEGV handler +
+page_dirty bitmap + deferred invalidation 路径 (跟 QEMU TCG user-mode + Box64
+同体例; plan §1.17), 而不是 store_helper 主动扫 SMC bitmap (trade_off_log
+§T.2 否决).
+
+handler async-signal-safe 限制只能写 bitmap (POSIX 硬约束; plan §1.17 + CLAUDE.md
+"Do not" 段); 真 invalidate 工作 deferred 到 dispatcher 主循环顶 (正常 thread
+上下文).
+
+
+--------------------------------------------------------------------------------
+机制
+--------------------------------------------------------------------------------
+
+### Step 1: JIT install 时 mprotect page R-only
+
+jit_cache_install 内 (两条路径 got_slot_install / got_slot_promote) 都在 atomic
+store status = COMPILED release **之前** 调 smc_protect_page(page_idx) 让 host
+kernel 把 page mprotect R-only. 时序拍 A (b_03_session_002 race 修正): B 选项
+(jit_entry.cc 组合层外部分两步调) t1 store COMPILED → t2 smc_protect_page 间
+窗口期, lookup hit COMPILED + 客户机 store → kernel 没 mprotect → SIGSEGV 不
+触发 → bitmap 不标 → stale JIT 块继续 hit → BUG. 反推 A (jit_cache 内部嵌入)
+是唯一正确, 且 smc_protect_page 必须 **store COMPILED release 之前** 调.
+
+### Step 2: 客户机 store 含 JIT 块的 page → SIGSEGV → handler 标 bitmap
+
+mprotect R-only page 上客户机 sw / sb / sh 任意 store → host kernel SIGBUS /
+SIGSEGV (mprotect 触发 SIGSEGV 在 Linux). smc_signal_handler (async-signal-safe):
+  1. atomic_fetch_or(&page_dirty[word_idx], mask, release) 标 bit
+  2. 若 (prev & mask) == 0 真新标 bit:
+       atomic_fetch_add(&dirty_pending, 1, release) 计数 +1
+  3. mprotect page R/W 恢复 (客户机 store 重发后能写)
+  4. SIGSEGV 落 RAM 范围外 → _exit(139) 兜底 (真 host bug)
+
+SMP release 顺序: page_dirty bit 先 fetch_or release, dirty_pending 后 fetch_add
+release. dispatcher 顶扫看 dirty_pending > 0 时, 用 acquire load page_dirty 必
+能看到该 bit (release/acquire 同步). dispatcher 看 dirty_pending == 0 时, 一定
+不会漏 bit (相反窗口期, race window benign 详 smc.c 顶段 doc).
+
+### Step 3: dispatcher 主循环顶 fast-path skip + consume
+
+dispatcher 每 iter 顶 (状态灯兜底清 之后 / trap_check_interrupt 之前) 调
+smc_consume_dirty(&page_idx):
+  1. atomic_load_explicit(&dirty_pending, relaxed) == 0u → return false (99%
+     iter 1 relaxed load 跳 512 word scan; **不读 page_dirty bitmap**)
+  2. dirty_pending > 0 → linear scan page_dirty (32768 page / 64 = 512 word),
+     找到 set bit → CAS clear bit + atomic_fetch_sub(&dirty_pending, 1, release):
+       - CAS 成功 → return true + 写 *page_idx (caller 调 jit_invalidate_page)
+       - CAS 失败 (别 hart 抢先 clear) → 继续 scan
+  3. scan 完无 set bit → return false (race 时另一 hart 抢走 bit, 浪费一次
+     scan; safe)
+
+dirty_pending counter 是 b_03 T4 加的 fast-path 路标 (b_03_session_005 perf
+退化 root cause + 修): 不加 counter 时 dispatcher 每 iter 跑 512 atomic acquire
+load (~us 级开销 / iter), 跑 hot 路径 1.4B 次抢 cache 撞 15× perf 骤降.
+
+### Step 4: jit_invalidate_page 4 步组合层
+
+dispatcher 拿到 page_idx 调 jit_invalidate_page(page_idx) (jit_entry.cc 组合层;
+extern "C" via api/jit_api.h):
+  1+2. jit_cache_invalidate_page(page_idx, out_host_codes, out_capacity, &out_n)
+       内部:
+         a. atomic_exchange page_block_head[page_idx] = JIT_PAGE_HEAD_END
+            (acq_rel) 拿 old_head; 此后别 hart install 挂的是 JIT_PAGE_HEAD_END,
+            不进当前链
+         b. 顺 old_head 链表遍历:
+              - out_host_codes[n++] = entry->host_code_ptr (collect; 跟清 status
+                同一遍历, 不可拆 — race-free 关键, 详 jit_cache.h:374 race
+                分析 + 实施期间发现段 #2)
+              - atomic store status = EMPTY (release; 包括 BLACK → EMPTY, Q12 c)
+         c. jit_rcu_synchronize() 等所有 hart 出 read critical section
+  3. 循环每 host_code 调 cpu_wait_all_harts_exit_host_code(host_code) 等所有
+     hart 退出该 host_code (busy-wait + PAUSE; 起步实装, 推 a_05+ 换 cond_wait)
+  4. 循环每 host_code 调 backend.invalidate_block(host_code) 真 release host
+     code RX 段 (asmjit JitRuntime::release).
+
+NULL skip: host_codes[i] == NULL 时 caller skip (BLACK / COUNTING entry 无
+host_code; out_capacity 是栈 MAX_BLOCKS_PER_PAGE 起步 16, 实际链长 > capacity
+静默截断 — 真撞需要 runtime_fatal; b_03 T1.a 起步未撞).
+
+
+--------------------------------------------------------------------------------
+race window benign 分析 (dirty_pending counter; smc.c 顶段 doc 详写)
+--------------------------------------------------------------------------------
+
+dirty_pending 跟 page_dirty 是两个 atomic 字段, 无法单原子操作同步. race
+window 全 benign:
+
+(1) handler fetch_or → fetch_add 之间 dispatcher 看 dirty_pending = 0 时:
+    skip 1 次, 下次 iter 看 > 0 再 consume; SMC 延迟 1 iter, 容忍.
+
+(2) consume fetch_and → fetch_sub 之间 dispatcher 看 dirty_pending > 0 时:
+    走 full scan 找不到 bit (已被本次 consume 清); return false; 浪费一次 scan
+    但 safe.
+
+(3) 两 hart 同时 consume 同 bit: CAS clear 只有一个赢, 输的 fetch_sub 不会
+    误减 (输的没 CAS 成功就不 fetch_sub).
+
+
+--------------------------------------------------------------------------------
+fence.i 块边界 + 不主动 invalidate (audit Q4.2.1+; src/isa/fence.h 顶段 doc)
+--------------------------------------------------------------------------------
+
+fence_i_helper 是 RV spec i-cache flush 语义入口, 但本项目实装:
+  - 不主动调 jit_invalidate_page — 走块边界 + SMC chain bitmap 自动触发
+  - 副作用只有 lrsc_clear_self(hart) (RV spec 七类 reservation 清除 #4)
+  - 是块边界 (decode.h is_block_boundary_inst → 1), interpreter / translator
+    遇 fence.i 都退块 → dispatcher 重派发
+
+理由 (b_03_session_001 user 洞察 + 5 case walk through):
+  - SMC SIGSEGV 工作正常 → page_dirty bitmap 实时反映 "哪些 page 被改"
+  - fence.i 是块边界 → 退出当前 JIT 块 → 回 dispatcher 主循环顶 → 顶扫
+    bitmap → 自动 invalidate dirty page (跟 SMC SIGSEGV 触发路径合并)
+  - 所有 5 case 走通: 改完 fence.i / 改完不 fence.i / fence.i 没改 / cross-page /
+    多 hart race; 唯一 Case F "cross-hart fence.i + store race" 真硬件也有,
+    RV spec 不保证 cross-hart i-cache coherence without SBI broadcast IPI
+  - 跟 R15 sfence_vma_helper 不调 jit_invalidate_block 同精神: JIT 子系统不
+    主动响应 RV 同步指令; instruction sync 走 SMC SIGSEGV bitmap, TLB sync
+    不影响 JIT key. 统一原则.
+  - industry 一致 (QEMU TCG user-mode 也是 page-fault 路径主导, 不靠 guest
+    fence.i)
+
+
+--------------------------------------------------------------------------------
+为什么 store_helper 不动 page_dirty
+--------------------------------------------------------------------------------
+
+store_helper (src/isa/lsu.c) 是 RAM 写路径, memcpy 后调 lrsc_on_store 清匹配
+reservation, 但**不动 page_dirty bitmap** — 副作用源是 host kernel SIGSEGV,
+不在 store_helper 这条路径上. 客户机 store 含 JIT 块的 page 时, mprotect R-only
+触发 SIGSEGV → handler 写 bitmap (本协议 Step 2); store_helper 内 memcpy 在
+handler 跑完 mprotect R/W 之后才能成功完成. store_helper 不需要也不应该主动
+扫 bitmap (trade_off_log §T.2 否决项: 主动扫=每次 store 付 bitmap 查代价,
+浪费 hot path).
+
+MMIO 非可执行 page, 不参与 SMC (跟 reservation 同理由), MMIO 路径 caller 不
+经 store_helper, 直接 mmio_write_helper.
+
+
+--------------------------------------------------------------------------------
+未来改进点
+--------------------------------------------------------------------------------
+
+(F1) busy-wait → cond_wait: cpu_wait_all_harts_exit_host_code 起步 PAUSE
+     busy-wait, 真撞 perf 时换 cond_wait / pthread_yield (jit_invalidate_page
+     不在 fast path 性能预算够, plan §2 deferred).
+
+(F2) SBI_REMOTE_FENCE_I broadcast IPI 接入: cross-hart fence.i 走 SBI broadcast
+     强保证 i-cache coherence, 跟 lsu RAM access 改 atomic 一起做 (plan §2
+     deferred; 当前 RUN-TSAN-SKIP 3 fixture 的根因).
+
+(F3) page_dirty bitmap collect 链长 > MAX_BLOCKS_PER_PAGE 静默截断 → 加
+     runtime_fatal (b_03 T1.a 起步未撞, 真撞需要升 fatal).
+
+(F4) jit_cache 调小 BITS verify Flush + retry + BLACK collect NULL skip 路径
+     (b_03 T_收尾 #2 真撞未触发, 因 fixture 块入口数远小于 slot 数; permanent
+     fprintf 已加到 jit_entry.cc Flush / BLACK 异常路径作 real-trigger 信号).
+
+
+--------------------------------------------------------------------------------
+非目标
+--------------------------------------------------------------------------------
+
+  - 本协议不处理精细块失效 (per-byte SMC; 整页失效是 plan §1.17 sacred,
+    trade_off_log §T deferred 项, plan §3 #13 否决).
+
+  - 本协议不处理 host page protection 模拟 guest PTE 权限 (粒度对不上, plan
+    §3 #14 否决).
+
+  - 本协议不处理 SIGSEGV handler 自身的 longjmp (handler 只写 bitmap, 不参与
+    trap 处理流程, dummy.txt §1 非目标段).
+

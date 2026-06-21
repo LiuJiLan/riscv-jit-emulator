@@ -24,10 +24,11 @@
 //      序列", 不是某个 PA 的 PTE_U 值; SUM/MXR 也是 runtime 读 mstatus)
 //   3. sfence.vma 清 TLB 后, JIT 块下次 load/store 走 walker_helper 自然适配新页表
 //
-//   JIT cache invalidate 的真正语义边界是 fence.i (i-cache flush = guest 自改代码段
-//   后的可见性边界) + SMC handler (page_dirty bitmap), 不是 sfence.vma. fence.h 顶段
-//   注释明确"fence.i 跟 sfence.vma 语义不同族, 三者无共享 helper". SMC 真挂点推 b_03
-//   / a_05+ (SIGSEGV + page_dirty bitmap; 详 plan §1.17).
+//   JIT cache invalidate 的真正语义边界是 SMC handler (page_dirty bitmap), 不是
+//   sfence.vma. fence.h 顶段注释明确"fence.i 跟 sfence.vma 语义不同族, 三者无共享
+//   helper". SMC 路径 b_03 T1.a 已落地 (SIGSEGV + mprotect + page_dirty bitmap;
+//   详 jit/smc.h + plan §1.17); fence.i 由 audit Q4.2.1+ 拍 fence_i_helper 不主动
+//   invalidate, 走块边界 + SMC chain 间接 (详 fence.h 顶段 doc).
 //
 //   推翻 trail: b_02_session_006 chat 重审 + memory `feedback_overturn_plan_leave_trail`
 //   (推翻 plan 留代码注释 trail). 未来开发若再质疑"sfence.vma 是否该调 jit invalidate",

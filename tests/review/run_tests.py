@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # tests/review/run_tests.py —— 跑批所有 tests/ fixture, 结果落 out/tests_res/。
 #
-# 用法:  python3 tests/review/run_tests.py
+# 用法:  python3 tests/review/run_tests.py [--tsan]
+#          (默认 Debug 跑批; --tsan 跑 TSan 二进制做 race detection)
 # 依赖:  tests/review/out/riscv_jit_emulator         —— debug+ASan 冻结副本 (默认)
 #        tests/review/out/riscv_jit_emulator_release —— release 冻结副本 (RUN-RELEASE
 #                                                       fixture 用; 无 RUN-RELEASE 则可缺)
-#        每次整理前自己从 cmake-build-debug / cmake-build-release 各复制一份过来
-#        (与并行的 src 改动隔离)。各 fixture 的 out.bin / out.elf / disk.img /
-#        input.txt 已 make 好 (先在 tests/ 跑一次 make)。
+#        tests/review/out/riscv_jit_emulator_tsan    —— tsan 冻结副本 (--tsan 用)
+#        每次整理前自己从 cmake-build-debug / cmake-build-release / cmake-build-tsan
+#        各复制一份过来 (与并行的 src 改动隔离)。各 fixture 的 out.bin / out.elf /
+#        disk.img / input.txt 已 make 好 (先在 tests/ 跑一次 make)。
 #
 # 运行接口 (新, a_03 收尾): base cmd = [EMU, '--bios', artifact]。需要 stdin / 块
 # 设备 / exit 断言 / release / 自定 timeout 的 fixture 在 stub.S banner 内 explicit
@@ -20,14 +22,18 @@
 #   # RUN-RELEASE                → 用 release 冻结二进制 (debug 太慢/必须 release)
 #   # RUN-TIMEOUT: 5             → 覆盖默认 timeout (秒); 不写默认 3.0
 #   # RUN-SMP: 2                 → 追加 --smp N (1..8; 多 hart fixture 用)
-#   # RUN-TSAN-SKIP               → fixture 跑 TSan build 时跳过 (Debug 仍跑). 用于
+#   # RUN-TSAN-SKIP               → fixture 跑 TSan 跑批时跳过 (Debug 仍跑). 用于
 #                                  RV spec 允许但 emulator host 实装无 atomic 的
 #                                  cross-hart RAM r/w race (如 b_03/b03_01/05_smc_
 #                                  smp2_race: hart 1 sw 改 inst + hart 0 fetch 同
 #                                  RAM word 没 atomic, TSan 视角真 race 但 RV spec
-#                                  允许无 fence.i broadcast cross-hart i-cache
-#                                  不 coherent). 当前 run_tests.py 只跑 Debug, 本
-#                                  tag 是 self-doc + future TSan 跑批 reference.
+#                                  允许无 fence.i broadcast cross-hart i-cache 不
+#                                  coherent; a_04/a04_3/02_lr_sc_spinlock 同源).
+#
+# TSan 跑批 (--tsan): 跑 Tsan 二进制 (替 Debug 用), RUN-TSAN-SKIP fixture 显示
+# TSAN-SKIP. RUN-RELEASE fixture 也跳 (perf 套件无 race 验目的, 不浪费 TSan run);
+# 显示 TSAN-REL-SKIP. timeout 自动 ×8 (TSan 比 Debug 慢 ~5-10x, 默认 timeout 3s
+# 多数 fixture 跑不完).
 # 没声明 tag → sensible default (debug 二进制 / 无 stdin / 无 blk / exit 仅记录
 # 不断言 / timeout=3.0)。tag 残缺 (未知名 / 缺值 / 布尔带值 / 文件不存在 / 数值
 # 解析失败 / RUN-RELEASE 但 release 二进制缺失) → fail loud: 该 fixture 标
@@ -40,6 +46,7 @@
 #
 # 本文件 + reorg_spec.md + REVIEW.md 跟踪进 repo; out/ 是一次性产物, gitignore。
 
+import argparse
 import os
 import re
 import subprocess
@@ -52,8 +59,10 @@ REPO = os.path.dirname(TESTS)                             # repo 根
 OUT = os.path.join(SCRIPT_DIR, "out")
 EMU = os.path.join(OUT, "riscv_jit_emulator")               # 默认 = debug + ASan
 EMU_RELEASE = os.path.join(OUT, "riscv_jit_emulator_release")  # RUN-RELEASE 用
+EMU_TSAN = os.path.join(OUT, "riscv_jit_emulator_tsan")        # --tsan 用
 RESDIR = os.path.join(OUT, "tests_res")
 TIMEOUT = 3.0  # 秒; 默认值, 单 fixture 可用 RUN-TIMEOUT 覆盖
+TSAN_TIMEOUT_SCALE = 8.0  # TSan 比 Debug 慢 5-10x, 默认 timeout 自动放大 (含 RUN-TIMEOUT)
 
 # RUN-STDIN 投递前的延迟 (秒)。pipe 瞬时投递会让 RX 字节早于 guest 跑完设备 init
 # (PLIC source / UART ERBFI 使能), reader 线程推字节 vs guest 配中断的先后踩到丢
@@ -64,7 +73,13 @@ STDIN_DELAY = 0.1
 # frozen 二进制通常是 debug + ASan 构建。批跑非 gdb 环境下 LSan 的 exit-time 扫描
 # 会把正常停机 (有意未释放的 mmap/线程资源) 报成泄漏 → 非 0 退出, 污染 PASS/FAIL
 # 与 exit 断言; detect_leaks=0 关掉它 (跟 CLAUDE.md / CLion run config 体例一致)。
-CHILD_ENV = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1")
+#
+# TSan 跑批 (--tsan) 时改用 TSAN_OPTIONS: halt_on_error=1 让真 race fixture exit 非 0
+# (跟 ASan abort_on_error 体例同), second_deadlock_stack=1 让死锁 trace 有两端 stack.
+CHILD_ENV_DEBUG = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1")
+CHILD_ENV_TSAN  = dict(os.environ,
+                       TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1")
+CHILD_ENV = CHILD_ENV_DEBUG  # 默认; main() 按 --tsan 切换
 
 # stub.S banner 内的运行参数 tag (方案 A explicit declaration)。
 # 两种形态: 带值 `# RUN-XXX: value` (group val) 或布尔裸 `# RUN-XXX` (val=None)。
@@ -175,7 +190,7 @@ def discover():
                     dirs.append(nn_p)
     return dirs
 
-def run_one(test_dir):
+def run_one(test_dir, tsan_mode=False):
     rel = os.path.relpath(test_dir, TESTS)
     out_dir = os.path.join(RESDIR, rel)
     os.makedirs(out_dir, exist_ok=True)
@@ -195,15 +210,37 @@ def run_one(test_dir):
             f.write(f"CONFIG ERROR: {e}\n")
         return (rel, "CONFIG-ERROR", None, 0.0, False)
 
-    # RUN-RELEASE → 换 release frozen 二进制 (a02_7 perf 这类 debug 太慢/必须
-    # release 跑的)。release 二进制缺失却被声明 → fail loud。
-    emu = EMU
-    if cfg["release"]:
+    # TSan mode skip 规则:
+    #   - RUN-TSAN-SKIP fixture: 显式 race 已被注释解释 (RV spec 允许 latent race);
+    #     跳过避免假阳, 跟 b03_01/05 / a04_3/02 体例对齐.
+    #   - RUN-RELEASE fixture: perf 套件无 race 验目的 (a02_7 16 个 perf fixture),
+    #     不浪费 TSan run 时间. 真要 race 验在专门 race fixture 里做.
+    if tsan_mode:
+        if cfg["tsan_skip"]:
+            with open(log, "w") as f:
+                f.write("TSAN-SKIP (RUN-TSAN-SKIP tag in stub.S)\n")
+            return (rel, "TSAN-SKIP", None, 0.0, False)
+        if cfg["release"]:
+            with open(log, "w") as f:
+                f.write("TSAN-REL-SKIP (RUN-RELEASE perf fixture, no race verify)\n")
+            return (rel, "TSAN-REL-SKIP", None, 0.0, False)
+
+    # emu 选择:
+    #   --tsan mode: 全跑 EMU_TSAN (上方 skip 已过滤)
+    #   默认 Debug mode: RUN-RELEASE → EMU_RELEASE, 其他 → EMU
+    if tsan_mode:
+        emu = EMU_TSAN
+    elif cfg["release"]:
         if not os.path.isfile(EMU_RELEASE):
             with open(log, "w") as f:
                 f.write(f"CONFIG ERROR: RUN-RELEASE but {EMU_RELEASE} missing\n")
             return (rel, "CONFIG-ERROR", None, 0.0, False)
         emu = EMU_RELEASE
+    else:
+        emu = EMU
+
+    # TSan 比 Debug 慢 5-10x; 自动放大 timeout (含 RUN-TIMEOUT 显式值).
+    timeout = cfg["timeout"] * (TSAN_TIMEOUT_SCALE if tsan_mode else 1.0)
 
     art_rel = os.path.relpath(art, REPO)
     cmd = [emu, "--bios", art_rel]
@@ -223,7 +260,7 @@ def run_one(test_dir):
         # 无 stdin: 直跑。
         try:
             p = subprocess.run(cmd, cwd=REPO, capture_output=True,
-                               timeout=cfg["timeout"], start_new_session=True,
+                               timeout=timeout, start_new_session=True,
                                env=CHILD_ENV)
             rc, so, se = p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired as e:
@@ -239,7 +276,7 @@ def run_one(test_dir):
                                 start_new_session=True, env=CHILD_ENV)
         time.sleep(STDIN_DELAY)
         try:
-            so, se = proc.communicate(input=stdin_bytes, timeout=cfg["timeout"])
+            so, se = proc.communicate(input=stdin_bytes, timeout=timeout)
             rc = proc.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -248,13 +285,14 @@ def run_one(test_dir):
             so, se = proc.communicate()   # 收尾捞已产出的输出
     dt = time.monotonic() - t0
 
+    build_label = "tsan" if tsan_mode else ("release" if cfg["release"] else "debug")
     with open(log, "wb") as f:
         head = (f"cmd       : {' '.join(cmd)}\n"
                 f"artifact  : {art_rel}\n"
-                f"build     : {'release' if cfg['release'] else 'debug'}\n"
+                f"build     : {build_label}\n"
                 f"stdin     : {os.path.relpath(cfg['stdin'], REPO) if cfg['stdin'] else '-'}\n"
                 f"expect_exit: {cfg['expect_exit'] if cfg['expect_exit'] is not None else '-'}\n"
-                f"timeout   : {cfg['timeout']} s\n"
+                f"timeout   : {timeout} s\n"
                 f"exit code : {'TIMEOUT' if timed_out else rc}\n"
                 f"wall time : {dt:.3f} s\n"
                 f"timed_out : {timed_out}\n"
@@ -274,28 +312,48 @@ def run_one(test_dir):
     return (rel, status, rc, dt, timed_out)
 
 def main():
-    if not os.path.isfile(EMU):
-        print(f"ERROR: emulator not found at {EMU}", file=sys.stderr)
-        print("  先从 cmake-build-debug/ 复制一份冻结二进制过来。", file=sys.stderr)
+    global CHILD_ENV
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--tsan", action="store_true",
+                    help="跑 TSan 二进制做 race detection; RUN-TSAN-SKIP / "
+                         "RUN-RELEASE fixture 自动跳过, timeout ×8")
+    args = ap.parse_args()
+
+    if args.tsan:
+        CHILD_ENV = CHILD_ENV_TSAN
+        binary = EMU_TSAN
+    else:
+        CHILD_ENV = CHILD_ENV_DEBUG
+        binary = EMU
+
+    if not os.path.isfile(binary):
+        print(f"ERROR: emulator not found at {binary}", file=sys.stderr)
+        if args.tsan:
+            print("  先从 cmake-build-tsan/ 复制一份冻结二进制过来。", file=sys.stderr)
+        else:
+            print("  先从 cmake-build-debug/ 复制一份冻结二进制过来。", file=sys.stderr)
         return 1
     dirs = discover()
-    print(f"discovered {len(dirs)} fixtures; timeout={TIMEOUT}s\n")
+    mode_label = "TSan" if args.tsan else "Debug"
+    print(f"discovered {len(dirs)} fixtures; mode={mode_label}; "
+          f"timeout={TIMEOUT}s (TSan ×{TSAN_TIMEOUT_SCALE})\n")
     rows = []
     for d in dirs:
-        rel, status, rc, dt, to = run_one(d)
+        rel, status, rc, dt, to = run_one(d, tsan_mode=args.tsan)
         rows.append((rel, status, dt, to))
         print(f"  {status:24s} {dt:6.3f}s  {rel}")
     os.makedirs(RESDIR, exist_ok=True)
     with open(os.path.join(RESDIR, "_summary.txt"), "w") as f:
-        f.write(f"fixtures: {len(rows)}   timeout: {TIMEOUT}s\n")
+        f.write(f"fixtures: {len(rows)}   mode: {mode_label}   timeout: {TIMEOUT}s\n")
         f.write("=" * 70 + "\n")
         for rel, status, dt, to in rows:
             f.write(f"{status:24s} {dt:7.3f}s  {rel}\n")
     n_to = sum(1 for r in rows if r[3])
     n_fail = sum(1 for r in rows if r[1].startswith("FAIL"))
     n_cfg = sum(1 for r in rows if r[1] == "CONFIG-ERROR")
+    n_skip = sum(1 for r in rows if r[1] in ("TSAN-SKIP", "TSAN-REL-SKIP"))
     print(f"\ndone: {len(rows)} fixtures, {n_to} timed out, "
-          f"{n_fail} FAIL, {n_cfg} config-error")
+          f"{n_fail} FAIL, {n_cfg} config-error, {n_skip} TSan-skipped")
     print(f"results -> {RESDIR}")
     return 0
 

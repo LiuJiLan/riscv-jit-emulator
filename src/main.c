@@ -651,7 +651,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // SMC chain SIGSEGV handler 注册 (b_03 T1.a; smc.h 顶段 doc 协议).
+    // SMC chain SIGSEGV handler 注册 (协议见 jit/smc.h 顶段 doc).
     // 紧跟 runtime_install_signal_handlers 之后 — 都是 signal 注册段; smc_init
     // 装 SIGSEGV 不跟 runtime 的 SIGINT/SIGTERM/SIGHUP 冲突. 必须在 jit_init
     // 之后 (smc handler 需要 host_ram_base 已 init; jit_init 自己不依赖 smc,
@@ -849,7 +849,7 @@ int main(int argc, char **argv) {
     }
     ram_destroy();
 
-    // SMC chain SIGSEGV handler 还原 (b_03 T1.a; 跟 smc_init 配对; 紧邻
+    // SMC chain SIGSEGV handler 还原 (跟 smc_init 配对; 紧邻
     // runtime_restore_signal_handlers — 都是 signal restore 段). 必须在
     // ram_destroy 之后 — ram_destroy munmap 客户机 RAM, 之后即使有 stray
     // SIGSEGV 也不该走我们 handler (host_ram_base 已 NULL).

@@ -36,13 +36,14 @@
 //              (起步 busy-wait + PAUSE);
 //   release : backend.invalidate_block(host_code) 真 release host code RX 段.
 //
-//   caller (a_05+ 真做 SMC chain): fence.i / SIGSEGV handler 触发 page_dirty
-//   bitmap → dispatcher 主循环顶扫 bitmap → 按 page 颗粒度调
-//   jit_cache_invalidate_page (顺链表清 status + sync grace) 而非本接口.
-//   本接口提供按 (pa, regime) 单块失效语义, future block chaining / 单点
-//   invalidate 真撞场景留用.
+//   caller: SMC chain 走 jit_invalidate_page (顺 per-page list 整页清; SIGSEGV
+//   handler 标 page_dirty bitmap → dispatcher 主循环顶扫 → 调 page 版组合层);
+//   本接口按 (pa, regime) 单块失效语义, 给 future block chaining / 单点
+//   invalidate 真撞场景留用, 主要 caller 是测试 fixture 验协议路径.
 //   注意 sfence.vma 不调本接口 — sfence 只清 TLB, JIT 块 key=(PA, regime) 在
 //   sfence 后不过期 (PA 不变 + perm runtime 读 TLB; 详 sfence.h 顶段).
+//   注意 fence.i 也不调本接口 — audit Q4.2.1+ 拍 fence_i_helper 不主动
+//   invalidate, 走块边界 + SMC chain bitmap 间接 (详 fence.h 顶段 doc).
 //
 // jit_compile_block — Q11 a 组合层 (dispatcher fork 点 miss 路径调):
 //   step 1: backend.compile_block → JIT_OK 时 jit_cache_install + 返 JIT_OK
@@ -69,8 +70,10 @@
 // NOT_IMPLEMENTED → set_blacklist → dispatcher 兜底走 interpret 真执行.
 //
 
+#include <stdio.h>           // fprintf (Flush / BLACK 异常路径 stderr 提示)
+
 #include "api/jit_api.h"
-#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小) / MAX_BLOCKS_PER_PAGE
+#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小) / MAX_BLOCKS_PER_PAGE / EOL
 #include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (invalidate 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
@@ -129,12 +132,12 @@ void jit_flush_all(void) {
 // invalidate / 还没 promote / BLACK).
 //
 // 调用者:
-//   - 当前: 测试 fixture 直调 (协议路径 verify)
-//   - 未来 a_05+: SMC handler 触发 page_dirty bitmap, dispatcher 主循环顶按 page
-//     调 jit_cache_invalidate_page (顺链表; 不是本接口). 本接口给 future
-//     block chaining 等按 (pa, regime) 单块失效场景预留.
+//   - 测试 fixture 直调 (协议路径 verify)
+//   - SMC chain 不走本接口, 走 jit_invalidate_page (按 page 整页清, 顺链表).
+//     本接口给 future block chaining 等按 (pa, regime) 单块失效场景预留.
 //
 // 不接 sfence_vma_helper — sfence 只清 TLB, JIT 块 key=(PA, regime) 不过期.
+// 不接 fence_i_helper — fence.i 走块边界 + SMC chain bitmap 间接 (详 fence.h).
 // ----------------------------------------------------------------------------
 void jit_invalidate_block(uxlen_t pa, regime_t regime) {
     /* step 1: take + CAS COMPILED→EMPTY */
@@ -222,8 +225,11 @@ jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
         return JIT_OK;
     }
 
-    /* step 2: JIT_CODE_CACHE_FULL → Flush + retry 1 次 */
+    /* step 2: JIT_CODE_CACHE_FULL → Flush + retry 1 次 (异常路径, 一次性 stderr
+     * 提示 — 信号价值高, 不 gate; 真撞 = JIT_CACHE_SIZE 触底). */
     if (s == JIT_CODE_CACHE_FULL) {
+        fprintf(stderr, "[jit] FULL → Flush + retry: pa=0x%08x regime=%u" EOL,
+                (uint32_t)pa, (uint32_t)regime);
         jit_flush_all();
         host_code = nullptr;
         s = be->backend_compile_block(pa, regime,
@@ -238,13 +244,21 @@ jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
              * ≤ 64 inst × ~16 byte/inst < 1KB; 1MB+ code_cache) — 真撞是 bug.
              * 进 BLACK + 返 BACKEND_INTERNAL (跟 IR_ERROR / 真 BACKEND_INTERNAL
              * 同处理, dispatcher 退 interpreter). */
+            fprintf(stderr, "[jit] 二次 FULL → BLACK: pa=0x%08x regime=%u (单块"
+                    " host code > code_cache; 检查 backend / config)" EOL,
+                    (uint32_t)pa, (uint32_t)regime);
             (void)jit_cache_set_blacklist(pa, regime);
             return JIT_BACKEND_INTERNAL;
         }
         /* 二次撞别的错码 (IR_ERROR / BACKEND_INTERNAL / NOT_IMPLEMENTED) 透传 step 3 */
     }
 
-    /* step 3: 非 FULL 错码透传 — set_blacklist + 透传; dispatcher 退 interpreter */
+    /* step 3: 非 FULL 错码透传 — set_blacklist + 透传; dispatcher 退 interpreter.
+     * NOT_IMPLEMENTED (块前缀空) 是 expected 常见路径不打; 其他错码异常路径打提示. */
+    if (s != JIT_ERR_NOT_IMPLEMENTED) {
+        fprintf(stderr, "[jit] compile error → BLACK: pa=0x%08x regime=%u status=%d" EOL,
+                (uint32_t)pa, (uint32_t)regime, (int)s);
+    }
     (void)jit_cache_set_blacklist(pa, regime);
     return s;
 }

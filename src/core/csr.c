@@ -313,8 +313,8 @@ static void csr_mie_write(cpu_t *hart, uxlen_t v) {
 //   bit 1/5/9 (SSIP/STIP/SEIP_sw) ← trap._mip_sw 软件 inject 字段
 //   bit 3     MSIP ← CLINT.msip[hartid] 异步源 (is_clint_msip_pending)
 //   bit 7     MTIP ← (mtime ≥ mtimecmp[hartid]) 派生 (is_clint_timer_pending)
-//   bit 9     SEIP_hw ← PLIC s_pending OR _mip_sw bit 9 (未来; v1 hw_seip 永远 0)
-//   bit 11    MEIP ← PLIC m_pending (未来; v1 永远 0)
+//   bit 9     SEIP_hw ← is_plic_seip_pending(hartid) OR _mip_sw bit 9 (PLIC s_pending)
+//   bit 11    MEIP    ← is_plic_meip_pending(hartid) (PLIC m_pending)
 //
 // csr_mip_write 只动 _mip_sw 的 MIP_SW_WRITABLE_MASK 对应位 (SSIP/STIP/SEIP_sw);
 // 其他位 (MSIP/MTIP/MEIP/reserved) 写忽略 (RO from M-mode csrw 视角).
