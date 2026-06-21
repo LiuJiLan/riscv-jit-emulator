@@ -75,7 +75,7 @@ halt_spin:
 #                           段, 说明 invalidate 错触发, 算 partial fail)
 #   x7     = 0x80200000  (data page address)
 #   x8     = 0xdeadbeef  (写入 value)
-#   x12    = 1           (phase counter; 只 phase 1 + 1)
+#   x12    = 2           (phase counter; phase 1 末 + phase 3 末 各 +1)
 #   x13    = 1
 #   x30/x31 = test_dev FINISHER PASS magic
 #   exit 0

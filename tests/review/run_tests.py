@@ -20,6 +20,14 @@
 #   # RUN-RELEASE                → 用 release 冻结二进制 (debug 太慢/必须 release)
 #   # RUN-TIMEOUT: 5             → 覆盖默认 timeout (秒); 不写默认 3.0
 #   # RUN-SMP: 2                 → 追加 --smp N (1..8; 多 hart fixture 用)
+#   # RUN-TSAN-SKIP               → fixture 跑 TSan build 时跳过 (Debug 仍跑). 用于
+#                                  RV spec 允许但 emulator host 实装无 atomic 的
+#                                  cross-hart RAM r/w race (如 b_03/b03_01/05_smc_
+#                                  smp2_race: hart 1 sw 改 inst + hart 0 fetch 同
+#                                  RAM word 没 atomic, TSan 视角真 race 但 RV spec
+#                                  允许无 fence.i broadcast cross-hart i-cache
+#                                  不 coherent). 当前 run_tests.py 只跑 Debug, 本
+#                                  tag 是 self-doc + future TSan 跑批 reference.
 # 没声明 tag → sensible default (debug 二进制 / 无 stdin / 无 blk / exit 仅记录
 # 不断言 / timeout=3.0)。tag 残缺 (未知名 / 缺值 / 布尔带值 / 文件不存在 / 数值
 # 解析失败 / RUN-RELEASE 但 release 二进制缺失) → fail loud: 该 fixture 标
@@ -62,7 +70,7 @@ CHILD_ENV = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1")
 # 两种形态: 带值 `# RUN-XXX: value` (group val) 或布尔裸 `# RUN-XXX` (val=None)。
 RUN_TAG_RE = re.compile(r'^\s*#\s*(RUN-[A-Z-]+)\s*(?::\s*(\S+)\s*)?$')
 VALUE_TAGS = ("RUN-BLK", "RUN-STDIN", "RUN-EXPECT-EXIT", "RUN-TIMEOUT", "RUN-SMP")
-BOOL_TAGS = ("RUN-RELEASE",)
+BOOL_TAGS = ("RUN-RELEASE", "RUN-TSAN-SKIP")
 KNOWN_TAGS = VALUE_TAGS + BOOL_TAGS
 
 class ConfigError(Exception):
@@ -94,7 +102,7 @@ def parse_run_config(test_dir):
     timeout=TIMEOUT)。残缺 → raise ConfigError。路径值相对 fixture 目录解析;
     文件不存在即报错。"""
     cfg = {"blk": None, "stdin": None, "expect_exit": None,
-           "release": False, "timeout": TIMEOUT, "smp": None}
+           "release": False, "timeout": TIMEOUT, "smp": None, "tsan_skip": False}
     stub = os.path.join(test_dir, "stub.S")
     if not os.path.isfile(stub):
         return cfg
@@ -138,6 +146,8 @@ def parse_run_config(test_dir):
                     raise ConfigError(f"RUN-TIMEOUT not a number: {val!r}")
             elif tag == "RUN-RELEASE":
                 cfg["release"] = True
+            elif tag == "RUN-TSAN-SKIP":
+                cfg["tsan_skip"] = True
             elif tag == "RUN-SMP":
                 try:
                     n = int(val)
