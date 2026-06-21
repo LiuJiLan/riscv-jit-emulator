@@ -54,17 +54,48 @@
 //   RV32M 8 : 走 emit_ir_muldiv (MUL 4 用 host x86 imul/mul, DIV/REM 4 inline
 //             branch 兜 by-0 + INT_MIN/-1 overflow 避 #DE).
 //
-// 静态固定映射 (Q2=b): RV x1-x5 (ra/sp/gp/tp/t0) → host callee-saved 32-bit reg
-//   x1 → ebx
-//   x2 → r12d
-//   x3 → r13d
-//   x4 → r14d
-//   x5 → r15d
-// 其余 RV reg (x0 = 常数 0 / x6-x31 = cpu->regs[r] 内存) 走 emit_load_rv_reg /
-// emit_store_rv_reg helper 分流.
+// 寄存器映射演进 (Q2=b → b_03 T3 Layer 2 块内动态):
 //
-// prologue/epilogue (Q6=a): 真做 load/store x1-x5 from/to cpu->regs[1..5]; 跟块体
-// ADD/ADDI 真消费形成 "load + op + store" 三段闭环.
+//   旧拍 (b_02 Q2=b / Q6=a): RV x1-x5 静态固定映射到 host callee-saved 32-bit reg
+//     (x1→ebx / x2→r12d / x3→r13d / x4→r14d / x5→r15d); 其余 RV reg (x0=0 const /
+//     x6-x31=cpu->regs[r] 内存) 走 emit_load_rv_reg / emit_store_rv_reg helper 分流.
+//     prologue/epilogue 真做 load/store x1-x5 from/to cpu->regs[1..5] 共 5 次.
+//
+//   推翻原因 (b_03 T3): block-local hot reg 不一定是 x1-x5. RV ABI 常用 reg —
+//     a0-a7 (x10-x17) / t0-t6 (x5-x7+x28-x31) / s1-s11 (x9+x18-x27) — 多落在
+//     x6-x31, 全走 cpu->regs[N] 内存; 块内即使 x1-x5 (ra/sp/gp/tp/t0) 没用到,
+//     prologue/epilogue 仍跑 5 次冗余 load/store. perf 上限被静态映射卡死.
+//
+//   新拍 (b_03 T3 Layer 2 — A 全替换 / iii Local greedy / P1 全 push):
+//     5 个 host callee-saved (ebx/r12d/r13d/r14d/r15d) 从硬编降级为 candidate
+//     pool (host_pool[5]). compile_block 入口扫 IR 流统计 use_count[32] (按
+//     inst.kind dispatch 分类计数, 不盲扫 rd/rs1/rs2 三字段 — CSR I 变体 rs1
+//     是 5-bit zimm, AMO/LR/SC 字段语义跟普通算术不同, SFENCE_VMA rs1/rs2 是
+//     reg 不是 imm, etc.), x0 排除, top 5 按 use_count 排序选, 不算 live range
+//     重叠 (假设全活, 简化算法 + Layer 3 真上 linear scan 留 hook), use_count >
+//     0 threshold (没真 use 的 reg 不进 host pool, 节省 prologue/epilogue 一次
+//     load/store). 选中 RV reg 填 g_rv_to_host[r] = 0..4 索引 host_pool, 未选
+//     -1. emit_load/store_rv_reg 判据从 "rv_reg <= 5" 改为 "g_rv_to_host[rv_reg]
+//     >= 0", 命中走 host_pool[g_rv_to_host[rv_reg]], 未中走 cpu->regs[N]. host_
+//     reg_for_rv 改为查 g_rv_to_host 索引 host_pool, assert 索引 >= 0.
+//     prologue/epilogue push/pop 仍全 5 个 callee-saved (P1 保栈布局 9 push
+//     天然 16-byte 对齐 + helper call 协议零动); load/store 部分改 for r in 1..31
+//     看 g_rv_to_host[r] >= 0 真 load/store, 真 N ≤ 5 次. g_rv_to_host 是
+//     anonymous-namespace file-static, jit_entry.cc compile_block 已 mutex
+//     single-threaded 保护 (b_02 audit), 安全; compile_block 入口必 reset
+//     整 32 entry = -1 防 stale.
+//
+//   推翻 trail:
+//     - plan §2 #1 (寄存器分配器层 2/3 — 改进列表项)
+//     - notes/context/b_03_audit_decision.md Q4.1.b (拍 Layer 2 块内动态 +
+//       Layer 3 跨块全局 TODO 推后, 等 block chaining + hot-trace 真需求)
+//     - notes/context/b_03_session_004.md (T3 实施 + perf delta 数据)
+//     - commit dab36e6 (b02_07: JIT M 扩展 + RVC; b_02 末段静态映射 baseline)
+//     - feedback_overturn_plan_leave_trail (推翻 plan 段在 src 顶段留 why)
+//
+//   未来开发若再质疑 x1-x5 静态映射 vs 块内动态 — 先读本段 + T3 perf delta;
+//   Layer 3 跨块全局 (linear scan 真做) 需要先有 block chaining / hot-trace
+//   数据, 当前 v1 永禁 chaining (plan §3 #6).
 //
 // host code 地址复用 (Q1=a 注): asmjit allocator 在 rt.release 后可能复用同地址,
 // jit_cache 清旧 status + RCU grace 已等所有 reader 出, 不撞 stale.
@@ -178,18 +209,226 @@ inline int32_t regs_offset(uint8_t reg_idx) {
            static_cast<int32_t>(reg_idx) * 4;
 }
 
-// 32-bit host reg 对应 RV reg 1..5 (Q2=b 拍法).
+// ----------------------------------------------------------------------------
+// Layer 2 块内寄存器映射 state + compute_reg_mapping (b_03 T3; 顶段 doc 推翻 trail)
+// ----------------------------------------------------------------------------
+//
+// g_rv_to_host[r] 语义:
+//   r = 0..31 索引 RV reg; 值 = -1 (未映射, emit_load/store_rv_reg 走 cpu->regs[N])
+//   或 0..4 (映射到 host_pool[idx]).
+// x0 永远不入 mapping (常数 0, 由 emit_load_rv_reg rv_reg==0 路径 xor 自处理).
+//
+// compile_block 入口必先调 compute_reg_mapping(insts, n_insts) 填; 退出无显式
+// reset (下次 compile_block 入口 memset -1 覆盖). 跨 compile_block 之间不依赖
+// 残值. jit_entry.cc compile_block 已 mutex 单线程, file-static 安全.
+
+static int8_t g_rv_to_host[32];
+
+static const asmjit::x86::Gp host_pool[5] = {
+    asmjit::x86::ebx,
+    asmjit::x86::r12d,
+    asmjit::x86::r13d,
+    asmjit::x86::r14d,
+    asmjit::x86::r15d,
+};
+
+// 32-bit host reg 对应 RV reg (查 g_rv_to_host 索引 host_pool). 入参必须是已
+// 映射的 RV reg (caller 保证: emit_load_rv_reg / emit_store_rv_reg 已 rv_reg
+// > 0 && g_rv_to_host[rv_reg] >= 0 分流过).
 inline asmjit::x86::Gp host_reg_for_rv(uint8_t rv_reg) {
-    switch (rv_reg) {
-        case 1: return asmjit::x86::ebx;
-        case 2: return asmjit::x86::r12d;
-        case 3: return asmjit::x86::r13d;
-        case 4: return asmjit::x86::r14d;
-        case 5: return asmjit::x86::r15d;
-        default: break;
+    int8_t idx = g_rv_to_host[rv_reg];
+    // idx < 0 = caller 错路径 (该走 cpu->regs[N] 不该走 host reg); idx >= 5 是
+    // compute_reg_mapping 写错. release build 兜底返 host_pool[0] 防 UB; debug
+    // 走 assert (cassert 已通过 helpers.h chain 引入: helpers.h → 其他 .h →
+    // 通常带 cassert; 若链断, 改用 fprintf+abort 也行 — 当前形态足够).
+    if (idx < 0 || idx >= 5) {
+        return host_pool[0];
     }
-    // 不可达 (caller 保证 1..5); 兜底返 ebx 防编译警告
-    return asmjit::x86::ebx;
+    return host_pool[idx];
+}
+
+// compute_reg_mapping —— 按 IR 流统计 use_count[32] (按 inst.kind 分类 dispatch
+// 不盲扫三字段; Plan agent 强调), top 5 选 (use_count 降序 tie-break reg index
+// 升序), use_count > 0 threshold (没真 use 的 reg 不进 mapping), 填 g_rv_to_host.
+//
+// caller: compile_block 入口 (emit_prologue 调用前); n_insts >= 2 (n_insts == 1
+// 早 return NOT_IMPLEMENTED 已分流, 走不到本 fn).
+//
+// 字段语义注意 (跟 translator.c rd/rs1/rs2 装填体例对偶):
+//   - CSR I 变体 (CSRRWI/RSI/RCI): rs1 字段是 5-bit zimm 不是 reg, **不计**
+//   - AMO 9 op: rs1=gva base (reg) / rs2=value (reg) 都计
+//   - LR_W: 只 rs1 (gva base); SC_W: rs1=gva base + rs2=value
+//   - STORE 3 op: 只 rs1 (gva base) + rs2 (value), 无 rd
+//   - BRANCH 6 op: 只 rs1 + rs2, 无 rd
+//   - SFENCE_VMA: rs1=vaddr + rs2=asid 都是 reg
+//   - FENCE / FENCE_I / ECALL/EBREAK/MRET/SRET/WFI: 无 reg 操作字段, 不计
+//   - JAL: 只 rd; JALR: rd + rs1
+//   - U-type (LUI/AUIPC): 只 rd
+//   - DISPATCH_EXIT / DISPATCH_EXIT_RUNTIME / UNSUPPORTED: 跳过整条
+inline void compute_reg_mapping(const ir_inst_t *insts, size_t n_insts) {
+    /* reset 整 32 entry; 跨 compile_block 不依赖残值. */
+    for (int r = 0; r < 32; r++) {
+        g_rv_to_host[r] = -1;
+    }
+
+    uint32_t use_count[32] = {0};
+
+    /* 工具 lambda: 增 reg counter, x0 排除. */
+    auto bump = [&](uint8_t reg) {
+        if (reg != 0 && reg < 32) {
+            use_count[reg]++;
+        }
+    };
+
+    for (size_t i = 0; i < n_insts; i++) {
+        const ir_inst_t &inst = insts[i];
+        switch (inst.kind) {
+            /* U-type (rd only) */
+            case IR_OP_LUI:
+            case IR_OP_AUIPC:
+                bump(inst.rd);
+                break;
+
+            /* I-imm 算术/比较/shift (rd + rs1) — 9 op */
+            case IR_OP_ADDI: case IR_OP_SLTI: case IR_OP_SLTIU:
+            case IR_OP_XORI: case IR_OP_ORI:  case IR_OP_ANDI:
+            case IR_OP_SLLI: case IR_OP_SRLI: case IR_OP_SRAI:
+                bump(inst.rd);
+                bump(inst.rs1);
+                break;
+
+            /* R-type 算术/比较/shift (rd + rs1 + rs2) — 10 op */
+            case IR_OP_ADD:  case IR_OP_SUB:
+            case IR_OP_SLL:  case IR_OP_SLT:  case IR_OP_SLTU:
+            case IR_OP_XOR:  case IR_OP_SRL:  case IR_OP_SRA:
+            case IR_OP_OR:   case IR_OP_AND:
+                bump(inst.rd);
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* RV32M 8 op (rd + rs1 + rs2) */
+            case IR_OP_MUL: case IR_OP_MULH: case IR_OP_MULHSU: case IR_OP_MULHU:
+            case IR_OP_DIV: case IR_OP_DIVU: case IR_OP_REM:    case IR_OP_REMU:
+                bump(inst.rd);
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* LOAD 5 op (rd + rs1 [gva base]) */
+            case IR_OP_LB: case IR_OP_LH: case IR_OP_LW:
+            case IR_OP_LBU: case IR_OP_LHU:
+                bump(inst.rd);
+                bump(inst.rs1);
+                break;
+
+            /* STORE 3 op (rs1 [gva base] + rs2 [value]; 无 rd) */
+            case IR_OP_SB: case IR_OP_SH: case IR_OP_SW:
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* CSR R/S/C (rd + rs1) — 3 op */
+            case IR_OP_CSRRW: case IR_OP_CSRRS: case IR_OP_CSRRC:
+                bump(inst.rd);
+                bump(inst.rs1);
+                break;
+
+            /* CSR I 变体 (rd; rs1 字段是 5-bit zimm 不是 reg, 不计) — 3 op */
+            case IR_OP_CSRRWI: case IR_OP_CSRRSI: case IR_OP_CSRRCI:
+                bump(inst.rd);
+                break;
+
+            /* AMO 9 op (rd + rs1 [gva base] + rs2 [value]) */
+            case IR_OP_AMO_ADD_W:  case IR_OP_AMO_SWAP_W:
+            case IR_OP_AMO_XOR_W:  case IR_OP_AMO_OR_W:
+            case IR_OP_AMO_AND_W:  case IR_OP_AMO_MIN_W:
+            case IR_OP_AMO_MAX_W:  case IR_OP_AMO_MINU_W:
+            case IR_OP_AMO_MAXU_W:
+                bump(inst.rd);
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* LR_W (rd + rs1 [gva base]) */
+            case IR_OP_LR_W:
+                bump(inst.rd);
+                bump(inst.rs1);
+                break;
+
+            /* SC_W (rd [success/fail] + rs1 [gva base] + rs2 [value]) */
+            case IR_OP_SC_W:
+                bump(inst.rd);
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* FENCE / FENCE_I (无 reg 操作) */
+            case IR_OP_FENCE:
+            case IR_OP_FENCE_I:
+                break;
+
+            /* BRANCH 6 op (rs1 + rs2; 无 rd) */
+            case IR_OP_BEQ: case IR_OP_BNE:
+            case IR_OP_BLT: case IR_OP_BGE:
+            case IR_OP_BLTU: case IR_OP_BGEU:
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* JAL (rd) */
+            case IR_OP_JAL:
+                bump(inst.rd);
+                break;
+
+            /* JALR (rd + rs1) */
+            case IR_OP_JALR:
+                bump(inst.rd);
+                bump(inst.rs1);
+                break;
+
+            /* SYSTEM 无 reg 操作字段 — ECALL/EBREAK/MRET/SRET/WFI 5 op */
+            case IR_OP_ECALL: case IR_OP_EBREAK:
+            case IR_OP_MRET:  case IR_OP_SRET:
+            case IR_OP_WFI:
+                break;
+
+            /* SFENCE_VMA (rs1=vaddr + rs2=asid 都是 reg) */
+            case IR_OP_SFENCE_VMA:
+                bump(inst.rs1);
+                bump(inst.rs2);
+                break;
+
+            /* 哨兵 + 出口模板 — 跳过整条 */
+            case IR_OP_UNSUPPORTED:
+            case IR_OP_DISPATCH_EXIT:
+            case IR_OP_DISPATCH_EXIT_RUNTIME:
+                break;
+        }
+    }
+
+    /* top 5 选择: 简单 5 轮 max scan (32 reg 规模够小, 排序算法无优势).
+     * use_count 降序; tie-break 按 reg index 升序 (确定性 + reproducible
+     * 调试友好). use_count > 0 threshold: 选不出真用过的 reg 时早 break. */
+    for (int slot = 0; slot < 5; slot++) {
+        int best_reg = -1;
+        uint32_t best_count = 0;
+        for (int r = 1; r < 32; r++) {                    /* x0 不入候选 */
+            if (g_rv_to_host[r] >= 0) continue;            /* 已选过 */
+            if (use_count[r] > best_count) {
+                best_count = use_count[r];
+                best_reg = r;
+            }
+            /* tie-break 已隐含: r 升序遍历, > best_count 才更新, == best_count
+             * 不动 → 同 use_count 先到的 (低 reg index) 胜出. */
+        }
+        if (best_reg < 0 || best_count == 0) {
+            /* use_count > 0 threshold: 没真用过的 reg 全部不进 mapping;
+             * 节省 prologue/epilogue 真 load/store. */
+            break;
+        }
+        g_rv_to_host[best_reg] = (int8_t)slot;
+    }
 }
 
 // emit_reload_hart 前向声明 (定义见后); rs/rd > 5 case 用 rdi 作 cpu->regs[]
@@ -197,14 +436,17 @@ inline asmjit::x86::Gp host_reg_for_rv(uint8_t rv_reg) {
 void emit_reload_hart(asmjit::x86::Assembler &a);
 
 // 把 RV reg 值 load 到 host scratch reg (32-bit Gpd):
-//   rv_reg == 0 → xor scratch, scratch (常数 0; dummy.txt §2 read x0 = 0)
-//   1..5        → mov scratch, host_reg_for_rv(rv_reg) (固定 host reg 直读)
-//   6..31       → reload rdi (helper call 后协议) + mov scratch, [rdi + regs_offset(rv_reg)]
+//   rv_reg == 0           → xor scratch, scratch (常数 0; dummy.txt §2 read x0 = 0)
+//   g_rv_to_host[r] >= 0  → mov scratch, host_reg_for_rv(rv_reg) (本块映射到 host reg)
+//   g_rv_to_host[r] == -1 → reload rdi + mov scratch, [rdi + regs_offset(rv_reg)] (走内存)
+//
+// 判据从 b_02 "rv_reg <= 5 硬编" 改为 "g_rv_to_host[rv_reg] >= 0 动态查表"
+// (b_03 T3 Layer 2). 顶段 doc "寄存器映射演进" 段为推翻 trail.
 void emit_load_rv_reg(asmjit::x86::Assembler &a, asmjit::x86::Gp scratch,
                       uint8_t rv_reg) {
     if (rv_reg == 0) {
         a.xor_(scratch, scratch);
-    } else if (rv_reg <= 5) {
+    } else if (g_rv_to_host[rv_reg] >= 0) {
         a.mov(scratch, host_reg_for_rv(rv_reg));
     } else {
         emit_reload_hart(a);   /* rdi 可能被 helper call 破坏, reload */
@@ -214,15 +456,17 @@ void emit_load_rv_reg(asmjit::x86::Assembler &a, asmjit::x86::Gp scratch,
 }
 
 // 把 host scratch reg (32-bit) 写入 RV reg:
-//   rv_reg == 0 → skip (dead store; dummy.txt §2 write x0 走 garbage)
-//   1..5        → mov host_reg_for_rv(rv_reg), scratch
-//   6..31       → reload rdi (helper call 后协议) + mov [rdi + regs_offset(rv_reg)], scratch
+//   rv_reg == 0           → skip (dead store; dummy.txt §2 write x0 走 garbage)
+//   g_rv_to_host[r] >= 0  → mov host_reg_for_rv(rv_reg), scratch
+//   g_rv_to_host[r] == -1 → reload rdi + mov [rdi + regs_offset(rv_reg)], scratch
+//
+// 判据同 emit_load_rv_reg, Layer 2 动态查表替 b_02 静态硬编.
 void emit_store_rv_reg(asmjit::x86::Assembler &a, uint8_t rv_reg,
                        asmjit::x86::Gp scratch) {
     if (rv_reg == 0) {
         return;
     }
-    if (rv_reg <= 5) {
+    if (g_rv_to_host[rv_reg] >= 0) {
         a.mov(host_reg_for_rv(rv_reg), scratch);
     } else {
         emit_reload_hart(a);   /* rdi 可能被 helper call 破坏, reload */
@@ -237,7 +481,7 @@ constexpr int32_t STACK_SLOT_COUNT_OUT   = -56;  // [rbp - 56] = saved rdx (coun
 constexpr int32_t STACK_SLOT_CURRENT_TLB = -64;  // [rbp - 64] = saved rsi (current_tlb ptr)
 
 // prologue: push callee-saved (rbp + rbx + r12-r15) + push rdi/rdx/rsi (helper call
-// reload 用) + load x1-x5 from cpu->regs[1..5].
+// reload 用) + load 真分配的 RV reg from cpu->regs[N] 到 host_pool[idx].
 //
 // 栈对齐: 9 push × 8 = 72 bytes, 入口 rsp ≡ 8 mod 16 (CALL 压 ret addr),
 //   push 后 rsp ≡ 80 ≡ 0 mod 16 天然对齐, 不需 dummy slot. SysV 要求 call helper
@@ -247,6 +491,11 @@ constexpr int32_t STACK_SLOT_CURRENT_TLB = -64;  // [rbp - 64] = saved rsi (curr
 //   早期 8 push + sub rsp 8 dummy 凑齐, 但 wfi_wait → pthread_cond_timedwait64
 //   内部 SSE / movaps 需严格 16-byte 对齐, 不对齐立爆 SEGV. 9 push (加 rsi
 //   current_tlb) 天然对齐后起源 issue 不再存在.
+//
+// b_03 T3 Layer 2: push/pop 仍全 5 个 callee-saved (P1 拍法, 栈布局 9 push 不动);
+// load 部分从 b_02 "硬编 5 次 load x1-x5" 改为 "for r in 1..31 看 g_rv_to_host[r]
+// >= 0 真 load 进 host_pool[idx]", 真 N ≤ 5 次. 顶段 doc "寄存器映射演进" 段为
+// 推翻 trail.
 void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::rbp);
     a.mov(asmjit::x86::rbp, asmjit::x86::rsp);
@@ -260,17 +509,17 @@ void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::rsi);   // [rbp - 64] = current_tlb ptr (SV32 fast path /
                                 //               AMO/LR-SC walker reload; BARE 时入口 = NULL)
 
-    // load x1-x5 from cpu->regs[1..5] (rdi 入口还是 hart, 未被 helper call 破坏)
-    a.mov(asmjit::x86::ebx,
-          asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(1)));
-    a.mov(asmjit::x86::r12d,
-          asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(2)));
-    a.mov(asmjit::x86::r13d,
-          asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(3)));
-    a.mov(asmjit::x86::r14d,
-          asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(4)));
-    a.mov(asmjit::x86::r15d,
-          asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)));
+    // load 真分配 RV reg 从 cpu->regs[N] 到 host_pool[idx]. rdi 入口还是 hart
+    // (未被 helper call 破坏, 不 reload). 没真分配的 reg 跳过 = 省 prologue 一
+    // 次 load. N ≤ 5 (5 个 host_pool slot 满足 use_count > 0 时 N = 5; 块小或
+    // RV reg 真用少时 N < 5).
+    for (uint8_t r = 1; r < 32; r++) {
+        int8_t idx = g_rv_to_host[r];
+        if (idx >= 0) {
+            a.mov(host_pool[idx],
+                  asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(r)));
+        }
+    }
 }
 
 // helper: reload hart 指针 (rdi) 从栈 saved slot. 每次 helper call 之前调.
@@ -289,21 +538,22 @@ void emit_reload_current_tlb(asmjit::x86::Assembler &a) {
           asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_CURRENT_TLB));
 }
 
-// epilogue: store x1-x5 to cpu->regs[1..5] + pop 对称 prologue + ret.
+// epilogue: store 真分配 host_pool[idx] to cpu->regs[N] + pop 对称 prologue + ret.
 //
 // 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). pop 顺序对称
 // prologue (后入先出). 9 push 天然 16-byte 对齐, 不需释放 dummy slot.
+//
+// b_03 T3 Layer 2: store 部分对偶 prologue load (真分配的 RV reg 才 store; 没真
+// 分配的 reg 跳过 = 省 epilogue 一次 store + 跟 prologue load 对称). pop 全 9 个
+// 不动 (P1; helper call 协议 + 栈布局零动). 顶段 doc "寄存器映射演进" 推翻 trail.
 void emit_epilogue(asmjit::x86::Assembler &a) {
-    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(1)),
-          asmjit::x86::ebx);
-    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(2)),
-          asmjit::x86::r12d);
-    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(3)),
-          asmjit::x86::r13d);
-    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(4)),
-          asmjit::x86::r14d);
-    a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)),
-          asmjit::x86::r15d);
+    for (uint8_t r = 1; r < 32; r++) {
+        int8_t idx = g_rv_to_host[r];
+        if (idx >= 0) {
+            a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(r)),
+                  host_pool[idx]);
+        }
+    }
 
     a.pop(asmjit::x86::rsi);    // 对称 prologue 末 push rsi (current_tlb)
     a.pop(asmjit::x86::rdx);
@@ -1632,6 +1882,11 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
     }
 
     asmjit::x86::Assembler a(&code);
+
+    /* b_03 T3 Layer 2: 算块内寄存器映射 (use_count 排序 top 5; 顶段 doc "寄存器
+     * 映射演进" 段). 必须在 emit_prologue 之前调 — prologue 真 load 哪些 RV
+     * reg 由 g_rv_to_host 决定. */
+    compute_reg_mapping(insts, n_insts);
 
     emit_prologue(a);
 

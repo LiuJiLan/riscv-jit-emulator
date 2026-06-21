@@ -44,7 +44,7 @@ OUT = os.path.join(SCRIPT_DIR, "out")
 TIMEOUT = 30.0  # 秒/单跑; perf fixture Release ~1s, 富余防挂死
 
 PERF_RE = re.compile(
-    r'\[perf\]\s+elapsed=([\d.]+)\s*s\s+total_count=(\d+)\s+MIPS=([\d.]+)')
+    r'\[hart\d+\s+perf\]\s+elapsed=([\d.]+)\s*s\s+total_count=(\d+)\s+MIPS=([\d.]+)')
 
 def discover(subpath):
     """收集 subpath 下带 Makefile 的叶子 fixture 目录。"""
