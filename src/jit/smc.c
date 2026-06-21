@@ -34,6 +34,26 @@
  * atomic_fetch_and (acq_rel) lock-free, SIGSEGV handler 内可调. */
 static _Atomic uint64_t page_dirty[GUEST_RAM_NPAGES / 64];
 
+/* dirty_pending —— page_dirty bitmap cardinality hint (b_03 dirty_pending fast
+ * path; b_03_session_005). dispatcher 顶扫的 fast-path skip 路标:
+ *   == 0 → page_dirty 全 0, smc_consume_dirty 1 个 relaxed load 跳 512 word scan
+ *   >  0 → 至少 1 bit set, smc_consume_dirty 走 full scan
+ *
+ * 跟 page_dirty 不强同步 (两 atomic 字段无法单原子操作), race window benign:
+ *   - handler 先 fetch_or (release) 再 fetch_add (release): dispatcher 在两步之
+ *     间 acquire load dirty_pending == 0 → skip 一次, 下次 iter 看 > 0 再
+ *     consume; SMC 延迟 1 iter, 容忍 (b03 fixture 不撞瞬时 race).
+ *   - consume 先 fetch_and (清 bit) 再 fetch_sub: dispatcher 在两步之间看
+ *     dirty_pending > 0 → 走 full scan 找不到, scan 完 return false; 浪费一
+ *     次 scan 但 safe.
+ *
+ * 起源 trail: 076ee08 引入 smc_consume_dirty 每 dispatcher iter 跑 512 atomic
+ * acquire load 顺扫, hot path 抢 cache → 15x perf 骤降 (a02_7/01_bare 645 →
+ * 42 MIPS); smc.c:115 注释已自承"真撞 perf 退化加快路 hint (atomic dirty_
+ * word_count counter)" 但 b_03 T1.a 未实装. dirty_pending 落地 b_03_session_
+ * 005 (本次), 注释撤旧 hint 改述已实装. */
+static _Atomic uint64_t dirty_pending;
+
 /* sigaction 老 handler 保存, smc_destroy 恢复 (跟 runtime_restore_signal_handlers
  * 体例; 进程退出时 OS 也会自动还, 这一步主要是 lifecycle 对称 + valgrind clean). */
 static struct sigaction old_sigsegv;
@@ -64,13 +84,20 @@ static void smc_signal_handler(int sig, siginfo_t *si, void *uctx) {
 
     /* plan §1.17.3 SMP release 顺序:
      *   1. atomic_fetch_or page_dirty (release)  ← bitmap 先标
-     *   2. smc_unprotect_page (mprotect R/W)     ← 然后开锁让 store 成功
+     *   2. atomic_fetch_add dirty_pending        ← counter 后增 (仅真新标 bit)
+     *   3. smc_unprotect_page (mprotect R/W)     ← 然后开锁让 store 成功
      *
      * release 语义: 让 dispatcher 顶扫 atomic_load (acquire) 看到 bit set 时,
-     * 之前所有内存修改 (无, 但保 happens-before 不让编译器乱序) visible. */
-    atomic_fetch_or_explicit(&page_dirty[page_idx / 64u],
-                             (uint64_t)1u << (page_idx % 64u),
-                             memory_order_release);
+     * 之前所有内存修改 (无, 但保 happens-before 不让编译器乱序) visible.
+     *
+     * dirty_pending: 仅真新标 bit ((prev & mask) == 0) 才 fetch_add, 重 fault
+     * 同 page 不重复增 — 跟 consume fetch_sub 配对保 cardinality 一致. */
+    uint64_t mask = (uint64_t)1u << (page_idx % 64u);
+    uint64_t prev = atomic_fetch_or_explicit(&page_dirty[page_idx / 64u],
+                                              mask, memory_order_release);
+    if ((prev & mask) == 0u) {
+        atomic_fetch_add_explicit(&dirty_pending, 1u, memory_order_release);
+    }
 
     smc_unprotect_page(page_idx);
 
@@ -113,9 +140,18 @@ void smc_unprotect_page(uint32_t page_idx) {
 // ============================================================================
 
 bool smc_consume_dirty(uint32_t *out_page_idx) {
-    /* 简单 linear scan — 32768 page / 64 = 512 word, cold path (dispatcher 顶
-     * 每 iter 调一次, 99% 情况整数组全 0 顺扫不 hit). 真撞 perf 退化加快路 hint
-     * (eg. atomic dirty_word_count counter). */
+    /* fast-path skip: 99% iter dirty_pending == 0 (page_dirty 全 0), 1 个 relaxed
+     * load 跳 512 word full scan. relaxed 因纯 fast-path 路标, 真 consume 内的
+     * fetch_and (acq_rel) 自己有 HB; 跟 page_dirty 同步靠 handler/consume 配
+     * 对 fetch_add/sub 跟 fetch_or/and 的顺序 (顶段 doc dirty_pending 段
+     * benign race 分析). */
+    if (atomic_load_explicit(&dirty_pending, memory_order_relaxed) == 0u) {
+        return false;
+    }
+
+    /* 进 full scan: 32768 page / 64 = 512 word. counter > 0 说明至少 1 bit set,
+     * 但 race window 内 counter 可能超前于 bit clear (consume fetch_and 后
+     * fetch_sub 前); 走完 scan 找不到也 safe return false. */
     for (size_t w = 0; w < (size_t)GUEST_RAM_NPAGES / 64u; w++) {
         uint64_t v = atomic_load_explicit(&page_dirty[w], memory_order_acquire);
         while (v != 0u) {
@@ -127,6 +163,10 @@ bool smc_consume_dirty(uint32_t *out_page_idx) {
                                                        ~mask,
                                                        memory_order_acq_rel);
             if (prev & mask) {
+                /* 真清掉 bit — 跟 handler fetch_add 配对; release 让 dispatcher
+                 * 别处 acquire load dirty_pending 看到 -1 时本 word 的 bit 已清. */
+                atomic_fetch_sub_explicit(&dirty_pending, 1u,
+                                          memory_order_release);
                 *out_page_idx = (uint32_t)(w * 64u + (uint32_t)b);
                 return true;
             }
@@ -148,6 +188,8 @@ int smc_init(void) {
     for (size_t w = 0; w < (size_t)GUEST_RAM_NPAGES / 64u; w++) {
         atomic_store_explicit(&page_dirty[w], 0u, memory_order_relaxed);
     }
+    /* dirty_pending 同 page_dirty, static 0 自初始化; 显式 store 0 配对 lifecycle. */
+    atomic_store_explicit(&dirty_pending, 0u, memory_order_relaxed);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
