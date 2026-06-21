@@ -166,8 +166,12 @@
 //   端 emit fence (tcg_gen_mb 风格), IR 不存 — 是局部增量, 不破坏现 IR 设计;
 //   weak host (ARM/AArch64) JIT 才有真收益, x86_64 host 永远是 no-op.
 //
-// 后续 T7 扩 enum:
-//   T7 M+RVC:          MUL/DIV/REM 8 + RVC 压缩指令
+// RVC: 不在 ir_op_kind_t 维度扩 enum — decode_rvc (decode.c:47-442) 把 RVC 折成
+//   32-bit op_kind_t (C.ADD→OP_ADD / C.BEQZ→OP_BEQ / 等), translator 走 d.pc_step
+//   字段 (PC_STEP_RVC=2 或 PC_STEP_RV=4) 推 cur_pc, IR 跟 backend 都 RVC-agnostic.
+//   ir.target_pc 已含 RVC 跨步预计算 (T4 translator BRANCH/JAL/JALR taken_pc 用
+//   cur_pc + d.imm; fall_through_pc 用 cur_pc + d.pc_step). backend 端无 hardcoded
+//   "+4" 残留, 全读 ir.target_pc / exit_inst.target_pc. (T7 验证)
 //
 // IR 流形态 (T1+T2+T3):
 //   [48 op 之一 前缀 N 条 (0 ≤ N ≤ BLOCK_INST_LIMIT - 1)]
@@ -205,7 +209,8 @@
 
 
 // ----------------------------------------------------------------------------
-// ir_op_kind_t —— IR op 分类 (T1-T4 范围: 3 哨兵/出口 + 62 真翻译 op)
+// ir_op_kind_t —— IR op 分类 (T1-T4 范围: 3 哨兵/出口 + 62 真翻译 op;
+//                              T7 扩 RV32M 8 op → 70 真翻译 op)
 //
 // IR_OP_UNSUPPORTED         - enum 完整性哨兵 (永不真出现在 IR buffer); backend
 //                              default case 写 __builtin_unreachable / abort 兜底
@@ -321,6 +326,22 @@ typedef enum {
     IR_OP_SRET,
     IR_OP_SFENCE_VMA,
     IR_OP_WFI,
+
+    /* ---- R-type RV32M (8; T7 加; 非边界; MUL 4 + DIV/REM 4) ----
+     * MUL/MULH/MULHU/MULHSU: 32x32 multiply, MUL 低 32, MUL*H 高 32 (signed/
+     *   unsigned 视角差异); host x86 imul/mul (单 op 形式 → edx:eax = 64-bit
+     *   result) 直接 emit. backend 走 emit_ir_muldiv (sibling of emit_ir_arith).
+     * DIV/DIVU/REM/REMU: 32-bit divide; by-0 跟 INT_MIN/-1 overflow edge case
+     *   inline branch 兜在 idiv 前 (避 x86 #DE trap; 镜像 interpreter.c:357-397
+     *   语义). 不走 helper (M 是纯算术, 无内存副作用, 无 trap). */
+    IR_OP_MUL,
+    IR_OP_MULH,
+    IR_OP_MULHSU,
+    IR_OP_MULHU,
+    IR_OP_DIV,
+    IR_OP_DIVU,
+    IR_OP_REM,
+    IR_OP_REMU,
 } ir_op_kind_t;
 
 

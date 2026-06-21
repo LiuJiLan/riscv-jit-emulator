@@ -39,9 +39,8 @@
 // 装在 BRANCH IR 自身); MRET/SRET/WFI 末段 target_pc 装 cur_pc 但 backend 走
 // COUNT_ONLY 出口不读此值 (helper 已自写 hart->regs[0]).
 //
-// T4 仍截断的 9 op (仍 fallthrough goto out_translate, 走 interpret 兜底):
-//   RV32M 8 (推 T7 真做 emit) / OP_UNSUPPORTED (兜底, interpret 走 trap_raise
-//   cause=2 illegal).
+// T7 后仍截断的 op (仍 fallthrough goto out_translate, 走 interpret 兜底):
+//   OP_UNSUPPORTED 1 op (RV32M 8 op 已全 emit; 兜底走 trap_raise cause=2 illegal).
 //
 
 #include "translator.h"
@@ -262,13 +261,25 @@ void translator_translate(uxlen_t pa, regime_t regime,
             case OP_SFENCE_VMA:  ir_kind = IR_OP_SFENCE_VMA;  is_hard_boundary = 1; break;
             case OP_WFI:         ir_kind = IR_OP_WFI;         is_hard_boundary = 1; break;
 
-            /* 仍截断 — 推 T7 真做 emit. 显式列全 (而非走 default) 是因为
-             * -Wswitch-enum -Werror 强制 op_kind_t switch 同步;
-             * CLAUDE.md 顶段 "load-bearing mechanism" 段. */
-            /* RV32M (推 T7) */
-            case OP_MUL:    case OP_MULH:   case OP_MULHSU: case OP_MULHU:
-            case OP_DIV:    case OP_DIVU:   case OP_REM:    case OP_REMU:
-            /* 兜底 (interpret 走 trap_raise cause=2 illegal) */
+            /* ---- T7 RV32M MUL 家族 4 op (T7-A2 真翻译) ----
+             * backend emit_ir_muldiv inline (3 路 imul/mul 路径 + MULHSU 64-bit
+             * imul); 非边界 (is_block_boundary_inst 返 0), 翻译完续翻译同块. */
+            case OP_MUL:    ir_kind = IR_OP_MUL;    break;
+            case OP_MULH:   ir_kind = IR_OP_MULH;   break;
+            case OP_MULHSU: ir_kind = IR_OP_MULHSU; break;
+            case OP_MULHU:  ir_kind = IR_OP_MULHU;  break;
+
+            /* ---- T7 RV32M DIV/REM 家族 4 op (T7-A3 真翻译) ----
+             * backend emit_ir_muldiv inline branch 兜 by-0 + INT_MIN/-1 overflow
+             * 避 x86 #DE trap; 镜像 interpreter.c:357-397. 非边界. */
+            case OP_DIV:    ir_kind = IR_OP_DIV;    break;
+            case OP_DIVU:   ir_kind = IR_OP_DIVU;   break;
+            case OP_REM:    ir_kind = IR_OP_REM;    break;
+            case OP_REMU:   ir_kind = IR_OP_REMU;   break;
+
+            /* 兜底 (interpret 走 trap_raise cause=2 illegal). 显式列 (而非走
+             * default) 是因为 -Wswitch-enum -Werror 强制 op_kind_t switch 同
+             * 步; CLAUDE.md 顶段 "load-bearing mechanism" 段. */
             case OP_UNSUPPORTED:
                 goto out_translate;
         }

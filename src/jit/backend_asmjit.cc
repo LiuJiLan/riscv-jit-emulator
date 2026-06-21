@@ -502,6 +502,225 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
         case IR_OP_ECALL: case IR_OP_EBREAK:
         case IR_OP_MRET:  case IR_OP_SRET:
         case IR_OP_SFENCE_VMA: case IR_OP_WFI:
+        /* T7 RV32M (走 emit_ir_muldiv 不该撞这里) */
+        case IR_OP_MUL: case IR_OP_MULH: case IR_OP_MULHSU: case IR_OP_MULHU:
+        case IR_OP_DIV: case IR_OP_DIVU: case IR_OP_REM:    case IR_OP_REMU:
+            __builtin_unreachable();
+    }
+}
+
+// emit_ir_muldiv (RV32M 8 op MUL/MULH/MULHU/MULHSU/DIV/DIVU/REM/REMU; inline emit
+// 不走 helper):
+//
+// MUL 家族 (T7-A2 真填; A1 阶段 4 case 走 __builtin_unreachable scaffold):
+//   MUL:    imul eax, ecx  (3-op 32-bit; signed/unsigned 低 32 同结果)
+//   MULH:   movsxd rax,rs1 + movsxd rcx,rs2 + imul rax,rcx + shr rax,32
+//   MULHU:  单 op mul ecx → edx:eax = eax*ecx; 取 edx
+//   MULHSU: movsxd rax,rs1 (signed-ext) + mov ecx,rs2 (zero-ext) + imul rax,rcx
+//           + shr rax,32 (RV spec §7.1 表 24.2 第 4 行)
+//
+// DIV/REM 家族 (T7-A3 真填; A1 阶段 4 case 走 __builtin_unreachable scaffold):
+//   inline branch 兜 by-0 + INT_MIN/-1 overflow 避 x86 #DE trap; 镜像
+//   interpreter.c:357-397 语义.
+//   DIV  by-0: -1                INT_MIN/-1 overflow: INT_MIN
+//   DIVU by-0: UINT32_MAX        (无 overflow case)
+//   REM  by-0: dividend (rs1)    INT_MIN/-1 overflow: 0
+//   REMU by-0: dividend (rs1)    (无 overflow case)
+//
+// 该 op 非边界 (is_block_boundary_inst 返 0), translator emit 完后续指令继续
+// 翻译同块.
+void emit_ir_muldiv(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
+    using namespace asmjit::x86;
+
+    switch (inst.kind) {
+        /* ---- MUL 家族 4 op (T7-A2 实装; 用 host x86 imul/mul 三形态) ---- */
+
+        /* MUL: 32x32 低 32 位 (signed/unsigned 低 32 同结果). 3-op imul. */
+        case IR_OP_MUL:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.imul(eax, ecx);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* MULH: signed × signed 高 32 位. 单 op `imul ecx` → edx:eax = 64-bit
+         * signed product (eax 隐式); rd = edx. */
+        case IR_OP_MULH:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.imul(ecx);
+            emit_store_rv_reg(a, inst.rd, edx);
+            return;
+
+        /* MULHU: unsigned × unsigned 高 32 位. 单 op `mul ecx` → edx:eax. */
+        case IR_OP_MULHU:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.mul(ecx);
+            emit_store_rv_reg(a, inst.rd, edx);
+            return;
+
+        /* MULHSU: signed rs1 × unsigned rs2 高 32 位. x86 无单 op 形式
+         * (imul/mul 都是同号), 走 64-bit imul 路径:
+         *   movsxd rax, eax   ; rs1 sign-ext 到 rax 全 64-bit
+         *   mov   ecx, rs2    ; rs2 zero-ext (32-bit mov 自动 clear 高 32 of rcx)
+         *   imul  rax, rcx    ; 2-op 64-bit signed mul, 结果低 64 in rax
+         *   shr   rax, 32     ; 取高 32 (product 范围 ≤ 2^63 不溢 int64, 低 64 = 全 product)
+         *   rd ← eax */
+        case IR_OP_MULHSU:
+            emit_load_rv_reg(a, eax, inst.rs1);
+            a.movsxd(rax, eax);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            a.imul(rax, rcx);
+            a.shr(rax, asmjit::imm(32));
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+
+        /* ---- DIV/REM 家族 4 op (T7-A3 实装) ----
+         * inline branch 兜 by-0 + INT_MIN/-1 overflow 避 x86 #DE trap;
+         * 镜像 interpreter.c:357-397 语义. */
+
+        /* DIV (signed):
+         *   by-0           → rd = -1
+         *   INT_MIN ÷ -1   → rd = INT_MIN (= rs1 原值, eax 不动 fall-through)
+         *   normal         → cdq + idiv ecx → rd = eax (quotient) */
+        case IR_OP_DIV: {
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            asmjit::Label l_div0   = a.new_label();
+            asmjit::Label l_ovfl   = a.new_label();
+            asmjit::Label l_normal = a.new_label();
+            asmjit::Label l_done   = a.new_label();
+
+            a.test(ecx, ecx);
+            a.jz(l_div0);
+            a.cmp(ecx, asmjit::imm(-1));
+            a.jne(l_normal);
+            a.cmp(eax, asmjit::imm(INT32_MIN));
+            a.je(l_ovfl);
+
+            a.bind(l_normal);
+            a.cdq();
+            a.idiv(ecx);
+            a.jmp(l_done);
+
+            a.bind(l_div0);
+            a.mov(eax, asmjit::imm(-1));
+            a.jmp(l_done);
+
+            a.bind(l_ovfl);    /* eax 仍 = rs1 = INT_MIN, fall-through */
+            a.bind(l_done);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        }
+
+        /* DIVU (unsigned):
+         *   by-0   → rd = UINT32_MAX (= -1 二进制)
+         *   normal → xor edx + div ecx → rd = eax (quotient)
+         *   无 overflow case */
+        case IR_OP_DIVU: {
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            asmjit::Label l_div0 = a.new_label();
+            asmjit::Label l_done = a.new_label();
+
+            a.test(ecx, ecx);
+            a.jz(l_div0);
+
+            a.xor_(edx, edx);   /* unsigned 高位 0 */
+            a.div(ecx);
+            a.jmp(l_done);
+
+            a.bind(l_div0);
+            a.mov(eax, asmjit::imm(-1));   /* UINT32_MAX */
+            a.bind(l_done);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        }
+
+        /* REM (signed):
+         *   by-0           → rd = rs1 (dividend; eax 仍 = rs1 fall-through)
+         *   INT_MIN ÷ -1   → rd = 0
+         *   normal         → cdq + idiv ecx → rd = edx (remainder), mov eax,edx 统一 */
+        case IR_OP_REM: {
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            asmjit::Label l_div0   = a.new_label();
+            asmjit::Label l_ovfl   = a.new_label();
+            asmjit::Label l_normal = a.new_label();
+            asmjit::Label l_done   = a.new_label();
+
+            a.test(ecx, ecx);
+            a.jz(l_div0);
+            a.cmp(ecx, asmjit::imm(-1));
+            a.jne(l_normal);
+            a.cmp(eax, asmjit::imm(INT32_MIN));
+            a.je(l_ovfl);
+
+            a.bind(l_normal);
+            a.cdq();
+            a.idiv(ecx);
+            a.mov(eax, edx);
+            a.jmp(l_done);
+
+            a.bind(l_div0);     /* eax 仍 = rs1, fall-through */
+            a.jmp(l_done);
+
+            a.bind(l_ovfl);
+            a.xor_(eax, eax);   /* INT_MIN ÷ -1 余数 = 0 */
+            a.bind(l_done);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        }
+
+        /* REMU (unsigned):
+         *   by-0   → rd = rs1 (dividend; eax 仍 = rs1 fall-through)
+         *   normal → xor edx + div ecx → rd = edx (remainder), mov eax,edx 统一
+         *   无 overflow case */
+        case IR_OP_REMU: {
+            emit_load_rv_reg(a, eax, inst.rs1);
+            emit_load_rv_reg(a, ecx, inst.rs2);
+            asmjit::Label l_div0 = a.new_label();
+            asmjit::Label l_done = a.new_label();
+
+            a.test(ecx, ecx);
+            a.jz(l_div0);
+
+            a.xor_(edx, edx);
+            a.div(ecx);
+            a.mov(eax, edx);
+            a.bind(l_div0);     /* eax 仍 = rs1, fall-through */
+            a.bind(l_done);
+            emit_store_rv_reg(a, inst.rd, eax);
+            return;
+        }
+
+        /* -Wswitch-enum 完整性 (其他 op 由各自 emit_ir_* 处理, 不进本函数) */
+        case IR_OP_UNSUPPORTED:
+        case IR_OP_DISPATCH_EXIT:
+        case IR_OP_DISPATCH_EXIT_RUNTIME:
+        case IR_OP_LUI: case IR_OP_AUIPC:
+        case IR_OP_ADDI: case IR_OP_SLTI: case IR_OP_SLTIU:
+        case IR_OP_XORI: case IR_OP_ORI: case IR_OP_ANDI:
+        case IR_OP_SLLI: case IR_OP_SRLI: case IR_OP_SRAI:
+        case IR_OP_ADD: case IR_OP_SUB: case IR_OP_SLL:
+        case IR_OP_SLT: case IR_OP_SLTU: case IR_OP_XOR:
+        case IR_OP_SRL: case IR_OP_SRA: case IR_OP_OR: case IR_OP_AND:
+        case IR_OP_LB: case IR_OP_LH: case IR_OP_LW: case IR_OP_LBU: case IR_OP_LHU:
+        case IR_OP_SB: case IR_OP_SH: case IR_OP_SW:
+        case IR_OP_CSRRW: case IR_OP_CSRRS: case IR_OP_CSRRC:
+        case IR_OP_CSRRWI: case IR_OP_CSRRSI: case IR_OP_CSRRCI:
+        case IR_OP_AMO_ADD_W: case IR_OP_AMO_SWAP_W: case IR_OP_AMO_XOR_W:
+        case IR_OP_AMO_OR_W: case IR_OP_AMO_AND_W: case IR_OP_AMO_MIN_W:
+        case IR_OP_AMO_MAX_W: case IR_OP_AMO_MINU_W: case IR_OP_AMO_MAXU_W:
+        case IR_OP_LR_W: case IR_OP_SC_W:
+        case IR_OP_FENCE: case IR_OP_FENCE_I:
+        case IR_OP_BEQ: case IR_OP_BNE: case IR_OP_BLT:
+        case IR_OP_BGE: case IR_OP_BLTU: case IR_OP_BGEU:
+        case IR_OP_JAL: case IR_OP_JALR:
+        case IR_OP_ECALL: case IR_OP_EBREAK:
+        case IR_OP_MRET: case IR_OP_SRET:
+        case IR_OP_SFENCE_VMA: case IR_OP_WFI:
             __builtin_unreachable();
     }
 }
@@ -1510,6 +1729,13 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 emit_ir_system(a, inst, exit_inst,
                                static_cast<uint64_t>(n_insts - 1));
                 block_done = true;
+                break;
+
+            /* T7 RV32M 8 op → emit_ir_muldiv (MUL 4 + DIV/REM 4; inline emit,
+             * 不走 helper — M 是纯算术, 无内存副作用, 无 trap). */
+            case IR_OP_MUL:    case IR_OP_MULH:   case IR_OP_MULHSU: case IR_OP_MULHU:
+            case IR_OP_DIV:    case IR_OP_DIVU:   case IR_OP_REM:    case IR_OP_REMU:
+                emit_ir_muldiv(a, inst);
                 break;
 
             case IR_OP_DISPATCH_EXIT:
