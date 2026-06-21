@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // decode 模块对外接口。
 //
 // 职责: 把 RV32 (含 RVC) 指令解析成 (op_kind, rd, rs1, rs2, imm, raw_inst, pc_step) 的

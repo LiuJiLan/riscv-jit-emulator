@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/12.
 // debug 模块实现: per-hart trace buffer 定义 (__thread storage) + flush 函数。
 // 宏在 debug.h (DEBUG_XXX 字符宏只 append 到 trace_buf, 不直接 fputc; flush
 // 时一把 fwrite 到 stderr; SMP 多 hart 自动 per-thread 隔离, 无 race)。

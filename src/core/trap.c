@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/4.
 // trap 模块实现 (架构语义层 + exception/interrupt 双拆 set_state + raise/check 入口接通
 // sigsetjmp 协议 + 真切 priv mode + 写 mstatus/sstatus 按 deliver_priv 分流)。
 //

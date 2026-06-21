@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/19.
 // runtime 模块实现 — bitmap 化 + 接口函数包协议 (set 用 atomic_fetch_or,
 // clear-with-condition 用 CAS-loop, shutdown 蕴含 system_reset 顺序 B);
 // host signal handler + host-side stdin termios raw mode 管理。

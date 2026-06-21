@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // interpreter 模块实现 (decode → switch → 执行; pure case + may-trap helper + boundary)。
 //
 // 顶部模块文档见 interpreter.h。fast/slow path 协议见 dummy.txt §1; x0 编码见 §2;
@@ -490,7 +489,7 @@ void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
             // ECALL: cause 按 priv 分流 (RV spec table 3.6): priv U/S/M → cause 8/9/11.
             //          公式 (8 + hart->priv) 利用 RV 编码巧合 (PRIV_U=0/S=1/M=3). tval = 0.
             // EBREAK: cause 3 (breakpoint, RV spec); tval = 0.
-            // MRET/SRET: T4 起抽 mret_helper / sret_helper 放 trap.c (单一真理; JIT backend
+            // MRET/SRET: mret_helper / sret_helper 放 trap.c (单一真理; JIT backend
             //          也调同一 helper). helper 内含 PRIV_CHECK_OR_TRAP + spec 状态机
             //          (mstatus xPIE/xIE/xPP 翻 + Smdbltrp MDT/Ssdbltrp SDT 联动 + pc =
             //          xepc[xpriv]). PRIV_CHECK 失败时 helper 内 trap_raise_exception

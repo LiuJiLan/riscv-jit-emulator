@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // 入口。本文件按 reset 三层 lifecycle 组织:
 //
 //   POR (Power-On Reset) — 进程启动一次
@@ -622,9 +621,9 @@ int main(int argc, char **argv) {
     lrsc_init();
 
     // JIT 子系统 init (jit_entry.cc 实装; backend.init + jit_cache_init 顺序;
-    // 当前 stub backend.init 返 0 + jit_cache_init 纯 atomic store 也不失败, 不传
-    // 播 fail; b_02 真做 emit 时 backend.init 失败语义按 wfi_init / lrsc_init
-    // 体例 fprintf + 不传播, 那时改本处签名接 int 返码 + main 接 fail 退).
+    // backend.init alloc asmjit JitRuntime + jit_cache_init 纯 atomic store, 失败
+    // 语义按 wfi_init / lrsc_init 体例 fprintf + 不传播, 真撞 alloc OOM 时改本处
+    // 签名接 int 返码 + main 接 fail 退).
     // 必须在 hart 线程 spawn 之前 — JIT 子系统是 hart 共享资源 (cap 配对内部数据 +
     // RCU 等 grace period 都依赖 init 完成).
     jit_init();

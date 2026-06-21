@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/16.
 // bus 模块对外接口 — MMIO 注册 + PA 派发。
 //
 // 职责: 持一份 (PA range → device read/write fn) 注册表; lsu / mmu 在 PA 落

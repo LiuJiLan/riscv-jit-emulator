@@ -2181,3 +2181,121 @@ JIT 块缓存 RCU 化 + #29 per-page block list); 现在 SMP 一定有了, 后�
   SC 自然失败, 语义自洽); 真要 audit guest 行为时加.
 
 
+
+
+## §17. JIT block 执行期 host code ABI + helper call 协议 (b_02 落地)
+
+JIT 块 (asmjit_backend_compile_block 产物, host_code_ptr 指 asmjit JitRuntime
+RX 段) 跟 helper call (slow path helpers / mmu_walker / trap_raise_exception
+等 declared in api/helpers.h) 之间的 ABI 协议, 跟 backend_asmjit.cc 顶段 doc
+"调用约定" 段对偶, 跨 src/jit 跟 isa/* / core/* helper 实装边界. JIT 真做后
+此协议固化, 后续 backend (LLVM 等) 加入也按此 ABI.
+
+### jit_block_func_t 签名 (顶层入口; dispatcher fork 点 hit 路径调)
+
+    typedef void (*jit_block_func_t)(cpu_t *hart, tlb_t *current_tlb,
+                                     uint64_t *count_out);
+
+跟 interpret_one_block 对偶 (core/interpreter.h):
+    void interpret_one_block(cpu_t *hart, tlb_t *current_tlb,
+                             uint8_t *hva_pc, uint64_t *count_out);
+
+JIT 块入口 = host_code_ptr 自身 (mmap RX 段), 不需 hva_pc 起点 → 减一参; 其他
+三参跟 interpreter 完全对偶, dispatcher fork 点 hit/miss 两侧调用代码不分支
+regime (BARE 块也接 current_tlb, dispatcher 按 BARE 时传 NULL).
+
+### 静态固定映射 RV x1-x5 → host callee-saved 32-bit reg
+
+(Q2 b 拍法; plan §1.2 起步方案 layer 1):
+
+    x1 → ebx
+    x2 → r12d
+    x3 → r13d
+    x4 → r14d
+    x5 → r15d
+
+其余 RV reg (x0 = 常数 0 / x6-x31 = cpu->regs[r] 内存) 走 emit_load_rv_reg /
+emit_store_rv_reg helper 分流; 对 rs/rd > 5 case 用 rdi (hart) 作 base reg 访
+cpu->regs[N], 前置 emit_reload_hart 保证 rdi 是 hart (helper call 可能破坏).
+
+prologue 真做 load x1-x5 from cpu->regs[1..5] (rdi 入口还是 hart, 未被破坏);
+epilogue 真做 store x1-x5 to cpu->regs[1..5] (rdi 入口前已 reload 在
+emit_dispatch_exit 末). 块体 ADD/ADDI 真消费形成 "load + op + store" 三段闭环
+(Q6 a 配套).
+
+### helper call ABI (SysV x86_64; 每次 helper call 之前 emit)
+
+    1. emit_reload_hart            ; mov rdi, [rbp - 48]
+    2. emit_reload_current_tlb     ; mov rsi, [rbp - 64]  (若 helper 第 2 参是 tlb)
+    3. (设其他参数: rdx/rcx/r8 等按 helper signature)
+    4. call <helper_static_addr>
+
+helper return 后 rax 装返回值; rdi/rsi/rdx/rcx/r8/r9 (caller-saved) 可能被改;
+下次 helper call 前再 reload rdi/rsi. 映射 host reg (rbx/r12-r15 = x1-x5)
+callee-saved, helper 不破坏, 不 save/restore.
+
+栈对齐: prologue 9 push (rbp/rbx/r12-r15/rdi/rdx/rsi) × 8 = 72 bytes; 入口
+rsp ≡ 8 mod 16 (CALL 压 ret addr), push 后 rsp ≡ 80 ≡ 0 mod 16 天然对齐
+(SysV 要求 call 时 rsp % 16 == 0); 任何后续改 push 数都需复算.
+
+### 栈布局 (push 顺序; 跟 backend_asmjit.cc STACK_SLOT_* 常量对偶)
+
+    [rbp]       = old rbp                                  (push rbp)
+    [rbp - 8]   = rbx                                      (push rbx)
+    [rbp - 16]  = r12
+    [rbp - 24]  = r13
+    [rbp - 32]  = r14
+    [rbp - 40]  = r15
+    [rbp - 48]  = rdi (hart pointer; helper call reload)   STACK_SLOT_HART
+    [rbp - 56]  = rdx (count_out ptr; emit_dispatch_exit)  STACK_SLOT_COUNT_OUT
+    [rbp - 64]  = rsi (current_tlb ptr; SV32 fast path /   STACK_SLOT_CURRENT_TLB
+                       AMO/LR-SC walker reload; BARE 时
+                       入口 = NULL, regime-agnostic, 走
+                       NULL 路径 walker 内部分流)
+
+stack alignment 起源 trail (a_03_14/03_wfi_irq_wakeup_race SEGV root cause):
+早期 8 push + sub rsp 8 dummy 凑齐, 但 wfi_wait → pthread_cond_timedwait64
+内部 SSE / movaps 需严格 16-byte 对齐, 不对齐立爆 SEGV. 9 push (加 rsi
+current_tlb) 后天然对齐 + 顺手把 current_tlb 也存栈槽给 SV32 fast path 用,
+起源 issue 不再存在.
+
+### 块出口模板 (DISPATCH_EXIT / DISPATCH_EXIT_RUNTIME / COUNT_ONLY 三形态)
+
+emit_dispatch_exit (标准末段; compile-time target):
+    reload rdi + rdx (块体 helper call 可能破坏)
+    写 cpu->regs[0] = target_pc                 (mov dword ptr [rdi+0], imm32)
+    写 *count_out = block_inst_count            (mov rax, imm + mov [rdx], rax)
+    后续 epilogue 紧接 emit (rdi 已 reload).
+
+emit_dispatch_exit_runtime (JALR 块用; runtime target 在 r9d):
+    跟 emit_dispatch_exit 同, 但写 cpu->regs[0] 时从 r9d (JALR 算 (rs1+imm)&~1u
+    存的) 读, 不是 imm32. r9d caller-saved 但 JALR → 末 RUNTIME 之间无 helper
+    call (translator 保证 JALR 是块倒数第二条 + 末 IR DISPATCH_EXIT_RUNTIME 中
+    间无 emit), 不破坏.
+
+emit_dispatch_exit_count_only (MRET/SRET/WFI 块用; helper 已自写 hart->regs[0]):
+    跟 emit_dispatch_exit 同, 但不写 cpu->regs[0] (helper 内已写为 xepc 或 pc+4).
+    仍 reload rdi (epilogue 入口要求) + 写 *count_out.
+
+### regime 分流 (jit_cache key 第二维)
+
+backend.compile_block 接 regime_t 参 (BARE / SV32_S / SV32_U). LOAD/STORE 三
+regime 分流真编:
+- BARE: inline IS_GPA_RAM + 直 host load/store (RAM) / call mmio_*_helper (MMIO).
+- SV32_S / SV32_U: inline TLB fast path (vpn/index 查 entry + V/tag/perm check),
+  baked S/U 视角 PTE_U (S: PTE_U=1 时需 SUM=1 runtime 读 mstatus; U: PTE_U=1
+  强制) + R/MXR check (PTE_R=0 fallback MXR=1 + PTE_X=1); hit 直 host load,
+  miss call mmu_walker_helper_load/store (walker 内部 walk + fill TLB 或 trap
+  longjmp).
+
+AMO 9 / LR/SC 2 直 call mmu_walker_helper_amo_xxx / lr_w / sc_w (BARE/SV32 共
+同, walker 内 tlb==NULL 分流). CSR 6 / FENCE 2 / SYSTEM 6 走对应 helper +
+emit 完即硬边界切块.
+
+### 推翻 trail (重要 — start_plan_b_02 §[2] T5 第 5 点)
+
+sfence_vma_helper 跟 fence_helper / fence_i_helper **不调 jit_invalidate_block**:
+JIT 块 key=(PA, regime), perm 是 TLB entry runtime 拿不 baked 数值; sfence 只
+清 TLB, JIT 块在 sfence 后不过期. fence.i 真触发 invalidate 是 a_05+ SMC chain
+双保险接口形态的事, 不是 sfence 范围. 详 trade_off_log §T.20 + src/isa/
+sfence.h:15-33 + fence.h:47-49 + jit_entry.cc 顶段 doc.

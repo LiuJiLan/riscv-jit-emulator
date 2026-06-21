@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/29.
 // mmu 模块对外接口。
 //
 // 职责 (回归 dummy.txt §8 三层模型):
@@ -32,7 +31,7 @@
 // 不重复。详 src/isa/lsu.h 顶段 + src/isa/amo.h 顶段。
 //
 // ============================================================================
-// 执行 regime —— 项目内部的"硬件逻辑"分类 (b_01 起 3 状态; 历史 2 状态 BARE/SV32 已扩)
+// 执行 regime —— 项目内部的"硬件逻辑"分类 (3 状态: BARE / SV32_S / SV32_U)
 // ============================================================================
 //
 // 我们项目把所有运行时上下文按"权限规则 + priv 视角"三分:
@@ -74,7 +73,7 @@
 //     NULL 编码 BARE / 非 NULL 编码 SV32_S 或 SV32_U; interpreter 不区分 S/U, 本来就
 //     runtime case 内按 cpu->priv 分支判 PTE_U / SUM/MXR; 慢路径不在 fast path, 不亏。
 //
-//   JIT 路径 (jit_cache key = (PA, regime); b_01 真起步后): 真显式吃 regime_t 三元
+//   JIT 路径 (jit_cache key = (PA, regime)): 真显式吃 regime_t 三元
 //     enum; (PA, SV32_S) 跟 (PA, SV32_U) 在 jit_cache 是两个独立槽; 块体 fast path
 //     编译时 baked S 或 U 视角的 PTE_U / SUM/MXR check, 消除运行时 priv 分支跟 PTE_U
 //     检查的运行时开销 (这是 JIT 跟 interpreter 性能差的来源之一)。
@@ -209,11 +208,11 @@
 //     - dispatcher 在 SV32 路径上 lazy alloc 后必传非 NULL (dispatcher.c block 1)
 //     两条状态不可伪造, 少一个参数 = 少一个 inconsistent state 的 bug 面。
 //
-// JIT 路径接口 (jit_cache key = (PA, regime); b_01 真起步后) 真显式吃 regime_t enum:
+// JIT 路径接口 (jit_cache key = (PA, regime)) 真显式吃 regime_t enum:
 //   - 选块即选 regime (S/U 编译期 baked, jit_cache 内 (PA, SV32_S) 跟 (PA, SV32_U)
 //     是两个独立槽)
 //   - 块体 fast path 编译时 baked PTE_U / SUM/MXR check, 消除运行时 priv 分支
-//   详 src/jit/* 顶段 (T1 真起步后).
+//   详 src/jit/* 顶段.
 //
 // regime_t enum 用途:
 //   - 模块 doc / 注释里给概念命名 (写 "REGIME_SV32_S 路径" 比 "(current_tlb != NULL) &&
@@ -478,7 +477,7 @@ int mmu_translate_pc(cpu_t *hart, tlb_t *current_tlb,
 // fast path A 位检查冗余: walker 进 TLB 时永远 set A=1, 后续 fast path 检查 A 永远过, 可 skip;
 // D 位检查不冗余: load 时 walker 不 set D, store 时 fast path 必须检查 D 决定 fall back。
 //
-// SMP A/D atomic (a_03 session_024 末落地):
+// SMP A/D atomic:
 //   caller 写回 PT 用 atomic_fetch_or_explicit (memory_order_relaxed), 多 hart 并发
 //   walk 同 PTE 时不丢 set bit。set_bits = PTE_A (fetch/load) 或 PTE_A | PTE_D (store)。
 //   写回点在 caller 端三处 (mmu_translate_pc / mmu_walker_helper_load / store);

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/5.
 // jit/backend.h —— JitBackend 抽象接口 (C ABI vtable, 跨 C/C++).
 //
 // ============================================================================
@@ -9,7 +8,7 @@
 // Dispatcher → Translator (RV → IR) → JitBackend (IR → host 机器码)
 //
 //   JitBackend 知道 host, 不知道 RISC-V; 只消费 IR (ir_inst_t 流) + 编译成 host
-//   可执行 code (mmap 区 host_code_ptr); 暴露 C ABI vtable, 实现可换 (当前只
+//   可执行 code (asmjit JitRuntime RX 段); 暴露 C ABI vtable, 实现可换 (当前只
 //   asmjit, plan §1.21 末段也论证过 LLVM 可行性).
 //
 // 接口形态选择 (plan §1.21):
@@ -32,21 +31,9 @@
 //   backend.*       = 后端实现细节 (jit_api 内部组合用, dispatcher 不直接见)
 //
 // ============================================================================
-// 当前实状
+// 调用约束 (plan §1.23.17)
 // ============================================================================
 //
-// backend_asmjit.cc 暴露一个 default backend 实例 (5 个 fn pointer 都填 stub
-// 函数 — compile_block 永返 JIT_ERR_NOT_IMPLEMENTED, 其他 nop). b_02 真做 emit
-// 时填真 asmjit 翻译路径.
-//
-// 签名可能演化 (b_02 真做时按 backend 真需要拍, 当前是骨架形态):
-//   - backend_compile_block 当前签名带 (pa, regime, ir 流, n_insts, host_code 出参);
-//     真做时可能拆 host_code 出参为返值 + status 拆出, 或加 hart 参数 baked
-//     mstatus snapshot 等
-//   - backend_invalidate_block 当前签名带 (host_code), 真做时可能改 (pa, regime)
-//     按 jit_cache key 失效
-//
-// 调用约束 (plan §1.23.17):
 //   - SMC handler 不直接调 backend (只动 page_dirty bitmap; dispatcher 延迟调
 //     backend_invalidate_block)
 //   - Translator 不直接调 backend (Translator 只 RV → IR; Dispatcher 拿 IR 后
@@ -67,7 +54,7 @@ extern "C" {
  * 同体例. */
 #include "api/jit_api.h" // jit_status_t (compile_block 返值)
 #include "core/mmu.h"    // regime_t (compile_block 参数) + mmu_walker_helper_*
-                         // declarations (T3 backend emit call 用)
+                         // declarations (backend emit call 用)
 #include "ir.h"          // ir_inst_t (compile_block 输入)
 #include "riscv.h"       // uxlen_t (pa 参数; dummy.txt §13 typedef family)
 
@@ -86,9 +73,8 @@ extern "C" {
 // REGIME_VS_SV32_S/_U, RV64 REGIME_SV39_S/_U 等都同签名); jit_cache entry 简洁
 // (一个 host_code_ptr 字段, 类型 cast 成 jit_block_func_t).
 //
-// 类型: 第二参 tlb_t * + 第三参 uint64_t * 跟 dispatcher.c 102-108 "count 一律
-// 64 bit" 心智一致 (实状跟 src 对偶取 tlb_t * + uint64_t *, 不是 audit 原稿
-// 的 tlb_p / uint32_t * plan_sample).
+// 类型: 第二参 tlb_t * + 第三参 uint64_t * 跟 dispatcher.c "count 一律
+// 64 bit" 心智一致.
 //
 // 调用方 (dispatcher fork 点 hit 路径):
 //   jit_block_func_t fn = (jit_block_func_t)entry->host_code_ptr;
@@ -107,8 +93,6 @@ typedef void (*jit_block_func_t)(cpu_t *hart, tlb_t *current_tlb,
 // 返指针); jit_entry.cc (jit_api.h 入口实装, backend-agnostic) 持有 backend_t *
 // 指针调度. 未来加 backend_llvm.cc 时是另一份 .cc 暴露另一 backend_t 实例,
 // jit_entry.cc 零改动.
-//
-// 签名占位 (b_02 真做 emit 时按 backend 真需要的形态拍).
 // ----------------------------------------------------------------------------
 typedef struct {
     // backend_init: 后端 init (asmjit Runtime 创建 / code_cache mmap 区分配 / ...).
@@ -116,7 +100,7 @@ typedef struct {
     int (*backend_init)(void);
 
     // backend_compile_block: 消费 ir_inst_t 流, 编译成 host code, 输出 host_code
-    //   入口指针 (mmap 区内的 RX 段地址).
+    //   入口指针 (asmjit JitRuntime RX 段地址).
     //
     //   参数:
     //     pa             — 块入口 PA (cosmetic; 给 backend 内部 trace / debug 用,
@@ -130,28 +114,24 @@ typedef struct {
     //
     //   返:
     //     JIT_OK                  — 成功, host_code_out 已填; 调用方装 jit_cache
-    //     JIT_CODE_CACHE_FULL     — code_cache mmap 区满, 调用方触发整体 Flush
+    //     JIT_CODE_CACHE_FULL     — JitRuntime allocator 满, 调用方触发整体 Flush
     //     JIT_IR_ERROR            — IR 内部不一致 (translator bug); 调用方进黑名单
     //     JIT_BACKEND_INTERNAL    — asmjit 内部错; 调用方进黑名单 / 退 interpreter
-    //     JIT_ERR_NOT_IMPLEMENTED — stub 阶段总返这个
-    //
-    //   stub: 返 JIT_ERR_NOT_IMPLEMENTED, *host_code_out = NULL.
+    //     JIT_ERR_NOT_IMPLEMENTED — IR 流空 (块前缀无真翻译指令) / unsupported op
     jit_status_t (*backend_compile_block)(uxlen_t pa, regime_t regime,
                                           const ir_inst_t *insts, size_t n_insts,
                                           void **host_code_out);
 
-    // backend_invalidate_block: 失效 host_code (从 code_cache mmap 区抹掉 / 标
-    //   dead 等). 当前签名按 host_code 索引; T3 真做时可能改按 (pa, regime).
-    //   stub: nop.
+    // backend_invalidate_block: 失效 host_code (asmjit JitRuntime::release 单块
+    //   RX 段). 签名按 host_code 索引 (jit_cache key 由 jit_cache 侧维护).
     void (*backend_invalidate_block)(void *host_code);
 
-    // backend_flush_all: 整体 Flush code_cache (CODE_CACHE_FULL 时调).
-    //   stub: nop.
+    // backend_flush_all: 整体 Flush code_cache (CODE_CACHE_FULL 时调; asmjit
+    //   JitRuntime::reset, allocator 内部回收 RX 段池).
     void (*backend_flush_all)(void);
 
-    // backend_destroy: 释放 backend 资源 (asmjit Runtime / code_cache mmap unmap).
+    // backend_destroy: 释放 backend 资源 (asmjit Runtime delete).
     //   不含 pthread_join (dummy.txt §12 — destroy 不 join).
-    //   stub: nop.
     void (*backend_destroy)(void);
 } backend_t;
 

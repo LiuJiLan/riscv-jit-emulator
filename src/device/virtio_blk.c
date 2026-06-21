@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // virtio-mmio block device (legacy v1.0) 实现 — host file 后端 (pread/pwrite) +
 // 异步 io_worker 辅助线程 + work queue + bus 注册 + InterruptStatus 同步驱动
 // device_line.

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/23.
 // PLIC 实现 — per-source <device_line, claimed, priority> + per-ctx <threshold,
 // enable bitmap> + plic_ctx_map + bus 注册 + 完整 claim/complete 仲裁 + hart 侧
 // is_plic_*_pending 合成 view + 外设侧 device_set/clear_pending 接口。

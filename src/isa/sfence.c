@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/7.
 // isa/sfence —— sfence_vma_helper 实现 (extern, slow path)。
 //
 // 顶部接口 doc + RV spec 四组合 vs 简化方案 4.a 对照 + 涉及哪些 tlb_table[] 槽 见 sfence.h。

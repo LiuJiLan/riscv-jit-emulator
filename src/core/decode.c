@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // decode 模块实现 (纯函数; 不读 / 不写 cpu_t)。
 //
 // 顶部模块文档见 decode.h。

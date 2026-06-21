@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/lrsc —— RV32 A 扩展 LR.W / SC.W (Zalrsc) + 全局 reservation 数据结构。
 //
 // 实装形态 (主方案 c, 决议见 trade_off_log §T LR/SC + lrsc_amo_decision.md):
@@ -138,7 +137,7 @@ void lrsc_on_store(cpu_t *hart, uxlen_t pa);
 // (按 n_harts 扫). lock-free (单向 atomic_store INVALID 写不读, 无 race; SC 内
 // 拿 bucket 锁后 atomic_load 看 INVALID 失败, ok).
 //
-// 接通点: virtio_blk io_worker pread/pwrite 完成后调 (T4 接).
+// 接通点: virtio_blk io_worker pread/pwrite 完成后调.
 // 其它 device (CLINT/PLIC/UART/test_dev) 都 MMIO 区不写 RAM, 不需 hook.
 // ----------------------------------------------------------------------------
 void lrsc_on_device_write(void);

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // UART (ns16550a) 实现 — 8 寄存器 byte-access + RX FIFO + reader 辅助线程 +
 // bus 注册 + 同步驱动 device_line 拉法。
 //

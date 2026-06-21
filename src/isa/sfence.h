@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/7.
 // isa/sfence —— RV32 SFENCE.VMA 指令实现 (TLB 失效)。
 //
 // helper 风格 (跟 isa/lsu.{c,h} 一致):

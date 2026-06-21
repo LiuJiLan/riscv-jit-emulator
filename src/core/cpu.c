@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // cpu 模块实现 (cpu_create / cpu_destroy)。
 //
 // tlb_table[4] 设计:
@@ -32,7 +31,7 @@ uint32_t n_harts = 1u;
 
 // harts_table — 进程级 hart_t * 注册表 (cap [MAX_HARTS]; cap-vs-n_harts §15 lifecycle
 // 配对体例). cpu_create 末段写 harts_table[hartid] = hart, cpu_destroy 头段清 NULL.
-// 用途: cpu_wait_all_harts_exit_host_code (b_02 T5 jit_invalidate_block 协议) 扫所有
+// 用途: cpu_wait_all_harts_exit_host_code (jit_invalidate_block 协议) 扫所有
 // hart 等退出某 host_code; 跟 wfi_slots[MAX_HARTS] 同形态 (file-static 数据 + 公开
 // fn 接口, 不 extern 暴露 array). phantom slot (idx ∈ [n_harts, cap)) 永远 NULL,
 // 扫描循环跳过. main.c local harts[] 本来已存类似含义, 此表是为了让 jit/cpu helper
@@ -148,7 +147,7 @@ cpu_t *cpu_create(uxlen_t misa, uxlen_t mhartid) {
 
     // [PRIV_M] / [PRIV_H]: 不分配, memset 0 保证 NULL。
 
-    // 注册进 harts_table (b_02 T5; cpu_wait_all_harts_exit_host_code 扫表用).
+    // 注册进 harts_table (cpu_wait_all_harts_exit_host_code 扫表用).
     // hartid < MAX_HARTS 是 cpu_create 入参约束 (main 0..n_harts-1); cap 边界防御.
     if (hart->hartid < MAX_HARTS) {
         harts_table[hart->hartid] = hart;
@@ -288,7 +287,7 @@ static void cpu_dump(const cpu_t *hart) {
 void cpu_destroy(cpu_t *hart) {
     if (hart == NULL) { return; }
 
-    // 注销 harts_table (b_02 T5; 防 cpu_wait_all_harts_exit_host_code 后续撞悬空指针).
+    // 注销 harts_table (防 cpu_wait_all_harts_exit_host_code 后续撞悬空指针).
     if (hart->hartid < MAX_HARTS && harts_table[hart->hartid] == hart) {
         harts_table[hart->hartid] = NULL;
     }
@@ -322,7 +321,7 @@ void cpu_destroy(cpu_t *hart) {
 
 
 // ----------------------------------------------------------------------------
-// cpu_wait_all_harts_exit_host_code — 扫所有 hart 等退出某 host_code (b_02 T5)
+// cpu_wait_all_harts_exit_host_code — 扫所有 hart 等退出某 host_code
 //
 // caller: jit_entry.cc 的 jit_invalidate_block — backend 真 unmap host_code mmap
 // 区前调用本 fn, 确保没有 hart 正在执行该 host code (跑过该 host_code 的指令
@@ -336,8 +335,8 @@ void cpu_destroy(cpu_t *hart) {
 // cap-vs-n_harts (§15): 扫 cap 是因 phantom slot 永远 NULL ≠ host_code 不卡;
 // 防御边界跟 lifecycle 配对走 cap 同体例 (跟 wfi_kick_all 一致).
 //
-// 起步 PAUSE busy-wait, 真撞 perf 推 b_03+ 换 cond_wait (start_plan_b_02 §0.8 R8
-// "起步 busy-wait + short pause; 真撞 perf 时换 cond_wait / pthread_yield 推 b_03+").
+// 起步 PAUSE busy-wait, 真撞 perf 时换 cond_wait / pthread_yield 推 a_05+
+// (jit_invalidate_block 不在 fast path, 性能预算够; 真撞 SMC 高频再换).
 // ----------------------------------------------------------------------------
 void cpu_wait_all_harts_exit_host_code(void *host_code) {
     if (host_code == NULL) { return; }

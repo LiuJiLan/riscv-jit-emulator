@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // test_dev — sifive_test 兼容外设, 跟 QEMU virt sifive_test 同地址 (0x00100000)。
 //
 // 职责: 三个 MMIO 入口:

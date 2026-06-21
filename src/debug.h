@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/12.
 // debug 模块: per-hart trace buffer + DEBUG_XXX 宏 (字符 append 到 buffer,
 // flush 时一把 fwrite 到 stderr; SMP per-thread 隔离免 race)。
 //

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/16.
 // CLINT (Core-Local Interruptor) 模块对外接口。
 //
 // 职责: 维护 mtime / mtimecmp[N] / msip[N] 三组 MMIO 寄存器, 经 bus 暴露给 guest。

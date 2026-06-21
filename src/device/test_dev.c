@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // test_dev 实现 — sifive_test 兼容外设的两入口 fanout (SET/CLEAR → PLIC).
 //
 // 接口形态 + monitor 模型 + lifecycle 见 test_dev.h 顶段 doc。

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/23.
 // PLIC (Platform-Level Interrupt Controller) 模块对外接口。
 //
 // 职责: per-source 中断状态维护 + per-ctx enable/threshold/priority 仲裁 + bus MMIO

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/5.
 // isa/lsu —— RV32 load/store ISA helpers (Spike `riscv/insns/{load,store}.h` 概念对应)。
 //
 // ============================================================================

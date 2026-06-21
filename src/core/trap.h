@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/4.
 // trap 模块对外接口: trap_csrs_t 物理存储 + 三层 raise 接口
 //   exception 路径: trap_set_exception_state (不长跳) + trap_raise_exception (含长跳)
 //   interrupt 路径: trap_set_interrupt_state (不长跳) + trap_check_interrupt (dispatcher 主帧 polling 入口)

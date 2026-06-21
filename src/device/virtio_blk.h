@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // virtio-mmio block device (legacy v1.0, DeviceID=2) — host file 后端;
 // 接 PLIC source 1.
 //

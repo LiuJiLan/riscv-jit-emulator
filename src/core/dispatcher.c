@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // dispatcher 实现 (block 1+2+3 调度; sigsetjmp 永久落点 + while(SRS==0) 多块循环)。
 // 跨文件协议见 src/dummy.txt §1 (sigsetjmp) / §4 (TLB 分发机制)。
 //
@@ -199,7 +198,7 @@ void dispatcher(cpu_t *hart) {
     // block 1: 算派发包 (regime, current_tlb)
     //
     // 派发包概念上是两件:
-    //   regime       : 执行 regime + priv 视角, 决定 "用哪套 PTE 检查规则" (b_01 起 3 状态)
+    //   regime       : 执行 regime + priv 视角, 决定 "用哪套 PTE 检查规则" (3 状态)
     //                    REGIME_BARE   = Trust  (M-mode 或任何 priv 带 bare satp)
     //                    REGIME_SV32_S = Checked S (priv=S + Sv32; PTE_U=0 默认; SUM/MXR 联动)
     //                    REGIME_SV32_U = Checked U (priv=U + Sv32; PTE_U=1 强制)
@@ -216,7 +215,7 @@ void dispatcher(cpu_t *hart) {
     //     baked priv 视角的 PTE_U / SUM/MXR check。
     //
     // 落地修订: dispatcher 内部仍把 regime 显式算出 (3 状态), 即使当前 interpreter 接口只
-    //   消费 current_tlb —— 是为 T4 jit_cache fork 点接入时不需要重新引入变量。
+    //   消费 current_tlb —— jit_cache fork 点真消费 regime 作 key 第二维。
     //
     // xatp 抽象层 (有意保留): 初版 = satp; 未来 H 扩展 V=1 时 = vsatp。
     //
@@ -287,10 +286,9 @@ void dispatcher(cpu_t *hart) {
     if (rc != 0) { continue; }
 
     // ========================================================================
-    // block 3: 派发到 jit / interpreter (fork 点; b_02 T5 接 counter + invalidate)
+    // block 3: 派发到 jit / interpreter (fork 点; heat counter + RCU 状态灯)
     //
-    // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案;
-    //       b_02 T5 加 heat counter 真消费):
+    // 协议 (jit_framework_overview §3 (a) caller 视角 + §11 (a) 候选 c 状态灯方案):
     //   1. jit_rcu_read_lock(hartid) — 进 RCU read critical section
     //   2. jit_cache_lookup_or_init(pa, regime) → entry 或 NULL
     //      - miss EMPTY 时内部 CAS install COUNTING entry counter=0

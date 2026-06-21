@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/fence —— RV32 FENCE / FENCE.I 指令实现 (Q14 拍 NOP + 副作用)。
 //
 // 跟 sfence.{c,h} 拆开的原因 (Q19):

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/2.
 //
 // RISC-V 架构级别定义。集中收纳"来自规范的 encoding / 位段 / mask",避免在各模块里
 // 散用裸数字 (`3` = M 模式之类)。
@@ -31,7 +30,7 @@
 #include <stdint.h>
 
 // ============================================================================
-// C/C++ portability shim (b_01 起加; api/ 头被 C++ 端 include 时需要)
+// C/C++ portability shim (api/ 头被 C++ 端 include 时需要)
 // ============================================================================
 //
 // 触发场景: backend_asmjit.cc (C++ 实现) #include "api/helpers.h" → transitive
@@ -42,7 +41,7 @@
 //
 // 限制 #ifdef __cplusplus scope — C 端不动 C11 keyword 原生行为.
 //
-// 已知未覆盖 (未来可能问题, b_01 暂回避; 真撞再处理):
+// 已知未覆盖 (未来可能问题, 暂回避; 真撞再处理):
 //   1. _Atomic 关键字 C++ 端无简单 macro 等价 (std::atomic<T> 是 template 不是
 //      storage class). 当前回避方式: api/helpers.h 不转发 runtime.h (后者
 //      extern _Atomic uint32_t ...; backend 用不到 runtime extern 字段).

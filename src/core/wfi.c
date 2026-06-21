@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/28.
 // WFI 唤醒框架实现 — file-static per-hart slot 数组 + 5 接口函数。
 //
 // 接口形态 + 设计意图见 wfi.h; per-hart slot 协议见 dummy.txt §14;
@@ -49,10 +48,10 @@ static wfi_slot_t wfi_slots[MAX_HARTS];
 // ----------------------------------------------------------------------------
 //
 // 背景: pthread_cond_signal 是 edge-triggered, 落到无 waiter 的瞬间即丢失。
-// race 场景 (session 026 排查 + 027 trace 确认):
-//   T1 worker: drain_done → plic device_set_pending → ctx_eip 0→1 → wfi_kick(h)
-//              (此时 hart h 还在 dispatcher 主循环跑 inst, 不在 cond_wait —
-//               signal 落空丢失)
+// race 场景:
+//   worker:     drain_done → plic device_set_pending → ctx_eip 0→1 → wfi_kick(h)
+//               (此时 hart h 还在 dispatcher 主循环跑 inst, 不在 cond_wait —
+//                signal 落空丢失)
 //   dispatcher: trap_check_interrupt 见 mip MEIP=1 → deliver trap (mepc = wfi inst)
 //   handler:    vblk_irq_ack → device_clear_pending → MEIP=0 → done=1 → mret
 //   hart h:     mret 回 wfi inst → wfi_wait → predicate 读 mip=0 → false →
@@ -67,8 +66,8 @@ static wfi_slot_t wfi_slots[MAX_HARTS];
 //              (cond_wait 期间 kick 可能再设, 醒来要消费; 跟 predicate 并列条件)。
 //
 // happens-before 链:
-//   T1 wfi_kick store(release)  → T2 wfi_wait exchange(acquire)  直接配对 (atomic)
-//   T1 cond_signal              → T2 cond_wait return            mutex 协议保证
+//   kicker wfi_kick store(release)  → waiter wfi_wait exchange(acquire)  直接配对 (atomic)
+//   kicker cond_signal              → waiter cond_wait return            mutex 协议保证
 //   两条独立, sticky 路径不依赖 cond_var 的 edge 语义, race 消失。
 //
 // 不影响正常 (非 race) 路径: kick 在 wait 之后 → wait 进 cond_wait, kick signal
@@ -215,8 +214,8 @@ void wfi_kick_all(void) {
 // ----------------------------------------------------------------------------
 // wfi_should_wake —— wfi_wait predicate (interpreter + JIT backend 共用)
 //
-// 顶段 doc 见 wfi.h. T4 期间从 interpreter.c file-static 提为 extern 放本模块.
-// 跟 wfi_wait 协议对偶 (predicate 跟 wait 同模块, 跨 TU 让 JIT backend 拿地址).
+// 顶段 doc 见 wfi.h. 跟 wfi_wait 协议对偶 (predicate 跟 wait 同模块, 跨 TU
+// 让 JIT backend 拿地址).
 //
 // 唤醒条件 (RV spec §3.3.2): SRS 非 0 或 (mie & csr_mip_read(hart)) != 0.
 // ----------------------------------------------------------------------------

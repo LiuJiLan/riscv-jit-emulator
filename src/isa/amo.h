@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/amo —— RV32 A 扩展 Zaamo 9 个 AMO ops (AMOADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU.W)
 //
 // 跟 LR/SC (Zalrsc) 拆开 (lrsc_amo_decision.md Q12): A 扩展 RV spec 已拆 Zaamo/Zalrsc 子

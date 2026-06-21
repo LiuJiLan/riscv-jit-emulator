@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/18.
 // jit/jit_entry.cc —— JIT 子系统对外入口实装 (jit_api.h 5 函数的 .cc 实装).
 //
 // ============================================================================
@@ -26,18 +25,18 @@
 //
 // jit_flush_all (jit_compile_block Q11 a 内部组合也调; dispatcher 不直接调):
 //   jit_cache_flush_all → backend.flush_all (固定顺序; jit_cache 内 RCU sync 等
-//                                            grace period 后才能 backend 真 unmap)
+//                                            grace period 后才能 backend 真 reset)
 //
-// jit_invalidate_block (b_02 T5 真填; 协议骨架接通):
+// jit_invalidate_block (协议骨架接通; 按 (pa, regime) 单块失效):
 //   take 路径: jit_cache_take_compiled_host_code(pa, regime) 拿 host_code +
 //              CAS COMPILED→EMPTY (后续 lookup 见 EMPTY 视 miss);
 //   RCU sync : jit_rcu_synchronize 等所有 in-flight dispatcher read critical
 //              出, 确保已经 hit COMPILED 的 dispatcher 都已经写完状态灯;
 //   状态灯扫 : cpu_wait_all_harts_exit_host_code 扫所有 hart 等退出该 host_code
-//              (起步 busy-wait + PAUSE, §0.8 R8);
-//   unmap   : backend.invalidate_block(host_code) 真 unmap host code mmap 区.
+//              (起步 busy-wait + PAUSE);
+//   release : backend.invalidate_block(host_code) 真 release host code RX 段.
 //
-//   caller (b_03 真做 SMC chain): fence.i / SIGSEGV handler 触发 page_dirty
+//   caller (a_05+ 真做 SMC chain): fence.i / SIGSEGV handler 触发 page_dirty
 //   bitmap → dispatcher 主循环顶扫 bitmap → 按 page 颗粒度调
 //   jit_cache_invalidate_page (顺链表清 status + sync grace) 而非本接口.
 //   本接口提供按 (pa, regime) 单块失效语义, future block chaining / 单点
@@ -55,13 +54,8 @@
 //   step 3: 非 FULL 错码 (IR_ERROR / BACKEND_INTERNAL / NOT_IMPLEMENTED):
 //     set_blacklist + 透传错码; dispatcher 看非 OK 退 interpreter
 //
-// stub backend.compile_block 永返 JIT_ERR_NOT_IMPLEMENTED → 走 step 3 →
-// set_blacklist + 返 NOT_IMPLEMENTED. 当前实际触发路径 = dispatcher fork 点
-// miss → jit_compile_block → 永走 step 3 进 BLACK; b_02 backend 真编译成功后
-// 才有 step 1 install 路径走通.
-//
 // ============================================================================
-// translator 调用 (T1 c+ 真做)
+// translator 调用
 // ============================================================================
 //
 // jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径:
@@ -70,17 +64,17 @@
 //   translator_translate(pa, regime, ir_buf, &n_insts);
 //   backend.compile_block(pa, regime, ir_buf, n_insts, &host_code);
 //
-// translator_translate 翻译 RV ADD/ADDI 子集 (T1 c+ 范围), 其他截断 emit
-// IR_OP_DISPATCH_EXIT 收尾; 块前缀空时 *n_insts = 1 (仅 DISPATCH_EXIT), backend
-// 端兜底返 NOT_IMPLEMENTED → set_blacklist → dispatcher 兜底走 interpret 真执行.
+// translator_translate 翻译 RV32 IMC 全集 (详 ir.h 顶段 op_kind 清单), 截断
+// emit 出口模板收尾; 块前缀空时 *n_insts = 1 (仅出口模板), backend 端兜底返
+// NOT_IMPLEMENTED → set_blacklist → dispatcher 兜底走 interpret 真执行.
 //
 
 #include "api/jit_api.h"
 #include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小)
-#include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (T5 invalidate 协议)
+#include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (invalidate 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
-#include "jit/translator.h"  // translator_translate (RV → IR; T1 c+ 真做)
+#include "jit/translator.h"  // translator_translate (RV → IR)
 
 extern "C" {
 
@@ -91,10 +85,10 @@ extern "C" {
 
 void jit_init(void) {
     const backend_t *be = backend_get_default();
-    /* backend.init 跟 jit_cache_init 当前实装都返 0 无失败路径; T3 stub backend.init
-     * 直接返 0; jit_cache_init 内部纯 atomic store 也不失败. 失败语义 (asmjit
-     * Runtime alloc OOM 等) b_02 真做时按 wfi_init / lrsc_init 体例 fprintf +
-     * 不传播 (跟 wfi/lrsc 一致), 那时调整本处签名为接 int 返码 + main 接 fail 退. */
+    /* backend.init 跟 jit_cache_init 当前实装都返 0 无失败路径; backend.init
+     * asmjit JitRuntime new 成功返 0; jit_cache_init 内部纯 atomic store 也不失败.
+     * 真失败语义 (asmjit Runtime alloc OOM 等) 按 wfi_init / lrsc_init 体例
+     * fprintf + 不传播; 那时调整本处签名为接 int 返码 + main 接 fail 退. */
     (void)be->backend_init();
     (void)jit_cache_init();
 }
@@ -112,8 +106,8 @@ void jit_shutdown(void) {
 //
 // 顺序固定: jit_cache_flush_all → backend.flush_all
 //   jit_cache_flush_all 内部 jit_rcu_synchronize 等 grace period (旧 host_code
-//   引用全释放), 之后 backend.flush_all 才能真 reset code_cache mmap 区. 反序的话
-//   reader 还在执行旧 host_code 时 mmap 区 unmap → segfault.
+//   引用全释放), 之后 backend.flush_all 才能真 reset code_cache RX 段. 反序的话
+//   reader 还在执行旧 host_code 时 RX 段被回收 → segfault.
 // ----------------------------------------------------------------------------
 void jit_flush_all(void) {
     jit_cache_flush_all();
@@ -123,20 +117,20 @@ void jit_flush_all(void) {
 
 
 // ----------------------------------------------------------------------------
-// jit_invalidate_block — b_02 T5 真填 (协议骨架接通; 调用者 = b_03 SMC chain)
+// jit_invalidate_block — 按 (pa, regime) 单块失效 (协议骨架接通)
 //
 // 协议 4 步 (详本文件顶段 §"5 个 extern C 入口" jit_invalidate_block 段):
 //   1. take: jit_cache_take_compiled_host_code 拿 host_code + CAS COMPILED→EMPTY
 //   2. RCU sync: 等 in-flight dispatcher read critical 出 (确保状态灯写完 visible)
 //   3. 状态灯扫: cpu_wait_all_harts_exit_host_code (busy-wait + PAUSE)
-//   4. unmap: backend.invalidate_block 真 unmap host code mmap 区
+//   4. release: backend.invalidate_block release host code RX 段
 //
 // race-safe: take CAS 拿失败 → host_code = NULL → 后续 step skip (别 hart 已
 // invalidate / 还没 promote / BLACK).
 //
 // 调用者:
-//   - 当前: jit_api 测试 fixture 直调 (T5 验收 fixture; 协议路径 verify)
-//   - 未来 b_03: SMC handler 触发 page_dirty bitmap, dispatcher 主循环顶按 page
+//   - 当前: 测试 fixture 直调 (协议路径 verify)
+//   - 未来 a_05+: SMC handler 触发 page_dirty bitmap, dispatcher 主循环顶按 page
 //     调 jit_cache_invalidate_page (顺链表; 不是本接口). 本接口给 future
 //     block chaining 等按 (pa, regime) 单块失效场景预留.
 //
@@ -156,7 +150,7 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
     /* step 3: 状态灯扫所有 hart 等退出 host_code (busy-wait + PAUSE) */
     cpu_wait_all_harts_exit_host_code(host_code);
 
-    /* step 4: backend 真 unmap host code mmap RX 段 */
+    /* step 4: backend release host code RX 段 (asmjit JitRuntime::release) */
     const backend_t *be = backend_get_default();
     be->backend_invalidate_block(host_code);
 }
@@ -170,10 +164,10 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
     const backend_t *be = backend_get_default();
 
-    /* RV → IR 翻译 (T1 c+ 真做; b_01 ir_stub/n_insts_stub 占位已替换).
-     * ir_buf stack 分配 BLOCK_INST_LIMIT slot, translator 写真实长度到 n_insts;
-     * 块前缀空 (i==0) 时 n_insts = 1 (仅 DISPATCH_EXIT), backend.compile_block
-     * 检测后返 NOT_IMPLEMENTED, step 3 set_blacklist 走 interpret 兜底. */
+    /* RV → IR 翻译. ir_buf stack 分配 BLOCK_INST_LIMIT slot, translator 写真实
+     * 长度到 n_insts; 块前缀空 (i==0) 时 n_insts = 1 (仅出口模板),
+     * backend.compile_block 检测后返 NOT_IMPLEMENTED, step 3 set_blacklist 走
+     * interpret 兜底. */
     ir_inst_t ir_buf[BLOCK_INST_LIMIT];
     size_t n_insts = 0;
     translator_translate(pa, regime, ir_buf, &n_insts);

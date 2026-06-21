@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/amo —— 9 个 amo_xxx_apply 实现 (extern, HVA-based; 副作用 = host atomic RMW + lrsc_on_store).
 //
 // 顶部接口 doc + 3-layer 模型 + funct5 mapping + 编码字段 + memory_order/cause 选择 + fast/slow

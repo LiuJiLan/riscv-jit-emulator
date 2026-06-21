@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/lrsc —— LR.W / SC.W / reservation 清除函数族 (主方案 c 实装)。
 //
 // 顶部接口 doc + 七类清除时机 + 类型规约 全部见 lrsc.h. 本文件只放实装, 不重复 doc.

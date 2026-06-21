@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/4.
 // isa/fence —— fence_helper / fence_i_helper 实现 (NOP + lrsc_clear_self).
 //
 // 顶部接口 doc + 双重 cover 论证 见 fence.h.

@@ -1,6 +1,5 @@
 //
-// Created by liujilan on 2026/6/18.
-// jit/backend_asmjit.cc —— JitBackend asmjit 实装 (T1+T2 真做).
+// jit/backend_asmjit.cc —— JitBackend asmjit 实装.
 //
 // ============================================================================
 // 跟 jit_entry.cc 的概念分工
@@ -13,7 +12,7 @@
 //     具体后端
 //
 // ============================================================================
-// T1-T6 实状
+// 实状
 // ============================================================================
 //
 // 5 vtable 全真填:
@@ -23,35 +22,37 @@
 //                                    块体 + DISPATCH_EXIT + epilogue) → JitRuntime::add
 //                                    拿 RX 段地址, 返 jit_block_func_t
 //   asmjit_backend_invalidate_block JitRuntime::release(host_code) (Q8 配合; backend
-//                                    纯 unmap host code; 状态灯扫在 jit_entry.cc)
+//                                    纯 release host code RX 段; 状态灯扫在 jit_entry.cc)
 //   asmjit_backend_flush_all        JitRuntime::reset() (asmjit v1.18+ 自带 reset)
 //   asmjit_backend_destroy          delete JitRuntime
 //
-// 块体 IR 翻译 (T1+T2+T3+T4 范围): 48 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 +
-// AMO 9 + LR/SC 2 + FENCE/FENCE_I 2 + BRANCH 6 + JAL/JALR 2 + SYSTEM 6;
+// 块体 IR 翻译: 70 op = RV32I 算术 21 + LOAD/STORE 8 + CSR 6 + AMO 9 + LR/SC 2 +
+// FENCE/FENCE_I 2 + BRANCH 6 + JAL/JALR 2 + SYSTEM 6 + RV32M 8;
 // IR_OP_DISPATCH_EXIT/_RUNTIME 收尾; IR_OP_UNSUPPORTED 哨兵 default case 写
 // __builtin_unreachable 兜底.
 //
 // emit 形态分组:
-//   LOAD 5  : T3 BARE inline IS_GPA_RAM 分流 + RAM 直 movsx/movzx eax, [hva] /
-//             MMIO call mmio_read_helper. T6 加 SV32_S / SV32_U fast path:
+//   LOAD 5  : BARE inline IS_GPA_RAM 分流 + RAM 直 movsx/movzx eax, [hva] /
+//             MMIO call mmio_read_helper. SV32_S / SV32_U fast path:
 //             inline TLB vpn/index 查 entry, V + tag + baked PTE_U (S 视角 SUM /
 //             U 视角强制) + R/MXR check, hit 直 movsx/movzx host load; miss
 //             call mmu_walker_helper_load (helper walk + fill TLB 或 trap longjmp).
-//   STORE 3 : T3 BARE 同 LOAD 分流, RAM 走 call store_helper (LR/SC + SMC 副作用
-//             强制经 helper, lsu.h §load/store 不对称真机理). T6 加 SV32_S/_U
+//   STORE 3 : BARE 同 LOAD 分流, RAM 走 call store_helper (LR/SC + SMC 副作用
+//             强制经 helper, lsu.h §load/store 不对称真机理). SV32_S/_U
 //             fast path: 同 LOAD baked S/U 视角 PTE_U, 加 PTE_W + PTE_D check
 //             (D=0 fall back walker 让 walker set D=1); hit 走 call store_helper;
 //             miss call mmu_walker_helper_store.
 //   AMO 9   : 直接 call mmu_walker_helper_amo_xxx; walker 内按 tlb==NULL 分流
-//             BARE/SV32 (T6 起 backend 端 emit_reload_current_tlb 不分 regime).
+//             BARE/SV32 (backend 端 emit_reload_current_tlb 不分 regime).
 //   LR/SC 2 : 直接 call mmu_walker_helper_lr_w / sc_w (同 AMO).
 //   CSR 6   : call csr_op(hart, csr_addr, new_val, op, raw_inst); 6 变体在
 //             ir_inst.kind 区分 + new_val/op 静态选择; 硬边界, 后续紧跟
 //             DISPATCH_EXIT
 //   FENCE 2 : FENCE call fence_helper / FENCE_I call fence_i_helper (硬边界,
 //             后续紧跟 DISPATCH_EXIT)
-//   BRANCH 6 / JAL / JALR / SYSTEM 6: T4 自含末段 / 标准末段 / runtime target 三类.
+//   BRANCH 6 / JAL / JALR / SYSTEM 6: 自含末段 / 标准末段 / runtime target 三类.
+//   RV32M 8 : 走 emit_ir_muldiv (MUL 4 用 host x86 imul/mul, DIV/REM 4 inline
+//             branch 兜 by-0 + INT_MIN/-1 overflow 避 #DE).
 //
 // 静态固定映射 (Q2=b): RV x1-x5 (ra/sp/gp/tp/t0) → host callee-saved 32-bit reg
 //   x1 → ebx
@@ -77,7 +78,7 @@
 //
 // x86_64 SysV ABI:
 //   rdi = hart        (cpu_t *)         — emit 内 base reg 用于 cpu->regs[N] 访问
-//   rsi = current_tlb (tlb_t *)         — T1 c+ 不用; T3 LOAD/STORE 走 TLB 时用
+//   rsi = current_tlb (tlb_t *)         — LOAD/STORE 走 TLB 时用; BARE 时 NULL
 //   rdx = count_out   (uint64_t *)      — emit 内目标地址写 *count_out
 //
 // callee-saved: rbx, rbp, r12-r15 (我们占 rbx + r12-r15 共 5 个映射 x1-x5; rbp
@@ -86,10 +87,9 @@
 //   reload 协议 — 见下)
 //
 // helper call 协议 (prologue 加 push rdi/rdx/rsi, 块体内 reload):
-//   T3 起步: prologue push rbp / rbx / r12-r15 / rdi / rdx 共 8 个 → 加 sub rsp 8
-//          dummy 凑 16-byte 对齐 (call helper SysV 要求 rsp % 16 == 0).
-//   T6 升级: prologue 多 push rsi (current_tlb), 9 个 push × 8 = 72 bytes; 入口
-//          rsp ≡ 8 mod 16, push 后 ≡ 80 ≡ 0 mod 16 天然对齐, 不再需要 dummy slot.
+//   prologue push rbp / rbx / r12-r15 / rdi / rdx / rsi 共 9 个 × 8 = 72 bytes;
+//   入口 rsp ≡ 8 mod 16, push 后 ≡ 80 ≡ 0 mod 16 天然对齐 (SysV 要求 call 时
+//   rsp % 16 == 0; 不需要 sub rsp 凑 dummy slot).
 //   每次 helper call 之前 emit:
 //     emit_reload_hart            ; mov rdi, [rbp - 48]
 //     emit_reload_current_tlb     ; mov rsi, [rbp - 64]  (若 helper 第 2 参是 tlb)
@@ -110,7 +110,7 @@
 //   [rbp - 40]  = r15
 //   [rbp - 48]  = rdi (hart pointer, save 用于 helper call reload)
 //   [rbp - 56]  = rdx (count_out pointer, save 用于 emit_dispatch_exit reload)
-//   [rbp - 64]  = rsi (current_tlb pointer, T6 SV32 fast path / AMO/LR-SC walker
+//   [rbp - 64]  = rsi (current_tlb pointer, SV32 fast path / AMO/LR-SC walker
 //                       reload 用; BARE 时 dispatcher 传 NULL, 槽里就是 NULL,
 //                       regime-agnostic — walker 内部按 tlb==NULL 分流 BARE/SV32)
 //
@@ -118,8 +118,8 @@
 // 命名 (项目体例)
 // ============================================================================
 //
-// 5 个 file-static vtable fn prefix `asmjit_backend_*` (跟 stub 阶段一致); 内部
-// emit helper 在 anonymous namespace 内 (file-static 等价 C++ 体例).
+// 5 个 file-static vtable fn prefix `asmjit_backend_*`; 内部 emit helper 在
+// anonymous namespace 内 (file-static 等价 C++ 体例).
 //
 // 不引 class / 不继承 / 不多态 — 项目 C-style vtable, .cc 内部代码也保持 C-style
 // (file-static fn + extern "C"); 见 plan §1.5 + §1.12 实状.
@@ -136,20 +136,20 @@
                             // (asmjit/asmjit.h v1.18 已 deprecated, 用 x86.h)
 
 #include "core/cpu.h"       // cpu_t (offsetof regs / priv / hartid / trap._mstatus;
-                            //   T4 backend 端 PRIV_CHECK / ECALL priv 公式 / WFI hartid
-                            //   入参用; T6 SV32 fast path SUM/MXR runtime 读)
-#include "core/mmu.h"       // regime_t (T3 regime 分流)
-#include "core/tlb.h"       // tlb_e_t / tlb_t / TLB_NUM_ENTRIES (T6 SV32 fast path
+                            //   PRIV_CHECK / ECALL priv 公式 / WFI hartid 入参 /
+                            //   SV32 fast path SUM/MXR runtime 读)
+#include "core/mmu.h"       // regime_t (regime 分流)
+#include "core/tlb.h"       // tlb_e_t / tlb_t / TLB_NUM_ENTRIES (SV32 fast path
                             //   inline TLB lookup 需要 offsetof / sizeof)
-#include "riscv.h"          // T4 backend 端 inline 用: PRIV_S / PRIV_M / CAUSE_* /
+#include "riscv.h"          // backend 端 inline 用: PRIV_S / PRIV_M / CAUSE_* /
                             //   MSTATUS_TW; ECALL/EBREAK cause / SFENCE_VMA PRIV_CHECK /
                             //   WFI TW 检查直接 emit 数值用
 #include "ir.h"             // ir_inst_t + IR_OP_*
-#include "api/helpers.h"    // T3 slow path helper 集中声明 (mmu_walker / csr_op /
+#include "api/helpers.h"    // slow path helper 集中声明 (mmu_walker / csr_op /
                             //   store_helper / mmio_*_helper / fence_*_helper /
                             //   trap_raise_exception 等; backend emit call 时取
                             //   helper 静态地址)
-#include "platform/ram.h"   // T3 LOAD/STORE BARE inline IS_GPA_RAM 用
+#include "platform/ram.h"   // LOAD/STORE BARE inline IS_GPA_RAM 用
                             //   gpa_to_hva_offset extern var + GUEST_RAM_START /
                             //   GUEST_RAM_SIZE config 宏
 
@@ -158,9 +158,9 @@
 // file-static state (Q1=a JitRuntime 自管 RX 段)
 // ============================================================================
 //
-// g_rt 指针 (非实例) — flush_all 需要 delete + new (asmjit 没 reset API). init
-// 一次性 alloc, destroy 一次性 release, lifetime 内只 destroy/init 各 1 次
-// (system reset 不触发, jit_init/jit_shutdown 配对 POR/teardown).
+// g_rt 指针 (非实例) — init 一次性 alloc, destroy 一次性 release, lifetime
+// 内只 destroy/init 各 1 次 (system reset 不触发, jit_init/jit_shutdown 配对
+// POR/teardown). flush_all 走 JitRuntime::reset (asmjit v1.18+ 自带).
 
 static asmjit::JitRuntime *g_rt = nullptr;
 
@@ -193,13 +193,13 @@ inline asmjit::x86::Gp host_reg_for_rv(uint8_t rv_reg) {
 }
 
 // emit_reload_hart 前向声明 (定义见后); rs/rd > 5 case 用 rdi 作 cpu->regs[]
-// base, 前置 reload 保证 rdi = hart (T3 块体内 helper call 可能破坏 rdi).
+// base, 前置 reload 保证 rdi = hart (块体内 helper call 可能破坏 rdi).
 void emit_reload_hart(asmjit::x86::Assembler &a);
 
 // 把 RV reg 值 load 到 host scratch reg (32-bit Gpd):
 //   rv_reg == 0 → xor scratch, scratch (常数 0; dummy.txt §2 read x0 = 0)
 //   1..5        → mov scratch, host_reg_for_rv(rv_reg) (固定 host reg 直读)
-//   6..31       → reload rdi (T3 协议) + mov scratch, [rdi + regs_offset(rv_reg)]
+//   6..31       → reload rdi (helper call 后协议) + mov scratch, [rdi + regs_offset(rv_reg)]
 void emit_load_rv_reg(asmjit::x86::Assembler &a, asmjit::x86::Gp scratch,
                       uint8_t rv_reg) {
     if (rv_reg == 0) {
@@ -207,7 +207,7 @@ void emit_load_rv_reg(asmjit::x86::Assembler &a, asmjit::x86::Gp scratch,
     } else if (rv_reg <= 5) {
         a.mov(scratch, host_reg_for_rv(rv_reg));
     } else {
-        emit_reload_hart(a);   /* T3: rdi 可能被 helper call 破坏, reload */
+        emit_reload_hart(a);   /* rdi 可能被 helper call 破坏, reload */
         a.mov(scratch,
               asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(rv_reg)));
     }
@@ -216,7 +216,7 @@ void emit_load_rv_reg(asmjit::x86::Assembler &a, asmjit::x86::Gp scratch,
 // 把 host scratch reg (32-bit) 写入 RV reg:
 //   rv_reg == 0 → skip (dead store; dummy.txt §2 write x0 走 garbage)
 //   1..5        → mov host_reg_for_rv(rv_reg), scratch
-//   6..31       → reload rdi (T3 协议) + mov [rdi + regs_offset(rv_reg)], scratch
+//   6..31       → reload rdi (helper call 后协议) + mov [rdi + regs_offset(rv_reg)], scratch
 void emit_store_rv_reg(asmjit::x86::Assembler &a, uint8_t rv_reg,
                        asmjit::x86::Gp scratch) {
     if (rv_reg == 0) {
@@ -225,31 +225,28 @@ void emit_store_rv_reg(asmjit::x86::Assembler &a, uint8_t rv_reg,
     if (rv_reg <= 5) {
         a.mov(host_reg_for_rv(rv_reg), scratch);
     } else {
-        emit_reload_hart(a);   /* T3: rdi 可能被 helper call 破坏, reload */
+        emit_reload_hart(a);   /* rdi 可能被 helper call 破坏, reload */
         a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(rv_reg)),
               scratch);
     }
 }
 
-// 栈 slot 偏移常量 (顶段 doc "栈布局" 段; T3 + T6 helper call 协议).
+// 栈 slot 偏移常量 (顶段 doc "栈布局" 段; helper call 协议).
 constexpr int32_t STACK_SLOT_HART        = -48;  // [rbp - 48] = saved rdi (hart pointer)
 constexpr int32_t STACK_SLOT_COUNT_OUT   = -56;  // [rbp - 56] = saved rdx (count_out ptr)
-constexpr int32_t STACK_SLOT_CURRENT_TLB = -64;  // [rbp - 64] = saved rsi (current_tlb ptr; T6)
+constexpr int32_t STACK_SLOT_CURRENT_TLB = -64;  // [rbp - 64] = saved rsi (current_tlb ptr)
 
 // prologue: push callee-saved (rbp + rbx + r12-r15) + push rdi/rdx/rsi (helper call
 // reload 用) + load x1-x5 from cpu->regs[1..5].
 //
-// 栈对齐:
-//   T3 起步: 8 push (rbp/rbx/r12-r15/rdi/rdx) + sub rsp 8 dummy. 入口 rsp ≡ 8 mod 16
-//          (CALL 压 ret addr), 8 push 后 ≡ 8 mod 16 (64 mod 16 = 0 不改), 减 8 让
-//          rsp ≡ 0 mod 16, helper call SysV 16-byte 对齐.
-//   T6 升级: 多 push rsi (current_tlb) → 9 push × 8 = 72 bytes, rsp ≡ 8 + 72 = 80
-//          ≡ 0 mod 16 天然对齐, 不再需要 dummy slot.
+// 栈对齐: 9 push × 8 = 72 bytes, 入口 rsp ≡ 8 mod 16 (CALL 压 ret addr),
+//   push 后 rsp ≡ 80 ≡ 0 mod 16 天然对齐, 不需 dummy slot. SysV 要求 call helper
+//   时 rsp % 16 == 0; 任何后续改 push 数都需复算.
 //
-// T4 stack alignment 起源 (a_03_14/03_wfi_irq_wakeup_race SEGV root cause; 留 trail):
-//   T4 wfi_wait → pthread_cond_timedwait64 内部 SSE / movaps 需严格 16-byte 对齐,
-//   不对齐立爆 SEGV. T6 改 9 push 后天然对齐, 起源 issue 不再存在 (但 SysV 16-byte
-//   要求本身没变, 任何后续改 push 数都需复算).
+// stack alignment 起源 trail (a_03_14/03_wfi_irq_wakeup_race SEGV root cause):
+//   早期 8 push + sub rsp 8 dummy 凑齐, 但 wfi_wait → pthread_cond_timedwait64
+//   内部 SSE / movaps 需严格 16-byte 对齐, 不对齐立爆 SEGV. 9 push (加 rsi
+//   current_tlb) 天然对齐后起源 issue 不再存在.
 void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::rbp);
     a.mov(asmjit::x86::rbp, asmjit::x86::rsp);
@@ -260,7 +257,7 @@ void emit_prologue(asmjit::x86::Assembler &a) {
     a.push(asmjit::x86::r15);
     a.push(asmjit::x86::rdi);   // [rbp - 48] = hart pointer (helper call reload)
     a.push(asmjit::x86::rdx);   // [rbp - 56] = count_out ptr (emit_dispatch_exit reload)
-    a.push(asmjit::x86::rsi);   // [rbp - 64] = current_tlb ptr (T6 SV32 fast path /
+    a.push(asmjit::x86::rsi);   // [rbp - 64] = current_tlb ptr (SV32 fast path /
                                 //               AMO/LR-SC walker reload; BARE 时入口 = NULL)
 
     // load x1-x5 from cpu->regs[1..5] (rdi 入口还是 hart, 未被 helper call 破坏)
@@ -276,13 +273,13 @@ void emit_prologue(asmjit::x86::Assembler &a) {
           asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)));
 }
 
-// helper: reload hart 指针 (rdi) 从栈 saved slot. T3 每次 helper call 之前调.
+// helper: reload hart 指针 (rdi) 从栈 saved slot. 每次 helper call 之前调.
 void emit_reload_hart(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::rdi,
           asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_HART));
 }
 
-// helper: reload current_tlb 指针 (rsi) 从栈 saved slot. T6 起步:
+// helper: reload current_tlb 指针 (rsi) 从栈 saved slot.
 //   - SV32 fast path 内算 TLB entry 地址 (rsi + index * 16) + miss 调
 //     mmu_walker_helper_load/store 时 (helper 第 2 参) 用
 //   - AMO / LR-SC 调 mmu_walker_helper_xxx 时用 (helper 第 2 参; BARE 时栈槽 = NULL
@@ -295,7 +292,7 @@ void emit_reload_current_tlb(asmjit::x86::Assembler &a) {
 // epilogue: store x1-x5 to cpu->regs[1..5] + pop 对称 prologue + ret.
 //
 // 入口前提: rdi 已是 hart 指针 (emit_dispatch_exit 末已 reload). pop 顺序对称
-// prologue (后入先出). T6 起 9 push 天然 16-byte 对齐, 不再需要释放 dummy slot.
+// prologue (后入先出). 9 push 天然 16-byte 对齐, 不需释放 dummy slot.
 void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(1)),
           asmjit::x86::ebx);
@@ -308,7 +305,7 @@ void emit_epilogue(asmjit::x86::Assembler &a) {
     a.mov(asmjit::x86::dword_ptr(asmjit::x86::rdi, regs_offset(5)),
           asmjit::x86::r15d);
 
-    a.pop(asmjit::x86::rsi);    // T6: 对称 prologue 末 push rsi (current_tlb)
+    a.pop(asmjit::x86::rsi);    // 对称 prologue 末 push rsi (current_tlb)
     a.pop(asmjit::x86::rdx);
     a.pop(asmjit::x86::rdi);
     a.pop(asmjit::x86::r15);
@@ -320,9 +317,9 @@ void emit_epilogue(asmjit::x86::Assembler &a) {
     a.ret();
 }
 
-// emit IR 算术 (T1+T2 范围: RV32I 算术全集 21 op).
+// emit IR 算术 (RV32I 算术全集 21 op).
 //
-// scratch 用法 (T1+T2 不调 helper 不撞 caller-saved):
+// scratch 用法 (不调 helper 不撞 caller-saved):
 //   eax (caller-saved): 主累加器 (rs1 装 eax, op 后存 rd)
 //   ecx (caller-saved): R-type 的 rs2 / shift count cl 来源
 //   al  (eax 低 8 位):   setcc 目标 (SLT/SLTU/SLTI/SLTIU)
@@ -481,9 +478,9 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
             emit_store_rv_reg(a, inst.rd, eax);
             return;
 
-        /* ---- 哨兵 + T3/T4 非算术 op (emit_ir_arith 不该看到; caller 路径已分流到
+        /* ---- 哨兵 + 非算术 op (emit_ir_arith 不该看到; caller 路径已分流到
                 emit_ir_load / store / amo / lr_sc / csr / fence / branch / jal /
-                jalr / system) ---- */
+                jalr / system / muldiv) ---- */
         case IR_OP_UNSUPPORTED:
         case IR_OP_DISPATCH_EXIT:
         case IR_OP_DISPATCH_EXIT_RUNTIME:
@@ -502,7 +499,7 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
         case IR_OP_ECALL: case IR_OP_EBREAK:
         case IR_OP_MRET:  case IR_OP_SRET:
         case IR_OP_SFENCE_VMA: case IR_OP_WFI:
-        /* T7 RV32M (走 emit_ir_muldiv 不该撞这里) */
+        /* RV32M (走 emit_ir_muldiv 不该撞这里) */
         case IR_OP_MUL: case IR_OP_MULH: case IR_OP_MULHSU: case IR_OP_MULHU:
         case IR_OP_DIV: case IR_OP_DIVU: case IR_OP_REM:    case IR_OP_REMU:
             __builtin_unreachable();
@@ -512,14 +509,14 @@ void emit_ir_arith(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
 // emit_ir_muldiv (RV32M 8 op MUL/MULH/MULHU/MULHSU/DIV/DIVU/REM/REMU; inline emit
 // 不走 helper):
 //
-// MUL 家族 (T7-A2 真填; A1 阶段 4 case 走 __builtin_unreachable scaffold):
+// MUL 家族:
 //   MUL:    imul eax, ecx  (3-op 32-bit; signed/unsigned 低 32 同结果)
 //   MULH:   movsxd rax,rs1 + movsxd rcx,rs2 + imul rax,rcx + shr rax,32
 //   MULHU:  单 op mul ecx → edx:eax = eax*ecx; 取 edx
 //   MULHSU: movsxd rax,rs1 (signed-ext) + mov ecx,rs2 (zero-ext) + imul rax,rcx
 //           + shr rax,32 (RV spec §7.1 表 24.2 第 4 行)
 //
-// DIV/REM 家族 (T7-A3 真填; A1 阶段 4 case 走 __builtin_unreachable scaffold):
+// DIV/REM 家族:
 //   inline branch 兜 by-0 + INT_MIN/-1 overflow 避 x86 #DE trap; 镜像
 //   interpreter.c:357-397 语义.
 //   DIV  by-0: -1                INT_MIN/-1 overflow: INT_MIN
@@ -533,7 +530,7 @@ void emit_ir_muldiv(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     using namespace asmjit::x86;
 
     switch (inst.kind) {
-        /* ---- MUL 家族 4 op (T7-A2 实装; 用 host x86 imul/mul 三形态) ---- */
+        /* ---- MUL 家族 4 op (用 host x86 imul/mul 三形态) ---- */
 
         /* MUL: 32x32 低 32 位 (signed/unsigned 低 32 同结果). 3-op imul. */
         case IR_OP_MUL:
@@ -576,7 +573,7 @@ void emit_ir_muldiv(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
             emit_store_rv_reg(a, inst.rd, eax);
             return;
 
-        /* ---- DIV/REM 家族 4 op (T7-A3 实装) ----
+        /* ---- DIV/REM 家族 4 op ----
          * inline branch 兜 by-0 + INT_MIN/-1 overflow 避 x86 #DE trap;
          * 镜像 interpreter.c:357-397 语义. */
 
@@ -726,13 +723,13 @@ void emit_ir_muldiv(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
 }
 
 // ============================================================================
-// T3 emit helper — helper call ABI 协议 (顶段 doc "T3 helper call 协议" 段)
+// emit helper — helper call ABI 协议 (顶段 doc "helper call 协议" 段)
 // ============================================================================
 //
 // 通用 ABI (SysV x86_64):
 //   - 参数顺序: rdi / rsi / rdx / rcx / r8 / r9
 //   - 每次 helper call 前: emit_reload_hart (rdi = hart) + 设其他参数 + call
-//   - call 时 rsp % 16 == 0 (prologue push 8 个 callee-saved 自然对齐, 不需 sub rsp)
+//   - call 时 rsp % 16 == 0 (prologue push 9 个 自然对齐, 不需 sub rsp)
 //   - helper return 后 rax 装返回值; rdi/rsi/rdx/rcx/r8/r9 (caller-saved) 可能被改
 //   - 映射 host reg (rbx/r12-r15 = x1-x5) callee-saved, helper 不破坏, 不 save/restore
 //
@@ -756,7 +753,7 @@ inline void emit_call_helper(asmjit::x86::Assembler &a, Fn *fn) {
 //   eax = rs1 + imm (gva); IS_GPA_RAM(gva) ? RAM 直读 *hva sext/zext :
 //   MMIO call mmio_read_helper; .Ldone: store rd.
 //
-// SV32_S / SV32_U fast path (T6; 镜像 lsu.h:139-187 interpreter SV32 路径):
+// SV32_S / SV32_U fast path (镜像 lsu.h:139-187 interpreter SV32 路径):
 //   eax = gva; vpn = gva>>12; index = vpn & (TLB_NUM_ENTRIES-1);
 //   reload rsi=current_tlb; r9 = &tlb->e[index];
 //   V bit check + tag compare;
@@ -766,9 +763,9 @@ inline void emit_call_helper(asmjit::x86::Assembler &a, Fn *fn) {
 //   miss / V=0 / tag mismatch / perm fail → call mmu_walker_helper_load
 //   (helper 内部 walk + fill TLB + sext/zext 由 backend 末段做, 或 trap longjmp).
 //
-// regime 拆分长期 (plan/start_plan_b_02 §[4.4]): jit_cache key=(PA, regime),
-// S/U 各编一份块体, 编译时 baked PTE_U 视角差异, 消除 runtime priv 分支.
-// SUM/MXR 仍 runtime 读 mstatus (guest 可动态改 csrw mstatus, 不可 baked).
+// regime 拆分长期 (plan §1.23.x): jit_cache key=(PA, regime), S/U 各编一份块体,
+// 编译时 baked PTE_U 视角差异, 消除 runtime priv 分支. SUM/MXR 仍 runtime 读
+// mstatus (guest 可动态改 csrw mstatus, 不可 baked).
 //
 // rd = x0 时 emit_store_rv_reg 走 skip 分支 — load 仍 emit (mmio_read_helper /
 // walker fault 副作用仍触发), 只是值丢.
@@ -960,7 +957,7 @@ void emit_ir_load(asmjit::x86::Assembler &a, const ir_inst_t &inst,
 //          (LR/SC + SMC 副作用强制经 helper)
 //     MMIO: call mmio_write_helper(hart, pa=gva, gva, value, size)
 //
-// SV32_S / SV32_U fast path (T6; 镜像 lsu.h:212-260 interpreter SV32 路径):
+// SV32_S / SV32_U fast path (镜像 lsu.h:212-260 interpreter SV32 路径):
 //   eax = gva; r8d = value; vpn / index → reload rsi=current_tlb → entry;
 //   V + tag + PTE_U baked (S 视角 SUM / U 视角强制) + W bit + D bit check;
 //   hit: call store_helper(hart, hva=host_ptr+(gva&0xFFF), gva, value, size).
@@ -1131,7 +1128,7 @@ void emit_ir_store(asmjit::x86::Assembler &a, const ir_inst_t &inst,
 // 形态: call mmu_walker_helper_amo_xxx(hart, current_tlb, gva=rs1, value=rs2)
 // 返 旧值 (RMW result before update) in eax → store rd.
 //
-// T6: current_tlb 从栈槽 reload (emit_reload_current_tlb), BARE 时槽里是 NULL
+// current_tlb 从栈槽 reload (emit_reload_current_tlb), BARE 时槽里是 NULL
 // 自动对偶, SV32 时槽里是真 tlb_t*, walker 内部按 tlb==NULL 分流 BARE/SV32
 // (a_04 拍 AMO/LR-SC 长期不加 inline TLB fast path, 永远走 walker).
 //
@@ -1168,7 +1165,7 @@ void emit_ir_amo(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
 // LR_W: call mmu_walker_helper_lr_w(hart, current_tlb, gva); 返 *hva in eax → store rd
 // SC_W: call mmu_walker_helper_sc_w(hart, current_tlb, gva, value); 返 0=success/1=fail in eax → store rd
 //
-// T6: current_tlb 从栈槽 reload (跟 emit_ir_amo 同体例; BARE 时槽里 NULL 自动对偶,
+// current_tlb 从栈槽 reload (跟 emit_ir_amo 同体例; BARE 时槽里 NULL 自动对偶,
 // SV32 时槽里真 tlb_t*, walker 内部按 tlb==NULL 分流).
 //
 // BARE walker 内: walker → lrsc_lr_w/sc_w (apply 层, PA-based; access_helper_call_graph
@@ -1256,16 +1253,16 @@ void emit_ir_fence(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
     }
 }
 
-// emit_dispatch_exit 前向声明 (定义见下方; T4 BRANCH/SYSTEM 自含末段时调本函数,
+// emit_dispatch_exit 前向声明 (定义见下方; BRANCH/SYSTEM 自含末段时调本函数,
 // 但函数定义在新 emit_ir_* helper 之后 — 加 forward 声明避开 reorder).
 void emit_dispatch_exit(asmjit::x86::Assembler &a, uxlen_t target_pc,
                         uint64_t block_inst_count);
 
 // ============================================================================
-// T4 emit helper —— 控制流 BRANCH/JAL/JALR + SYSTEM 6
+// emit helper —— 控制流 BRANCH/JAL/JALR + SYSTEM 6
 // ============================================================================
 //
-// 形态分组 (顶段 doc T1-T4 实状段):
+// 形态分组 (顶段 doc 实状段):
 //   BRANCH 6: 双出口块体 — 内嵌 emit cmp + jcc + 两份 epilogue (taken 边 + fall-
 //             through 边). 自含末段, compile_block 不再 emit DISPATCH_EXIT.
 //   JAL: 仅写 rd = pc + pc_step (compile-time imm); jump target 在末段 DISPATCH_
@@ -1383,9 +1380,9 @@ void emit_ir_jal(asmjit::x86::Assembler &a, const ir_inst_t &inst) {
 // r9d 选择 rationale: caller-saved 32-bit reg, 不跟 x1-x5 host 映射冲突 (那是
 // callee-saved rbx/r12d-r15d). 假设 JALR → 末 RUNTIME 之间无 helper call —
 // translator 保证 JALR 是块倒数第二条 (is_hard_boundary=1 触发 break), 末 IR
-// 是 DISPATCH_EXIT_RUNTIME 中间无 emit. 后续 milestone (e.g. T5 加 interrupt
-// check inline) 若破坏此假设, 改 r9d 为 callee-saved scratch (e.g. push 一个 8-byte
-// 给 jalr_target 用) 维持假设.
+// 是 DISPATCH_EXIT_RUNTIME 中间无 emit. 后续若加 interrupt check inline 等破坏
+// 此假设, 改 r9d 为 callee-saved scratch (e.g. push 一个 8-byte 给 jalr_target
+// 用) 维持假设.
 //
 // rd / rs1 可能相同 (e.g. jalr ra, 0(ra) return 模式) — 必须先算 target 再写 rd:
 //   emit_load_rv_reg(a, eax, rs1) → 算 (rs1 + imm) & ~1u 存 r9d → store rd.
@@ -1557,14 +1554,14 @@ void emit_ir_system(asmjit::x86::Assembler &a, const ir_inst_t &inst,
 }
 
 // emit DISPATCH_EXIT (块出口模板):
-//   reload rdi (hart) + rdx (count_out) — 块体内 helper call 可能破坏 (T3)
+//   reload rdi (hart) + rdx (count_out) — 块体内 helper call 可能破坏
 //   写 cpu->regs[0] = target_pc (regs[0] 物理位置存 pc; uxlen_t = uint32_t for RV32)
 //   写 *count_out = block_inst_count (块前缀 RV 指令数; rdx = uint64_t *)
 //   后续 epilogue 紧接在 caller 处 emit (假设 rdi 仍是 hart, 因本函数末已 reload)
 void emit_dispatch_exit(asmjit::x86::Assembler &a, uxlen_t target_pc,
                         uint64_t block_inst_count) {
-    // T3: reload rdi + rdx 从 saved 栈 slot (T1+T2 不需要 reload 也无害,
-    // 统一形态简洁; helper call 没有 - reload 一次 ~2 cycle 几乎免费)
+    // reload rdi + rdx 从 saved 栈 slot (无 helper call 块也 reload, 统一形态;
+    // reload 一次 ~2 cycle 几乎免费)
     emit_reload_hart(a);
     a.mov(asmjit::x86::rdx,
           asmjit::x86::qword_ptr(asmjit::x86::rbp, STACK_SLOT_COUNT_OUT));
@@ -1607,15 +1604,14 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                                                  void **host_code_out) {
     (void)pa;
 
-    // T6 regime 分流: BARE / SV32_S / SV32_U 三 regime 都真编译.
+    // regime 分流: BARE / SV32_S / SV32_U 三 regime 都真编译.
     //   - BARE  : LOAD/STORE inline IS_GPA_RAM; AMO/LR-SC call walker (BARE→NULL tlb)
     //   - SV32_*: LOAD/STORE inline TLB fast path (baked S/U 视角 PTE_U + 运行时
     //             SUM/MXR), miss 走 mmu_walker_helper_load/store; AMO/LR-SC call
     //             walker (SV32 路径)
     // regime baked 到 emit_ir_load/store 函数内 (作为函数参), 跟 jit_cache key
-    // (PA, regime) 拆分一致 — 同一 PA 在 S/U 视角下编两份块体.
-    // (T3 起步阶段 SV32 早 return NOT_IMPLEMENTED → set_blacklist BLACK 的体例
-    // T6 拆除, 但 plan §1.1 / mmu.h:79 line "消除运行时 priv 分支" 设计仍有效.)
+    // (PA, regime) 拆分一致 — 同一 PA 在 S/U 视角下编两份块体. (plan §1.1 /
+    // mmu.h regime 接口分裂 "消除运行时 priv 分支" 设计落地.)
 
     // 块前缀空 (仅 DISPATCH_EXIT 收尾, n_insts == 1) → 不真编译, NOT_IMPLEMENTED
     // 让 jit_entry.cc step 3 set_blacklist + interpret 兜底真执行那条 RV
@@ -1639,16 +1635,16 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
 
     emit_prologue(a);
 
-    /* T4: 块末 IR (insts[n_insts-1]) 给 BRANCH/SYSTEM 自含末段路径用 (传 exit_inst
-     * 给 emit_ir_branch / emit_ir_system 让它们 emit 完整 epilogue). 单 IR_OP_DISPATCH_
-     * EXIT_RUNTIME 块 (JALR) 跟标准 DISPATCH_EXIT 块由外层末段分流 emit. */
+    /* 块末 IR (insts[n_insts-1]) 给 BRANCH/SYSTEM 自含末段路径用 (传 exit_inst
+     * 给 emit_ir_branch / emit_ir_system 让它们 emit 完整 epilogue). 单
+     * DISPATCH_EXIT_RUNTIME 块 (JALR) 跟标准 DISPATCH_EXIT 块由外层末段分流 emit. */
     const ir_inst_t &exit_inst = insts[n_insts - 1];
 
-    /* T4: 块体内自含末段的 op (BRANCH 6 + SYSTEM 6) set block_done=true 后跳过外
-     * 层末段 emit. JAL/JALR + 算术/LOAD/STORE/AMO/LR_SC/CSR/FENCE 走外层标准末段. */
+    /* 块体内自含末段的 op (BRANCH 6 + SYSTEM 6) set block_done=true 后跳过外层
+     * 末段 emit. JAL/JALR + 算术/LOAD/STORE/AMO/LR_SC/CSR/FENCE/RV32M 走外层标准末段. */
     bool block_done = false;
 
-    // 块体: 前 n_insts-1 条 (T1+T2+T3+T4 62 op), 末 1 条 DISPATCH_EXIT/_RUNTIME 单独处理
+    // 块体: 前 n_insts-1 条 (RV32 IMC + M 共 70 op), 末 1 条 DISPATCH_EXIT/_RUNTIME 单独处理
     for (size_t i = 0; i < n_insts - 1; i++) {
         const ir_inst_t &inst = insts[i];
         switch (inst.kind) {
@@ -1664,26 +1660,26 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 emit_ir_arith(a, inst);
                 break;
 
-            /* T3 LOAD 5 op → emit_ir_load (T6: regime 三分流, BARE 沿用 inline
-             * IS_GPA_RAM; SV32_S/_U 走 TLB fast path + miss walker) */
+            /* LOAD 5 op → emit_ir_load (regime 三分流, BARE 沿用 inline IS_GPA_RAM;
+             * SV32_S/_U 走 TLB fast path + miss walker) */
             case IR_OP_LB:  case IR_OP_LH:  case IR_OP_LW:
             case IR_OP_LBU: case IR_OP_LHU:
                 emit_ir_load(a, inst, regime);
                 break;
 
-            /* T3 STORE 3 op → emit_ir_store (T6: regime 三分流, BARE 沿用 inline
-             * IS_GPA_RAM; SV32_S/_U 走 TLB fast path + W/D check + miss walker) */
+            /* STORE 3 op → emit_ir_store (regime 三分流, BARE 沿用 inline IS_GPA_RAM;
+             * SV32_S/_U 走 TLB fast path + W/D check + miss walker) */
             case IR_OP_SB:  case IR_OP_SH:  case IR_OP_SW:
                 emit_ir_store(a, inst, regime);
                 break;
 
-            /* T3 CSR 6 op → emit_ir_csr (call csr_op; 硬边界, 下一条必是 DISPATCH_EXIT) */
+            /* CSR 6 op → emit_ir_csr (call csr_op; 硬边界, 下一条必是 DISPATCH_EXIT) */
             case IR_OP_CSRRW:  case IR_OP_CSRRS:  case IR_OP_CSRRC:
             case IR_OP_CSRRWI: case IR_OP_CSRRSI: case IR_OP_CSRRCI:
                 emit_ir_csr(a, inst);
                 break;
 
-            /* T3 AMO 9 op → emit_ir_amo (BARE call walker_helper) */
+            /* AMO 9 op → emit_ir_amo (call walker_helper; walker 内 tlb==NULL 分流 BARE/SV32) */
             case IR_OP_AMO_ADD_W:  case IR_OP_AMO_SWAP_W: case IR_OP_AMO_XOR_W:
             case IR_OP_AMO_OR_W:   case IR_OP_AMO_AND_W:
             case IR_OP_AMO_MIN_W:  case IR_OP_AMO_MAX_W:
@@ -1691,17 +1687,17 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 emit_ir_amo(a, inst);
                 break;
 
-            /* T3 LR/SC 2 op → emit_ir_lr_sc (BARE call walker_helper) */
+            /* LR/SC 2 op → emit_ir_lr_sc (call walker_helper; 同 AMO regime 对偶) */
             case IR_OP_LR_W: case IR_OP_SC_W:
                 emit_ir_lr_sc(a, inst);
                 break;
 
-            /* T3 FENCE 2 op → emit_ir_fence (FENCE_I 硬边界, 下一条 DISPATCH_EXIT) */
+            /* FENCE 2 op → emit_ir_fence (FENCE_I 硬边界, 下一条 DISPATCH_EXIT) */
             case IR_OP_FENCE: case IR_OP_FENCE_I:
                 emit_ir_fence(a, inst);
                 break;
 
-            /* T4 BRANCH 6 op → emit_ir_branch (双出口自含末段; block_done=true) */
+            /* BRANCH 6 op → emit_ir_branch (双出口自含末段; block_done=true) */
             case IR_OP_BEQ: case IR_OP_BNE: case IR_OP_BLT:
             case IR_OP_BGE: case IR_OP_BLTU: case IR_OP_BGEU:
                 emit_ir_branch(a, inst, exit_inst,
@@ -1709,18 +1705,17 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 block_done = true;
                 break;
 
-            /* T4 JAL → emit_ir_jal (compile-time target; 走外层标准末段) */
+            /* JAL → emit_ir_jal (compile-time target; 走外层标准末段) */
             case IR_OP_JAL:
                 emit_ir_jal(a, inst);
                 break;
 
-            /* T4 JALR → emit_ir_jalr (runtime target 存 r9d; 走外层 DISPATCH_EXIT
-             * _RUNTIME 末段) */
+            /* JALR → emit_ir_jalr (runtime target 存 r9d; 走外层 DISPATCH_EXIT_RUNTIME 末段) */
             case IR_OP_JALR:
                 emit_ir_jalr(a, inst);
                 break;
 
-            /* T4 SYSTEM 6 op → emit_ir_system (自含末段; block_done=true).
+            /* SYSTEM 6 op → emit_ir_system (自含末段; block_done=true).
              * ECALL/EBREAK 走 _Noreturn longjmp 无末段; MRET/SRET/WFI 走 COUNT_ONLY;
              * SFENCE_VMA 走标准 DISPATCH_EXIT — 都由 emit_ir_system 内部 emit. */
             case IR_OP_ECALL: case IR_OP_EBREAK:
@@ -1731,7 +1726,7 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
                 block_done = true;
                 break;
 
-            /* T7 RV32M 8 op → emit_ir_muldiv (MUL 4 + DIV/REM 4; inline emit,
+            /* RV32M 8 op → emit_ir_muldiv (MUL 4 + DIV/REM 4; inline emit,
              * 不走 helper — M 是纯算术, 无内存副作用, 无 trap). */
             case IR_OP_MUL:    case IR_OP_MULH:   case IR_OP_MULHSU: case IR_OP_MULHU:
             case IR_OP_DIV:    case IR_OP_DIVU:   case IR_OP_REM:    case IR_OP_REMU:
@@ -1749,7 +1744,7 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
         }
     }
 
-    /* 末段 emit (T4 起按 block_done + exit_inst.kind 分流):
+    /* 末段 emit (按 block_done + exit_inst.kind 分流):
      *   block_done=true (BRANCH 6 / SYSTEM 6) — 跳过, 末段已内嵌 emit
      *   exit_inst.kind == DISPATCH_EXIT — 走标准 emit_dispatch_exit (compile-time
      *                                       target_pc; JAL/CSR/FENCE_I/算术截断等)
@@ -1779,8 +1774,8 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
     err = g_rt->add(&fn, &code);
     if (err != asmjit::kErrorOk) {
         *host_code_out = nullptr;
-        // T1 起步统一 BACKEND_INTERNAL; T5+ 真撞 OOM 时按 err code 细化到
-        // CODE_CACHE_FULL (走 jit_entry.cc Q11 a Flush+retry)
+        // 统一 BACKEND_INTERNAL; 真撞 OOM 时按 err code 细化到 CODE_CACHE_FULL
+        // (走 jit_entry.cc Q11 a Flush+retry) 是未来精细化项
         return JIT_BACKEND_INTERNAL;
     }
 

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // cpu 模块对外接口。
 //
 // cpu_t = 单 hart 的 guest CPU 状态镜像 (per-hart, 无并发, 普通读写)。
@@ -138,9 +137,8 @@ typedef struct cpu_s {
                                                 // 各项); MDT/SDT spec 路径 (Smdbltrp/Ssdbltrp) 替代
                                                 // 早期 in_trap 字段, 详 trap.h 顶部 + trap.c
     // JIT 块执行状态灯 (§11 (a) 候选 c):
-    //   持当前正在跑的 host_code 指针 (jit_block_func_t 入口指针; 当前 stub backend
-    //   永返 NOT_IMPLEMENTED 路径下永远 NULL, b_02 真做 emit 后 = backend 编出的
-    //   mmap RX 段地址). 是 cpu_t 内第一个 _Atomic 字段.
+    //   持当前正在跑的 host_code 指针 (jit_block_func_t 入口指针 = asmjit JitRuntime
+    //   RX 段地址; 未跑 JIT 块时 = NULL). 是 cpu_t 内第一个 _Atomic 字段.
     //
     //   dispatcher fork 点协议 (dispatcher.c 已接):
     //     - lookup hit: RCU read_lock 内取 host_code_ptr 后 atomic store 状态灯 (release),
@@ -150,21 +148,19 @@ typedef struct cpu_s {
     //     - sigsetjmp 落点兜底清 (longjmp 路径 host_code 内 helper trap_raise_exception
     //       跳过 host_code 后续清状态灯代码时, 由 dispatcher.c sigsetjmp 落点兜底).
     //
-    //   b_02 backend.invalidate_block 真做时的 caller (当前 stub nop 无真 caller):
-    //     按 host_code 指针扫所有 hart 此字段, 等所有 hart 跑出 (字段值不为 待 unmap
-    //     的 host_code) 才能真 unmap mmap RX 段; 跟 jit_rcu_synchronize 同 "存在性遍历
+    //   backend.invalidate_block 真 release 前的 caller (jit_entry.cc jit_invalidate_block):
+    //     按 host_code 指针扫所有 hart 此字段, 等所有 hart 跑出 (字段值不为待 release
+    //     的 host_code) 才能真 release RX 段; 跟 jit_rcu_synchronize 同 "存在性遍历
     //     用 n_harts" 体例 (§15 cap-vs-n_harts).
     //
-    //   memory_order: 跨 hart 读/写都用 release/acquire 配对; 当前 dispatcher 单 hart
-    //   自读自写不强求严格 order, 但 release 是 b_02+ backend 跨 hart 扫状态灯时的
-    //   协议预备.
+    //   memory_order: 跨 hart 读/写都用 release/acquire 配对.
     //
     //   C++ 端字段类型条件 typedef 成 `void *` (非 _Atomic): GCC 11 g++ 不接受 _Atomic
     //   keyword extension, 但 _Atomic(void *) 跟 void * 在常见 ABI 下 layout 兼容
-    //   (size = align = sizeof(void *)). C++ 端 (backend_asmjit.cc / jit_entry.cc) 当前
-    //   不直接读写此字段 (stub backend 不接 cpu_t; b_02 真做时若需读, 用 GCC
-    //   __atomic_load_n builtin 替代 atomic_load_explicit; 那时若 layout 出问题再
-    //   reshape 跟 _Atomic 字段分离 sub-struct).
+    //   (size = align = sizeof(void *)). C++ 端 (backend_asmjit.cc / jit_entry.cc)
+    //   当前不直接读写此字段; 若需读, 用 GCC __atomic_load_n builtin 替代
+    //   atomic_load_explicit; 那时若 layout 出问题再 reshape 跟 _Atomic 字段分离
+    //   sub-struct.
 #ifdef __cplusplus
     void                    *jit_executing_host_code;
 #else
@@ -230,11 +226,12 @@ void cpu_destroy(cpu_t *hart);
 
 
 // ----------------------------------------------------------------------------
-// cpu_wait_all_harts_exit_host_code (b_02 T5; jit_invalidate_block 协议)
+// cpu_wait_all_harts_exit_host_code (jit_invalidate_block 协议)
 //
 // 扫 harts_table (cap MAX_HARTS) 等所有 hart 的 jit_executing_host_code 字段
-// 不再 == host_code; 起步 busy-wait + PAUSE (start_plan_b_02 §0.8 R8). caller =
-// jit_entry.cc 的 jit_invalidate_block, backend 真 unmap 前必调.
+// 不再 == host_code; 起步 busy-wait + PAUSE (真撞 perf 时换 cond_wait /
+// pthread_yield 推 a_05+). caller = jit_entry.cc 的 jit_invalidate_block,
+// backend 真 release 前必调.
 //
 // 不强求 caller 持锁; cpu_create/cpu_destroy 维护 harts_table 注册表, phantom
 // slot 跳过. 协议跟 cpu_t.jit_executing_host_code 字段顶段 doc 对偶 (cpu.h 上方).

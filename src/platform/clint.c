@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/16.
 // CLINT 实现 — mtime / mtimecmp[N] / msip[N] MMIO 寄存器 + bus 注册 + timer
 // 辅助线程 (file-static timer_run, 异步累加 atomic clint.mtime)。
 //

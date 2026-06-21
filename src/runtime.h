@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/19.
 // runtime 模块 — host-side 生命周期信号 (degenerate monitor; src/dummy.txt §7)。
 //
 // 两个 atomic uint32_t bitmap, 0 = "允许执行", 非 0 = "触发对应停机路径"。

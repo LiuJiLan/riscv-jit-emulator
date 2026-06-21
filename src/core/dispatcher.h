@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // dispatcher 模块对外接口。
 //
 // dispatcher 是 hart 主循环: sigsetjmp 一次性建立永久落点 + while(SRS==0) 多块循环 +

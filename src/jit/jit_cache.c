@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/7.
 // jit/jit_cache.c —— JIT 块缓存 + EBR RCU 实装.
 //
 // 顶部接口 doc + 设计依据 全部见 jit_cache.h. 本文件只放实装.
@@ -89,7 +88,7 @@ static inline size_t jit_cache_hash(uxlen_t pa, regime_t regime) {
 
 
 /* ============================================================================
- * 内部 helper: entry_key_matches — atomic load key 比较 (b_02 T5 race-free)
+ * 内部 helper: entry_key_matches — atomic load key 比较 (race-free)
  *
  * key_pa / key_regime 升 _Atomic (jit_cache.h struct 字段段 doc). 比较读用
  * atomic_load_explicit relaxed (status 的 acquire/release 已建立 happens-before,
@@ -257,7 +256,7 @@ static void link_into_page_list(jit_cache_entry_t *e, uxlen_t pa,
 /* ============================================================================
  * jit_cache_install — RCU modify-side, atomic CAS 路径无锁
  *
- * 两个 entry 路径 (b_02 T5):
+ * 两个 entry 路径:
  *   (a) install 路径: 撞 EMPTY slot → CAS EMPTY→COUNTING → 填字段 + 挂链表 →
  *       store COMPILED. 走 jit_compile_block 二次 Flush 后 (entry 全清回 EMPTY)
  *       的重试场景.
@@ -288,7 +287,7 @@ int jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr) {
         /* CAS 失败: expected 已被 CAS 更新成当前 status.
          * 撞 key 匹配的两种 idempotent / promote 路径:
          *   - status=COMPILED/BLACK + key 匹配 → idempotent return 0
-         *   - status=COUNTING + key 匹配 → promote (b_02 T5 主路径)
+         *   - status=COUNTING + key 匹配 → promote (主路径)
          *
          * COUNTING 撞 key 匹配的 race 安全: dispatcher lookup_or_init 在 CAS
          * EMPTY→COUNTING 成功之后填了 key / next_in_page (release 之前所有 store
@@ -341,7 +340,7 @@ got_slot_promote:
 /* ============================================================================
  * jit_cache_lookup_or_init — RCU read-side + lazy install COUNTING entry
  *
- * b_02 T5 dispatcher fork 点专用. 跟 lookup 体例:
+ * dispatcher fork 点专用. 跟 lookup 体例:
  *   - 撞 key 匹配 + 任意非 EMPTY status (COMPILED/COUNTING/BLACK) → return entry
  *     (caller dispatcher 自己据 status 分流)
  *   - 撞 EMPTY → CAS EMPTY→COUNTING; 成功填 key + 挂链表 + counter=0; 返本 entry
@@ -396,7 +395,7 @@ jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime) {
 
 
 /* ============================================================================
- * jit_cache_take_compiled_host_code — CAS COMPILED→EMPTY 取 host_code (b_02 T5)
+ * jit_cache_take_compiled_host_code — CAS COMPILED→EMPTY 取 host_code
  *
  * caller: jit_entry.cc 的 jit_invalidate_block. 找到 status=COMPILED + key 匹配
  * 的 entry → CAS COMPILED→EMPTY (release; 后续 lookup 见 EMPTY 视 miss) →
@@ -489,7 +488,14 @@ got_slot:
 /* ============================================================================
  * jit_cache_invalidate_page — RCU modify-side, sync grace period
  *
- * 顺 old_head 链表清 status → synchronize → backend.invalidate_block (T2 stub nop).
+ * 顺 old_head 链表清 status → synchronize → backend.invalidate_block.
+ *
+ * 注: 本函数 caller (b_03 SMC chain) 当前没接通 — page_dirty bitmap 是 a_05+
+ * 真做项, 本函数预先填好走通协议. backend_invalidate_block 真 release host
+ * code RX 段 (asmjit JitRuntime::release), 顺链清的每个 host_code_ptr 都要调,
+ * 但本函数遍历链表时只清 status 不读 host_code_ptr (entry 字段 invalidate 后
+ * lookup 见 EMPTY 即可); SMC chain 真做时需 collect host_code_ptr 列表后逐个
+ * backend.invalidate_block 调.
  * ============================================================================ */
 void jit_cache_invalidate_page(uint32_t page_idx) {
     if (page_idx >= GUEST_RAM_NPAGES) { return; }   /* 防御 */
@@ -511,23 +517,21 @@ void jit_cache_invalidate_page(uint32_t page_idx) {
     }
 
     /* 等所有 hart 出 read critical section, 旧引用 host_code_ptr 不再被任何
-     * hart 持有, backend 可安全 unmap host_code mmap 区 (当前 backend stub nop). */
+     * hart 持有, backend 可安全 release host_code RX 段. */
     jit_rcu_synchronize();
 
-    /* 当前 backend stub nop; b_02 真做 emit 后调
-     *   const backend_t *be = backend_get_default();
-     *   for (清完的每个 slot.host_code_ptr) be->backend_invalidate_block(...);
-     * 当前 host_code_ptr 永是 NULL (stub backend.compile_block 返
-     * NOT_IMPLEMENTED 不真 install); b_02 真做 emit 时 backend 编 host code
-     * 进 mmap RX 段, 这时 backend.invalidate_block 真 unmap. */
+    /* 顺链 backend.invalidate_block 真 release 由 caller (SMC chain) 协议补完,
+     * 见函数顶段 doc; jit_cache 本身只清 status. */
 }
 
 
 /* ============================================================================
  * jit_cache_flush_all — RCU modify-side, sync grace period (整表清)
  *
- * 扫整张 hash_table → 扫 page_block_head → synchronize → backend.flush_all
- * (当前 backend stub nop).
+ * 扫整张 hash_table → 扫 page_block_head → synchronize.
+ *
+ * 注: backend.flush_all (asmjit JitRuntime::reset 整片回收 RX 池) 由 caller
+ * (jit_entry.cc jit_flush_all) 紧接其后调, 见 jit_entry.cc 协议.
  * ============================================================================ */
 void jit_cache_flush_all(void) {
     for (uint32_t i = 0; i < JIT_CACHE_SIZE; i++) {
@@ -540,8 +544,4 @@ void jit_cache_flush_all(void) {
     }
 
     jit_rcu_synchronize();
-
-    /* 当前 backend stub nop; b_02 真做后调
-     *   const backend_t *be = backend_get_default();
-     *   be->backend_flush_all(); */
 }

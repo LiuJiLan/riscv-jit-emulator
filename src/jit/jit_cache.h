@@ -1,9 +1,8 @@
 //
-// Created by liujilan on 2026/6/7.
 // jit/jit_cache.h —— JIT 块缓存 (PA, regime) → host_code_ptr 的 hash table.
 //
 // ============================================================================
-// 设计依据 (Q9/Q10/Q11/Q12; 详 notes/context/jit_plan_audit_decision.md)
+// 设计依据 (audit Q9/Q10/Q11/Q12; 详 trade_off_log §T JIT cache)
 // ============================================================================
 //
 // 三个核心拍法:
@@ -13,19 +12,17 @@
 //                比 invalidate O(块/页) vs O(全 cache))
 //   Q10 c RCU — EBR (epoch-based reclamation) 自实现, lookup read-side 无锁;
 //                install / invalidate_page / flush_all 走 modify-side, 等
-//                grace period 后才允许 backend 真 unmap host_code mmap 区
-//                (b_03 SMC 真触发时 backend.invalidate_block 才真做)
+//                grace period 后才允许 backend 真 release host_code RX 段
 //   Q11 a    — jit_api 层 Flush + retry 1 次, dispatcher 不感知 Flush;
 //                jit_cache_install 返 -1 (FULL) 时 caller (jit_entry.cc) 触发
 //                jit_flush_all + 再 install 重试 1 次 (retry 完整路径见
-//                jit/jit_entry.cc; backend 真编译完成前永走 NOT_IMPLEMENTED 路径)
-//   Q12 c    — invalidate_reason_t 入参不带; 现役
-//                两条路径 (SMC invalidate / Flush_all) 都清 BLACK; 未来加
-//                block chaining / SMC 立即重编时 ABI append-only 扩 reason 入参
+//                jit/jit_entry.cc)
+//   Q12 c    — invalidate_reason_t 入参不带; 现役两条路径 (SMC invalidate /
+//                Flush_all) 都清 BLACK; 未来加 block chaining / SMC 立即重编时
+//                ABI append-only 扩 reason 入参
 //
-// SMP 一次性到位原则 (S6; plan §1.9 末段 + dummy.txt §15 末段):
-//   SMP 已落地 (a_03 #205-#209), 后续 SMP 相关设计必须一次性到位; jit_cache
-//   出生即 lock-free + RCU, 不走"先单 hart 后补 SMP".
+// SMP 一次性到位原则 (plan §1.9 末段 + dummy.txt §15 末段):
+//   jit_cache 出生即 lock-free + RCU, 不走"先单 hart 后补 SMP".
 //
 // cap-vs-n_harts (dummy.txt §15): 数组定义 / lifecycle 配对 / phantom 防御
 //   按 cap (MAX_HARTS / JIT_CACHE_SIZE); RCU synchronize 遍历按 n_harts (存在性).
@@ -54,7 +51,7 @@
 //   jit_cache_invalidate_page          — RCU modify-side (sync grace period)
 //   jit_cache_flush_all                — RCU modify-side (sync grace period)
 //
-// jit_rcu_*      — EBR critical section; caller = dispatcher (T4 fork 点真接) +
+// jit_rcu_*      — EBR critical section; caller = dispatcher fork 点 +
 //                   modify-side 函数自身 (jit_rcu_synchronize)
 //   jit_rcu_read_lock / read_unlock    — read critical section enter / exit
 //                                         (1 cycle 退化为 store 一个 epoch)
@@ -122,14 +119,12 @@ typedef enum {
 //   key_pa         — 块入口 PA (uxlen_t; dummy.txt §13)
 //   key_regime     — baked priv 视角 (BARE / SV32_S / SV32_U; core/mmu.h)
 //   status         — 状态机 (atomic; load acquire / store release)
-//   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; b_02 T5 升 _Atomic,
-//                     dispatcher fork 点多 hart 并发 atomic_fetch_add, 不再走
-//                     "owner 独占写"假设). 达 config.h COMPILE_THRESHOLD 触发
+//   counter        — 解释器执行次数计数 (热度阈值; plan §1.23.8; _Atomic 多 hart
+//                     并发 atomic_fetch_add). 达 config.h COMPILE_THRESHOLD 触发
 //                     jit_compile_block + promote COUNTING → COMPILED.
 //   host_code_ptr  — backend 编译产物入口 (类型 jit_block_func_t = void (*)
-//                     (cpu_t*, tlb_t*, uint64_t*); Q1 a; 当前 stub backend
-//                     永返 NOT_IMPLEMENTED 不进 install 路径, b_02 backend
-//                     真做 emit 后填真 mmap RX 段地址)
+//                     (cpu_t*, tlb_t*, uint64_t*); Q1 a; 指向 asmjit JitRuntime
+//                     mmap RX 段)
 //   next_in_page   — per-page block list 链表 next 索引 (uint16_t; JIT_CACHE_SIZE
 //                     = 65536 索引正好用满 uint16_t; 0xFFFF = 链尾哨兵 = JIT_PAGE_HEAD_END)
 //
@@ -138,11 +133,11 @@ typedef enum {
 //   status = COMPILED 配 lookup acquire load 形成 happens-before, lookup 看到
 //   COMPILED 时其他字段已 visible.
 //
-// key_pa / key_regime / counter 是 _Atomic (b_02 T5):
+// key_pa / key_regime / counter 是 _Atomic:
 //   - counter: dispatcher fork 点 multi-hart 并发 atomic_fetch_add
 //   - key_pa / key_regime: lookup_or_init 在 status=COUNTING 状态也读 key 比较
-//     (跟 install owner CAS 后填 key 期间是 in-flight 窗口, 旧体例"COUNTING 不读
-//     key"会导致 lookup_or_init 误退 → 同 PA 多 entry 蔓延). 升 _Atomic 让读写都
+//     (跟 install owner CAS 后填 key 期间是 in-flight 窗口, "COUNTING 不读 key"
+//     会导致 lookup_or_init 误退 → 同 PA 多 entry 蔓延). _Atomic 让读写都
 //     atomic_relaxed (relaxed 即可 — status 的 acquire/release 已建立 happens-
 //     before, key 只需要不撕裂值; TSan 验证 race 无).
 //
@@ -154,7 +149,7 @@ typedef struct jit_cache_entry_s {
     _Atomic uxlen_t   key_pa;
     _Atomic uint32_t  key_regime;      // 实际 regime_t 值, atomic 字段用 uint32_t 体例
     _Atomic uint32_t  status;          // jit_cache_status_t
-    _Atomic uint32_t  counter;         // heat counter (b_02 T5)
+    _Atomic uint32_t  counter;         // heat counter
     void             *host_code_ptr;
     uint16_t          next_in_page;
 } jit_cache_entry_t;
@@ -163,10 +158,10 @@ typedef struct jit_cache_entry_s {
 // ----------------------------------------------------------------------------
 // C++ 端: forward decl entry struct (opaque type)
 //
-// 真做 C++ caller (jit_entry.cc) 只调 lifecycle / install / flush / set_blacklist,
+// C++ caller (jit_entry.cc) 只调 lifecycle / install / flush / set_blacklist,
 // 不实例化 entry struct 也不读字段, opaque pointer 够用. jit_cache_lookup 返
 // jit_cache_entry_t * 在 C++ 端是 opaque 指针 (访问字段会撞 incomplete type fail);
-// dispatcher fork 点 T4 真做时调 lookup, 那是 C 文件不撞此问题.
+// dispatcher fork 点调 lookup 是 C 文件不撞此问题.
 //
 // 这条避绕是因 GCC 11 g++ 不接受 _Atomic keyword extension (升 GCC 13+ 后可重审).
 // ----------------------------------------------------------------------------
@@ -204,15 +199,15 @@ void jit_cache_destroy(void);
 //
 // caller 后续:
 //   - hit 路径: 调 host_code(entry->host_code_ptr) 后再调 jit_rcu_read_unlock
-//     (host_code 执行过程 host_code mmap 区 RX 不能被 backend 真 unmap;
-//      invalidate 路径 jit_rcu_synchronize 等出 critical 才允许 backend unmap)
-//   - miss 路径: 调 jit_rcu_read_unlock 后走 interpreter fallback (T4 真接时)
+//     (host_code 执行过程 RX 段不能被 backend 真 release;
+//      invalidate 路径 jit_rcu_synchronize 等出 critical 才允许 backend release)
+//   - miss 路径: 调 jit_rcu_read_unlock 后走 interpreter fallback
 // ----------------------------------------------------------------------------
 jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime);
 
 
 // ----------------------------------------------------------------------------
-// jit_cache_lookup_or_init —— RCU read-side + lazy install COUNTING (b_02 T5)
+// jit_cache_lookup_or_init —— RCU read-side + lazy install COUNTING
 //
 // caller: dispatcher fork 点 (C-only, dispatcher.c). C++ 端 (jit_entry.cc) 不
 // 调用此接口 — 它访问 entry 字段 (status/counter/host_code_ptr) 而 C++ 端
@@ -238,7 +233,7 @@ jit_cache_entry_t *jit_cache_lookup(uxlen_t pa, regime_t regime);
 //   - BLACK    → interpret 兜底, 不增 counter (永不编)
 //
 // 跟 lookup 关系: lookup 体例不变 (其他 caller 兼容), lookup_or_init 是
-// dispatcher T5 后专用. 共享 hash + 探测核心 (jit_cache.c 内 file-static helper).
+// dispatcher 专用. 共享 hash + 探测核心 (jit_cache.c 内 file-static helper).
 // ----------------------------------------------------------------------------
 #ifndef __cplusplus
 jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime);
@@ -253,8 +248,8 @@ jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime);
 //   2. 线性探测 ≤ JIT_INSTALL_MAX_PROBES 步:
 //      - 撞 EMPTY slot: status atomic CAS EMPTY → COUNTING; 成功后填 key /
 //        host_code_ptr / counter=0 / 挂 page_block_head; 走 step 3 store COMPILED
-//      - 撞 key 匹配 + status = COUNTING (b_02 T5 dispatcher 已 lookup_or_init
-//        建好 COUNTING entry): 写 host_code_ptr; 走 step 3 store COMPILED
+//      - 撞 key 匹配 + status = COUNTING (dispatcher 已 lookup_or_init 建好
+//        COUNTING entry): 写 host_code_ptr; 走 step 3 store COMPILED
 //        (promote 路径; 此时 key / next_in_page 已 visible, 不重填)
 //      - 撞 key 匹配 + status = COMPILED / BLACK: idempotent return 0 (race 时
 //        另一 hart 已完成)
@@ -269,15 +264,15 @@ jit_cache_entry_t *jit_cache_lookup_or_init(uxlen_t pa, regime_t regime);
 // caller (jit_api 层) 处理 -1 (Q11 a): 调 jit_flush_all + 再调 install 重试 1 次;
 // 二次 -1 调 jit_cache_set_blacklist (本头下方接口) 让 (PA, regime) 进 BLACK.
 //
-// b_02 T5 后兼容两路径: dispatcher fork 点 lookup_or_init 已建 COUNTING entry,
-// 走 promote; jit_compile_block 二次 Flush 后 entry 被全清回 EMPTY, 走旧
-// EMPTY→COMPILED 直通路径.
+// 兼容两路径: dispatcher fork 点 lookup_or_init 已建 COUNTING entry, 走 promote;
+// jit_compile_block 二次 Flush 后 entry 被全清回 EMPTY, 走 EMPTY→COMPILED
+// 直通路径.
 // ----------------------------------------------------------------------------
 int  jit_cache_install(uxlen_t pa, regime_t regime, void *host_code_ptr);
 
 
 // ----------------------------------------------------------------------------
-// jit_cache_take_compiled_host_code —— take + CAS COMPILED→EMPTY (b_02 T5)
+// jit_cache_take_compiled_host_code —— take + CAS COMPILED→EMPTY
 //
 // caller: jit_entry.cc 的 jit_invalidate_block (C/C++ 共用接口, 返 void* 不返
 // entry struct, C++ 端友好).
@@ -340,11 +335,11 @@ int  jit_cache_set_blacklist(uxlen_t pa, regime_t regime);
 //   2. 顺 old_head 链表清: 每 slot atomic store status = EMPTY (release;
 //      包括 BLACK → EMPTY, Q12 c)
 //   3. jit_rcu_synchronize() — 等所有 hart 出 read critical section
-//   4. (T2 stub: backend.invalidate_block 是 nop) backend 真做后 unmap host_code
-//      mmap 区
+//   4. backend.invalidate_block release host_code RX 段 (asmjit
+//      JitRuntime::release)
 //
-// caller: b_03 SMC handler 触发 page_dirty bitmap → dispatcher 主循环顶扫
-// bitmap → 调 jit_cache_invalidate_page(page_idx); 真触发端到端 verify 推 b_03.
+// caller: a_05+ SMC handler 触发 page_dirty bitmap → dispatcher 主循环顶扫
+// bitmap → 调 jit_cache_invalidate_page(page_idx); 真端到端 verify 推 a_05+.
 // ----------------------------------------------------------------------------
 void jit_cache_invalidate_page(uint32_t page_idx);
 
@@ -357,9 +352,9 @@ void jit_cache_invalidate_page(uint32_t page_idx);
 //      (release; 包括 BLACK)
 //   2. 扫 page_block_head[0..GUEST_RAM_NPAGES) 全部 = JIT_PAGE_HEAD_END
 //   3. jit_rcu_synchronize()
-//   4. (T2 stub: backend.flush_all 是 nop) backend 真做后 reset code_cache mmap 区
+//   4. backend.flush_all reset code_cache RX 段 (asmjit JitRuntime::reset)
 //
-// caller: jit_api_flush_all (Q11 a CODE_CACHE_FULL 路径; T3 backend 真做时拍).
+// caller: jit_api_flush_all (Q11 a CODE_CACHE_FULL 路径).
 // ----------------------------------------------------------------------------
 void jit_cache_flush_all(void);
 

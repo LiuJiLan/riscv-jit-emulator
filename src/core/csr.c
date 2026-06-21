@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/4.
 // csr 模块实现 (csr_op 大 helper + 各小 r/w helper 真读写 hart->trap / hart->satp 字段)。
 //
 // 顶部模块文档见 csr.h; 跨文件协议见 src/dummy.txt §1。

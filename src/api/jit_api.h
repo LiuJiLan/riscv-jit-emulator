@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/5.
 // api/jit_api.h —— JIT 子系统对外入口 (C++ 实现, 给 C 调).
 //
 // ============================================================================
@@ -22,19 +21,19 @@
 // 5 个对外入口实装在 jit/jit_entry.cc (backend-agnostic 组合层, 通过
 // backend_get_default() 拿 backend_t* 调 vtable). dispatcher fork 点 miss 路径
 // 调 jit_compile_block; lifecycle (jit_init / jit_shutdown) main POR / teardown
-// 配对一次; jit_flush_all / jit_invalidate_block 当前仅作 jit_compile_block
-// 内部 Q11 a 组合用 + 占位 (SMC 真触发在 b_03).
+// 配对一次; jit_flush_all 作 jit_compile_block 内部 Q11 a 组合用;
+// jit_invalidate_block 当前 caller 只有测试 fixture (SMC 真触发在 a_05+).
 //
 // 错误码 jit_status_t:
 //   JIT_OK                  — 编译成功 / 接口调用成功
-//   JIT_CODE_CACHE_FULL     — code_cache mmap 区满, 调用方触发整体 Flush
+//   JIT_CODE_CACHE_FULL     — JitRuntime allocator 满, 调用方触发整体 Flush
 //                              (plan §1.23.9)
 //   JIT_IR_ERROR            — IR 内部不一致 / translator 产物错; 调用方进
 //                              编译黑名单 (plan §1.23.8)
 //   JIT_BACKEND_INTERNAL    — backend (asmjit) 内部错; 调用方进黑名单 / 退
 //                              interpreter
-//   JIT_ERR_NOT_IMPLEMENTED — backend stub 阶段返这个; 当前 stub backend 永
-//                              返这个, dispatcher fork 点 fall back interpreter
+//   JIT_ERR_NOT_IMPLEMENTED — IR 流空 (块前缀无真翻译 op) / unsupported op;
+//                              dispatcher fork 点 fall back interpreter
 //
 // 命名: jit_* prefix, snake_case (CLAUDE.md "Naming and style").
 //
@@ -65,9 +64,9 @@ typedef enum {
 // jit lifecycle
 // ----------------------------------------------------------------------------
 
-// jit_init: 初始化 JIT 子系统 (backend.init / translator 内部状态 / code_cache
-//   mmap 区分配 / jit_cache hash 表). main 在 cpu/clint/plic 等子系统 init 之后
-//   调一次; SMP 多 hart 仍只调一次 (jit_cache / code_cache 是 shared).
+// jit_init: 初始化 JIT 子系统 (backend.init alloc asmjit JitRuntime / jit_cache
+//   hash 表). main 在 cpu/clint/plic 等子系统 init 之后调一次; SMP 多 hart 仍
+//   只调一次 (jit_cache / JitRuntime 是 shared).
 void jit_init(void);
 
 // jit_shutdown: 释放 JIT 子系统资源. main 在所有 hart join 之后调一次, 跟
@@ -76,7 +75,7 @@ void jit_shutdown(void);
 
 
 // ----------------------------------------------------------------------------
-// jit block 操作 (dispatcher fork 点 T4 真做时调)
+// jit block 操作 (dispatcher fork 点 miss 路径调)
 // ----------------------------------------------------------------------------
 
 // jit_compile_block: 触发翻译 + backend 编译一个块, 入口 = (pa, regime).
@@ -84,22 +83,19 @@ void jit_shutdown(void);
 //   失败时按返码处理 (CODE_CACHE_FULL → Flush; IR_ERROR / BACKEND_INTERNAL →
 //   黑名单).
 //
-//   当前 stub backend 永返 JIT_ERR_NOT_IMPLEMENTED, jit_entry.cc 三 step 分流后
-//   进 BLACK; backend 真编译 (b_02) 后才有 JIT_OK 路径.
-//
-//   签名细节 (b_02 真做时可调整): 当前不带 hart 参数 — translator 编译期 baked
-//   regime 已涵盖 priv 视角, 不需要具体 hart 上下文 (mstatus.SUM/MXR 等 runtime
-//   inline 读, 不 baked).
+//   签名不带 hart 参数 — translator 编译期 baked regime 已涵盖 priv 视角,
+//   不需要具体 hart 上下文 (mstatus.SUM/MXR 等 runtime inline 读, 不 baked).
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime);
 
-// jit_invalidate_block: 失效 jit_cache 内 (pa, regime) 对应的块.
-//   SMC handler 延迟 invalidate / fence.i / 单块失效路径调.
-//   当前 stub: nop (SMC 路径走 jit_cache_invalidate_page 按 page 颗粒度;
-//   按 (pa, regime) 单块语义留 b_03 真做 SMC + fence.i 双保险时拍).
+// jit_invalidate_block: 失效 jit_cache 内 (pa, regime) 对应的块, release host
+//   code RX 段. 当前 caller 只有测试 fixture (协议路径 verify); a_05+ SMC handler
+//   触发后改走 jit_cache_invalidate_page (按 page 颗粒度更高效), 本接口给 future
+//   block chaining 等单块失效场景留用. 协议 4 步详 jit_entry.cc 实装.
 void jit_invalidate_block(uxlen_t pa, regime_t regime);
 
 // jit_flush_all: 整体 Flush jit_cache + code_cache (CODE_CACHE_FULL 时调).
-//   实装: jit_cache_flush_all → backend.flush_all (顺序固定; backend stub nop).
+//   实装: jit_cache_flush_all → backend.flush_all (顺序固定; backend.flush_all
+//   走 asmjit JitRuntime::reset).
 void jit_flush_all(void);
 
 

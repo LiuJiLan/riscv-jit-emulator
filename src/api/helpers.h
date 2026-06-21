@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/6/5.
 // api/helpers.h —— slow path helper 集中声明 (C 实现, 给 C++ backend 调).
 //
 // ============================================================================
@@ -32,10 +31,10 @@
 //   isa/sfence.h  — sfence_vma_helper
 //   isa/fence.h   — fence_helper / fence_i_helper
 //   core/trap.h   — trap_raise_exception (helper longjmp 入口; dummy.txt §1)
-//   core/wfi.h    — wfi_wait (可能 b_03+ JIT 翻译 WFI 时调; 先纳入)
+//   core/wfi.h    — wfi_wait (JIT 翻译 WFI 时调)
 //
-// 当前 re-export 全套. backend 真做 emit (b_02) 时若需 namespace 精细控制
-// (只 export 部分) 再拆 — 当前转发简单 + 维护友好.
+// 当前 re-export 全套. 真需 namespace 精细控制 (只 export 部分) 再拆 — 转发简单
+// + 维护友好.
 //
 // ============================================================================
 // 命名

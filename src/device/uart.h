@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/24.
 // UART (ns16550a 兼容) — TX → host stdout / RX ← host stdin; 接 PLIC source 10.
 //
 // 跟 QEMU virt machine + Linux earlycon=uart8250 + OpenSBI 默认 console 一致;

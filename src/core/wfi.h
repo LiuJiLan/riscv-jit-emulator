@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/28.
 // WFI 唤醒框架 — per-hart cond+mutex slot + 5 接口函数。
 //
 // 用途: RV WFI 指令的真实装 (interpreter case OP_WFI 调 wfi_wait 挂起 hart;
@@ -138,9 +137,8 @@ void wfi_kick_all(void);
 // 锁与可见性: predicate 在 wfi_wait 内 mutex hold 下被调; atomic_load(SRS, acquire)
 // 跟 SRS-setter 端 release 配对; csr_mip_read 内部走 atomic_load.
 //
-// 此函数 T4 期间从 interpreter.c file-static 提为 extern 放本模块 (跟 wfi_wait 协议
-// 对偶, 同模块); JIT backend emit `call wfi_wait(hartid, wfi_should_wake, hart)`
-// 跨 TU 拿地址.
+// extern (非 file-static) 放本模块跟 wfi_wait 协议对偶 (同模块); JIT backend
+// emit `call wfi_wait(hartid, wfi_should_wake, hart)` 跨 TU 拿地址.
 // ----------------------------------------------------------------------------
 bool wfi_should_wake(void *closure);
 

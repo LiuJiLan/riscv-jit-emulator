@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/16.
 // bus 实现 — MMIO 注册表 (静态数组) + PA range 线性派发。
 //
 // 接口形态见 bus.h; 三层职责 (mmu / pmp / 内存) 见 src/dummy.txt §8;

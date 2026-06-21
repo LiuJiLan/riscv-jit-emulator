@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/5/5.
 // isa/lsu —— store_helper 实现 (extern, HVA-based, RAM 写 + 副作用)。
 //
 // 顶部接口 doc + 调用拓扑 + 不对称真机理 + misalign 隐式契约 见 lsu.h。
@@ -49,10 +48,10 @@ void store_helper(cpu_t *hart, uint8_t *hva, uxlen_t gva_for_tval,
     // ----------------------------------------------------------------------
     // SMC 检测 (page_dirty bitmap) —— 占位
     //
-    // JIT 接入后: store 写到含 JIT 翻译过的 page 时, 配合 jit/smc.c 的 page_dirty
-    // bitmap 检测, 让 dispatcher 在下次进 block 前 invalidate 该 page 上所有
-    // jit_cache 条目 (整页失效 — 不是精细; plan §1.17 + §3 #13 决策)。
-    // 当前没 JIT 也没 jit_cache, 占位等真做。
+    // a_05+ SMC chain: store 写到含 JIT 翻译过的 page 时, 配合 jit/smc.c 的
+    // page_dirty bitmap 检测, 让 dispatcher 在下次进 block 前 invalidate 该 page
+    // 上所有 jit_cache 条目 (整页失效 — 不是精细; plan §1.17 + §3 #13 决策)。
+    // 当前 store_helper 不动 page_dirty, 等 a_05+ SIGSEGV mprotect path 真做。
     //
     // 注: MMIO 非可执行 page, 不参与 SMC (跟 reservation 同理由), 所以本 helper
     // 不服务 MMIO 路径。

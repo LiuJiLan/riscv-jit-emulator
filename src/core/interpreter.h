@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/28.
 // interpreter 模块对外接口。
 //
 // interpret_one_block: 解释执行一段 RV32 代码, 从 hva_pc 开始顺序取指 + decode + dispatch

@@ -1,5 +1,4 @@
 //
-// Created by liujilan on 2026/4/29.
 // tlb 模块实现 (tlb_alloc / tlb_clear / tlb_table_reset)。
 // 顶部模块文档见 tlb.h。报错风格见 src/dummy.txt §5。
 //
