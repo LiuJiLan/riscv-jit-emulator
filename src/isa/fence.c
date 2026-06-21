@@ -16,6 +16,6 @@ void fence_helper(cpu_t *hart) {
 
 void fence_i_helper(cpu_t *hart) {
     /* i-cache flush 副作用: 清当前 hart reservation. RV spec 七类清除 #4.
-     * 未来 SMC chain (a_05+): 这里加 JIT cache page invalidate / page_dirty bitmap 重置. */
+     * 不主动调 jit_cache_invalidate_page — 详 fence.h 顶段 "fence_i_helper 不调 ... 为什么" 段. */
     lrsc_clear_self(hart);
 }
