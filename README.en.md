@@ -2,919 +2,274 @@
 
 English | [简体中文](./README.md)
 
-> **Note:** this English README lags behind the project state — it currently
-> reflects roughly the a_02 close. The [简体中文](./README.md) version is the
-> authoritative, up-to-date one; this translation is refreshed less often.
+A graduate-level user-space RISC-V JIT emulator, targeting RV32 G (IMAFD_Zicsr_Zifencei) plus the standard compressed extension C, aiming to boot OpenSBI / small operating systems / FreeRTOS-with-MMU. Current state (`66c9cf3`, milestone b_03 closeout): JIT subsystem fully landed end to end, multi-hart SMP support complete, geometric-mean JIT/interpreter speedup 3x, with large blocks reaching 10x.
 
-A graduate-level user-space RISC-V JIT emulator, targeting RV32 G plus the
-standard compressed extension C, with the goal of booting OpenSBI / small OSes /
-FreeRTOS-with-MMU. Milestone a_02 (the interpreter + bus/MMIO stage) is closed
-out, with all sub-tasks T1~T6 landed; the project is now entering a_03 (PLIC +
-UART external interrupts + virtio-blk + end-to-end verification).
+## Project Goals
 
+| Dimension   | State                                                                                  |
+| ----------- | -------------------------------------------------------------------------------------- |
+| Target ISA  | RV32 IMAC + Zaamo + Zalrsc + Zicsr + Zifencei landed; F/D deferred, Vector not in scope |
+| Priv levels | M / S / U three priv levels landed, with Sv32 MMU and full trap delegation (medeleg / mideleg) |
+| Multi-hart  | `--smp N` support, `MAX_HARTS=8`, per-hart pthread, SMP-aware JIT cache (EBR RCU)       |
+| Host        | Linux user-space process on x86_64; JIT backend is asmjit, LLVM OrcJIT interface reserved |
+| Devices     | CLINT / PLIC v1.0.0 / ns16550a UART / virtio-mmio blk legacy / test_dev (fixture helper) |
+| Test suite  | 146 fixtures (accumulated since a_01), all PASS across three build types (Debug+ASan / Release / Tsan) |
 
-## Design Goals
-
-- ISA: RV32 G (IMAFD_Zicsr_Zifencei) + the standard compressed extension C
-- Three-layer JIT architecture: Dispatcher / Translator / JitBackend (asmjit to
-  start, with an LLVM OrcJIT interface reserved)
-- Host: a Linux user-space process
-- SMP is not implemented, but every design is SMP-ready
-- 64-bit interfaces are reserved but not implemented
-
-
-## Signal Hierarchy + Bidirectional Autonomy
-
-The entire runtime is **a cohort of peer devices cooperating**. What
-distinguishes them is not "is it the CPU", but **which level of stop signal
-they obey**. Stop signals are strictly three-layered:
-
-```mermaid
-graph TB
-    SDS["SDS — shutdown signal<br/>persists across multiple system resets<br/>(e.g. CLINT timer ≈ an oscillator-class always-on part)"]
-    SRS["SRS — system reset signal<br/>a cohort of peer SRS-domain devices start/stop together<br/>(dispatcher / interrupt controllers / peripherals ...)"]
-    HR["in_trap — hart-reset encoding<br/>dispatcher's internal level of autonomy"]
-    SDS -. "force (top-down)" .-> SRS
-    SRS -. "force (top-down)" .-> HR
-    HR -. "escalate (bottom-up, only after self-handling fails)" .-> SRS
-    SRS -. "escalate (bottom-up)" .-> SDS
-```
-
-The hierarchy supports two directions at once, and the two directions are
-self-consistent:
-
-- **Force direction (top-down)**: once a higher-level signal is asserted, lower
-  levels stop naturally — no individual notification is needed. When shutdown
-  comes, the SRS domain and every hart stop with it; when system reset comes,
-  the self-handling at each hart is naturally interrupted. High pressure
-  arrives, and low pressure yields automatically.
-- **Escalate direction (bottom-up)**: **each level first tries to handle the
-  situation itself, and only escalates when it cannot**. A hart first tries
-  hart-reset autonomy; only if that fails does it set SRS=0. The system-reset
-  layer first joins all SRS-domain devices back, then decides "is this severe
-  enough to escalate to shutdown" — only if so does it stop SDS-domain threads.
-
-This "self-first, escalate only when insufficient" link makes **every level an
-autonomous unit that can resolve itself or call upward for help**.
-
-### The Dispatcher's Dual Identity
-
-In this architecture, the dispatcher is a special device — it carries two roles
-at once:
-
-- **Horizontally (peer to other devices)**: the dispatcher is **one** peer
-  device in the SRS domain, alongside future PLIC / UART / virtio-blk and so
-  on. They are all started/stopped by SRS, and they all follow the "spawn /
-  join in pairs" + atomic-flag cooperative shutdown protocol. The dispatcher
-  has no special status on this axis.
-- **Vertically (the hart execution core, with other peripherals serving it)**:
-  the dispatcher is also the one that actually runs guest instructions — other
-  peripherals (CLINT / future PLIC / UART / virtio-blk) are all monitors
-  (Hoare/Brinch-Hansen paradigm) that **serve** the dispatcher through
-  consumer / producer interfaces. The dispatcher reads/writes its own hart's
-  `cpu_t` (per-hart, no synchronization needed); whenever it touches shared
-  state it goes through monitor interfaces — **synchronization complexity is
-  shut inside the monitors**, so the dispatcher keeps pure single-thread
-  sequential semantics.
-
-The reason the dispatcher owns the internal hart-reset autonomy (the
-hart → SRS escalation level) is precisely this "hart execution core" identity —
-when something goes wrong inside the hart, it first tries to restart itself;
-only if that truly fails does it escalate to system reset.
-
-### CLINT's Position in the Architecture
-
-CLINT occupies its own large section in this README only because it is the
-first monitor instance to be wired up (and currently the only peripheral in
-the SDS domain); this is an accident of implementation order, **not a
-reflection of its architectural status**. Once subsequent SRS-domain
-peripherals (PLIC / UART / virtio-blk and so on) are wired up — they all
-follow the same monitor template (consumer / producer interfaces + spawn/join
-in pairs + cooperative shutdown) — CLINT's share of the README will naturally
-settle back to a size commensurate with the other peripherals.
-
-The three-layer reset lifecycle is this signal hierarchy unfolded along the
-time axis, see "Multithreading + Reset Lifecycle"; the monitor model and
-cooperative shutdown protocol are in the same section.
-
+Out of scope: H extension (virtualization), PMP, AIA / IMSIC, modern PLIC v1.1, virtio multi-queue / modern v1.1 three-PFN forms.
 
 ## Architecture Overview
 
-The runtime structure can be understood from four viewpoints. This section gives
-the overview; the detailed mechanisms follow in later sections, and the
-per-file design is in "Project Layout".
+The whole runtime is organized as a set of **peer devices**, governed by a **signal hierarchy** and coordinated through the **monitor model**. This design unfolds across four viewpoints: machine and thread model (§main) / dispatcher main loop (§hart) / running-block memory model (§memory) / JIT three-layer architecture (§JIT). The discussion below is the core narrative; the full derivation lives in `notes/Demo/SoftwareArchitecture_v3.md` (local maintainer material).
 
-### Machine Model (RAM + CPU)
+### Signal Hierarchy + Bidirectional Autonomy
 
-A classical computer can be abstracted as CPU + RAM (I/O concepts such as MMIO
-and ports are left aside here). Memory side: `ram` manages the guest physical
-memory with a single anonymous mmap, and `loader` places an ELF / raw binary at
-its physical address. CPU side: `cpu_t` is pure data (registers / CSRs / the TLB
-dispatch table), and `dispatcher` is behavior (the fetch-decode-execute main
-loop). Separating "data" from "behavior" keeps the dispatcher stateless — under
-SMP, each hart owns one `cpu_t` and one dispatcher thread.
-
-### Thread Model and the Three-Layer Reset Lifecycle
-
-Thread control is "Signal Hierarchy + Bidirectional Autonomy" (top section)
-unfolded along the time axis: **POR** (one-shot at process start, SDS-domain
-threads power up) / **System reset** (every iteration of the `main` while
-loop — SRS-domain devices spawn → run → join) / **HART reset** (the
-dispatcher's internal level of autonomy). The current configuration is a
-single hart (`dispatcher` invoked directly on the `main` thread) plus one
-timer helper thread (SDS domain, the CLINT actor) that asynchronously
-accumulates `mtime`.
-
-The monitor model (the Hoare/Brinch-Hansen paradigm) encapsulates the atomic
-fields and memory-order choices of shared state behind consumer / producer
-interfaces. The `dispatcher` reads/writes its own hart's `cpu_t` (per-hart,
-no synchronization needed); whenever it touches shared state it goes through
-monitor interfaces — **synchronization complexity is shut inside the monitors**,
-so the `dispatcher` keeps pure single-thread sequential semantics and "does
-not see" multithreading. See "Multithreading + Reset Lifecycle".
-
-### The Dispatcher Main Loop
-
-Each hart runs one `dispatcher`: a one-time `sigsetjmp` permanent landing pad +
-a `while (in_trap < 3)` multi-block loop + loop-head housekeeping. Each iteration
-runs three blocks: select the leaf TLB / fetch / enter the execution segment
-(currently the interpreter). Exit is governed by the `in_trap` bit-field
-encoding. See "Control-Flow Overview" and "in_trap Bit-Field Encoding".
-
-### The Memory Model Inside an Executed Block
-
-Memory access in the execution segment is split into two regimes: REGIME_BARE
-(M-mode or a bare satp; bypasses the TLB, identity offset) and REGIME_SV32 (goes
-through the leaf TLB + PTE permissions). The separation of run models is
-fundamentally a consequence of the memory model.
-
-**Run regime ↔ TLB are mutual constraints (the causal reason the fast/slow path
-abstraction even works)**: when translation is in effect, the TLB is not just a
-GVA→HVA cache — it also doubles as a "run-regime dispatch table at the
-granularity of a leaf TLB". The dispatcher selects a leaf TLB pointer based on
-`priv` / `satp.mode` and hands it to the execution block; the execution block
-only reads / writes through that pointer and **does not care which privilege
-level this leaf TLB came from**. Through these mutual constraints,
-**privilege-sensitivity is pushed out of the hot path entirely, into the MMU
-walker slow-path helper** — so the fast path is not "skipping the privilege
-check"; structurally there is no privilege to check. This is structural
-simplicity earned by design, not corner-cutting.
-
-Going further, the asymmetry on a load / store hit: a load hit dereferences
-`*hva` directly, while a store hit must go through `store_helper` because of
-side effects such as the LR/SC reservation. The real causal chain is not
-"performance vs. side effects" but "TLB caches hva + MMIO doesn't enter the
-TLB → the hit path structurally has no RAM/MMIO branch → a load can return
-`*hva` directly; a store must go through the helper because LR/SC + future
-SMC side effects force it". See "TLB Topology".
-
-> The JIT subsystem (the three-layer Dispatcher / Translator / JitBackend, the
-> jit_cache, and SMC detection) is planned design, not yet implemented (see the
-> not-implemented list at the end of "Implemented So Far"); it is outside the
-> scope of this README's "current progress". Key design points are already
-> locked in: **the block cache key is PA** (not VA, so `sfence.vma` does not
-> invalidate JIT blocks, and the same PA segment's translation is reusable
-> across M / S modes); **all block exits go through dispatch**, no block
-> chaining in v1; **SMC integral-page invalidation + lazy invalidation**
-> (write-protect + the SIGSEGV handler only sets an atomic flag, the actual
-> cleanup is done by the dispatcher when it next enters the block, since the
-> handler is constrained by async-signal-safety and cannot call malloc / take
-> locks).
-
-
-## TLB Topology
-
-`cpu_t.tlb_table[4]` is a four-slot dispatch array, indexed by the RV privilege
-encoding:
+Stop signals are strictly three-level, distinguishing the **top-down enforcement direction** from the **bottom-up escalation direction**:
 
 ```mermaid
 graph TB
-    subgraph cpu_t.tlb_table
-        direction LR
-        U["[0] U<br/>always mirror semantics"]
-        S["[1] S<br/>ASID container<br/>eager alloc"]
-        VS["[2] VS<br/>currently NULL<br/>(H-extension interface)"]
-        M["[3] M<br/>always NULL<br/>(Trust bypasses TLB)"]
-    end
-
-    U -.->|"MSU default: mirror"| S
-    U -.->|"MU-only mirror<br/>(future misa dispatch)"| M
+    SDS["SDS — shutdown signal<br/>persists across multiple system resets<br/>(SDS domain: CLINT timer, etc.)"]
+    SRS["SRS — system reset signal<br/>peer SRS-domain devices start/stop together<br/>(dispatcher / PLIC / UART / virtio-blk / ...)"]
+    HR["hart-internal autonomy<br/>(Double Trap halt / WFI self-sleep)"]
+    SDS -. "enforce (top-down)" .-> SRS
+    SRS -. "enforce (top-down)" .-> HR
+    HR -. "escalate (bottom-up, can't handle locally)" .-> SRS
+    SRS -. "escalate (bottom-up)" .-> SDS
 ```
 
-- **[0] U** always has mirror semantics (mirrors [1] S or [3] M, depending on
-  misa). Even on a MU-only CPU where U mirrors M and the slot is NULL (because M
-  runs bare and does not consult the TLB), the "mirror" semantics itself does
-  not change. Mirror allocation has two paths:
-    - Initialization — `cpu_create` dispatches by misa (MSU mirrors [1]; MU-only
-      mirrors [3])
-    - Runtime — the H extension (VS / VU switching) maintains the mirror via the
-      corresponding csr_helper
-- **[1] S** — the ASID array container (`tlb_t **`); the container is eagerly
-  allocated by `cpu_create`, while entries are lazily allocated by the walker on
-  first access to a given ASID
-- **[2] VS** — NULL in v1 (no H extension); takes the same shape as [1] when the
-  H extension is active
-- **[3] M** — always NULL. The Trust regime (M-mode, or any privilege level with
-  a bare satp) goes straight through identity + the IS_GPA_RAM check and needs
-  no TLB (a real CPU also bypasses the MMU/TLB in bare mode)
+Enforcement direction: once a higher-level signal is asserted, lower levels stop naturally — no need to notify each one individually. For shutdown, the SRS domain and all harts halt naturally; for system reset, each hart's local handling is interrupted.
 
+Escalation direction: each layer first tries to handle the situation locally, only escalating when it cannot. A hart first attempts hart-reset self-recovery; if that fails, it issues SRS=0. The system reset layer joins all SRS devices, then judges whether the failure is severe enough to escalate to shutdown; only then does it stop SDS-domain threads. This "try self-recovery first, escalate only when insufficient" chain makes every level a unit that can either resolve itself or call for help upward.
 
-## in_trap Bit-Field Encoding
+### Machine Model + Three-Layer Reset Lifecycle
 
-`hart->trap.in_trap` is a bit-field encoding (a host-side protocol; multiple
-signals may be superimposed):
+The machine model starts from the classic CPU + RAM abstraction: `ram` manages guest physical memory via a single anonymous mmap; `loader` places ELF or raw binaries by physical address; `cpu_t` holds all guest-visible state (registers / CSRs / TLB dispatch table); `dispatcher` holds no guest state and only drives execution. The data/behavior split lets each hart own one `cpu_t` plus one dispatcher thread under SMP, keeping state ownership clean.
 
-| Bit field | Value range | Meaning                                                            |
-|-----------|-------------|--------------------------------------------------------------------|
-| bit 0-1   | 0..3        | actual trap nesting depth: 0/1/2 ordinary nesting; 3 = triple fault |
-| bit 2     | 4..7        | reserved gap, preventing future expansion of the nesting bits from colliding with the fields below |
-| bit 3     | 8..15       | internal exception / internal normal halt (host-side protocol, not an RV trap) |
-| bit 4     | 16..31      | reserved gap                                                       |
-| bit 5+    | 32+         | future halt extensions                                             |
+The three-layer reset lifecycle is the signal hierarchy unfolded along the time axis: **POR** (one-shot at process start: `ram_init` / `clint_init` / `cpu_create` plus spawning SDS-domain threads such as the CLINT timer) → **system reset** (each iteration of `main`'s while loop: SRS-domain devices spawn → run → join) → **hart reset** (the internal autonomy level of the dispatcher itself, viewed as one SRS device).
 
-Design philosophy (bit-wise superposition):
+The thread model borrows the **monitor model** from Hoare / Brinch Hansen: each shared-state module encapsulates its internal atomic fields and memory_order choices, exposing only consumer / producer interfaces, so callers never touch synchronization primitives. The dispatcher reads/writes its own hart's `cpu_t` (per-hart, no synchronization required); any access to shared state goes through a monitor interface — synchronization complexity stays sealed inside the monitor, and the dispatcher keeps pure single-threaded sequential semantics. Error handling unifies through the SRS / SDS signal channels and **does not branch into a separate error path** — normal exits and various failures therefore have identical control-flow shapes.
 
-- The interpreter / JIT internally looks only at bits 0-1 (the trap-nesting
-  view); `in_trap < 3` means "keep going"
-- The higher bits (bit 3+) are written only by the dispatcher; the interpreter /
-  JIT never touches them
-- The `while (in_trap < 3)` test doubles as a safety gate: once a higher bit is
-  set the value becomes ≥ 8 > 3 and the dispatcher exits automatically
-- The reset path clears only bits 0-1; the higher bits are decided explicitly by
-  the reset flow according to the halt type
+### Dispatcher: an SRS-Domain Device with Internal hart-reset Autonomy
 
-Unrelated to the RV Smdbltrp extension (`CAUSE_DOUBLE_TRAP=16`) — Smdbltrp is an
-architectural trap-delivery mechanism, while in_trap is the host emulator's exit
-protocol; the two coexist but their semantics do not overlap.
+The dispatcher's shape: one-shot `sigsetjmp` permanent landing + a `while` multi-block loop + iteration-head bookkeeping. Each iteration runs three blocks: block 1 derives the dispatch packet `(regime, current_tlb)` from `priv` / `satp.mode`; block 2 calls `mmu_translate_pc` to translate the entry PC into a physical address; block 3 enters the real execution segment (JIT block or interpreter).
 
+Whenever a slow-path helper decides to raise an exception, `trap_raise_exception` directly `siglongjmp`s back to the permanent landing point. Since `longjmp` bypasses the iteration tail, all tail bookkeeping (instruction counting, `mtime` advance, interrupt check) is moved to the iteration head, so the normal exit path and the longjmp-back path see the same shape on the next iteration. The dispatcher's only exit condition is `while (in_trap < 3 && SRS)`; the high bits of `in_trap` encode the host-side stop protocol — once any high bit is set, the value becomes ≥8 > 3 and the loop exits automatically.
 
-## Control-Flow Overview
+### JIT Three-Layer Architecture
+
+The JIT subsystem is the performance core, built as Dispatcher / Translator / JitBackend three layers, so swapping backends (e.g. asmjit for LLVM) only touches the bottom layer without polluting the rest. The sequence diagram below shows the full life cycle of a guest basic block, from cold start through steady-state hit:
 
 ```mermaid
-graph TD
-    Main[main] --> Ram[ram_init]
-    Ram --> Loader[loader suffix dispatch]
-    Loader --> Cpu["cpu_create<br/>+ boot protocol<br/>(pc / satp / priv / a0 / a1)"]
-    Cpu --> Disp[dispatcher]
-    Disp --> Sj[sigsetjmp permanent landing pad]
-    Sj --> Wh{"in_trap < 3?"}
-    Wh -->|true| Hd["loop-head housekeeping<br/>count accumulation / trap_check_interrupt"]
-    Hd --> B1["block 1<br/>regime + current_tlb"]
-    B1 --> B2["block 2<br/>mmu_translate_pc<br/>→ (pa, hva)"]
-    B2 --> B3["block 3<br/>interpret_one_block"]
-    B3 --> Ek{exit reason}
-    Ek -->|hard boundary| Wh
-    Ek -->|page cross / BLOCK_INST_LIMIT| Wh
-    Ek -->|trap_raise_exception<br/>longjmp| Sj
-    Wh -->|false| Halt["halt<br/>(bits 0-1 = 3, or bit 3 set)"]
-    Halt --> Dump["main: dump<br/>reg / trap / state"]
+sequenceDiagram
+    autonumber
+    participant D as Dispatcher
+    participant C as jit_cache<br/>(key = PA, regime)
+    participant T as Translator
+    participant B as JitBackend<br/>(asmjit)
+
+    Note over D,B: Phase 1 — cold block, counting, interpreter executes
+    D->>C: lookup(PA, regime)
+    C-->>D: miss / COUNTING
+    Note over D: counter[start_pc]++<br/>interpret the whole block
+
+    Note over D,B: Phase 2 — threshold reached (=100), trigger JIT compile
+    D->>T: translate(start_pc, regime)
+    T-->>D: IR (n_insts + ir_inst[])
+    D->>B: compile_block(IR)
+    B-->>D: host code entry pointer
+    D->>C: install(PA, regime, host_code)
+    Note over C: status = COMPILED<br/>+ mprotect write-protect page (SMC tripwire)
+
+    Note over D,B: Phase 3 — subsequent hits, run host code directly
+    D->>C: lookup(PA, regime)
+    C-->>D: COMPILED + host code entry
+    Note over D: call host_code(cpu, tlb, &count_out)<br/>dispatcher advances by returned count
 ```
 
+Four key design decisions:
 
-## Multithreading + Reset Lifecycle
-
-This section is "Signal Hierarchy + Bidirectional Autonomy" (top section)
-unfolded at the implementation level — the `main` flow pseudo-code / the
-three-layer reset timing / monitor behavior / the cooperative shutdown
-protocol, in the concrete form we have at a_02 close. After a_02 T5 landed,
-the project evolved from single-threaded (the hart thread solely advancing
-mtime) to multithreaded (the hart thread + a timer helper thread running
-concurrently, synchronized with an atomic mtime + the monitor model). Error
-handling is unified through the SRS / SDS signal channel, with **no separate
-error path** — normal exit and the various failure modes therefore have the
-same shape. For the detailed protocols see `src/dummy.txt §7` (the monitor
-model) + `§12` (whoever spawns, joins); for signal semantics see the
-top-of-file doc in `src/runtime.h`.
-
-### Three-Layer Reset Lifecycle
-
-```mermaid
-graph LR
-    A["POR<br/>(Power-On Reset)"] --> B["System reset<br/>(each main-while iter)"]
-    B --> A2["POR teardown<br/>(after the while loop)"]
-    B -.->|cpu_reset / clint_reset| B
-    subgraph "future"
-        Hr["HART reset<br/>(per-hart restart inside dispatcher)"]
-    end
-    B -.->|coordinated with HART reset| Hr
-```
-
-- **POR (Power-On Reset)** — once per process: ram_init / clint_init /
-  cpu_create (which writes the hardware reset default state) / explicitly set
-  SRS=1 SDS=1 / start the timer helper thread (clint_start_timer_thread). The
-  timer helper thread keeps running across system resets (matching real
-  hardware, where the RTC oscillator does not lose power or stop); it exits only
-  with SDS
-- **System reset** — each main-while iteration: cpu_reset (clears
-  regs/pc/mstatus/in_trap, keeps the hardwired hartid) + clint_reset (clears
-  mtimecmp/msip back to their sentinels, **mtime untouched, timer untouched**) +
-  dispatcher(hart) + distinguishing an SR-only re-iteration from a shutdown exit
-  (currently simplified to always shut down, with an `if(0)` placeholder)
-- **HART reset** — a per-hart restart inside the dispatcher (future; a comment
-  placeholder at the end of dispatcher.c); under SMP, one hart failing does not
-  affect the others
-
-### `main` Flow Pseudo-Code (current form, a_02 T5 landed)
-
-```c
-int main(int argc, char **argv) {
-    /* === POR === */
-    ram_init();                   // failure → main returns 1
-    clint_init();                 // failure → main returns 1 (via destroy chain + return)
-    cpu_t *hart = cpu_create();   // failure → main returns 1
-
-    /* explicitly set the lifecycle signals to 1 (redundant with runtime.c's
-       BSS-1 init fallback, but explicit is more readable) */
-    atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
-    atomic_store_explicit(&shutdown_signal,     1, memory_order_release);
-
-    /* start the timer helper thread; on failure it internally does fprintf +
-       set SRS=0 + SDS=0; main does not check, has no separate error path —
-       errors flow through the SRS/SDS signal channel */
-    clint_start_timer_thread();
-
-    /* === System reset === */
-    while (atomic_load_explicit(&system_reset_signal, memory_order_acquire)) {
-        cpu_reset(hart);
-        clint_reset();
-
-        /* placeholder: spawn all SRS-controlled threads — spawn/join each iter,
-           started/stopped in sync with the system reset (e.g. a future
-           multi-hart setup does pthread_create per hart; other SRS-controlled
-           helper threads go here too) */
-        dispatcher(hart);                   /* single hart, direct call; tri-fault sets SRS=0 internally */
-        /* placeholder: join all SRS-controlled threads — dual of the spawn
-           above (the hart thread + other SRS-controlled helper threads all
-           join here) */
-
-        /* SR-only vs shutdown branch (currently simplified to always shut down) */
-        if (0 /* SR_only placeholder; a real reset-and-re-iterate goes here later */) {
-            atomic_store_explicit(&system_reset_signal, 1, memory_order_release);
-            continue;
-        } else {
-            atomic_store_explicit(&shutdown_signal, 0, memory_order_release);
-            break;
-        }
-    }
-
-    /* === POR teardown === */
-    clint_join_timer_thread();    /* the timer thread exits on observing SDS=0, then is joined */
-    /* dump (reg + trap + state) */
-    clint_destroy();
-    cpu_destroy(hart);
-    ram_destroy();
-    return 0;
-}
-```
-
-All three exit paths converge on `while → join → cleanup → return 0`:
-
-1. **Normal exit** (dispatcher tri-fault): the dispatcher function ends with
-   `atomic_store(&SRS, 0, release)` → the main while loop exits → the else
-   branch sets SDS=0 → break → join (normal exit) → cleanup
-2. **Timer spawn failure**: `clint_start_timer_thread` internally does
-   `atomic_store(&SRS, 0) + atomic_store(&SDS, 0)` → the main while loop is not
-   entered because SRS=0 → SDS is already 0 (the else branch never runs) → join
-   (pthread_t = BSS 0, glibc returns ESRCH; one fprintf line, not fatal) →
-   cleanup
-3. **Failure inside the timer routine** (a clock_nanosleep / clock_gettime
-   errno): the timer routine likewise sets SRS=0 + SDS=0 + returns NULL → the
-   main while loop exits → the else branch sets SDS=0 (already 0, a no-op) →
-   break → join (the timer thread has already returned, a normal join) → cleanup
-
-Error handling uniformly flows through the SRS/SDS signal channel, **with no
-separate error path** — the destroy chain is written once, in the cleanup
-section, and not repeated on the spawn-fail / dispatcher-fail paths.
-
-### Monitor Behavior (dummy.txt §7)
-
-From the Hoare/Brinch-Hansen concurrent-monitor paradigm — each shared-state
-module encapsulates its internal atomic fields + memory_order, exposing only
-consumer / producer interfaces; callers are not aware of the internal
-synchronization.
-
-> **Position note** (echoing "CLINT's Position in the Architecture" at the
-> top): CLINT is currently the only peripheral in the SDS domain; it takes up
-> a large share of this section only because it is the first complete monitor
-> instance. Once subsequent SRS-domain peripherals (PLIC / UART / virtio-blk
-> and so on) come online, they will all follow the same template below
-> (consumer / producer interfaces + spawn/join in pairs + cooperative
-> shutdown), and CLINT's share of the README will naturally settle back.
-
-The project has two instances:
-
-```mermaid
-graph TB
-    subgraph "clint = full monitor"
-        CL_State["_Atomic mtime / mtimecmps[N] / msip[N]<br/>+ pthread_t timer_thread"]
-        CL_Actor["file-static timer_run<br/>(async atomic_fetch_add mtime)"]
-        CL_Cons["consumer:<br/>is_clint_msip_pending<br/>is_clint_timer_pending<br/>clint_read"]
-        CL_Prod["producer:<br/>clint_write"]
-        CL_Life["lifecycle:<br/>clint_init / clint_reset / clint_destroy<br/>clint_start_timer_thread / clint_join_timer_thread"]
-    end
-
-    subgraph "runtime = degenerate monitor"
-        RT_State["extern _Atomic int<br/>system_reset_signal (SRS)<br/>shutdown_signal (SDS)"]
-        RT_Use["callers use atomic_load_explicit /<br/>atomic_store_explicit directly (no wrapper)"]
-    end
-```
-
-- **clint** = a full monitor: a three-function lifecycle (init / reset /
-  destroy) + a spawn/join pair (clint_start_timer_thread /
-  clint_join_timer_thread, called explicitly on the main side, not buried inside
-  destroy); the file-static timer_run routine runs as an internal actor, holding
-  no cpu_t and touching only shared fields. memory_order: producer release
-  (atomic_fetch_add &mtime) / consumer acquire (is_clint_timer_pending /
-  clint_read), the pair establishing happens-before
-- **runtime** = a degenerate monitor (a single-flag simplification): the
-  `extern _Atomic int` flags are read and written directly, with no wrapper; a
-  single field has no cross-field consistency concern, so interface functions
-  are not enforced. The "SDS implies SRS" trigger contract — before setting
-  SDS=0 one must first set SRS=0 ("tell all helper threads to exit" implies "the
-  system itself must exit too")
-
-External modules (csr.c / dispatcher.c / bus.c, etc.) **do not perform
-`atomic_*` operations on clint's internal fields directly**; they always go
-through the consumer/producer interfaces. For example, the synthesized read in
-csr_mip_read goes through `is_clint_msip_pending(hartid) |
-is_clint_timer_pending(hartid)`, not a direct
-`atomic_load_explicit(&clint.mtime, ...)` (the latter would break the monitor's
-encapsulation, violating dummy.txt §7).
-
-### Cooperative Shutdown Protocol (dummy.txt §12 + runtime.h)
-
-```
-spawn caller (main)        worker thread (timer_run)       lifecycle signal
--------------------        -------------------------       ----------------
-SRS = 1, SDS = 1                                           runtime.c
-clint_start_timer_thread() --> pthread_create
-                                                           SRS = 1, SDS = 1
-                           --> while (atomic_load(SDS))
-                                 accumulate mtime
-                                 ...
-normal: dispatcher tri-fault                               SRS = 0 (dispatcher)
-main while loop exits                                      SDS = 0 (main else branch)
-                           <-- timer observes SDS=0, exits
-clint_join_timer_thread()  <-- pthread_join
-cleanup chain
-return 0
-```
-
-- **No pthread_cancel / pthread_kill**: a deferred cancel deep in the
-  interpreter / JIT call stack risks half-updated state; pthread_kill actually
-  sends a signal that kills the whole process rather than the thread.
-  Shutdown is always cooperative (atomic flag + periodic worker check + main
-  join)
-- **No SIGINT/SIGTERM signal handler**: the default Ctrl-C kill of the process
-  is enough for now (atomic_fetch_add is a single lock-prefixed instruction, so
-  killing the process does not corrupt data); revisit once the reset machinery
-  matures (a_03+)
-- **Destroy functions are pure cleanup**: they contain no pthread_join (to avoid
-  implicitly blocking control flow); the spawn/join pair is exposed separately
-  and joined explicitly by the spawn caller
-
-
-
-## Project Layout
-
-
-### Program Entry + Global Config
-
-
-#### main.c
-
-The program entry point, with a three-phase lifecycle: POR (`ram_init` /
-`clint_init` / `cpu_create` + explicitly set SRS/SDS + start the timer helper
-thread) / system reset (each `while` iteration: `cpu_reset` / `clint_reset` +
-call `dispatcher(hart)`) / POR teardown (join the timer thread + dump + the
-destroy chain). See "Multithreading + Reset Lifecycle".
-
-The current single hart calls `dispatcher(hart)` directly on the `main` thread,
-spawning no pthread for it; the timer helper thread is the only genuinely
-concurrent thread today. The trailing dump section is temporary — it prints
-registers / trap / state for fixture comparison after a run, to be replaced
-gradually once a UART + a real unit harness are in place.
-
-
-#### config.h
-
-The project's own compile-time macros (RAM config / TLB topology / IALIGN /
-block soft boundary / CLINT layout / TIMEBASE / MAX_HARTS). Runtime variables
-(`host_ram_base` and the like) live in `ram.h`.
-
-
-#### riscv.h
-
-A central collection of RISC-V specification definitions (privilege encodings /
-CSR addresses / PTE bit fields / mstatus fields / Exception Codes). Incremental
-principle: add one when it is actually used. Division of labor with `config.h`:
-`config.h` = "how we configure", `riscv.h` = "what the spec defines".
-
-
-#### loader.{c,h}
-
-Guest program loading, three functions: `guest_load_bin / guest_load_elf /
-guest_is_elf`.
-
-ELF loading does a strict 6-item sanity check (magic / class=ELFCLASS32 /
-data=ELFDATA2LSB / machine=EM_RISCV / type=ET_EXEC / phentsize+phnum).
-
-Three semantic boundaries: **does not move the ELF** (segments placed strictly
-at `p_paddr`, out-of-range is a failure), **does not handle the entry point**
-(the caller guarantees it = `GUEST_RAM_START`), and **does not clear BSS** (the
-guest startup is responsible) — the emulator is just an observer of physical
-addresses, not an OS loader, and does no relocation.
-
-
-#### dummy.txt
-
-The cross-file protocol ledger (`.txt`, not compiled, but part of the source —
-it collects "runtime mechanisms / ABI conventions / call-order contracts that
-span multiple files"), 13 sections:
-
-- **§1 sigsetjmp / siglongjmp protocol** — the dispatcher's one-time permanent
-  landing pad + helper longjmp return + unified register protection; path D
-  interrupts go through the dispatcher main frame return-based; the final part
-  covers the **true mechanism of load/store asymmetry** (the TLB caches hva +
-  MMIO does not enter the TLB → the hit path is structurally branch-free; a load
-  hit does *hva, a store hit goes through store_helper because of the forced
-  reservation+SMC side effects)
-- **§2 global x0 register encoding** — read = the literal 0, write = a dead
-  store to a local garbage variable (so IR / backend stay unaware of x0's
-  specialness)
-- **§3 satp ASID validity contract** — csr.c is the producer (WARL truncation),
-  the dispatcher is the consumer (indexes `tlb_table[priv][asid]` directly with
-  no bounds check)
-- **§4 the TLB as the block-entry dispatch mechanism** — bare mode also goes
-  through the TLB, unifying dispatch logic across privilege levels and letting
-  JIT translation products be reused across privilege levels
-- **§5 error-reporting style** — exactly two lines on stderr per failure (inner
-  why + outer where); no enum error codes, no `*_strerror` translation table,
-  modules do not call `exit`
-- **§6 the five-category naming of CSR physical storage fields** — the `_`
-  prefix / `x` prefix / no prefix / `_sw`-`_hw` suffix, four naming categories
-  (the 5th category = a software-writable subset + a synthesized read from
-  async sources, e.g. `_mip_sw`)
-- **§7 multithreading vs. multi-HART terminology + the monitor model** —
-  per-hart / shared / thread-local tristate; shared fields are always atomic;
-  shared modules encapsulate consumer/producer interfaces (the Hoare/Brinch-
-  Hansen paradigm)
-- **§8 the PMP / MMU / memory three-layer relationship** — the mmu only
-  translates GVA→PA; ram+bus do the real access; PMP is not implemented long
-  term
-- **§9 the cause-0 path + the "0 = success" interface convention** —
-  mmu_translate_pc / mmio_*_helper / device read/write share an encoding; the
-  underlying rule of the longjmp-vs-return mechanism
-- **§10 helper granularity + the may-longjmp boundary + JIT register
-  preservation** — mmu_walker_helper_* / lsu_*_helper / amo_*_helper each have
-  their own entry (granularity = one instruction, not merged); the JIT
-  translator stores the mapped host registers to cpu_t before every may-longjmp
-  call
-- **§11 the predicate `is_*` naming** — query functions with boolean semantics
-  uniformly take the `is_` prefix
-- **§12 thread lifecycle — whoever spawns, joins** — spawn / join are exposed as
-  a pair, called explicitly by the creator; `*_destroy` is pure cleanup and
-  contains no `pthread_join`
-- **§13 the typedef family type discipline** — `uxlen_t` / `ixlen_t`
-  (XLEN-tied) + `u32_t` / `u64_t` (spec-pinned); a grep trail for the RV64
-  switch, not a runtime XLEN abstraction
-
-
-### Core (`src/core/`)
-
-
-#### cpu.{c,h}
-
-The single-hart guest CPU state (`cpu_t`). `regs[32]` is a single contiguous
-array; the physical position `regs[0]` holds the pc (x0 takes a special path and
-never touches it). `tlb_table[4]` is the four-slot dispatch array (see
-[TLB Topology](#tlb-topology)).
-
-The split into `per_hart_info` (embedded) / `shared_info` (a pointer to a
-`static const` in cpu.c) reflects SMP-readiness — in a heterogeneous SMP
-(1×MU + 4×MSU), `misa / mhartid` differ per hart while `mvendorid / marchid /
-mimpid` are shared across the whole machine.
-
-
-#### decode.{c,h}
-
-RV32I + RVC instruction decoding, a pure function (does not read / write
-`cpu_t`), shared by the interpreter / the future translator. 49 op_kinds (RVC
-reuses the same-origin RV32I ops, with `pc_step` distinguishing the length).
-
-`is_block_boundary_inst` is a shared inline, keeping the interpreter and the
-future translator 100% consistent on hard-boundary judgment (`-Wswitch-enum
--Werror` forces full coverage).
-
-
-#### interpreter.{c,h}
-
-The interpreter body. `interpret_one_block` does a sequential fetch + decode +
-switch-execute, until one of five exit conditions: `OP_UNSUPPORTED` / a hard
-boundary / an exception longjmp / the `BLOCK_INST_LIMIT` runaway guard / a
-cross-page soft boundary.
-
-PC maintenance is data-driven (decode decides `pc_step` once, the fetch loop
-advances it uniformly at the tail); a control-flow case that describes its own
-pc goes through the `WRITE_PC_OR_TRAP` macro, which includes an IALIGN alignment
-check + a trap placeholder.
-
-The count synchronization contract: on a may-trap path the sync happens inside
-the case before trap_raise; the boundary path syncs as a fallback in the `out`
-section; a pure case (pure arithmetic / logic) needs no sync, consistent with RV
-precise traps (the trap-triggering instruction itself does not count).
-
-
-#### dispatcher.{c,h}
-
-The hart main loop. Shape: **a one-time sigsetjmp permanent landing pad + a
-while(in_trap<3) multi-block loop + loop-head housekeeping**. Each iteration runs
-3 blocks:
-
-- **block 1** — compute the dispatch packet `(regime, current_tlb)` from
-  `priv + xatp.mode`
-- **block 2** — `mmu_translate_pc` fetch
-- **block 3** — `interpret_one_block` (the future `jit_cache_hit` takes priority)
-
-A helper-side longjmp back to the sigsetjmp landing pad skips the loop tail, so
-the housekeeping (count accumulation / future mtime advancement / interrupt
-checking / `perf_advance`) must be moved to the loop head — making it the same
-shape as the normal continue path. Exit is governed by the `in_trap` bit-field
-encoding (see [in_trap Bit-Field Encoding](#in_trap-bit-field-encoding)).
-
-
-#### csr.{c,h}
-
-A big CSR switch + per-field r/w file-static helpers. `csr_op` is the unified
-entry for the 6 CSR instruction variants (CSRRW/RS/RC + their 3 immediate
-variants).
-
-The entry check uses the permission bit fields built into `csr_addr`:
-`bits[11:10]` = RO / `bits[9:8]` = the minimum required privilege; on failure it
-uniformly traps with cause 2.
-
-The 5-category organizing philosophy: category 1, extension CSRs (F/V/Debug),
-will move to `isa/`; category 2, cross-module CSRs (`satp`), keep their fields
-in `cpu_t` and their functions in csr.c; category 3, core CSRs, keep their
-fields in `trap_csrs_t`; category 4, boot-info RO CSRs, split into per-hart +
-shared; category 5, temporary debug CSRs (`tohost / privrd`), do streaming
-output and the whole section will be deleted once a UART is in place.
-
-
-#### trap.{c,h}
-
-The trap system, with two layers of responsibility. The architectural-semantics
-layer does not longjmp: `trap_set_exception_state` (the synchronous path — writes
-xcause/xtval/xepc + switches the priv mstatus fields + `regs[0] = xtvec`,
-medeleg routing) and `trap_set_interrupt_state` (the asynchronous path — mideleg
-routing + vectored mode base+4*cause). The control-flow layer:
-`trap_raise_exception` is `_Noreturn` and does a longjmp (for use deep in helper
-stacks; internally `trap_set_exception_state + siglongjmp` back to the
-dispatcher's one-time landing pad); `trap_check_interrupt` is return-based
-(polled every iteration in the dispatcher main frame, no longjmp). The
-non-symmetric shape — exception longjmp vs. interrupt return — is by design
-(dummy.txt §1 path D).
-
-`deliver_priv` takes effect by medeleg (an M-mode trap always M; a U/S-mode trap
-with bit=1 → S). When `in_trap >= 3` it does not deliver, keeping the fields at
-the second occurrence's state as the root cause for the main-side dump.
-
-
-#### mmu.{c,h}
-
-The Sv32 MMU walker + the walker helpers. **A return to the dummy.txt §8
-three-layer model** — the mmu only translates + routes, it does not do the "real
-access" itself: on the RAM path the walker fills the TLB and the caller does a
-direct `*hva` (load) / `store_helper` (store); on the MMIO path it calls
-`mmio_*_helper` directly (not entering the TLB).
-
-The execution regime split (the project's internal "two hardware-logic
-families" classification): **REGIME_BARE** (`priv == M`, or any priv with a bare
-satp; bypasses the TLB, identity) / **REGIME_SV32** (the
-`tlb_table[priv][asid]` leaf TLB + PTE permission semantics). The interface
-layer is simplified — the downstream `mmu_translate_pc / interpret_one_block /
-lsu_*_helper` only take `current_tlb` (NULL encodes BARE).
-
-`check_perm` (`mmu.h` `static inline`) is shared in three places (fetch / load /
-store) and, being same-origin with the walker, will not drift between two
-copies. **hw-managed A/D** (non-Svade): the walker only **computes** the
-suggested post-set new_pte and returns it to the caller via an out-parameter;
-the caller does the real memcpy write-back to the PT only on the RAM path; the
-MMIO path does not write back (a simplified version consistent with Spike's "do
-not set on fail"). The TLB does not store the PTE physical address, so on a
-store hit with D=0 it falls back to the walker to re-set.
-
-The `mmu_walker_helper_*` family (load/store + future amo_lr/sc/amo_*) is **JIT
-granularity by design** — each access instruction has one helper entry, the JIT
-does not merge them; see dummy.txt §10.
-
-
-#### tlb.{c,h}
-
-The TLB data structure (`tlb_e_t`, 16 B, with field positions aligned to the RV
-PTE) + the two functions `tlb_alloc` / `tlb_clear`. `tlb_table[4]` is the
-four-slot dispatch array (see [TLB Topology](#tlb-topology)).
-
-The fast path exposes no `tlb_lookup` function — a hit is inlined by the caller
-(V + tag + `check_perm`), and only a miss calls the walker helper.
-`tlb_clear(NULL)` is a C-standard no-op, so the sfence helper needs no
-null-check.
-
-
-### ISA Implementations (`src/isa/`)
-
-
-#### sfence.{c,h}
-
-`sfence_vma_helper` (extern, slow path). The RV-spec 4-combination simplification
-scheme 4.a: `rs1=x0 + rs2!=x0` clears a single ASID, the other three
-combinations all clear everything (over-flushing is allowed by the RV spec;
-sfence is not a hot path, so no loss).
-
-The interface passes two groups, `(vaddr_val, asid_val)` + `(rs1, rs2)` — the RV
-spec uses `rs1=x0` as a **magic encoding** for "ignore vaddr", but `vaddr_val=0`
-is also a legal real value; the helper, seeing only register values, cannot tell
-them apart and must look at the register numbers.
-
-
-#### lsu.{c,h}
-
-The true mechanism of load / store asymmetry (dummy.txt §1, final part). Current
-form:
-
-- `lsu_load_helper` / `lsu_store_helper` (inline top level in `lsu.h`, called
-  directly by the interpreter): BARE inlines the RAM/MMIO routing / an SV32 TLB
-  hit goes straight through (load `*hva`, store calls store_helper) / an SV32
-  miss falls back to `mmu_walker_helper_*`
-- `store_helper` (extern in `lsu.c`, **HVA-based**): the RAM write + an LR/SC
-  reservation-clear placeholder + the entry point for the future SMC side
-  effect; shared by three callers (BARE / SV32 hit / the walker_helper RAM path)
-- the MMIO path does not go through store_helper, calling `mmio_*_helper`
-  directly (skipping reservation+SMC, since MMIO does not participate)
-- the `LOAD_MISALIGN_CHECK` / `STORE_MISALIGN_CHECK` implicit contract: the
-  caller (the interpreter case entry) does it in one place, and all helpers
-  trust that the caller has already checked
-
-A future improvement is to inline `store_helper` (a naming clarification: this
-is **not** "store becoming a fast path" — all of its operations remain
-slow-path in nature; only the linkage form changes from extern to inline,
-eliminating the function call/ret cost on every store).
-
-
-### Platform (`src/platform/`)
-
-
-#### ram.{c,h}
-
-Host mmap management. Two globals, `host_ram_base` + `gpa_to_hva_offset =
-host_ram_base - GUEST_RAM_START`, let the fast path turn gpa → hva with a single
-addition and no cast.
-
-The `IS_GPA_RAM(pa)` macro (an unsigned-underflow idiom) uniformly wraps the "PA
-is in the RAM region" judgment, shared by 7 call sites (mmu / lsu).
-
-`MAP_NORESERVE` does not pre-charge swap commit; `MADV_NOHUGEPAGE` explicitly
-rules out transparent huge pages to keep 4 KB granularity for the future SMC
-detection (smc.c's `page_dirty` bitmap is indexed by 4 KB). `mmap(NULL, ...)`
-returns a kernel-allocated, 4 KB-aligned address — the interpreter's cross-page
-guard depends on this invariant.
-
-
-#### bus.{c,h}
-
-The MMIO registry + dispatch. The `mmio_dev_t` struct (gpa_start / gpa_end /
-ctx / read / write / name); `bus_register_mmio` registers + checks half-open
-interval overlap; `mmio_read_helper` / `mmio_write_helper` do a linear-scan
-dispatch (BUS_MAX_DEV=16, a static array).
-
-Interface form: **_Noreturn-on-failure** — on a bus failure (no match / device
-rejection) it does a trap_raise longjmp internally and does not return to the
-caller; a device read/write fn returns a cause (0 = success / non-0 = cause),
-which the bus passes through to trap_raise (the same form as mmu_translate_pc).
-See dummy.txt §8 + §9.
-
-The `mmio_dev_t` struct **contains no R/W/X/execute / tick / has_pending_irq
-fields** — those three things belong to independent dimensions (PMP / physical
-fetchability / device side effects), see dummy.txt §8.
-
-Future-extension placeholders (in the top-of-file comment of bus.h): (a) a
-fetchable-range table (when ROM/flash is enabled); (b) device unregister +
-hot-plug (RCU / atomic pointer swap).
-
-
-#### clint.{c,h}
-
-The CLINT (Core-Local Interruptor) MMIO device — mtime / mtimecmp[N] / msip[N],
-all `_Atomic` (satisfying dummy.txt §7, "shared fields are always atomic"; on a
-single hart they compile to plain load/store, zero overhead). The layout matches
-the SiFive CLINT + QEMU virt (CLINT_BASE=0x02000000, mtimecmp @+0x4000 per hart,
-mtime @+0xBFF8 global).
-
-`mtime` is advanced asynchronously by the file-static timer helper thread
-(clock_nanosleep ABSTIME, waking roughly every ~1 ms to atomic_fetch_add
-TIMEBASE_PER_WAKE; scheme C). clint is the project's first full monitor
-instance: a three-function lifecycle (init / reset / destroy) + a spawn/join
-pair (clint_start_timer_thread / clint_join_timer_thread). A `size != 4` /
-`off & 3 != 0` / an out-of-range offset all yield an access fault.
-
-
-
-## Implemented So Far
-
-- The complete RV32 IM + RVC instruction set (49 op_kinds, RVC reuse)
-- M / S mode CSRs (mstatus stored physically as 64 bits with split access /
-  sstatus masked view / medeleg-driven trap delegation; the mip/mie/sip/sie
-  interrupt CSRs — `_mip_sw` software-writable subset + synthesized read from
-  async sources, `_mie` masked view; csr_op entry checks priv + RO write)
-- The Sv32 MMU walker (incl. hw-managed A/D, 4 KB + 4 MB superpages; **the
-  walker does not write back the PT, the caller writes back on the RAM path, the
-  MMIO path does not write back**, consistent with Spike's "do not set on fail")
-- The mmu / lsu / bus three-layer model (dummy.txt §8) — the mmu only translates
-  + routes, lsu does the real access after the PA, bus dispatches MMIO; the
-  **mmu_walker_helper_\*** family is JIT granularity by design (§10)
-- The TLB four-slot, two-level ASID index (per-priv isolation / U mirror /
-  sfence.vma full clear / single-ASID clear); **MMIO does not enter the TLB**,
-  keeping the hit path structurally branch-free
-- The LSU (lsu_load/store_helper inline top level + store_helper HVA-based
-  extern; the LOAD/STORE MISALIGN_CHECK implicit contract; SUM/MXR perm check
-  shared in three places)
-- The trap system — exception: medeleg-driven `deliver_priv` / mret/sret really
-  switching the priv mstatus fields / **PRIV_CHECK_OR_TRAP** checking priv at the
-  MRET/SRET/SFENCE.VMA entry; interrupt: `trap_check_interrupt` wired into the
-  top of the dispatcher loop + mideleg routing + vectored mode (mtvec/stvec
-  mode=1 really wired, base+4*cause)
-- The dispatcher (a sigsetjmp permanent landing pad + while(in_trap<3) + loop-
-  head housekeeping + the count synchronization contract; a **loop-top pc IALIGN
-  fallback** as a single source catching errors on every pc-write path,
-  dummy.txt §9)
-- The in_trap bit-field encoding (bits 0-1 trap nesting / bit 3 internal halt /
-  higher bits reserved)
-- Cross-page protection (after the interpreter advances, hva_pc crossing 4 KB →
-  leave the block, the dispatcher re-dispatches)
-- The bus + CLINT MMIO (the mmio_dev_t registry + linear dispatch; CLINT
-  mtime/mtimecmp/msip `_Atomic`, layout matching QEMU virt + SiFive CLINT)
-- The timer helper thread asynchronously advancing the atomic `mtime`
-  (clock_nanosleep ABSTIME, scheme C) + the three-layer reset lifecycle + the
-  runtime degenerate monitor (the two SRS/SDS atomic flags) + the whoever-spawns-
-  joins protocol
-- The register-width typedef family (`uxlen_t` / `ixlen_t` / `u32_t` / `u64_t`;
-  a grep trail for the RV64 switch, dummy.txt §13)
-- The debug character trace (`_` refetch / `E` exception / `t/s/e`
-  time/soft/ext intr; on stderr, auto line-wrap at the DEBUG_TICK threshold 80)
-
-Not yet implemented (later milestones): the JIT subsystem (Translator / IR /
-jit_cache / code_cache / SMC, a_05+) / PLIC / UART / virtio-blk / boot ROM
-(a_03+) / the A-extension LR/SC/AMO / F/D-extension floating point / the
-a_02_end end-to-end hello world (depends on a_03's UART + PLIC) / long-term
-TODO: graceful Ctrl-C interruption, mstatus.TSR/TVM control-bit traps, WFI
-implementation.
-
-
-## Build + Run
-
-Dependencies:
-
-- CMake ≥ 3.10
-- gcc / clang (host compilation; AddressSanitizer on by default in Debug)
-- riscv64-unknown-elf-gcc (cross-compiling fixtures; `-march=rv32imac
-  -mabi=ilp32`)
-
-Build:
+1. **Block cache key = (PA, regime) tuple rather than VA**: keying by VA would force every `sfence.vma` to invalidate a large number of blocks; keying by PA means `sfence.vma` does not affect the JIT cache at all. The `regime` axis distinguishes BARE / SV32_S / SV32_U block variants — the same PA is compiled separately for each regime, with the PTE_U viewpoint baked in at compile time, eliminating a runtime priv-level branch.
+2. **All block exits go through dispatch, no block chaining**: both successors of a conditional branch jump back to the dispatcher. This independence pays off when switching backends, and `jalr`-style indirect jumps cannot be statically linked anyway.
+3. **SMC (self-modifying code): whole-page invalidation + lazy invalidation**: the host pages holding JIT code are `mprotect`-ed read-only; a guest write to such a page triggers SIGSEGV. The handler, constrained by POSIX async-signal-safety, does only the minimum (an `atomic_fetch_or` on the `page_dirty` bit + `mprotect` back to writable + return); real cleanup is deferred to the dispatcher's main-loop head checking the bitmap, and invalidation granularity is the whole page. A companion `_Atomic uint64_t dirty_pending` cardinality counter lets the dispatcher's fast-path skip 99% of iterations with a single relaxed load, avoiding the 512-word table scan.
+4. **Register mapping uses block-local use_count dynamic allocation (Layer 2)**: each `compile_block` entry scans all IR instructions, counts use_count per RV register by op-kind dispatch, picks the top 5 by descending use_count, and promotes them into a 5-register callee-saved host pool (rbx / r12-r15). For large blocks (32+ insts) the hot registers' use_count easily exceeds 5, yielding a +170 ~ +210% improvement over static fixed mapping (Layer 1) in a02_7 measurements.
+
+The JIT block cache's shared data uses a hand-rolled **EBR (Epoch-Based Reclamation) RCU** (~30 lines): per-hart `_Atomic uint32_t` epoch slots plus a single global epoch counter. The read side (`jit_rcu_read_lock` / `unlock`) is one atomic each; the write side (`synchronize`) advances the global epoch and busy-waits until every hart's local epoch catches up before reclaiming the old host code.
+
+### Memory Model: regime ↔ TLB as Mutual Constraints
+
+In translated mode, the TLB is not just a GVA→HVA cache — it also acts as a "leaf-TLB-grained regime dispatch table". `cpu_t` holds a four-slot `tlb_table[4]`, indexed by the RV privilege encoding (U / S / VS / M).
+
+The constraint closes thus:
+
+1. **The regime determines TLB use**: before each block, the dispatcher selects the leaf TLB pointer from `priv` / `satp.mode` and passes it into the running block; empty slots are lazily allocated by `tlb_alloc`, so unused guest ASIDs cost no memory. The BARE regime (M-mode or any priv with bare satp) bypasses the TLB directly.
+2. **A TLB hit lets the running block ignore priv level**: the body of the running block (interpreter or JIT) reads/writes only via the pointer the dispatcher hands it, with zero awareness of which priv level that leaf TLB came from.
+3. **The fast/slow path abstraction stands on this pair of constraints**: priv-level concerns simply do not exist on the hot path — they have been pushed out of the hot path entirely, into the MMU walker (slow-path helper). The fast path is not "skipping a priv check"; the constraint structurally guarantees there is no priv check to perform.
+
+### Fast Path / Slow Path Philosophy
+
+JIT block emission strictly separates two paths:
+
+- **Fast path** = arithmetic / logic / branches / register ops / TLB-hit loads, emitted directly as host instructions
+- **Slow path** = memory writes / atomics / CSR reads/writes / interrupt checks / fences / TLB misses / permission faults — uniformly routed through C helpers via `call helper`, **never inlined** into the JIT block
+
+The motivation for not inlining is multi-fold: changing helper logic does not invalidate the JIT cache; interpreter and JIT share one helper codebase; call stacks remain readable during debugging; on modern CPUs a call/ret costs roughly 5-15 cycles and is essentially free. The side effect is that store / CSR / atomic operations have a JIT speedup ceiling roughly at the interpreter level — a fact the performance data reflects.
+
+The load/store asymmetry on a TLB hit is often misunderstood. The real causal chain is: the TLB caches hva (not pa) + MMIO never enters the TLB → on hit, the structure inherently cannot branch on RAM-vs-MMIO → load on hit can simply `return *hva` with no sub-helper; while store on hit must still go through `store_helper` (to clear LR/SC reservation + the SMC side-effect entry). So the load/store asymmetry is "side effect must go through helper" vs "no side effect can use TLB directly via `*hva`", not a "performance vs side effect" dichotomy.
+
+## Current Capabilities
+
+### ISA and System Software
+
+- Full RV32 IM + C compressed instruction set (70 truly translated ops + 3 exit templates; RVC reuses the underlying RV32I ops)
+- A extension: Zaamo 9 ops (AMOADD/SWAP/XOR/OR/AND through C11 atomic, MIN/MAX through CAS loops) + Zalrsc LR.W/SC.W + Zifencei (fence + fence.i)
+- M / S mode CSRs (physical 64-bit mstatus accessed in halves, masked sstatus view, medeleg-driven trap delegation, mip/mie/sip/sie interrupt CSRs with `_mip_sw` software-writable subset and synthesized read of async sources)
+- Sv32 MMU walker (hw-managed A/D, 4 KB + 4 MB superpages, PTE permission with SUM/MXR shared across three callsites)
+- Trap system: exceptions take `siglongjmp` back to the dispatcher's permanent landing; interrupts go through dispatcher-frame return-based polling (mideleg routing + real vectored-mode dispatch); Double Trap follows the spec MDT/SDT (no NMI implementation)
+- WFI fully implemented: `pthread_cond_wait` + per-hart `(mutex, cond)` slot; `wfi_kick` triggered at each CLINT / PLIC pending 0→1 edge; 500 ms `cond_timedwait` fallback
+
+### Multi-hart SMP
+
+The `--smp N` command-line flag spawns one pthread per hart running the dispatcher, with `MAX_HARTS=8` as a compile-time cap. Data is classified per-hart vs shared: `cpu_t` (including its embedded TLB / register mapping) is per-hart and needs no synchronization; RAM PTE A/D bits, CLINT, PLIC, JIT block cache, and LR/SC reservations are shared and use C11 atomics inside monitor wrappers. **`--smp 1` still walks the multithreaded path** (one pthread spawned), with zero overhead from this generalization.
+
+JIT cache multi-hart safety relies on the hand-rolled EBR RCU described above; the block state machine uses four states (EMPTY / COUNTING / COMPILED / BLACK) maintained by atomic CAS; each page additionally has an `_Atomic uint16_t page_block_head` linked-list head — install CAS-prepends to it, whole-page invalidation walks the list and clears blocks, dropping single invalidation complexity from O(entire cache) to O(blocks/page).
+
+### JIT Subsystem
+
+End-to-end complete:
+
+- Translator: RV → IR (POD struct, 70 truly translated ops, block-boundary judgement shared with the interpreter via `is_block_boundary_inst`)
+- JitBackend: abstract C-style vtable (`backend.h`); asmjit implementation in `backend_asmjit.cc`; adding LLVM only requires a new `backend_llvm.cc` with the same vtable
+- JitEntry: backend-agnostic composition layer (`jit_entry.cc`), implementing the five entrypoints `jit_init` / `jit_shutdown` / `jit_compile_block` / `jit_invalidate_block` / `jit_flush_all`
+- jit_cache: 65536-slot open-addressing hash table, key=(PA, regime), with Fibonacci hash XOR regime
+- SMC chain: SIGSEGV handler + `page_dirty` bitmap + `dirty_pending` counter + dispatcher head scan + jit_invalidate_page — four steps composed
+- Register mapping Layer 2: block-local use_count dynamically promotes the top 5 to a callee-saved host pool
+- Unsupported instructions truncate the block + mark BLACK state + interpreter falls back to executing the whole block
+
+### Devices
+
+- **CLINT** (Core-Local Interruptor) — mtime / mtimecmps[N] / msip[N] all `_Atomic`, layout matching SiFive CLINT + QEMU virt (CLINT_BASE=0x02000000). A timer helper thread `clock_nanosleep` ABSTIME wakes roughly every 1 ms and advances mtime via `atomic_fetch_add`. MTIP is precomputed on the producer side (timer thread + guest writes to mtimecmp) inside a short `mtip_lock` critical section, with the dispatcher reading `atomic_load(mtip)` directly.
+- **PLIC** (Platform-Level Interrupt Controller, v1.0.0) — per-source `<device_line, claimed, priority>` + per-context `<threshold, enable bitmap>` + `plic_ctx_map` reverse index. Synchronous wrlock implementation, with hot-path optimization via two atomic fields (`plic_ctx_eip` / `plic_pending_bitmap_cache`); on the dispatcher, `is_plic_*_pending` reduces to an atomic_load — zero lock, zero scan (cost ~1 cycle).
+- **ns16550a UART** — TX → host stdout, RX ← host stdin; `uart_reader_run` helper thread polls stdin (100 ms timeout) + dual mutex + dual cond + asynchronous TX FIFO drain; wired to PLIC source 10 (QEMU virt UART0-compatible).
+- **virtio-mmio block device** (legacy v1.0, DeviceID=2) — host file backend (`pread`/`pwrite`), `io_worker` helper thread asynchronously drains the avail ring, dual mutex + dual cond + work queue cap=8; wired to PLIC source 1 (QEMU virt virtio-mmio.0-compatible).
+- **test_dev** — a fanout helper, lets fixtures write MMIO to drive PLIC `device_set/clear_pending` directly, or write a `SIFIVE_TEST` magic to trigger main's exit_code.
+
+CLINT is in the SDS domain (persists across system reset); the other four are in the SRS domain (start/stop with system reset).
+
+### Tests
+
+146 fixtures, each self-contained in a directory named `NN_descriptive_name[_reject]/` containing `stub.S` (RV32 assembly source, some fixtures additionally configure `main.c`) + `Makefile` (riscv64-unknown-elf-gcc cross-compile) + `link.ld` (entry at 0x80000000). A `_reject` suffix marks negative tests (verifying a specific loader validation branch is exercised).
+
+`tests/review/run_tests.py` is the batch runner across three build types (`debug+ASan` by default / `--tsan` / Release auto-dispatched by `RUN-RELEASE` tag). Currently all PASS (Debug 146 fixtures all PASS; Tsan 146 fixtures with 19 skipped all PASS). The 3 RUN-TSAN-SKIP fixtures (`b03_01/05 SMC SMP2 race` / `a04_3/02 LR-SC spinlock` / `a02_5/01 timer basic`) cover a cross-hart latent race that the RV spec explicitly allows; details in each fixture's top-of-file doc.
+
+## Performance
+
+Comparing against the interpreter under identical conditions (the a_03 interrupt-check hot-path optimized steady state), the JIT MVP fully landed; release median × 5 across a02_7's 16 fixtures gives:
+
+| Speedup category   | Range       | Representative scenario                       |
+| ------------------ | ----------- | --------------------------------------------- |
+| Fetch fast path    | 3-4x        | BARE / SV32 fetch, TLB-hit load               |
+| load memory access | 1.3-2.7x    | dense / sparse, TLB miss                      |
+| Block-size sweep   | 1.1-10.5x   | block 2 inst → 1.1x; block 32 inst → 10.5x    |
+| Slow path parity   | ~1.0x       | store, AMO, CSR (sacred design expectation)   |
+
+Overall: arithmetic mean 3.39x, geometric mean 2.66x. For real OS guest mixed workloads, typical basic block size is 10-20 inst, with an end-to-end speedup prediction in the 3-5x range. Full data (all fixtures + per-path analysis of JIT subsystems + cross-milestone perf trail) is in `tests/review/REVIEW_REPORT.md`; the detailed experimental record (milestone-end timelines, intermediate experiments, 4-binary comparison runs) is in `tests/review/REVIEW.md`.
+
+## Build
+
+Dependencies: CMake ≥ 3.10 / gcc or clang (host compile) / riscv64-unknown-elf-gcc (cross-compile fixtures, recommended gcc 16.1+ / binutils 2.46+ with `-march=rv32im_zicsr_zifencei -mabi=ilp32`). AsmJit is fetched via CMake `FetchContent` on first configure (~30s clone + build), no system install required.
+
+Three build types:
 
 ```bash
-cmake -B cmake-build-debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build cmake-build-debug
+# Debug (ASan + UBSan, default development)
+make debug
+# or: cmake -B cmake-build-debug -DCMAKE_BUILD_TYPE=Debug && cmake --build cmake-build-debug
+
+# Release (-O2, used for perf runs)
+make release
+
+# Tsan (TSan + UBSan, SMP race detection)
+# Note: Linux kernel 6.5+ requires `sudo sysctl vm.mmap_rnd_bits=28`
+make tsan
 ```
 
-Run a fixture:
+CLion users continue with the GUI build profiles; the Makefile is for non-CLion / CI use.
+
+Running fixtures:
 
 ```bash
-make -C tests                                                # rebuild all fixture .bin/.elf
-./cmake-build-debug/jit-emu tests/a_01/a01_3/01_arith_basic/out.bin
+# Rebuild all fixture binaries
+make -C tests
+
+# Run a single fixture
+./cmake-build-debug/riscv_jit_emulator --bios tests/a_01/a01_3/01_arith_basic/out.bin
+
+# Multi-hart
+./cmake-build-debug/riscv_jit_emulator --bios FILE --smp 4
+
+# Batch runs (auto-dispatched across build types)
+python3 tests/review/run_tests.py            # Debug
+python3 tests/review/run_tests.py --tsan     # Tsan
+
+# Perf batch
+python3 tests/review/run_perf.py             # Release, runs the a02_7 perf suite
 ```
 
-Under CLion Debug, the environment variable
-`ASAN_OPTIONS=abort_on_error=1:detect_leaks=0` is required — LSan collides with
-gdb's ptrace and would fatally exit 1, looking like a program bug but actually a
-toolchain limitation; Run mode (no gdb) does not need it.
+For CLion Debug runs, set `ASAN_OPTIONS=abort_on_error=1:detect_leaks=0` — LSan's ptrace conflicts with gdb's ptrace and fatally exits 1 under Debug. Run mode (no gdb) does not need this.
 
+Command-line flags: `--bios FILE` (main guest image) / `--load [ADDR=]FILE` (additional load: ELF by p_paddr, or raw with `ADDR=` prefix) / `--blk FILE` (virtio-blk backing file) / `--smp N` (multi-hart, defaults to 1).
 
-## Test Organization
-
-Each fixture is a self-contained directory, named `NN_descriptive_name[_reject]/`:
+## Project Structure
 
 ```
-tests/a_01/a01_<N>/<NN>_<name>/
-  stub.S       (RV32 assembly source; some fixtures also have a main.c)
-  Makefile     (riscv64-unknown-elf-gcc cross-compile)
-  link.ld      (linker script, origin 0x80000000)
+src/
+  main.c              entry point, three-phase lifecycle (POR / system reset / teardown)
+  config.h            compile-time macros (RAM / TLB / CLINT layout / MAX_HARTS)
+  riscv.h             RV ISA definitions (priv encoding / CSR addresses / PTE fields / mstatus fields)
+  loader.{c,h}        ELF / raw binary loading, strict 6-point sanity check
+  runtime.{c,h}       SRS / SDS atomic bitmaps, host signal handlers (SIGINT/TERM/HUP)
+  debug.{c,h}         per-thread trace buffer, 4 CMake-driven gate flags
+  dummy.txt           cross-file protocol ledger (§1-§18, not compiled, but part of the source)
+
+  core/               CPU subsystem (all C)
+    cpu / dispatcher / interpreter / decode / csr / mmu / tlb / trap / wfi
+
+  isa/                ISA implementations (all C)
+    lsu / sfence / fence / amo / lrsc
+
+  platform/           hardware platform infrastructure (all C)
+    ram / bus / clint / plic
+
+  device/             peripherals (all C)
+    test_dev / uart / virtio_blk
+
+  jit/                JIT subsystem (C plus two .cc)
+    translator / ir / jit_cache / smc / backend (C)
+    backend_asmjit / jit_entry (C++)
+
+  api/                cross-language boundary (extern "C" + POD structs, all C-compilable)
+    helpers.h         C-implemented, called from the C++ backend
+    jit_api.h         C++-implemented, called from C
 ```
 
-The `_reject` suffix marks a negative test (verifying that a loader validation
-branch is actually reached). Each sub-milestone gets at least one fixture, and
-they accumulate into a regression suite.
+C is the default language; C++ is used only where strictly required (AsmJit is a C++ library → `backend_asmjit.cc` and `jit_entry.cc` are C++). Translator / IR / jit_cache / SMC / dispatcher / interpreter and other core modules remain C. Each file's top contains a design doc; cross-file protocols live in `src/dummy.txt`.
 
+## Documentation Map
+
+In-repo:
+
+- `tests/review/REVIEW_REPORT.md` — performance evaluation report (paper-section style, targeting paper readers + open-source researchers)
+- `tests/review/REVIEW.md` — accumulated experimental record (milestone-end timelines, cross-milestone perf trail)
+- `tests/review/reorg_spec.md` — four-section banner spec for fixture stub.S
+- `src/dummy.txt` — cross-file protocol ledger, 18 sections
+- `src/<module>/<file>.{c,h}` — each module has a top-of-file doc with design motivation and invariants
+
+Out of repo (maintainer-internal material, gitignored):
+
+- `notes/Demo/SoftwareArchitecture_v3.md` — software-architecture narrative (full four-viewpoint derivation, paper-chapter style)
+- `notes/plan_v7.md` — full design plan (§1 design principles / §2 deferred optimizations / §3 evaluated-and-rejected)
+- `notes/trade_off_log_v7.md` — rationale records for key design decisions (§T.1-§T.25)
+- `notes/context-summary.md` — project snapshot and milestone progress
 
 ## License
 
-To be determined.
+TBD.
