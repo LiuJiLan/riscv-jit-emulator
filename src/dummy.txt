@@ -1489,28 +1489,64 @@ _Noreturn longjmp) 的位置。本项目当前 may-longjmp 边界:
 
 
 --------------------------------------------------------------------------------
-(C) 寄存器保存协议 (JIT translator 配合)
+(C) 寄存器保存 + count_out 同步协议 (JIT backend 配合; b_04_02 落地)
 --------------------------------------------------------------------------------
 
 §1 中段已规定 "Translator 配合机制 (寄存器保护)": **emit 每个 may-longjmp
-helper call 之前, store 所有映射 host 寄存器到 cpu_t**。本节是具体应用清单。
-
-(B) 列出的每个 may-longjmp 边界, JIT translator 都要在 emit call 之前插
-寄存器保存序列 (跟 csr_op / lsu_*_helper / mmu_walker_helper_* 同处理)。
-没有例外, 没有"这个 helper 不会 longjmp 所以省了"的标注 — 见 §1 "统一保护
-vs 标注式" 的策略选择。
+helper call 之前, store 所有映射 host 寄存器到 cpu_t**。本节是落地形态 +
+单点闭包 invariant + 实装位置。
 
 → 解释器视角与 JIT 视角的对偶:
 
-  解释器:  SYNC_COUNT() 宏在 may-longjmp 调用前同步 count_out
+  解释器:  SYNC_COUNT() 宏在 may-longjmp 调用前同步 *count_out
            (RV precise trap 要求"触发指令不算入" — failing 那条不能被
             cumulative count 累上, 否则 dispatcher 用旧 count 算错)
+           寄存器同步隐式: WRITE_REG 每条 inst 直接写 hart->regs[N], 无
+           映射到瞬态副本
 
-  JIT:     emit "store 所有映射 host 寄存器" 序列在 may-longjmp call 前
-           (寄存器值要在 longjmp 跳走前固化到 cpu_t, 否则 sigsetjmp 落点
-            读到的是旧值)
+  JIT:     emit "spill 所有映射 host_pool 寄存器到 cpu->regs[N]" + "*count_out
+           = cur_inst_idx" 序列在 may-longjmp call 前
+           (host_pool 寄存器值要在 longjmp 跳走前固化到 cpu_t, 否则 sigsetjmp
+            落点读到的是 sigsetjmp 时 dispatcher 主帧值 — host_pool 是
+            callee-saved, 正常返回路径自动保留, longjmp 路径 jmp_buf 把它们
+            恢复成主帧值, 必须显式 spill 兜底)
 
 两者是同一哲学的两个版本: "may-longjmp 边界前, 把瞬态状态固化到 cpu_t"。
+
+
+→ 单点闭包 invariant (b_04_02 落地; 天然约束, 不是未来约束):
+
+  执行块中任何异常的触发都通过 `trap_raise_exception` (_Noreturn longjmp)
+  直接或间接调用:
+    - 直接: backend 自己 emit_call_helper(trap_raise_exception) — ECALL/
+      EBREAK/SFENCE_VMA priv-fail/WFI TW-fail 4 处
+    - 间接: 其他所有 may-trap helper (mmu_walker_helper_* / store_helper /
+      mmio_*_helper / csr_op / mret_helper / sret_helper /
+      sfence_vma_helper / wfi_wait) 内部撞 trap_raise_exception longjmp
+
+  backend 唯一进 helper 的入口 = `emit_call_helper` (grep 一抓即抓),
+  故 **`ctx.a.call` 行为一一对应可能 trap** — 这是天然 invariant,
+  不需要 may_trap 字段标注 (plan §3 #46 永久否决标注式).
+
+  → 在 emit_call_helper 包装层做 spill + count sync 即闭包覆盖所有
+    may-longjmp 边界, 没有遗漏, 没有"这个 helper 不会 longjmp 所以省了"
+    的标注 — 跟 §1 "统一保护 vs 标注式" 的策略选择一致.
+
+
+→ 实装位置 (跟 src 同步):
+
+  emit_pre_helper_call_sync(compile_ctx_t &ctx)
+    — anonymous namespace, 紧挨 emit_call_helper 上方; 见
+      src/jit/backend_asmjit.cc 函数顶段 doc.
+
+  emit_call_helper 顶部强制调 emit_pre_helper_call_sync, caller (emit_ir_*)
+  不需要每处手动 emit spill 序列, 也不能绕过 emit_call_helper 直接
+  ctx.a.call() 调 helper (破 invariant).
+
+  cur_inst_idx 维护: compile_ctx_t 字段, compile_block 循环顶
+  `ctx.cur_inst_idx = i;` (i 是 0-based RV inst 索引); emit_pre_helper_call_
+  sync 读此字段 emit `*count_out = i` — 跟 RV precise trap "触发那条不
+  算入" 一致.
 
 
 --------------------------------------------------------------------------------
@@ -1519,9 +1555,15 @@ vs 标注式" 的策略选择。
 
   - 本协议不规定 helper 内部具体 trap cause 细分 (cause 集见 §1 + 各 helper
     自身 doc)
-  - 本协议不规定 JIT 寄存器映射策略 (是 translator / backend 内部决定)
-  - 本协议不延伸到 IRQ 中断分发 (T3+ 真做中断时, "中断走长跳还是返回机制"
-    再扩 §9 + 本节)
+  - 本协议不规定 JIT 寄存器映射策略 (是 backend 内部决定; 见 backend_asmjit.cc
+    "寄存器映射演进" 段)
+  - 本协议不延伸到 IRQ 中断分发 (中断走 §9 路径 D 返回机制, 不长跳, 不经
+    emit_call_helper 包装层; 寄存器同步靠 emit_epilogue 正常出口路径)
+
+  Do not (b_04_02 新增):
+  - 绕过 emit_call_helper 直接 ctx.a.call() 调 helper — 漏 spill + count
+    sync, 破单点闭包 invariant. backend 内任何 helper 调用必须经 emit_call_
+    helper.
 
 
 ================================================================================

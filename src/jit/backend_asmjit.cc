@@ -133,7 +133,16 @@
 //     call <helper_static_addr>
 //   helper return 后 rax 装返回值, rdi/rsi/rdx/rcx 可能被 helper 改 (caller-saved)
 //   下次 helper call 前再 reload rdi/rsi
-//   映射 host reg (rbx/r12-r15 = x1-x5) callee-saved, helper 不破坏, 不 save/restore
+//   映射 host reg (host_pool = rbx/r12-r15) callee-saved 双路径处理 (b_04_02):
+//     - 正常返回路径: C ABI 保证 helper 不破坏, 块体内 host_pool 值跨 call 保留
+//     - longjmp 路径: siglongjmp 把 callee-saved 恢复成 sigsetjmp 时 dispatcher
+//       主帧值, host_pool 写过的 RV reg 当前值丢失 (dummy.txt §1 附段)
+//     → emit_call_helper 顶部强制调 emit_pre_helper_call_sync: spill host_pool
+//       到 cpu->regs[N] + 写 *count_out = ctx.cur_inst_idx (解释器 SYNC_COUNT
+//       宏的 JIT 对偶, dummy.txt §10 (C) invariant). 天然 invariant: 执行块
+//       任何异常都经 trap_raise_exception, backend 唯一 helper 入口 = emit_call
+//       _helper → ctx.a.call 一一对应 may-longjmp 边界, 包装层做 spill+sync 即
+//       闭包. caller 不应绕过 emit_call_helper 直接 ctx.a.call() 调 helper.
 //   emit_dispatch_exit 前置 reload rdi + rdx (写 cpu->regs[0] + *count_out)
 //   epilogue 入口前 rdi 已 reload (emit_dispatch_exit 末), 直接 store x1-x5
 //
@@ -245,6 +254,13 @@ inline int32_t regs_offset(uint8_t reg_idx) {
 struct compile_ctx_t {
     asmjit::x86::Assembler &a;
     int8_t rv_to_host[32];
+    // b_04_02 (dummy.txt §10 (C) invariant): 当前在翻译的 RV inst 0-based 索引
+    // (= compile_block 循环 i; 范围 0..n_insts-2). emit_pre_helper_call_sync
+    // 读此字段 emit `*count_out = cur_inst_idx` — helper longjmp 后 dispatcher
+    // 落点拿到的 local_count = 本块触发 trap 前已完整执行的 RV inst 数 (跟
+    // RV precise trap "触发指令本身不算入" 一致). 解释器 SYNC_COUNT() 宏的 JIT
+    // 对偶. compile_block 入口默认 0, 循环顶 ctx.cur_inst_idx = i 更新.
+    uint64_t cur_inst_idx;
 };
 
 static const asmjit::x86::Gp host_pool[5] = {
@@ -1005,7 +1021,10 @@ void emit_ir_muldiv(compile_ctx_t &ctx, const ir_inst_t &inst) {
 //   - 每次 helper call 前: emit_reload_hart (rdi = hart) + 设其他参数 + call
 //   - call 时 rsp % 16 == 0 (prologue push 9 个 自然对齐, 不需 sub rsp)
 //   - helper return 后 rax 装返回值; rdi/rsi/rdx/rcx/r8/r9 (caller-saved) 可能被改
-//   - 映射 host reg (rbx/r12-r15 = x1-x5) callee-saved, helper 不破坏, 不 save/restore
+//   - 映射 host reg (host_pool = rbx/r12-r15) callee-saved 双路径 (b_04_02):
+//     正常返回路径 helper 不破坏 (C ABI), longjmp 路径 siglongjmp 恢复成
+//     sigsetjmp 主帧值 → emit_pre_helper_call_sync 强制 spill 兜底 (顶段
+//     "helper call 协议" 段 + 函数顶 doc; dummy.txt §10 (C) invariant)
 //
 // gpa_to_hva_offset baked into JIT 块: ram_init 在 main POR 一次性填, JIT 编译触
 // 发时已 init; ram_destroy 在 POR 退出前才重置, JIT 块只在 POR 内跑 — baked 安全
@@ -1013,11 +1032,108 @@ void emit_ir_muldiv(compile_ctx_t &ctx, const ir_inst_t &inst) {
 //
 // ============================================================================
 
+// emit_pre_helper_call_sync —— 解释器 SYNC_COUNT() 宏的 JIT 对偶, b_04_02
+// (dummy.txt §10 (C) invariant 实装).
+//
+// scratch reg 选择 (踩坑 trail): emit_pre_helper_call_sync 在 emit_call_helper
+// 顶部跑, 此时 caller (emit_ir_csr / emit_ir_load 等) 已经把 SysV ABI 第 1-5
+// 入参装进 rdi/rsi/rdx/rcx/r8. emit_pre_helper_call_sync 内**只能用 rdi
+// (emit_reload_hart 重新 reload 同值 = no-op) 跟 rax (caller-saved 非 arg,
+// helper 入口前 undef OK)**, 不能动 rsi/rdx/rcx/r8 — 否则破坏 caller 装好的
+// args, helper 拿到错值.
+// (踩坑 trail: b_04_session_004 初版 count sync 段用 rdx 暂存 count_out ptr →
+// csr_op / mmu_walker / mmio_helper / trap_raise_exception 第 3 参全被破坏 →
+// MDT critical-error 早死; csr_heavy / mem_tlbmiss / mmu_sparse 4 fixture
+// release perf 跑 -86% 到 -92%, run_perf.py --compare 严格交错跑批二分定位.
+// Debug regression 漏抓是因为 RUN-RELEASE fixture 跑 frozen release binary,
+// 修复 binary 没 cp 过去, 实际跑的是 baseline binary.)
+//
+// 天然 invariant (落地论据):
+//   执行块中任何异常的触发都通过 trap_raise_exception (_Noreturn longjmp):
+//     - backend 直接 emit_call_helper(trap_raise_exception): ECALL/EBREAK/
+//       SFENCE_VMA priv-fail/WFI TW-fail
+//     - 间接调用: 其他所有 may-trap helper (mmu_walker_helper_* / store_helper /
+//       mmio_*_helper / csr_op / mret_helper / sret_helper / sfence_vma_helper /
+//       wfi_wait) 内部撞 trap_raise_exception longjmp
+//   backend 唯一进 helper 入口 = emit_call_helper, 故 ctx.a.call 一一对应可能
+//   trap. 在 emit_call_helper 包装层做 spill + count_out sync 即闭包覆盖所有
+//   may-longjmp 边界 — 天然约束, 不是未来约束. grep emit_call_helper 一抓即抓.
+//
+// 必要性 (callee-saved + siglongjmp 真机理, dummy.txt §1 附段):
+//   host_pool = {ebx, r12d, r13d, r14d, r15d} 都是 callee-saved. helper 正常
+//   返回时 host_pool 值保留 (C ABI 保证, callee 不破坏); 但 helper 内
+//   trap_raise_exception → siglongjmp 时, jmp_buf 把 callee-saved 恢复成
+//   dispatcher 主帧 sigsetjmp 时的值 — host_pool 写过的 RV reg 当前值丢失.
+//   必须在 emit_call_helper 之前显式 spill 到 cpu->regs[N], trap handler 才看
+//   到正确 RV 状态 (跟 RV precise trap "触发指令前已成功执行" 语义对齐).
+//
+// 解释器 vs JIT 对偶:
+//   解释器: SYNC_COUNT() 宏在 may-longjmp 调用前同步 *count_out (寄存器同步
+//           隐式 — 解释器 WRITE_REG 每条 inst 直接写 hart->regs[N]); cur_count
+//           跟 count_out 跨 longjmp 的同步契约见 interpreter.c SYNC_COUNT 顶段 doc
+//   JIT:    emit_pre_helper_call_sync 在 ctx.a.call 之前 emit spill 序列把
+//           host_pool 寄存器写回 cpu->regs[N], 同时 emit *count_out = cur_inst_idx
+//           (本条触发 inst 没算入, 跟 RV precise trap 一致).
+//   两者是同一哲学的两个版本: "may-longjmp 边界前, 把瞬态状态固化到 cpu_t".
+//
+// emit 序列:
+//   1. emit_reload_hart                              ; rdi = hart (spill 用)
+//   2. for r in 1..31 if ctx.rv_to_host[r] >= 0:
+//        mov [rdi + regs_offset(r)], host_pool[idx]  ; spill host_pool 到 cpu->regs
+//   3. mov rdx, [rbp - 56]                           ; STACK_SLOT_COUNT_OUT reload
+//      mov rax, imm(ctx.cur_inst_idx)                ; uint64_t imm
+//      mov [rdx], rax                                ; *count_out = cur_inst_idx
+//
+// 跟 emit_epilogue / emit_dispatch_exit 各自责任分工:
+//   - emit_epilogue 在块正常退出末段做完整 host_pool → cpu->regs store + pop
+//     callee-saved + ret. longjmp 路径跳过 epilogue, 所以 epilogue 不兜底 longjmp.
+//   - emit_dispatch_exit 末段写 *count_out = block_inst_count = n_insts - 1
+//     (全块完成). emit_pre_helper_call_sync 写 *count_out = cur_inst_idx (本条
+//     trap inst 没算入). 两者各取一路: 正常退出最终值 = block_inst_count,
+//     trap longjmp 跳过 emit_dispatch_exit, 留在 cur_inst_idx, 各自正确.
+//
+// 冗余 reload 论 (R1): 部分 caller 在 emit_call_helper 前已 emit_reload_hart
+//   (e.g. emit_ir_load miss path); 本 helper 内 emit_reload_hart 再 reload 是
+//   冗余 ~1 cycle, 但 invariant 优先, 局部冗余不破规.
+inline void emit_pre_helper_call_sync(compile_ctx_t &ctx) {
+    using namespace asmjit::x86;
+
+    /* 1. rdi = hart (spill 用) */
+    emit_reload_hart(ctx);
+
+    /* 2. spill 真分配 host_pool[idx] 到 cpu->regs[r]
+     * (跟 emit_epilogue 内 store 序列同形态, 详 emit_epilogue 顶段 doc) */
+    for (uint8_t r = 1; r < 32; r++) {
+        int8_t idx = ctx.rv_to_host[r];
+        if (idx >= 0) {
+            ctx.a.mov(dword_ptr(rdi, regs_offset(r)), host_pool[idx]);
+        }
+    }
+
+    /* 3. count_out 同步 — 只用 rax 不用 rdx (避破坏 caller 装好的 SysV 第 3 参):
+     *
+     *   mov rax, [rbp - 56]                   ; rax = count_out ptr (caller-saved scratch)
+     *   mov qword ptr [rax], imm32(cur_idx)   ; *count_out = cur_inst_idx (sign-ext to 64)
+     *
+     * cur_inst_idx 范围 [0, BLOCK_INST_LIMIT-1] = [0, 63], imm32 sign-ext 永远正确.
+     * 跟 emit_dispatch_exit 形态差异: 后者用 mov rax, imm64 + mov [rdx], rax 两步是
+     * 因为 block_inst_count 可能 ≥ 2^31 (其实当前 ≤ 64 也安全, 但 emit_dispatch_exit
+     * 是非 hot path 早写法, 不强求统一; 这里走 imm32 路径节省一条 mov + 不动 rdx). */
+    ctx.a.mov(rax, qword_ptr(rbp, STACK_SLOT_COUNT_OUT));
+    ctx.a.mov(qword_ptr(rax),
+              asmjit::imm(static_cast<int32_t>(ctx.cur_inst_idx)));
+}
+
 // helper: emit "call <absolute_addr>" (静态绑定 helper 函数指针; dummy.txt §10
 // "helper 颗粒度 by design"). 跟 ctx.a.call(asmjit::imm(uint64_t)) 等价, 包装一层
 // 防止 reinterpret_cast 反复 boilerplate.
+//
+// b_04_02: 顶部强制调 emit_pre_helper_call_sync — backend 唯一 helper 入口,
+// 包装层 spill + count sync 闭包覆盖所有 may-longjmp 边界 (dummy.txt §10 (C)
+// invariant). caller 不应绕过此函数直接 ctx.a.call() 调 helper.
 template<typename Fn>
 inline void emit_call_helper(compile_ctx_t &ctx, Fn *fn) {
+    emit_pre_helper_call_sync(ctx);
     ctx.a.call(asmjit::imm(reinterpret_cast<uintptr_t>(fn)));
 }
 
@@ -1908,8 +2024,9 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
     asmjit::x86::Assembler a(&code);
 
     /* per-compile_block ctx (栈局部, 不跨调用; 详 ctx 段顶 doc "推翻 trail").
-     * rv_to_host 零初始化为 0, compute_reg_mapping 入口立即覆写为 -1. */
-    compile_ctx_t ctx{a, {}};
+     * rv_to_host 零初始化为 0, compute_reg_mapping 入口立即覆写为 -1.
+     * cur_inst_idx 零初始化, 循环顶逐条覆写 (b_04_02 helper-call sync 用). */
+    compile_ctx_t ctx{a, {}, 0u};
 
     /* b_03 T3 Layer 2: 算块内寄存器映射 (use_count 排序 top 5; 顶段 doc "寄存器
      * 映射演进" 段). 必须在 emit_prologue 之前调 — prologue 真 load 哪些 RV
@@ -1929,6 +2046,11 @@ static jit_status_t asmjit_backend_compile_block(uxlen_t pa, regime_t regime,
 
     // 块体: 前 n_insts-1 条 (RV32 IMC + M 共 70 op), 末 1 条 DISPATCH_EXIT/_RUNTIME 单独处理
     for (size_t i = 0; i < n_insts - 1; i++) {
+        // b_04_02: helper-call 前 emit_pre_helper_call_sync 读此字段 emit
+        // `*count_out = i` — trap longjmp 后 dispatcher 落点 local_count = i
+        // (本条触发 inst 没算入, RV precise trap 对偶). 详 compile_ctx_t.cur_inst_idx
+        // 字段顶段 doc + dummy.txt §10 (C) invariant.
+        ctx.cur_inst_idx = (uint64_t)i;
         const ir_inst_t &inst = insts[i];
         switch (inst.kind) {
             /* RV32I 算术全集 21 op → emit_ir_arith */
