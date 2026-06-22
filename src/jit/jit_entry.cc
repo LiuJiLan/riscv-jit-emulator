@@ -24,8 +24,12 @@
 //   jit_shutdown 反序: jit_cache_destroy → backend.destroy
 //
 // jit_flush_all (jit_compile_block Q11 a 内部组合也调; dispatcher 不直接调):
-//   jit_cache_flush_all → backend.flush_all (固定顺序; jit_cache 内 RCU sync 等
-//                                            grace period 后才能 backend 真 reset)
+//   backend_lock wrlock (排他, 等所有 rdlock 持有方退) → jit_cache_flush_all
+//   (mark EMPTY + RCU sync) → cpu_wait_all_harts_idle_jit (等所有 hart 退出
+//   任何 host_code) → backend.flush_all (asmjit JitRuntime::reset, 现在物理
+//   安全) → wrunlock. 协议 4 步对偶 jit_invalidate_block 但 wait 升级到全
+//   hart idle (reset 释放整片 RX 池). b_04_session_002 加 SMP 保护, 详 backend_
+//   lock 段顶 doc 跟 jit_flush_all 函数顶 doc.
 //
 // jit_invalidate_block (协议骨架接通; 按 (pa, regime) 单块失效):
 //   take 路径: jit_cache_take_compiled_host_code(pa, regime) 拿 host_code +
@@ -70,16 +74,43 @@
 // NOT_IMPLEMENTED → set_blacklist → dispatcher 兜底走 interpret 真执行.
 //
 
+#include <pthread.h>         // backend_lock rwlock (b_04_session_002 SMP)
 #include <stdio.h>           // fprintf (Flush / BLACK 异常路径 stderr 提示)
 
 #include "api/jit_api.h"
 #include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小) / MAX_BLOCKS_PER_PAGE / EOL
-#include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code (invalidate 协议)
+#include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code / idle_jit (invalidate / flush 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
 #include "jit/translator.h"  // translator_translate (RV → IR)
 
 extern "C" {
+
+// ----------------------------------------------------------------------------
+// backend_lock —— rwlock 串行化 g_rt 访问跟 reset 之间的关系 (b_04_session_002)
+//
+// 背景: asmjit JitAllocator::reset() 上游 doc 明字 "not thread-safe ... when
+// nobody else is using the JitAllocator" — alloc / release 内部 LockGuard 真
+// SMP 安全 (跨 hart 同时 compile/invalidate 没 race), 但 reset() 跟其他任何
+// op 并发就会撞 freelist + freed-while-executing. 解法 = 加 rwlock:
+//
+//   rdlock 持有方: jit_compile_block (backend.compile_block + install 整段) /
+//                   jit_invalidate_block / jit_invalidate_page (backend.invalidate_
+//                   block 调用) — 真并发互不阻塞 (asmjit 内部 LockGuard 已防 race)
+//   wrlock 持有方: jit_flush_all (cache_flush_all + wait_idle + backend.flush_all
+//                   整段) — 排他, 等所有 rdlock release 才能 acquire
+//
+// 协议跟 jit_invalidate_block 4-step 同精神, 但 reset 涉及全 host_code 段, 所以
+// step 3 wait 从单 host_code 升级到 "全 hart 退出任何 host_code"
+// (cpu_wait_all_harts_idle_jit).
+//
+// 锁顺序 invariant: rdlock 持有时不嵌套调任何走 wrlock 的接口 (否则 deadlock).
+// jit_compile_block step 2 的 jit_flush_all 必须在 rdunlock **之后** 调.
+//
+// PTHREAD_RWLOCK_INITIALIZER 静态初始化, 不需 init/destroy 配对 (跟 uart_lock /
+// other file-static pthread_mutex_t 对偶).
+// ----------------------------------------------------------------------------
+static pthread_rwlock_t backend_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 // ----------------------------------------------------------------------------
 // lifecycle (main POR / teardown 一次配对; jit_cache + backend 都是单例 + 跨
@@ -105,17 +136,41 @@ void jit_shutdown(void) {
 
 // ----------------------------------------------------------------------------
 // jit_flush_all — Q11 a 组合层内部用; dispatcher 不直接调 (Q11 a 拍 "dispatcher
-// 不感知 Flush").
+// 不感知 Flush"). 4-step 协议跟 jit_invalidate_block 对偶, 但 reset 全 RX 池,
+// step 3 wait 升级到全 hart idle (b_04_session_002).
 //
-// 顺序固定: jit_cache_flush_all → backend.flush_all
-//   jit_cache_flush_all 内部 jit_rcu_synchronize 等 grace period (旧 host_code
-//   引用全释放), 之后 backend.flush_all 才能真 reset code_cache RX 段. 反序的话
-//   reader 还在执行旧 host_code 时 RX 段被回收 → segfault.
+// 协议 4 步:
+//   step 1+2: jit_cache_flush_all (mark 全表 EMPTY + 内部 jit_rcu_synchronize
+//              等 grace period; 新 lookup 全 miss)
+//   step 3:   cpu_wait_all_harts_idle_jit (等所有 hart 退出任何 host_code,
+//              避免 reset 释放 RX 段时别 hart 跳进垃圾内存)
+//   step 4:   backend.flush_all (asmjit JitRuntime::reset 整片回收)
+//
+// SMP 保护: 整套裹在 backend_lock wrlock 内, 跟 jit_compile_block /
+// jit_invalidate_block / jit_invalidate_page 的 rdlock 互斥 (rwlock writer 等
+// readers 全 release). asmjit JitAllocator::reset() doc 明字 "not thread-safe",
+// 加 wrlock 才物理安全.
+//
+// 推翻 trail (b_04_session_002): 早期版本只 jit_cache_flush_all → backend.flush_all,
+// 缺 SMP 保护 + 缺 step 3 wait. 当时 jit_flush_all 是 dead code (backend 不返
+// JIT_CODE_CACHE_FULL, jit_compile_block 走不到 step 2 Flush 路径) 没暴露. 本
+// session 顺手把 backend OOM 细化 + flush_all 4-step 补全, 真撞 cache 满时安全.
 // ----------------------------------------------------------------------------
 void jit_flush_all(void) {
+    pthread_rwlock_wrlock(&backend_lock);
+
+    /* step 1+2: mark 全表 EMPTY + RCU sync */
     jit_cache_flush_all();
+
+    /* step 3: 等所有 hart 退出任何 host_code (reset 释放整片 RX 池, 不能像
+     * invalidate_block 那样按单 host_code wait) */
+    cpu_wait_all_harts_idle_jit();
+
+    /* step 4: backend release 整 RX 池 (asmjit JitRuntime::reset, 现在物理安全) */
     const backend_t *be = backend_get_default();
     be->backend_flush_all();
+
+    pthread_rwlock_unlock(&backend_lock);
 }
 
 
@@ -153,9 +208,14 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime) {
     /* step 3: 状态灯扫所有 hart 等退出 host_code (busy-wait + PAUSE) */
     cpu_wait_all_harts_exit_host_code(host_code);
 
-    /* step 4: backend release host code RX 段 (asmjit JitRuntime::release) */
+    /* step 4: backend release host code RX 段 (asmjit JitRuntime::release).
+     * 裹 backend_lock rdlock 防跟 jit_flush_all wrlock 内的 backend.flush_all
+     * (reset 整片 RX 池) race; rdlock 允许多 hart 并发 invalidate_block, asmjit
+     * release() 内部 LockGuard 已防 alloc/release 同 freelist race. */
+    pthread_rwlock_rdlock(&backend_lock);
     const backend_t *be = backend_get_default();
     be->backend_invalidate_block(host_code);
+    pthread_rwlock_unlock(&backend_lock);
 }
 
 
@@ -189,13 +249,19 @@ void jit_invalidate_page(uint32_t page_idx) {
         return;   /* page 空 (无 JIT 块) / page_idx 越界 — 不需 release */
     }
 
-    /* step 3 + 4: 循环每 host_code 等 hart 退出 + backend release */
+    /* step 3 + 4: 循环每 host_code 等 hart 退出 + backend release. 整 loop 裹
+     * 一次 backend_lock rdlock — flush_all wrlock 不能在 loop 中途插入 (插入
+     * 会导致后续 backend.invalidate_block 撞已 release 的 host_code, double-free
+     * 或撞 asmjit freelist). 单次 rdlock 包整 loop 是 minimal scope, 跟 b_03_
+     * session_009 backend_lock 段顶 doc 协议一致. */
+    pthread_rwlock_rdlock(&backend_lock);
     const backend_t *be = backend_get_default();
     for (size_t i = 0; i < n_codes; i++) {
         if (host_codes[i] == nullptr) { continue; }   /* BLACK / COUNTING 无 host_code */
         cpu_wait_all_harts_exit_host_code(host_codes[i]);
         be->backend_invalidate_block(host_codes[i]);
     }
+    pthread_rwlock_unlock(&backend_lock);
 }
 
 
@@ -215,30 +281,42 @@ jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
     size_t n_insts = 0;
     translator_translate(pa, regime, ir_buf, &n_insts);
 
-    /* step 1: 首次 compile */
+    /* step 1: 首次 compile (rdlock 包 compile + install, 防 flush_all wrlock
+     * 在 compile 返 OK 跟 install 之间插入释放 host_code RX 段 → 别 hart 后续
+     * lookup 拿到悬空指针). 详 backend_lock 段顶 doc. */
     void *host_code = nullptr;
+    pthread_rwlock_rdlock(&backend_lock);
     jit_status_t s = be->backend_compile_block(pa, regime,
                                                ir_buf, n_insts,
                                                &host_code);
     if (s == JIT_OK) {
         (void)jit_cache_install(pa, regime, host_code);
+        pthread_rwlock_unlock(&backend_lock);
         return JIT_OK;
     }
+    pthread_rwlock_unlock(&backend_lock);
 
     /* step 2: JIT_CODE_CACHE_FULL → Flush + retry 1 次 (异常路径, 一次性 stderr
-     * 提示 — 信号价值高, 不 gate; 真撞 = JIT_CACHE_SIZE 触底). */
+     * 提示 — 信号价值高, 不 gate; 真撞 = JIT_CACHE_SIZE 触底).
+     * 关键: jit_flush_all 内部走 wrlock, 必须在上方 rdunlock 之后调 (否则
+     * deadlock). retry 重新 rdlock 包. */
     if (s == JIT_CODE_CACHE_FULL) {
         fprintf(stderr, "[jit] FULL → Flush + retry: pa=0x%08x regime=%u" EOL,
                 (uint32_t)pa, (uint32_t)regime);
-        jit_flush_all();
+        jit_flush_all();   /* 内部 wrlock; rdunlock 完成才能调, 见上方 invariant */
+
         host_code = nullptr;
+        pthread_rwlock_rdlock(&backend_lock);
         s = be->backend_compile_block(pa, regime,
                                       ir_buf, n_insts,
                                       &host_code);
         if (s == JIT_OK) {
             (void)jit_cache_install(pa, regime, host_code);
+            pthread_rwlock_unlock(&backend_lock);
             return JIT_OK;
         }
+        pthread_rwlock_unlock(&backend_lock);
+
         if (s == JIT_CODE_CACHE_FULL) {
             /* 二次 FULL: 单块 host code > 整个 code_cache, 几乎不可能 (RV block
              * ≤ 64 inst × ~16 byte/inst < 1KB; 1MB+ code_cache) — 真撞是 bug.

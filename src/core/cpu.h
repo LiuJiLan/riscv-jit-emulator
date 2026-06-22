@@ -238,6 +238,24 @@ void cpu_destroy(cpu_t *hart);
 // ----------------------------------------------------------------------------
 void cpu_wait_all_harts_exit_host_code(void *host_code);
 
+
+// ----------------------------------------------------------------------------
+// cpu_wait_all_harts_idle_jit (jit_flush_all 协议; b_04_session_002)
+//
+// 扫 harts_table (cap MAX_HARTS) 等所有 hart 的 jit_executing_host_code 字段
+// 全 == NULL (即所有 hart 都不在执行任何 JIT host_code, 都退到 dispatcher 主
+// 帧). 对偶 cpu_wait_all_harts_exit_host_code 但判据是"全空"而非"全离某段".
+//
+// caller = jit_entry.cc 的 jit_flush_all — backend.flush_all (g_rt->reset 整片
+// 回收 RX 池) 前必调, 防 reset() 释放别 hart 正在跑的 host_code RX 段 (asmjit
+// JitAllocator::reset doc 明字 "not thread-safe ... when nobody else is using
+// the JitAllocator"; 加 backend rwlock + 本 wait 才物理安全).
+//
+// 起步 busy-wait + PAUSE 同体例; 跟 exit_host_code 共享设计精神 (a_05+ 真撞
+// perf 时再换 cond_wait). phantom slot 跳过同体例.
+// ----------------------------------------------------------------------------
+void cpu_wait_all_harts_idle_jit(void);
+
 #ifdef __cplusplus
 }
 #endif

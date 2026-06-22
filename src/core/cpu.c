@@ -349,3 +349,26 @@ void cpu_wait_all_harts_exit_host_code(void *host_code) {
         }
     }
 }
+
+
+// ----------------------------------------------------------------------------
+// cpu_wait_all_harts_idle_jit — 扫所有 hart 等退出任何 JIT host_code
+//
+// b_04_session_002 加: caller jit_entry.cc 的 jit_flush_all, backend.flush_all
+// (g_rt->reset 整片回收 RX 池) 前必调. 对偶 exit_host_code 但判据是字段全
+// == NULL (所有 hart 都不在执行任何 JIT 块, 都退到 dispatcher 主帧).
+//
+// reset() 释放整片 RX 段, 不像 release(p) 那样只清单块; 所以也不能像
+// invalidate_block 那样按单 host_code wait, 必须等全空. cap-vs-n_harts /
+// phantom slot / busy-wait + PAUSE 同体例 cpu_wait_all_harts_exit_host_code.
+// ----------------------------------------------------------------------------
+void cpu_wait_all_harts_idle_jit(void) {
+    for (uint32_t i = 0; i < MAX_HARTS; i++) {
+        cpu_t *h = harts_table[i];
+        if (h == NULL) { continue; }   /* phantom slot / 已 destroy hart */
+        while (atomic_load_explicit(&h->jit_executing_host_code,
+                                    memory_order_acquire) != NULL) {
+            __builtin_ia32_pause();
+        }
+    }
+}
