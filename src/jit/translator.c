@@ -8,7 +8,10 @@
 //   - 取指 memcpy 4 字节 (跟 interpreter.c:226 同; 防 strict-aliasing)
 //   - 跨页 check 推进后 cur_pc 进新 page 退 (跟 interpreter.c:896 同体例;
 //     page_mask = ~0xFFFu)
-//   - 软边界 BLOCK_INST_LIMIT - 1 (留 1 slot 给 DISPATCH_EXIT 收尾)
+//   - 软边界 i < BLOCK_INST_LIMIT (跟 interpreter.c:189 字面对偶, 真翻译
+//     BLOCK_INST_LIMIT 条 RV inst; 末段 DISPATCH_EXIT 哨兵占 ir_buf 第
+//     BLOCK_INST_LIMIT 槽, 故 caller stack 分配 ir_buf 大小 BLOCK_INST_LIMIT
+//     + 1; b_04_session_004 对齐)
 //   - PC_STEP 用 d.pc_step (RVC 时自动适应; PC_STEP_RV = 4, PC_STEP_RVC = 2)
 //
 // AUIPC: cur_pc + d.imm 合并写进 ir.imm (选 a 常量折叠, 跟 QEMU 默认 + rv8 一致;
@@ -17,9 +20,34 @@
 // 等价; OS guest 真撞 pa != VA 时 (mapping 跨 page 不同 VA), AUIPC baked_pc 来源
 // (用 pa 还是 cpu->pc VA) 单独议. 当前测试范围内未撞.
 //
-// 硬边界 op: CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6 = 19 op
-// (plan §1.23.1 表 4 + 表 7; is_block_boundary_inst 返 1), translator emit
-// 完该 op 的 IR 后立刻 break 出翻译循环.
+// 硬边界 op: CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6 = 21 op
+// (plan §1.23.1 表 4 + 表 7; is_block_boundary_inst 返 1), translator 在
+// case 装填 IR 后通过 decode.h is_block_boundary_inst(&d) 判定立刻 break
+// 出翻译循环 — 跟 interpreter.c:792 fetch loop 末段字面对偶, 共享同一份
+// 判定函数; 加新 RV op 时 decode.h is_block_boundary_inst 加 case
+// (-Wswitch-enum 强制), translator 单点 pick up 不重复维护.
+//
+// TODO (JIT 独有优化路径, 明确推迟): 解释器视角"硬边界 = 立即切块"是必然的
+// (解释器单条 inst execute 后必须重派发); JIT 视角则不一定 — IR 阶段已经能
+// 看到一整条 RV inst 流, 有多种 IR-level 优化可在切块前融合:
+//   1. BRANCH compile-time 静态目标 (target_pc baked) + JAL: 块内连续 BRANCH/JAL
+//      链可被融合成单块, taken/fall-through 双出口都在同块 emit, 减少 dispatcher
+//      round-trip. 当前 emit_ir_branch 一块两份 epilogue 已是双出口形态, 但仍
+//      单块 (BRANCH 后即切); 真融合需要 translator 在 BRANCH/JAL target 也在
+//      当前 page 时续译目标块.
+//   2. CSR 一刀切硬边界 (plan §1.6 "过度刷新允许") 留了优化余地: 实际 CSRRS rd,
+//      csr, x0 = 纯读不写, csrr mhartid 之类 RO identity CSR 完全无副作用 — 可
+//      细分 csr_addr (mtvec/satp/sstatus/medeleg 等真有副作用的硬边界, 其他 read
+//      不切块). 收益主要在 csr_heavy 类 fixture (当前 0.81x 退化, 见
+//      REVIEW_REPORT §4.1).
+//   3. IR 阶段常量传播 / 死代码消除: LUI + ADDI 序列折叠 baked 32-bit imm,
+//      AUIPC + JALR pair 折叠 absolute target; 当前 AUIPC 已 baked cur_pc + imm
+//      (translator.c 选 a 常量折叠), 但 LUI + ADDI link-time relocation pair
+//      没融合.
+// 跟 plan §2 deferred (block chaining + tiered JIT + Layer 3 跨块寄存器分配)
+// 同性质: 都需要 JIT 视角的全局优化框架, 当前 v1 简化形态 ("硬边界 = 立即切块",
+// 跟解释器对偶) 是基线, 未来 hot-trace profiling 数据到位后单独评估上不上.
+// 不在 b_04 milestone 范围.
 //
 // CSR 字段约定 (ir.h 顶段 + ir_inst_t 段对偶 decode.h 字段约定):
 //   ir_imm = d.imm = csr_addr 12-bit; RWI/RSI/RCI 变体 d.rs1 字段直接是 5-bit
@@ -78,13 +106,15 @@ void translator_translate(uxlen_t pa, regime_t regime,
     int     use_runtime_exit  = 0;
 
     /* 翻译循环 (块前缀):
-     *   - 软边界 i < BLOCK_INST_LIMIT - 1u (留 1 slot 给 DISPATCH_EXIT 收尾)
+     *   - 软边界 i < BLOCK_INST_LIMIT (跟 interpreter.c:189 字面对偶, 真翻译
+     *     BLOCK_INST_LIMIT 条 RV inst; caller stack 分配 ir_buf 大小
+     *     BLOCK_INST_LIMIT + 1, 末槽留 DISPATCH_EXIT 哨兵)
      *   - 截断条件 (走 interpret 兜底): OP_UNSUPPORTED
-     *   - 硬边界 op (CSR 6 / FENCE_I / BRANCH 6 / JAL / JALR / SYSTEM 6) emit
+     *   - 硬边界 op (21 op; 调 is_block_boundary_inst() 共享 decode.h) emit
      *     完 IR 后 break 切块
      *   - 跨页 check (推进后 cur_pc 进新 page → 退)
      */
-    while (i < BLOCK_INST_LIMIT - 1u) {
+    while (i < BLOCK_INST_LIMIT) {
         u32_t inst;
         memcpy(&inst, hva_base + (cur_pc - pa), 4);
 
@@ -101,10 +131,12 @@ void translator_translate(uxlen_t pa, regime_t regime,
         /* ir_target_pc — BRANCH IR.target_pc 装 taken_pc; JAL/JALR IR.target_pc
          * 装 rd 写入值 (= pre-incr cur_pc + pc_step). 默认 0 (其他 op 不用此字段). */
         uxlen_t      ir_target_pc = 0;
-        /* 硬边界 op (CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6);
-         * emit 完该 op IR 后强制 break 出循环 → 末段 DISPATCH_EXIT/_RUNTIME
-         * 收尾切块. plan §1.23.1 表 4 + 表 7. */
-        int          is_hard_boundary = 0;
+        /* 硬边界 (CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6 = 21 op):
+         * emit 完该 op IR 后, 末段 break 出循环 → DISPATCH_EXIT/_RUNTIME 收尾
+         * 切块. 判定共享 decode.h is_block_boundary_inst() 跟 interpreter 对偶
+         * (b_04_session_004 重构), 不在 case 内重复手填标志 — 加新 RV op 时
+         * decode.h is_block_boundary_inst() 加 case (-Wswitch-enum 强制),
+         * translator 自动 pick up. plan §1.23.1 表 4 + 表 7. */
 
         switch (d.kind) {
             /* ---- U-type ---- */
@@ -155,12 +187,12 @@ void translator_translate(uxlen_t pa, regime_t regime,
              * ir.rs1 = d.rs1 直传 (RW/RS/RC 是寄存器号, RWI/RSI/RCI 是 5-bit
              * zimm 数值, 字段位置共用 — decode.h:159-162 line + ir.h 字段约定
              * I 变体段). */
-            case OP_CSRRW:  ir_kind = IR_OP_CSRRW;  is_hard_boundary = 1; break;
-            case OP_CSRRS:  ir_kind = IR_OP_CSRRS;  is_hard_boundary = 1; break;
-            case OP_CSRRC:  ir_kind = IR_OP_CSRRC;  is_hard_boundary = 1; break;
-            case OP_CSRRWI: ir_kind = IR_OP_CSRRWI; is_hard_boundary = 1; break;
-            case OP_CSRRSI: ir_kind = IR_OP_CSRRSI; is_hard_boundary = 1; break;
-            case OP_CSRRCI: ir_kind = IR_OP_CSRRCI; is_hard_boundary = 1; break;
+            case OP_CSRRW:  ir_kind = IR_OP_CSRRW;  break;
+            case OP_CSRRS:  ir_kind = IR_OP_CSRRS;  break;
+            case OP_CSRRC:  ir_kind = IR_OP_CSRRC;  break;
+            case OP_CSRRWI: ir_kind = IR_OP_CSRRWI; break;
+            case OP_CSRRSI: ir_kind = IR_OP_CSRRSI; break;
+            case OP_CSRRCI: ir_kind = IR_OP_CSRRCI; break;
 
             /* ---- R-type A 扩展 Zaamo (9; rs1=gva, rs2=value) ---- */
             case OP_AMO_ADD_W:  ir_kind = IR_OP_AMO_ADD_W;  break;
@@ -179,7 +211,7 @@ void translator_translate(uxlen_t pa, regime_t regime,
 
             /* ---- MISC-MEM (2; FENCE_I 硬边界, FENCE 不是) ---- */
             case OP_FENCE:    ir_kind = IR_OP_FENCE;                          break;
-            case OP_FENCE_I:  ir_kind = IR_OP_FENCE_I; is_hard_boundary = 1; break;
+            case OP_FENCE_I:  ir_kind = IR_OP_FENCE_I; break;
 
             /* ---- B-type BRANCH (6; 硬边界; 双出口) ----
              * BRANCH IR.target_pc 装 taken_pc (= 本指令 PC + d.imm); 末段
@@ -188,32 +220,26 @@ void translator_translate(uxlen_t pa, regime_t regime,
             case OP_BEQ:
                 ir_kind = IR_OP_BEQ;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
             case OP_BNE:
                 ir_kind = IR_OP_BNE;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
             case OP_BLT:
                 ir_kind = IR_OP_BLT;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
             case OP_BGE:
                 ir_kind = IR_OP_BGE;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
             case OP_BLTU:
                 ir_kind = IR_OP_BLTU;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
             case OP_BGEU:
                 ir_kind = IR_OP_BGEU;
                 ir_target_pc = cur_pc + (uint32_t)d.imm;
-                is_hard_boundary = 1;
                 break;
 
             /* ---- J-type JAL (1; 硬边界; compile-time target) ----
@@ -225,7 +251,6 @@ void translator_translate(uxlen_t pa, regime_t regime,
                 ir_target_pc      = cur_pc + d.pc_step;
                 hard_exit_pc      = cur_pc + (uint32_t)d.imm;
                 have_hard_exit_pc = 1;
-                is_hard_boundary  = 1;
                 break;
 
             /* ---- I-type JALR (1; 硬边界; runtime target) ----
@@ -236,7 +261,6 @@ void translator_translate(uxlen_t pa, regime_t regime,
                 ir_kind = IR_OP_JALR;
                 ir_target_pc = cur_pc + d.pc_step;
                 use_runtime_exit = 1;
-                is_hard_boundary = 1;
                 break;
 
             /* ---- I-type SYSTEM (6; 全硬边界) ----
@@ -252,12 +276,12 @@ void translator_translate(uxlen_t pa, regime_t regime,
              *   进; 末段走 COUNT_ONLY 不写 cpu->pc.
              * raw_inst 由 ir_buf 末段统一装 (line 184), helper 内 PRIV_CHECK/TW
              * 失败 trap 时用作 mtval. */
-            case OP_ECALL:       ir_kind = IR_OP_ECALL;       is_hard_boundary = 1; break;
-            case OP_EBREAK:      ir_kind = IR_OP_EBREAK;      is_hard_boundary = 1; break;
-            case OP_MRET:        ir_kind = IR_OP_MRET;        is_hard_boundary = 1; break;
-            case OP_SRET:        ir_kind = IR_OP_SRET;        is_hard_boundary = 1; break;
-            case OP_SFENCE_VMA:  ir_kind = IR_OP_SFENCE_VMA;  is_hard_boundary = 1; break;
-            case OP_WFI:         ir_kind = IR_OP_WFI;         is_hard_boundary = 1; break;
+            case OP_ECALL:       ir_kind = IR_OP_ECALL;       break;
+            case OP_EBREAK:      ir_kind = IR_OP_EBREAK;      break;
+            case OP_MRET:        ir_kind = IR_OP_MRET;        break;
+            case OP_SRET:        ir_kind = IR_OP_SRET;        break;
+            case OP_SFENCE_VMA:  ir_kind = IR_OP_SFENCE_VMA;  break;
+            case OP_WFI:         ir_kind = IR_OP_WFI;         break;
 
             /* ---- RV32M MUL 家族 4 op ----
              * backend emit_ir_muldiv inline (3 路 imul/mul 路径 + MULHSU 64-bit
@@ -296,10 +320,14 @@ void translator_translate(uxlen_t pa, regime_t regime,
 
         cur_pc += d.pc_step;
 
-        /* 硬边界 op (CSR 6 + FENCE_I): emit 完后强制 break 出循环, 走
-         * DISPATCH_EXIT 收尾 — dispatcher 重派发以重新算 (regime, current_tlb)
-         * 跟 trap 状态. plan §1.23.1 + ir.h 顶段 helper call 段. */
-        if (is_hard_boundary) {
+        /* 硬边界 21 op (CSR 6 + FENCE_I + BRANCH 6 + JAL + JALR + SYSTEM 6):
+         * emit 完后强制 break 出循环, 走 DISPATCH_EXIT 收尾 — dispatcher 重派发
+         * 以重新算 (regime, current_tlb) 跟 trap 状态. 跟解释器 fetch loop 末段
+         * `if (is_block_boundary_inst(&d)) goto out;` 字面对偶 (interpreter.c:792),
+         * 共享 decode.h is_block_boundary_inst() — 加新 RV op 时 decode.h
+         * -Wswitch-enum 强制归类, translator 单点自动跟随. plan §1.23.1 +
+         * ir.h 顶段 helper call 段. */
+        if (is_block_boundary_inst(&d)) {
             break;
         }
 

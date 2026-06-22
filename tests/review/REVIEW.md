@@ -1120,3 +1120,52 @@ load 命中 TLB inline `*hva` (BARE identity / SV32 fast path 跟 b_02 T6 落地
      数据, 都没; 当前 Layer 2 是 b_03 最终态.
 
 
+## b_04_02 收尾 — JIT 软边界跟解释器字面对齐 + blocksize_64 翻倍 — 2026-06-23
+
+### 起因 (chat 审查 "JIT 块边界是否正确" 议题)
+
+解释器跟 JIT translator 软边界字面差 1 条:
+- 解释器 `while (count < BLOCK_INST_LIMIT)` 跑 **64 条** RV inst (interpreter.c:189)
+- JIT translator `while (i < BLOCK_INST_LIMIT - 1u)` 翻 **63 条** RV inst + 1 哨兵
+  (translator.c:87, b_04_02 前)
+
+历史成因: ir_buf 大小 = BLOCK_INST_LIMIT (jit_entry.cc:280), 末槽要给 DISPATCH_EXIT/
+_RUNTIME 出口模板, 所以真翻译位上限 BLOCK_INST_LIMIT - 1. doc 自洽但跟解释器
+"软边界协议" 形式不严格对偶.
+
+### 修法 (4.2 严格对齐)
+
+- translator.c while 改 `i < BLOCK_INST_LIMIT` (真翻译 64 条 RV inst, 跟
+  interpreter.c:189 字面对偶)
+- jit_entry.cc:280 `ir_buf[BLOCK_INST_LIMIT]` → `[BLOCK_INST_LIMIT + 1]`,
+  末槽 (idx=64) 给 DISPATCH_EXIT 哨兵; stack +24 字节可忽略
+- translator.h / translator.c / jit_entry.cc 顶段 doc 三处同步更新
+
+### 真 perf 收益 (a02_7 compare, 5 sample median; 严格交错 ABCABC 紧贴)
+
+| Fixture                | b_04_02 前 | b_04_02 后 | delta     |
+| ---------------------- | ---------: | ---------: | --------: |
+| **blocksize_64**       |   1576.7   |  **3239.7**| **+105%** |
+| 其他 15 fixture        |   各自基线  |  噪声内    | -1.9%~+3.2% |
+
+blocksize_64 翻倍解读:
+- fixture 设计块大小 64 inst (无硬边界, 纯算术 loop body)
+- b_04_02 前: JIT 软边界 63 强制 fixture 64-inst 块切成 (63 + 1) 两段, 第二段
+  只 1 条 inst, dispatch overhead 几乎翻倍
+- b_04_02 后: fixture 块完整 64 inst 一段跑完, dispatch frequency 减半 → 吞吐
+  几乎翻倍
+
+### 对 REVIEW_REPORT.md §4.1/§4.2 加速曲线的影响
+
+原 §4.1 数据 16_blocksize_64 加速比 7.80x (反序于 15_blocksize_32 10.53x); 原
+§4.2 line 204 把反序归因 "I-cache 容量边界" — 实为 misdiagnosis. 真因 = JIT
+软边界差 1 强制切块.
+
+b_04_02 修后:
+- 16_blocksize_64 加速比 3239.7 / 201.2 = **16.10x** (新最大加速比)
+- 32 → 64 加速曲线单调上升 (10.53x → 16.10x), 反序消失, §4.2 原 "I-cache" 假说
+  失效
+- §4.1 表 + §4.2 表 + §4.2 反序段全部需同步 update; 详 REVIEW_REPORT.md b_04_02
+  改动段
+
+

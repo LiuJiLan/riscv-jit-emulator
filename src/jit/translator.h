@@ -25,11 +25,12 @@
 //   再 forward 给 backend.compile_block. translator 不调 backend (跟 plan §1.23.17
 //   一致: Translator 不直接调 backend).
 //
-// caller 保证 ir_buf 大小 ≥ BLOCK_INST_LIMIT (jit_compile_block 内部 stack 分配
-// BLOCK_INST_LIMIT 大小 ir_buf).
+// caller 保证 ir_buf 大小 ≥ BLOCK_INST_LIMIT + 1 (jit_compile_block 内部 stack
+// 分配 BLOCK_INST_LIMIT + 1 大小 ir_buf): 前 BLOCK_INST_LIMIT 槽给真翻译 RV inst
+// (跟 interpreter.c:189 软边界字面对偶), 末槽给 DISPATCH_EXIT/_RUNTIME 哨兵.
 //
 // 跨页边界处理 (跟 interpreter 同体例): 块前缀推进后 cur_pc 进新 page → 截断.
-// 软边界 BLOCK_INST_LIMIT - 1 (留 1 slot 给出口模板收尾).
+// 软边界 BLOCK_INST_LIMIT 跟解释器字面一致 (b_04_session_004 对齐).
 //
 // 块前缀空 (N = 0, 第一条就是 unsupported op): translator 仍 emit 出口模板一条,
 // *n_insts = 1; backend.compile_block 检测后返 NOT_IMPLEMENTED, jit_entry.cc
@@ -54,7 +55,7 @@ extern "C" {
 //   pa       - 块入口 PA (uxlen_t)
 //   regime   - baked priv 视角 (REGIME_BARE / REGIME_SV32_S / REGIME_SV32_U);
 //              translator 不消费 regime, 透传给 backend (LOAD/STORE fast path 用)
-//   ir_buf   - 出参 IR buffer (大小 ≥ BLOCK_INST_LIMIT)
+//   ir_buf   - 出参 IR buffer (大小 ≥ BLOCK_INST_LIMIT + 1; 末槽给出口模板)
 //   n_insts  - 出参 IR 流真实长度 (含末尾 DISPATCH_EXIT)
 //
 // 前置: pa 在 RAM 区 (IS_GPA_RAM(pa) == 1); caller (jit_compile_block) 保证.

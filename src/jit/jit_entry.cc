@@ -64,7 +64,7 @@
 // ============================================================================
 //
 // jit_api.h doc 写 "触发翻译 + backend 编译一个块" — 完整路径:
-//   ir_inst_t ir_buf[BLOCK_INST_LIMIT];
+//   ir_inst_t ir_buf[BLOCK_INST_LIMIT + 1];   // 末槽给 DISPATCH_EXIT 哨兵
 //   size_t n_insts = 0;
 //   translator_translate(pa, regime, ir_buf, &n_insts);
 //   backend.compile_block(pa, regime, ir_buf, n_insts, &host_code);
@@ -78,7 +78,7 @@
 #include <stdio.h>           // fprintf (Flush / BLACK 异常路径 stderr 提示)
 
 #include "api/jit_api.h"
-#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 大小) / MAX_BLOCKS_PER_PAGE / EOL
+#include "config.h"          // BLOCK_INST_LIMIT (ir_buf 真翻译槽数, +1 哨兵给末槽) / MAX_BLOCKS_PER_PAGE / EOL
 #include "core/cpu.h"        // cpu_wait_all_harts_exit_host_code / idle_jit (invalidate / flush 协议)
 #include "jit/backend.h"
 #include "jit/jit_cache.h"
@@ -273,11 +273,13 @@ void jit_invalidate_page(uint32_t page_idx) {
 jit_status_t jit_compile_block(uxlen_t pa, regime_t regime) {
     const backend_t *be = backend_get_default();
 
-    /* RV → IR 翻译. ir_buf stack 分配 BLOCK_INST_LIMIT slot, translator 写真实
-     * 长度到 n_insts; 块前缀空 (i==0) 时 n_insts = 1 (仅出口模板),
+    /* RV → IR 翻译. ir_buf stack 分配 BLOCK_INST_LIMIT + 1 slot (前
+     * BLOCK_INST_LIMIT 给真翻译 RV inst 跟 interpreter 软边界字面对偶, 末槽
+     * 给 DISPATCH_EXIT/_RUNTIME 哨兵; b_04_session_004 对齐). translator 写
+     * 真实长度到 n_insts; 块前缀空 (i==0) 时 n_insts = 1 (仅出口模板),
      * backend.compile_block 检测后返 NOT_IMPLEMENTED, step 3 set_blacklist 走
      * interpret 兜底. */
-    ir_inst_t ir_buf[BLOCK_INST_LIMIT];
+    ir_inst_t ir_buf[BLOCK_INST_LIMIT + 1];
     size_t n_insts = 0;
     translator_translate(pa, regime, ir_buf, &n_insts);
 
