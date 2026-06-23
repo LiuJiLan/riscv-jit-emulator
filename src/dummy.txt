@@ -573,43 +573,49 @@ block 内的子段(JIT 翻译过程中的局部块,例如某 else 分支长期 t
 
 
 --------------------------------------------------------------------------------
-bare 模式下也走 TLB(关键设计)
+bare regime 不走 TLB,SV32 regime 才走(关键设计)
 --------------------------------------------------------------------------------
 
-M 态 / S 态的 bare 模式下,gva == pa(恒等映射)。一种朴素实现可能想
-"这种情况直接拿 pc 算 host pointer,跳过 TLB"。本项目不这样做。
+(演进 note: 早期曾设计"bare 也走 TLB 统一分发"——M/S bare 下 TLB 装恒等条目、
+walker short-circuit 仍填表。后改为现行 regime 分流:bare 完全 bypass TLB。本节
+记现行设计;早期方案见 git history + README §8 演进叙事。)
 
-理由:dispatcher 是按 "入口 pc → 块" 做派发的,要做到统一派发就需要
-一个统一的分发表;TLB 就是这个分发表。如果 bare 模式绕开 TLB,bare
-路径和有页表路径就分裂成两条派发流程,代码量、JIT 翻译产物、调试路径
-都翻倍。
+M 态 / 任意 priv 带 bare satp 下,gva == pa(恒等映射)。现行设计:bare regime
+(REGIME_BARE)直接 identity + IS_GPA_RAM 分流访存,**不查 TLB**;只有 SV32
+regime(S/U 走页表)才查 leaf TLB。
+
+理由:走 TLB 必然可能触发 MMU 相关异常(page fault / PTE 权限),而 bare 模式
+按 RV 语义不应在访存时遇到这些异常;让 bare 走 TLB 反要在快路径上区分"这是
+bare 恒等条目、不该报 MMU 异常",得不偿失。再者把"运行模式(regime)"作为分流
+维度,为未来 H-extension(VS/VU)留出不同行为的接口。
 
 具体:
 
-  - M/bare 模式下,TLB 仍被装载,装载的内容是恒等映射条目
-    (gva → host_ram_base + (gva - GUEST_RAM_START))
-  - mmu walker 在 M/bare 下是 short-circuit(直接返回 gva = pa,不走真
-    页表),但 TLB miss 路径仍然调 walker 填表
-  - 解释器和 JIT 翻译产物都通过 TLB 拿 host pointer,不论 priv 模式
+  - tlb_table[PRIV_M] 恒 NULL(Trust regime):bare 访存走 identity +
+    IS_GPA_RAM(pa)——RAM 走 gpa_to_hva_offset + pa,非 RAM 走 mmio helper;
+    不进 TLB。
+  - mmu walker 在 bare 下是 short-circuit(直接返回 gva = pa,不走真页表),
+    只有 SV32 miss 才走真页表遍历填 leaf TLB。
+  - 派发维度是 regime 三分 BARE / SV32_S / SV32_U,不是"统一 TLB"。
 
 
 --------------------------------------------------------------------------------
 收益
 --------------------------------------------------------------------------------
 
-  (1) dispatcher 派发逻辑不感知 priv 模式
-      不论 M/bare/S+页表,dispatcher 干的事都是 "拿 leaf TLB 指针 →
-      fetch 入口 → 调 block"。priv 切换时只切 leaf TLB 指针,派发主
-      循环不动。
+  (1) bare 快路径不背 MMU 异常包袱
+      identity + IS_GPA_RAM 直算 host pointer,无 PTE 权限检查、无 page
+      fault 分支,bare 访存最短。
 
-  (2) JIT 翻译产物跨 priv 复用
-      JIT 翻译出的 host code 通过 TLB 拿 host pointer。同一 PA 在 M
-      态和 S 态产生的翻译产物可以共用(jit_cache key 是 PA),无需
-      为不同 priv 编两份。
+  (2) regime 作为统一分流维度 + JIT cache key
+      dispatcher 每块前按 priv / satp.mode 算 regime,选 leaf TLB(SV32)或
+      identity(bare);命中后执行块不再关心 priv。regime 同时是 JIT cache key
+      的一维(key = (regime, PA),编译期 baked 权限视角),故 bare(M)与 SV32_S
+      产生的是不同 cache 条目,不跨 regime 复用。
 
-  (3) 单一调试路径
-      "block 跑不动了" 无论 priv 模式,都查同一个分发表 + 同一组 walker
-      逻辑,不必为不同模式准备不同诊断手段。
+  (3) 为 H-extension 预留
+      regime 已是分流接口,未来 VS/VU 加更复杂派发主要改 dispatcher 选择逻辑,
+      执行块主体不重写(执行块不在意当前权级)。
 
 
 --------------------------------------------------------------------------------
@@ -1151,9 +1157,13 @@ memory_order 选择。
     lifecycle:    uart_init / uart_reset / uart_destroy + 两对 spawn/join 接口
                   (uart_start/join_reader_thread + uart_start/join_tx_drain_thread)
 
-  runtime = degenerate monitor (单 flag 简化)
-    extern _Atomic int runtime_system_reset_signal / runtime_shutdown_signal,
-    直接读写无封装函数; 单字段无跨字段一致性问题, 不强制接口函数
+  runtime = degenerate monitor (无跨字段一致性锁; 详 runtime.h 顶段 doc)
+    extern _Atomic uint32_t system_reset_signal / shutdown_signal —— 多 bit
+    bitmap (0=允许 / 非0=触发对应停机路径); 读路径 (main while) 直接 atomic_load
+    (acquire), 写路径走接口函数 system_reset_signal_set_bit /
+    shutdown_signal_set_bit (顺序 B "SDS 蕴含 SRS" 写死在 set 内) + 仅 main 的
+    system_reset_signal_try_clear_if_shutdown_zero (CAS-loop)。"degenerate" 指
+    无跨字段一致性问题, 不是 "单 flag 无接口"
 
 memory_order 配对规则:
   producer (write): memory_order_release
@@ -1164,7 +1174,8 @@ memory_order 配对规则:
 边界规则 (跨模块):
   外部模块 (csr.c / dispatcher.c / bus.c 等) 不直接 atomic_* 操作 clint 内部
   字段, 一律走 clint.h 接口 (例 is_clint_*_pending 而非裸 atomic_load(&clint.
-  msip[N]))。runtime extern flag 是 degenerate case 例外 (单字段)。
+  msip[N]))。runtime extern signal 读路径直接 atomic_load 是 degenerate case
+  例外 (写路径仍走 *_set_bit 接口)。
 
 
 --------------------------------------------------------------------------------

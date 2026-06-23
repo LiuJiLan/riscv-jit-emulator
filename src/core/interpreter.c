@@ -20,7 +20,7 @@
 #include "riscv.h"      // PRIV_M / MSTATUS_TW (WFI 检查)
 #include "tlb.h"
 #include "trap.h"       // trap_raise_exception (_Noreturn longjmp) + mret_helper / sret_helper
-#include "wfi.h"        // wfi_wait / wfi_predicate_fn / wfi_should_wake_default
+#include "wfi.h"        // wfi_wait / wfi_predicate_fn / wfi_should_wake
 
 #include <stdint.h>
 #include <string.h>     // memcpy: 4 字节取指, 防 strict-aliasing

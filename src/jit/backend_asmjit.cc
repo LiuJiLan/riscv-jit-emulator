@@ -1808,7 +1808,7 @@ void emit_ir_jalr(compile_ctx_t &ctx, const ir_inst_t &inst) {
 //               (target_pc=exit_inst.target_pc=fall_through_pc) + epilogue.
 //   WFI: emit TW 检查 inline (cmp priv,M; jae l_skip; test mstatus,TW; jz l_no_trap;
 //        trap_raise illegal+raw_inst; l_no_trap: l_skip:); emit `call wfi_wait(
-//        hartid, wfi_should_wake_default, hart)` (cond_wait 阻塞到 SRS / 中断
+//        hartid, wfi_should_wake, hart)` (cond_wait 阻塞到 SRS / 中断
 //        pending); emit `call lrsc_clear_self(hart)`; emit `add cpu->regs[0], 4`
 //        自推进. 末段走 emit_dispatch_exit_count_only (cpu->regs[0] 已自加) +
 //        epilogue.

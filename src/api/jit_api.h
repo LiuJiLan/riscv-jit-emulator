@@ -109,8 +109,10 @@ void jit_invalidate_block(uxlen_t pa, regime_t regime);
 void jit_invalidate_page(uint32_t page_idx);
 
 // jit_flush_all: 整体 Flush jit_cache + code_cache (CODE_CACHE_FULL 时调).
-//   实装: jit_cache_flush_all → backend.flush_all (顺序固定; backend.flush_all
-//   走 asmjit JitRuntime::reset).
+//   实装 4 步 (jit_entry.cc; 整套裹 backend_lock wrlock 防跟 compile/invalidate
+//   的 rdlock race): 1+2. jit_cache_flush_all (全表 status=EMPTY + RCU sync) →
+//   3. cpu_wait_all_harts_idle_jit (等所有 hart 退出任何 host_code) →
+//   4. backend.flush_all (asmjit JitRuntime::reset 整片回收 RX 池).
 void jit_flush_all(void);
 
 

@@ -20,10 +20,10 @@
 #include <time.h>
 
 #include "config.h"               // MAX_HARTS / WFI_TIMEOUT_NS
-#include "cpu.h"                  // cpu_t (wfi_should_wake_default 读 hart->trap._mie)
-#include "csr.h"                  // csr_mip_read (wfi_should_wake_default 合成读 mip)
+#include "cpu.h"                  // cpu_t (wfi_should_wake 读 hart->trap._mie)
+#include "csr.h"                  // csr_mip_read (wfi_should_wake 合成读 mip)
 #include "debug.h"                // DEBUG_WFI_SLEEP ('w' 进 cond_wait 前打)
-#include "runtime.h"              // system_reset_signal (wfi_should_wake_default predicate 内读)
+#include "runtime.h"              // system_reset_signal (wfi_should_wake predicate 内读)
 
 
 // ----------------------------------------------------------------------------

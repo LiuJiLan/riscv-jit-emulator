@@ -90,7 +90,7 @@ typedef struct {
     // (cpu_t.tlb_table[4] 同风格, 直接 [priv] 索引免减法)。
     // 命名 "x" 前缀对应 RV 手册 xepc 风格 (xepc[PRIV_M] = mepc, xepc[PRIV_S] = sepc 等);
     // csr 大 switch 的 mepc / sepc / ... read/write helper 映射到对应槽位。
-    // 详见 dummy.txt §6 CSR 物理存储字段命名四类划分。
+    // 详见 dummy.txt §6 CSR 物理存储字段命名五类划分。
     uxlen_t   xcause[4];
     uxlen_t   xtval[4];
     uxlen_t   xepc[4];

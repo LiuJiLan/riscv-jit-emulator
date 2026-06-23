@@ -14,7 +14,7 @@
 // ----------------------------------------------------------------------------
 //
 // monitor 范式四态:
-//   CLINT      = "monitor + timer 辅助线程"     (mtime 由 host wall clock 推进)
+//   CLINT      = "monitor + timer 辅助线程"     (mtime 按固定步长 fetch_add 推进; host 时钟只定唤醒节奏, 非墙钟值)
 //   UART       = "monitor + reader 辅助线程"    (RX 源 = host stdin)
 //   virtio-blk = "monitor + io_worker 辅助线程" (异步执行 pread/pwrite + 触发 IRQ)
 //   PLIC       = "monitor 但无辅助线程"         (atomic 字段直接做 hot path 优化)

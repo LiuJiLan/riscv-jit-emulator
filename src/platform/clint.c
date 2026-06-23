@@ -100,14 +100,13 @@ static clint_per_hart_slot_t clint_per_hart[MAX_HARTS];
 //   lock(mtip_lock) → 重 load mtime + mtimecmps[hartid] → compute new_mtip
 //   → 比 old_mtip, 0→1 调 wfi_kick(hartid) → atomic_store mtip → unlock。
 //
-// 注意 kick 在 atomic_store 之前还是之后: 之后更安全 (避免 hart 醒来 predicate
-// re-check 时 mtip 还没更新看不到, 又睡回去 — 不算错但多一次假醒)。但本设计选
-// 先 kick 再 store —— 为什么? 因为 atomic_store(release) 跟 hart 端 atomic_load
-// (acquire) 配对建立 happens-before, store 是"对外公布"的瞬间; kick 在 store
-// 后还是先无所谓 (kick 自带 pthread_mutex 进入 + cond_signal 已经建立 happens-
-// before, hart 醒来 re-check 时 atomic_load mtip 必看见新值, 因为 hart 必 lock
-// wfi_mutex 之后才 cond_wait, kick 之前必 lock wfi_mutex, 锁就形成 ordering 屏障)。
-// 实装上 store 紧跟 kick 也行, 当前选 store 后 kick (更直觉)。
+// 注意 kick 在 atomic_store 之前还是之后: 当前选 store 之后 (更安全也更直觉 —
+// 避免 hart 醒来 predicate re-check 时 mtip 还没更新看不到、又睡回去, 不算错但
+// 多一次假醒)。两序其实都正确: atomic_store(release) 跟 hart 端 atomic_load
+// (acquire) 配对建立 happens-before; 且 kick 自带 pthread_mutex 进入 +
+// cond_signal, hart 必 lock wfi_mutex 之后才 cond_wait、kick 之前必 lock
+// wfi_mutex, 锁本身已形成 ordering 屏障, hart 醒来 re-check 时 atomic_load mtip
+// 必看见新值。实装即下方 if 块: 先 atomic_store(mtip) 再 wfi_kick。
 static void clint_recompute_mtip(uint32_t hartid) {
     if (hartid >= MAX_HARTS) return;     /* defensive; 上层调用方应已 bound check */
 
